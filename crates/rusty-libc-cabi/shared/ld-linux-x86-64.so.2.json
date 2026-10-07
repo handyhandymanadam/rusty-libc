@@ -1,0 +1,287 @@
+{
+ "soname": "ld-linux-x86-64.so.2",
+ "verdefs": [
+  {
+   "name": "GLIBC_2.2.5",
+   "parent": null
+  },
+  {
+   "name": "GLIBC_2.3",
+   "parent": "GLIBC_2.2.5"
+  },
+  {
+   "name": "GLIBC_2.4",
+   "parent": "GLIBC_2.3"
+  },
+  {
+   "name": "GLIBC_2.34",
+   "parent": "GLIBC_2.4"
+  },
+  {
+   "name": "GLIBC_2.35",
+   "parent": "GLIBC_2.34"
+  },
+  {
+   "name": "GLIBC_PRIVATE",
+   "parent": "GLIBC_2.35"
+  }
+ ],
+ "symbols": [
+  {
+   "name": "_dl_rtld_di_serinfo",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 544
+  },
+  {
+   "name": "_dl_audit_symbind_alt",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 433
+  },
+  {
+   "name": "__nptl_initial_report_events",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "OBJECT",
+   "bind": "GLOBAL",
+   "size": 1
+  },
+  {
+   "name": "_rtld_global_ro",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "OBJECT",
+   "bind": "GLOBAL",
+   "size": 928
+  },
+  {
+   "name": "_dl_allocate_tls",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 48
+  },
+  {
+   "name": "__rseq_flags",
+   "version": "GLIBC_2.35",
+   "default": true,
+   "type": "OBJECT",
+   "bind": "GLOBAL",
+   "size": 4
+  },
+  {
+   "name": "_rtld_global",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "OBJECT",
+   "bind": "GLOBAL",
+   "size": 2120
+  },
+  {
+   "name": "_dl_allocate_tls_init",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 545
+  },
+  {
+   "name": "__libc_stack_end",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "OBJECT",
+   "bind": "GLOBAL",
+   "size": 8
+  },
+  {
+   "name": "__libc_enable_secure",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "OBJECT",
+   "bind": "GLOBAL",
+   "size": 4
+  },
+  {
+   "name": "_dl_deallocate_tls",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 202
+  },
+  {
+   "name": "__tunable_is_initialized",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 26
+  },
+  {
+   "name": "_dl_x86_get_cpu_features",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 12
+  },
+  {
+   "name": "_dl_signal_exception",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 97
+  },
+  {
+   "name": "_r_debug",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "OBJECT",
+   "bind": "GLOBAL",
+   "size": 40
+  },
+  {
+   "name": "_dl_catch_exception",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 457
+  },
+  {
+   "name": "__tls_get_addr",
+   "version": "GLIBC_2.3",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 65
+  },
+  {
+   "name": "_dl_exception_free",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 47
+  },
+  {
+   "name": "_dl_debug_state",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "_dl_get_tls_static_info",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 25
+  },
+  {
+   "name": "_dl_find_dso_for_object",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 212
+  },
+  {
+   "name": "__rseq_offset",
+   "version": "GLIBC_2.35",
+   "default": true,
+   "type": "OBJECT",
+   "bind": "GLOBAL",
+   "size": 8
+  },
+  {
+   "name": "__rtld_version_placeholder",
+   "version": "GLIBC_2.34",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "_dl_fatal_printf",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 163
+  },
+  {
+   "name": "__rseq_size",
+   "version": "GLIBC_2.35",
+   "default": true,
+   "type": "OBJECT",
+   "bind": "GLOBAL",
+   "size": 4
+  },
+  {
+   "name": "__tunable_get_val",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 103
+  },
+  {
+   "name": "_dl_signal_error",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 114
+  },
+  {
+   "name": "_dl_exception_create_format",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 1144
+  },
+  {
+   "name": "_dl_argv",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "OBJECT",
+   "bind": "GLOBAL",
+   "size": 8
+  },
+  {
+   "name": "_dl_mcount",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 498
+  },
+  {
+   "name": "_dl_exception_create",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 234
+  },
+  {
+   "name": "_dl_audit_preinit",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 152
+  }
+ ]
+}

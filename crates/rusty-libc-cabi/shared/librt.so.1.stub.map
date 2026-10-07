@@ -1,0 +1,22 @@
+GLIBC_2.2.5 {
+  global:
+    __stub_GLIBC_2_2_5;
+};
+GLIBC_2.3.3 {
+  global:
+    __stub_GLIBC_2_3_3;
+} GLIBC_2.2.5;
+GLIBC_2.3.4 {
+  global:
+    __stub_GLIBC_2_3_4;
+} GLIBC_2.3.3;
+GLIBC_2.4 {
+  global:
+    __stub_GLIBC_2_4;
+} GLIBC_2.3.4;
+GLIBC_2.7 {
+  global:
+    __stub_GLIBC_2_7;
+  local:
+    *;
+} GLIBC_2.4;

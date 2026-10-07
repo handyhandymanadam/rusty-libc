@@ -1,0 +1,11 @@
+language = "C"
+include_guard = "_RLIBC_MATH_CALLS_H"
+no_includes = true
+sys_includes = ["stdint.h"]
+[defines]
+"feature = misc" = "__RLIBC_MATH_MISC"
+"feature = gnu" = "__RLIBC_MATH_GNU"
+"feature = ext" = "__RLIBC_MATH_EXT"
+"feature = floatn" = "__RLIBC_MATH_FLOATN"
+[export]
+exclude = ["EDOM", "ERANGE", "F80Arg", "nexttoward", "nexttowardf"]

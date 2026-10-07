@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SUFFIX = {"d": "", "f": "f", "l": "l", "q": "f128"}
+STEMS = {
+    "acos": "1", "acosh": "1", "asin": "1", "atanh": "1", "cosh": "1", "exp": "1", "exp10": "1", "exp2": "1", "j0": "1", "j1": "1",
+    "lgamma": "1", "log": "1", "log10": "1", "log2": "1", "sinh": "1", "sqrt": "1", "tgamma": "1", "y0": "1", "y1": "1",
+    "atan2": "2", "fmod": "2", "hypot": "2", "pow": "2", "remainder": "2", "scalb": "2",
+    "jn": "I", "yn": "I", "lgamma_r": "R", "gamma_r": "R",
+}
+MODERN_RAW = {("exp10", "f"), ("remainder", "d"), ("sqrt", "f"), ("tgamma", "f")}
+ALIAS = {"pow10": "exp10"}
+
+
+def split_name(name):
+    base = ALIAS.get(name[:-1] if name.endswith(("f", "l")) and name[:-1] in ALIAS else name)
+    for t in "qfld":
+        for stem in STEMS:
+            if STEMS[stem] == "R":
+                s = stem[: -len("_r")] + SUFFIX[t] + "_r"
+            else:
+                s = stem + SUFFIX[t]
+            if name == s:
+                return stem, t
+    if name in ("pow10", "pow10f", "pow10l"):
+        return "exp10", {"pow10": "d", "pow10f": "f", "pow10l": "l"}[name]
+    return None
+
+
+def target_of(stem, t):
+    if stem == "gamma_r":
+        return "tgamma" + SUFFIX[t]
+    s = stem
+    if STEMS[stem] == "R":
+        return s[: -len("_r")] + SUFFIX[t] + "_r"
+    return s + SUFFIX[t]
+
+
+def entries():
+    out = []
+    for line in open(os.path.join(ROOT, "tools", "compat_symbols_libm.txt")):
+        if line.startswith("#") or not line.strip():
+            continue
+        name, ver, kind, size = line.split()
+        if kind != "func" or name.startswith(("fromfp", "ufromfp", "totalorder", "matherr")):
+            continue
+        finite = name.startswith("__") and name.endswith("_finite")
+        base = name[2:-len("_finite")] if finite else name
+        c = split_name(base)
+        if c is None:
+            continue
+        stem, t = c
+        if not finite and ver not in ("GLIBC_2.2.5", "GLIBC_2.23"):
+            continue
+        if not finite and t == "q":
+            continue
+        label = "__rl_sv_%s_%s" % (name, ver.replace("GLIBC_", "").replace(".", "_"))
+        out.append((label, name, ver, stem, t, finite, STEMS[stem], target_of(stem, t)))
+    return out
+
+
+def asm_sse(label, target, idx, shape, t):
+    mov = {"d": "movsd", "f": "movss", "q": "movups"}[t]
+    L = ['    ".pushsection .text.rl_compat,\\"ax\\",@progbits",', '    ".p2align 4",', '    ".globl %s",' % label, '    ".type %s, @function",' % label, '    "%s:",' % label,
+         '    "push rbx",', '    "sub rsp, 64",', '    "%s [rsp], xmm0",' % mov]
+    if shape == "2":
+        L.append('    "%s [rsp+16], xmm1",' % mov)
+    elif shape == "I":
+        L += ['    "movsxd rax, edi",', '    "mov [rsp+16], rax",']
+    elif shape == "R":
+        L.append('    "mov [rsp+16], rdi",')
+    L += ['    "mov rdi, rsp",', '    "mov esi, %d",' % idx, '    "call __rl_sv_pre",', '    "%s xmm0, [rsp]",' % mov]
+    if shape == "2":
+        L.append('    "%s xmm1, [rsp+16]",' % mov)
+    elif shape == "I":
+        L.append('    "mov edi, [rsp+16]",')
+    elif shape == "R":
+        L.append('    "mov rdi, [rsp+16]",')
+    L += ['    "call %s",' % target, '    "%s [rsp+32], xmm0",' % mov, '    "mov rdi, rsp",', '    "mov esi, %d",' % idx, '    "call __rl_sv_post",',
+          '    "%s xmm0, [rsp+32]",' % mov, '    "add rsp, 64",', '    "pop rbx",', '    "ret",', '    ".size %s, .-%s",' % (label, label), '    ".popsection",']
+    return L
+
+
+def asm_x87(label, target, idx, shape):
+    L = ['    ".pushsection .text.rl_compat,\\"ax\\",@progbits",', '    ".p2align 4",', '    ".globl %s",' % label, '    ".type %s, @function",' % label, '    "%s:",' % label,
+         '    "push rbx",', '    "sub rsp, 64",', '    "fld tbyte ptr [rsp+80]",', '    "fstp tbyte ptr [rsp]",']
+    if shape == "2":
+        L += ['    "fld tbyte ptr [rsp+96]",', '    "fstp tbyte ptr [rsp+16]",']
+    elif shape == "I":
+        L += ['    "movsxd rax, edi",', '    "mov [rsp+16], rax",']
+    elif shape == "R":
+        L.append('    "mov [rsp+16], rdi",')
+    L += ['    "mov rdi, rsp",', '    "mov esi, %d",' % idx, '    "call __rl_sv_pre",', '    "sub rsp, 32",', '    "fld tbyte ptr [rsp+32]",', '    "fstp tbyte ptr [rsp]",']
+    if shape == "2":
+        L += ['    "fld tbyte ptr [rsp+48]",', '    "fstp tbyte ptr [rsp+16]",']
+    elif shape == "I":
+        L.append('    "mov edi, [rsp+48]",')
+    elif shape == "R":
+        L.append('    "mov rdi, [rsp+48]",')
+    L += ['    "call %s",' % target, '    "add rsp, 32",', '    "fstp tbyte ptr [rsp+32]",', '    "mov rdi, rsp",', '    "mov esi, %d",' % idx, '    "call __rl_sv_post",',
+          '    "fld tbyte ptr [rsp+32]",', '    "add rsp, 64",', '    "pop rbx",', '    "ret",', '    ".size %s, .-%s",' % (label, label), '    ".popsection",']
+    return L
+
+
+def main():
+    ents = entries()
+    out = ["// GENERATED by tools/gen_svid_compat.py: do not edit.", "",
+           "pub static DESCS: [Desc; %d] = [" % len(ents)]
+    for (label, name, ver, stem, t, finite, shape, target) in ents:
+        skip = (not finite) and ((stem, t) in MODERN_RAW)
+        out.append('    Desc { stem: "%s", ty: Ty::%s, finite: %s, shape: b\'%s\', modern_raw: %s }, // %s@%s' % (stem, t.upper(), str(finite).lower(), shape, str(skip).lower(), name, ver))
+    out.append("];")
+    out.append("")
+    out.append("core::arch::global_asm!(")
+    for i, (label, name, ver, stem, t, finite, shape, target) in enumerate(ents):
+        out += asm_x87(label, target, i, shape) if t == "l" else asm_sse(label, target, i, shape, t)
+    out.append(");")
+    open(os.path.join(ROOT, "crates/rusty-libc-cabi/src/compat_svid_gen.rs"), "w").write("\n".join(out) + "\n")
+    raw = ["// GENERATED by tools/gen_svid_compat.py from tools/svid_raw_table.txt: do not edit.", "", "pub static RAW: &[Raw] = &["]
+    p = os.path.join(ROOT, "tools", "svid_raw_table.txt")
+    if os.path.exists(p):
+        for line in open(p):
+            if line.startswith("#") or not line.strip():
+                continue
+            name, t, e, n = line.split()
+            raw.append('    Raw { name: "%s", ty: Ty::%s, errno: b\'%s\', nan: b\'%s\' },' % (name, t.upper(), e, n))
+    raw.append("];")
+    open(os.path.join(ROOT, "crates/rusty-libc-cabi/src/compat_svid_raw.rs"), "w").write("\n".join(raw) + "\n")
+    print("%d old libm entries" % len(ents))
+
+
+if __name__ == "__main__":
+    main()

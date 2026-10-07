@@ -1,0 +1,12 @@
+language = "C"
+include_guard = "_RLIBC_FENV_CALLS_H"
+no_includes = true
+[defines]
+"feature = gnu" = "__RLIBC_MATH_GNU"
+"feature = ext" = "__RLIBC_MATH_EXT"
+[export]
+exclude = ["FE_INVALID", "FE_DENORM", "FE_DIVBYZERO", "FE_OVERFLOW", "FE_UNDERFLOW", "FE_INEXACT", "FE_ALL_EXCEPT", "FE_TONEAREST", "FE_DOWNWARD", "FE_UPWARD", "FE_TOWARDZERO", "FenvT", "FemodeT", "FexceptT"]
+[export.rename]
+"FenvT" = "fenv_t"
+"FemodeT" = "femode_t"
+"FexceptT" = "fexcept_t"

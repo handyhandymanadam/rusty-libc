@@ -1,0 +1,7 @@
+language = "C"
+include_guard = "_ERROR_H"
+usize_is_size_t = true
+documentation = false
+no_includes = true
+[fn]
+no_return = "__attribute__((noreturn))"

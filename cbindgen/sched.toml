@@ -1,0 +1,100 @@
+language = "C"
+style = "tag"
+include_guard = "_RLIBC_SCHED_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h", "stdint.h"]
+after_includes = '''
+typedef unsigned long int __cpu_mask;
+#define SCHED_OTHER 0
+#define SCHED_FIFO 1
+#define SCHED_RR 2
+#define SCHED_NORMAL 0
+#define SCHED_BATCH 3
+#define SCHED_ISO 4
+#define SCHED_IDLE 5
+#define SCHED_DEADLINE 6
+#define SCHED_EXT 7
+#define SCHED_RESET_ON_FORK 0x40000000
+#define SCHED_FLAG_RESET_ON_FORK 0x01
+#define SCHED_FLAG_RECLAIM 0x02
+#define SCHED_FLAG_DL_OVERRUN 0x04
+#define SCHED_FLAG_KEEP_POLICY 0x08
+#define SCHED_FLAG_KEEP_PARAMS 0x10
+#define SCHED_FLAG_UTIL_CLAMP_MIN 0x20
+#define SCHED_FLAG_UTIL_CLAMP_MAX 0x40
+#define SCHED_FLAG_KEEP_ALL 24
+#define SCHED_FLAG_UTIL_CLAMP 96
+#define SCHED_ATTR_SIZE_VER0 48
+#define SCHED_ATTR_SIZE_VER1 56
+#define CSIGNAL 0x000000ff
+#define CLONE_VM 0x00000100
+#define CLONE_FS 0x00000200
+#define CLONE_FILES 0x00000400
+#define CLONE_SIGHAND 0x00000800
+#define CLONE_PIDFD 0x00001000
+#define CLONE_PTRACE 0x00002000
+#define CLONE_VFORK 0x00004000
+#define CLONE_PARENT 0x00008000
+#define CLONE_THREAD 0x00010000
+#define CLONE_NEWNS 0x00020000
+#define CLONE_SYSVSEM 0x00040000
+#define CLONE_SETTLS 0x00080000
+#define CLONE_PARENT_SETTID 0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_DETACHED 0x00400000
+#define CLONE_UNTRACED 0x00800000
+#define CLONE_CHILD_SETTID 0x01000000
+#define CLONE_NEWCGROUP 0x02000000
+#define CLONE_NEWUTS 0x04000000
+#define CLONE_NEWIPC 0x08000000
+#define CLONE_NEWUSER 0x10000000
+#define CLONE_NEWPID 0x20000000
+#define CLONE_NEWNET 0x40000000
+#define CLONE_IO 0x80000000
+#define CLONE_NEWTIME 0x00000080
+#define CPU_SETSIZE 1024
+
+typedef struct {
+  unsigned long __bits[16];
+} cpu_set_t;
+#define CPU_SETSIZE 1024
+#define __CPU_SETBITS 64
+#define CPU_ZERO_S(setsize, cpusetp) \
+  do { size_t __i; size_t __n = (setsize) / sizeof(unsigned long); unsigned long *__p = (unsigned long *)(cpusetp); \
+       for (__i = 0; __i < __n; ++__i) __p[__i] = 0; } while (0)
+#define CPU_SET_S(cpu, setsize, cpusetp) \
+  (__extension__ ({ size_t __cpu = (cpu); __cpu / 8 < (setsize) \
+     ? (((unsigned long *)(cpusetp))[__cpu / 64] |= 1UL << (__cpu % 64)) : 0UL; }))
+#define CPU_CLR_S(cpu, setsize, cpusetp) \
+  (__extension__ ({ size_t __cpu = (cpu); __cpu / 8 < (setsize) \
+     ? (((unsigned long *)(cpusetp))[__cpu / 64] &= ~(1UL << (__cpu % 64))) : 0UL; }))
+#define CPU_ISSET_S(cpu, setsize, cpusetp) \
+  (__extension__ ({ size_t __cpu = (cpu); __cpu / 8 < (setsize) \
+     ? ((((const unsigned long *)(cpusetp))[__cpu / 64] & (1UL << (__cpu % 64))) != 0) : 0; }))
+#define CPU_COUNT_S(setsize, cpusetp) __sched_cpucount(setsize, (const cpu_set_t *)(cpusetp))
+#define CPU_EQUAL_S(setsize, cpusetp1, cpusetp2) (__builtin_memcmp(cpusetp1, cpusetp2, setsize) == 0)
+#define __CPU_OP_S(setsize, destset, srcset1, srcset2, op) \
+  (__extension__ ({ cpu_set_t *__dest = (destset); const unsigned long *__a = (const unsigned long *)(srcset1); \
+     const unsigned long *__b = (const unsigned long *)(srcset2); size_t __n = (setsize) / sizeof(unsigned long), __i; \
+     for (__i = 0; __i < __n; ++__i) ((unsigned long *)__dest)[__i] = __a[__i] op __b[__i]; __dest; }))
+#define CPU_AND_S(setsize, destset, srcset1, srcset2) __CPU_OP_S(setsize, destset, srcset1, srcset2, &)
+#define CPU_OR_S(setsize, destset, srcset1, srcset2) __CPU_OP_S(setsize, destset, srcset1, srcset2, |)
+#define CPU_XOR_S(setsize, destset, srcset1, srcset2) __CPU_OP_S(setsize, destset, srcset1, srcset2, ^)
+#define __NCPUBITS (8 * sizeof (__cpu_mask))
+#define CPU_ALLOC_SIZE(count) ((((count) + __NCPUBITS - 1) / __NCPUBITS) * sizeof (__cpu_mask))
+#define CPU_ALLOC(count) __sched_cpualloc(count)
+#define CPU_FREE(cpuset) __sched_cpufree(cpuset)
+#define CPU_ZERO(cpusetp) CPU_ZERO_S(sizeof(cpu_set_t), cpusetp)
+#define CPU_SET(cpu, cpusetp) CPU_SET_S(cpu, sizeof(cpu_set_t), cpusetp)
+#define CPU_CLR(cpu, cpusetp) CPU_CLR_S(cpu, sizeof(cpu_set_t), cpusetp)
+#define CPU_ISSET(cpu, cpusetp) CPU_ISSET_S(cpu, sizeof(cpu_set_t), cpusetp)
+#define CPU_COUNT(cpusetp) CPU_COUNT_S(sizeof(cpu_set_t), cpusetp)
+#define CPU_EQUAL(cpusetp1, cpusetp2) CPU_EQUAL_S(sizeof(cpu_set_t), cpusetp1, cpusetp2)
+#define CPU_AND(destset, srcset1, srcset2) CPU_AND_S(sizeof(cpu_set_t), destset, srcset1, srcset2)
+#define CPU_OR(destset, srcset1, srcset2) CPU_OR_S(sizeof(cpu_set_t), destset, srcset1, srcset2)
+#define CPU_XOR(destset, srcset1, srcset2) CPU_XOR_S(sizeof(cpu_set_t), destset, srcset1, srcset2)
+'''
+[export]
+include = ["sched_attr"]
+[fn]

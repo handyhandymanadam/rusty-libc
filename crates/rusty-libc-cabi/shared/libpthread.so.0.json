@@ -1,0 +1,151 @@
+{
+ "soname": "libpthread.so.0",
+ "verdefs": [
+  {
+   "name": "GLIBC_2.2.5",
+   "parent": null
+  },
+  {
+   "name": "GLIBC_2.2.6",
+   "parent": "GLIBC_2.2.5"
+  },
+  {
+   "name": "GLIBC_2.3.2",
+   "parent": "GLIBC_2.2.6"
+  },
+  {
+   "name": "GLIBC_2.3.3",
+   "parent": "GLIBC_2.3.2"
+  },
+  {
+   "name": "GLIBC_2.3.4",
+   "parent": "GLIBC_2.3.3"
+  },
+  {
+   "name": "GLIBC_2.4",
+   "parent": "GLIBC_2.3.4"
+  },
+  {
+   "name": "GLIBC_2.11",
+   "parent": "GLIBC_2.4"
+  },
+  {
+   "name": "GLIBC_2.12",
+   "parent": "GLIBC_2.11"
+  },
+  {
+   "name": "GLIBC_2.18",
+   "parent": "GLIBC_2.12"
+  },
+  {
+   "name": "GLIBC_2.28",
+   "parent": "GLIBC_2.18"
+  },
+  {
+   "name": "GLIBC_2.30",
+   "parent": "GLIBC_2.28"
+  },
+  {
+   "name": "GLIBC_2.31",
+   "parent": "GLIBC_2.30"
+  }
+ ],
+ "symbols": [
+  {
+   "name": "__libpthread_version_placeholder",
+   "version": "GLIBC_2.28",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__libpthread_version_placeholder",
+   "version": "GLIBC_2.11",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__libpthread_version_placeholder",
+   "version": "GLIBC_2.4",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__libpthread_version_placeholder",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__libpthread_version_placeholder",
+   "version": "GLIBC_2.30",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__libpthread_version_placeholder",
+   "version": "GLIBC_2.3.3",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__libpthread_version_placeholder",
+   "version": "GLIBC_2.12",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__libpthread_version_placeholder",
+   "version": "GLIBC_2.18",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__libpthread_version_placeholder",
+   "version": "GLIBC_2.31",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__libpthread_version_placeholder",
+   "version": "GLIBC_2.2.6",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__libpthread_version_placeholder",
+   "version": "GLIBC_2.3.4",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__libpthread_version_placeholder",
+   "version": "GLIBC_2.3.2",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  }
+ ]
+}

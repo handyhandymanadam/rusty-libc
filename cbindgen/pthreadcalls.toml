@@ -1,0 +1,27 @@
+language = "C"
+style = "type"
+include_guard = "_RLIBC_PTHREADCALLS_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h"]
+[export]
+item_types = ["functions"]
+exclude = ["rl_syscall_cancel_arch", "rl_clone", "rl_sigreturn", "rl_cancel_start", "rl_cancel_end", "pthread_sigqueue"]
+[export.rename]
+"PthreadT" = "pthread_t"
+"PthreadAttr" = "pthread_attr_t"
+"Mutex" = "pthread_mutex_t"
+"MutexAttr" = "pthread_mutexattr_t"
+"Cond" = "pthread_cond_t"
+"CondAttr" = "pthread_condattr_t"
+"RwLock" = "pthread_rwlock_t"
+"RwLockAttr" = "pthread_rwlockattr_t"
+"Barrier" = "pthread_barrier_t"
+"BarrierAttr" = "pthread_barrierattr_t"
+"Timespec" = "struct timespec"
+"SchedParam" = "struct sched_param"
+"SigsetT" = "sigset_t"
+"CpuSet" = "cpu_set_t"
+"CleanupBuf" = "struct _pthread_cleanup_buffer"
+[fn]
+no_return = "__attribute__((noreturn))"

@@ -1,0 +1,12 @@
+posix_spawn_file_actions_addchdir GLIBC_2.43
+__libc_walk_threads GLIBC_PRIVATE
+__ctype_b GLIBC_2.2.5
+__ctype_tolower GLIBC_2.2.5
+__ctype_toupper GLIBC_2.2.5
+_res GLIBC_2.2.5
+loc1 GLIBC_2.2.5
+loc2 GLIBC_2.2.5
+locs GLIBC_2.2.5
+__ctype32_b GLIBC_2.2.5
+__ctype32_tolower GLIBC_2.2.5
+__ctype32_toupper GLIBC_2.2.5

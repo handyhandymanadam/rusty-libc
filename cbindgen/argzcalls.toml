@@ -1,0 +1,10 @@
+language = "C"
+style = "type"
+include_guard = "_RLIBC_ARGZCALLS_H"
+usize_is_size_t = true
+no_includes = true
+documentation = false
+[export]
+item_types = ["functions"]
+[export.rename]
+"ErrorT" = "error_t"

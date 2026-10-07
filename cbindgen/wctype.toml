@@ -1,0 +1,54 @@
+language = "C"
+include_guard = "_RLIBC_WCTYPE_H"
+no_includes = true
+sys_includes = ["stddef.h", "stdint.h"]
+after_includes = """
+#define __need_wint_t
+#include <stddef.h>
+#undef __need_wint_t
+#ifndef ____mbstate_t_defined
+#define ____mbstate_t_defined 1
+typedef struct { int __count; union { wint_t __wch; char __wchb[4]; } __value; } __mbstate_t;
+#endif
+#ifndef __mbstate_t_defined
+#define __mbstate_t_defined 1
+typedef __mbstate_t mbstate_t;
+#endif
+#if !defined _BITS_TYPES_LOCALE_T_H && !defined _RLIBC_LOCALE_T
+#define _BITS_TYPES_LOCALE_T_H 1
+#define _RLIBC_LOCALE_T
+typedef struct __locale_struct *__locale_t;
+typedef __locale_t locale_t;
+#endif
+
+#define WEOF (0xffffffffu)
+typedef unsigned long wctype_t;
+typedef const __INT32_TYPE__ *wctrans_t;
+
+int iswalnum(wint_t);
+int iswalpha(wint_t);
+int iswblank(wint_t);
+int iswcntrl(wint_t);
+int iswdigit(wint_t);
+int iswgraph(wint_t);
+int iswlower(wint_t);
+int iswprint(wint_t);
+int iswpunct(wint_t);
+int iswspace(wint_t);
+int iswupper(wint_t);
+int iswxdigit(wint_t);
+int iswalnum_l(wint_t, locale_t);
+int iswalpha_l(wint_t, locale_t);
+int iswblank_l(wint_t, locale_t);
+int iswcntrl_l(wint_t, locale_t);
+int iswdigit_l(wint_t, locale_t);
+int iswgraph_l(wint_t, locale_t);
+int iswlower_l(wint_t, locale_t);
+int iswprint_l(wint_t, locale_t);
+int iswpunct_l(wint_t, locale_t);
+int iswspace_l(wint_t, locale_t);
+int iswupper_l(wint_t, locale_t);
+int iswxdigit_l(wint_t, locale_t);
+"""
+[export]
+exclude = ["locale_t"]

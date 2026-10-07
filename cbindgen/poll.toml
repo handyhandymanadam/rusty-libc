@@ -1,0 +1,26 @@
+language = "C"
+style = "tag"
+include_guard = "_RLIBC_POLL_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h", "stdint.h"]
+after_includes = '''
+#define POLLIN 0x001
+#define POLLPRI 0x002
+#define POLLOUT 0x004
+#define POLLRDNORM 0x040
+#define POLLRDBAND 0x080
+#define POLLWRNORM 0x100
+#define POLLWRBAND 0x200
+#define POLLMSG 0x400
+#define POLLREMOVE 0x1000
+#define POLLRDHUP 0x2000
+#define POLLERR 0x008
+#define POLLHUP 0x010
+#define POLLNVAL 0x020
+
+typedef unsigned long nfds_t;
+'''
+[export]
+include = ["pollfd"]
+[fn]

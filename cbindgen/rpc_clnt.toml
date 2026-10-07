@@ -1,0 +1,34 @@
+language = "C"
+style = "type"
+include_guard = "_RLIBC_RPC_CLNT_DECLS_H"
+usize_is_size_t = true
+no_includes = true
+documentation = false
+[export]
+item_types = ["functions"]
+[export.rename]
+"rpc_msg" = "struct rpc_msg"
+"xdr_discrim" = "struct xdr_discrim"
+"netobj" = "struct netobj"
+"opaque_auth" = "struct opaque_auth"
+"authunix_parms" = "struct authunix_parms"
+"accepted_reply" = "struct accepted_reply"
+"rejected_reply" = "struct rejected_reply"
+"rpc_err" = "struct rpc_err"
+"rpc_createerr" = "struct rpc_createerr"
+"svc_req" = "struct svc_req"
+"pmap" = "struct pmap"
+"pmaplist" = "struct pmaplist"
+"rmtcallargs" = "struct rmtcallargs"
+"rmtcallres" = "struct rmtcallres"
+"authdes_cred" = "struct authdes_cred"
+"authdes_verf" = "struct authdes_verf"
+"rpc_timeval" = "struct rpc_timeval"
+"timeval" = "struct timeval"
+"sockaddr" = "struct sockaddr"
+"sockaddr_in" = "struct sockaddr_in"
+"sockaddr_un" = "struct sockaddr_un"
+"pollfd" = "struct pollfd"
+"File" = "FILE"
+"XdrIoFn" = "__xdr_io_fn_t"
+"dispatch_fn_t" = "__dispatch_fn_t"

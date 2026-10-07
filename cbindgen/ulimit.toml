@@ -1,0 +1,12 @@
+language = "C"
+style = "tag"
+include_guard = "_RLIBC_ULIMIT_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h", "stdint.h"]
+after_includes = '''
+#define UL_GETFSIZE 1
+#define UL_SETFSIZE 2
+'''
+[export]
+[fn]

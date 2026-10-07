@@ -1,0 +1,14 @@
+language = "C"
+style = "type"
+include_guard = "_RLIBC_THREADSCALLS_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h"]
+[export]
+item_types = ["functions"]
+exclude = ["rl_syscall_cancel_arch", "rl_clone", "rl_sigreturn", "rl_cancel_start", "rl_cancel_end"]
+[export.rename]
+"timespec" = "struct timespec"
+"Timespec" = "struct timespec"
+[fn]
+no_return = "__attribute__((noreturn))"

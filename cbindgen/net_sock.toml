@@ -1,0 +1,27 @@
+language = "C"
+include_guard = "_RLIBC_NET_SOCK_DECLS_H"
+usize_is_size_t = true
+documentation = false
+no_includes = true
+style = "tag"
+
+[export.rename]
+"sockaddr" = "struct sockaddr"
+"sockaddr_in" = "struct sockaddr_in"
+"msghdr" = "struct msghdr"
+"cmsghdr" = "struct cmsghdr"
+"mmsghdr" = "struct mmsghdr"
+"timespec" = "struct timespec"
+"in_addr" = "struct in_addr"
+"in6_addr" = "struct in6_addr"
+"hostent" = "struct hostent"
+"servent" = "struct servent"
+"protoent" = "struct protoent"
+"netent" = "struct netent"
+"rpcent" = "struct rpcent"
+"aliasent" = "struct aliasent"
+"addrinfo" = "struct addrinfo"
+"if_nameindex" = "struct if_nameindex"
+"ifaddrs" = "struct ifaddrs"
+"ether_addr" = "struct ether_addr"
+"ResState" = "struct __res_state"

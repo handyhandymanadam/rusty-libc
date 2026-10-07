@@ -1,0 +1,12 @@
+language = "C"
+include_guard = "_RLIBC_STDIO_EXT_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h", "stdio.h"]
+after_includes = """
+#define FSETLOCKING_QUERY 0
+#define FSETLOCKING_INTERNAL 1
+#define FSETLOCKING_BYCALLER 2
+"""
+[export]
+exclude = ["FILE"]

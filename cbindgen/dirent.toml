@@ -1,0 +1,44 @@
+language = "C"
+style = "tag"
+include_guard = "_RLIBC_DIRENT_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h", "stdint.h"]
+after_includes = '''
+#define _DIRENT_MATCHES_DIRENT64 1
+#define DT_UNKNOWN 0
+#define DT_FIFO 1
+#define DT_CHR 2
+#define DT_DIR 4
+#define DT_BLK 6
+#define DT_REG 8
+#define DT_LNK 10
+#define DT_SOCK 12
+#define DT_WHT 14
+#define MAXNAMLEN 255
+#ifdef __USE_MISC
+# include <limits.h>
+#endif
+
+typedef struct __dirstream DIR;
+struct dirent64 {
+  uint64_t d_ino;
+  int64_t d_off;
+  unsigned short d_reclen;
+  unsigned char d_type;
+  char d_name[256];
+};
+#define d_fileno d_ino
+#define _DIRENT_HAVE_D_RECLEN 1
+#define _DIRENT_HAVE_D_OFF 1
+#define _DIRENT_HAVE_D_TYPE 1
+#ifdef __USE_MISC
+# define _D_EXACT_NAMLEN(d) (strlen ((d)->d_name))
+# define _D_ALLOC_NAMLEN(d) (((char *) (d) + (d)->d_reclen) - &(d)->d_name[0])
+#endif
+#define IFTODT(mode) (((mode) & 0170000) >> 12)
+#define DTTOIF(dirtype) ((dirtype) << 12)
+'''
+[export]
+include = ["dirent"]
+[fn]

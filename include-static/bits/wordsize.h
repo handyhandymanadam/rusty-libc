@@ -1,0 +1,8 @@
+#ifndef _RLIBC_BITS_WORDSIZE_H
+#define _RLIBC_BITS_WORDSIZE_H 1
+#ifndef __WORDSIZE
+# define __WORDSIZE 64
+#endif
+#define __WORDSIZE_TIME64_COMPAT32 1
+#define __SYSCALL_WORDSIZE 64
+#endif

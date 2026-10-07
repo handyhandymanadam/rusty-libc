@@ -1,0 +1,6 @@
+#ifndef _RLIBC_BITS_SOCKADDR_H
+#define _RLIBC_BITS_SOCKADDR_H 1
+typedef unsigned short int __sa_family_t;
+#define __SOCKADDR_COMMON(sa_prefix) __sa_family_t sa_prefix##family
+#define __SOCKADDR_COMMON_SIZE (sizeof (unsigned short int))
+#endif

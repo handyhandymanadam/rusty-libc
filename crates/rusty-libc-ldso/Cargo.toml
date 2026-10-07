@@ -1,0 +1,17 @@
+[package]
+name = "rusty-libc-ldso"
+version = "0.0.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
+opt-level = 2
+debug = false

@@ -1,0 +1,52 @@
+language = "C"
+include_guard = "_SEARCH_H"
+usize_is_size_t = true
+documentation = false
+no_includes = true
+sys_includes = ["stddef.h"]
+after_includes = """
+struct qelem {
+  struct qelem *q_forw;
+  struct qelem *q_back;
+  char q_data[1];
+};
+
+#ifndef __COMPAR_FN_T
+# define __COMPAR_FN_T
+typedef int (*__compar_fn_t)(const void *, const void *);
+typedef __compar_fn_t comparison_fn_t;
+#endif
+
+typedef enum { FIND, ENTER } ACTION;
+
+typedef struct entry {
+  char *key;
+  void *data;
+} ENTRY;
+
+struct _ENTRY;
+
+struct hsearch_data {
+  struct _ENTRY *table;
+  unsigned int size;
+  unsigned int filled;
+};
+
+typedef enum { preorder, postorder, endorder, leaf } VISIT;
+
+#ifndef __ACTION_FN_T
+# define __ACTION_FN_T
+typedef void (*__action_fn_t)(const void *__nodep, VISIT __value, int __level);
+#endif
+typedef void (*__free_fn_t)(void *__nodep);
+
+void twalk(const void *__root, __action_fn_t __action);
+void twalk_r(const void *__root, void (*__action)(const void *__nodep, VISIT __value, void *__closure), void *__closure);
+"""
+[export.rename]
+"Entry" = "ENTRY"
+"Action" = "ACTION"
+"HsearchData" = "struct hsearch_data"
+"Compar" = "__compar_fn_t"
+[fn]
+no_return = "__attribute__((noreturn))"

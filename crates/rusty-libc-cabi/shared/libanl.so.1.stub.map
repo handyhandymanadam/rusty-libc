@@ -1,0 +1,6 @@
+GLIBC_2.2.5 {
+  global:
+    __stub_GLIBC_2_2_5;
+  local:
+    *;
+};

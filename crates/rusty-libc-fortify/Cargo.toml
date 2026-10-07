@@ -1,0 +1,22 @@
+[package]
+name = "rusty-libc-fortify"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusty-libc-core = { path = "../rusty-libc-core" }
+rusty-libc-mem = { path = "../rusty-libc-mem" }
+rusty-libc-malloc = { path = "../rusty-libc-malloc" }
+rusty-libc-ctype = { path = "../rusty-libc-ctype" }
+rusty-libc-stdlib = { path = "../rusty-libc-stdlib" }
+rusty-libc-stdio = { path = "../rusty-libc-stdio" }
+rusty-libc-sys = { path = "../rusty-libc-sys" }
+rusty-libc-wchar = { path = "../rusty-libc-wchar" }
+rusty-libc-net = { path = "../rusty-libc-net" }
+rusty-libc-util = { path = "../rusty-libc-util" }
+rusty-libc-extra = { path = "../rusty-libc-extra" }
+
+[features]
+export = ["start"]
+start = ["rusty-libc-core/start"]

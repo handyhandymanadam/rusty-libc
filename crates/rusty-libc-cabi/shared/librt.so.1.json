@@ -1,0 +1,67 @@
+{
+ "soname": "librt.so.1",
+ "verdefs": [
+  {
+   "name": "GLIBC_2.2.5",
+   "parent": null
+  },
+  {
+   "name": "GLIBC_2.3.3",
+   "parent": "GLIBC_2.2.5"
+  },
+  {
+   "name": "GLIBC_2.3.4",
+   "parent": "GLIBC_2.3.3"
+  },
+  {
+   "name": "GLIBC_2.4",
+   "parent": "GLIBC_2.3.4"
+  },
+  {
+   "name": "GLIBC_2.7",
+   "parent": "GLIBC_2.4"
+  }
+ ],
+ "symbols": [
+  {
+   "name": "__librt_version_placeholder",
+   "version": "GLIBC_2.3.4",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__librt_version_placeholder",
+   "version": "GLIBC_2.7",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__librt_version_placeholder",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__librt_version_placeholder",
+   "version": "GLIBC_2.3.3",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  },
+  {
+   "name": "__librt_version_placeholder",
+   "version": "GLIBC_2.4",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  }
+ ]
+}

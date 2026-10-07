@@ -1,0 +1,12 @@
+language = "C"
+include_guard = "_ERR_H"
+usize_is_size_t = true
+documentation = false
+no_includes = true
+sys_includes = ["stdarg.h"]
+after_includes = """
+extern char *program_invocation_name;
+extern char *program_invocation_short_name;
+"""
+[fn]
+no_return = "__attribute__((noreturn))"

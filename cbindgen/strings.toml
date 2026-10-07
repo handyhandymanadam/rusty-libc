@@ -1,0 +1,5 @@
+language = "C"
+include_guard = "_RLIBC_STRINGS_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h"]

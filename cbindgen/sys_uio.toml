@@ -1,0 +1,21 @@
+language = "C"
+style = "tag"
+include_guard = "_RLIBC_SYS_UIO_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h", "stdint.h"]
+after_includes = '''
+#define UIO_MAXIOV 1024
+#define RWF_HIPRI 0x00000001
+#define RWF_DSYNC 0x00000002
+#define RWF_SYNC 0x00000004
+#define RWF_NOWAIT 0x00000008
+#define RWF_APPEND 0x00000010
+#define RWF_NOAPPEND 0x00000020
+#define RWF_ATOMIC 0x00000040
+#define RWF_DONTCACHE 0x00000080
+
+#define UIO_MAXIOV 1024
+'''
+[export]
+[fn]

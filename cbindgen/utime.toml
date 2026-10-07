@@ -1,0 +1,24 @@
+language = "C"
+include_guard = "_RLIBC_UTIME_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h"]
+after_includes = """
+#include <bits/types/time_t.h>
+
+struct utimbuf {
+  time_t actime;
+  time_t modtime;
+};
+"""
+
+[export]
+exclude = ["Timespec", "Timeval", "Itimerval", "Itimerspec", "Timezone", "Utimbuf", "Timeb", "Sigval", "SigevUn", "Sigevent", "Tm",
+  "ClockId", "TimerId", "TimeT", "ClockT", "LocaleT",
+  "CLOCK_REALTIME", "CLOCK_MONOTONIC", "CLOCK_PROCESS_CPUTIME_ID", "CLOCK_THREAD_CPUTIME_ID", "CLOCK_MONOTONIC_RAW",
+  "CLOCK_REALTIME_COARSE", "CLOCK_MONOTONIC_COARSE", "CLOCK_BOOTTIME", "CLOCK_REALTIME_ALARM", "CLOCK_BOOTTIME_ALARM", "CLOCK_TAI",
+  "TIMER_ABSTIME", "ITIMER_REAL", "ITIMER_VIRTUAL", "ITIMER_PROF", "TIME_UTC", "TIME_MONOTONIC", "TIME_ACTIVE", "TIME_THREAD_ACTIVE",
+  "CLOCKS_PER_SEC", "SIGEV_SIGNAL", "SIGEV_NONE", "SIGEV_THREAD", "SIGEV_THREAD_ID", "SIGALRM", "UTIME_NOW", "UTIME_OMIT"]
+
+[export.rename]
+"Utimbuf" = "struct utimbuf"

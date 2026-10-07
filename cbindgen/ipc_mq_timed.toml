@@ -1,0 +1,12 @@
+language = "C"
+style = "tag"
+include_guard = "_RLIBC_IPC_MQ_TIMED_DECLS_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h"]
+[export]
+item_types = ["functions"]
+[export.rename]
+"MqAttr" = "struct mq_attr"
+"SigEvent" = "struct sigevent"
+"Timespec" = "struct timespec"

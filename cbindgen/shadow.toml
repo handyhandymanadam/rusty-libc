@@ -1,0 +1,32 @@
+language = "C"
+include_guard = "_SHADOW_H"
+usize_is_size_t = true
+documentation = false
+no_includes = true
+sys_includes = ["stddef.h"]
+after_includes = """
+#ifndef __FILE_defined
+#include <bits/types/struct_FILE.h>
+typedef struct _IO_FILE FILE;
+# define __FILE_defined 1
+#endif
+
+#define SHADOW "/etc/shadow"
+
+struct spwd {
+  char *sp_namp;
+  char *sp_pwdp;
+  long int sp_lstchg;
+  long int sp_min;
+  long int sp_max;
+  long int sp_warn;
+  long int sp_inact;
+  long int sp_expire;
+  unsigned long int sp_flag;
+};
+"""
+[export.rename]
+"Spwd" = "struct spwd"
+"File" = "FILE"
+[fn]
+no_return = "__attribute__((noreturn))"

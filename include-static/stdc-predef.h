@@ -1,0 +1,8 @@
+#ifndef _STDC_PREDEF_H
+#define _STDC_PREDEF_H 1
+#define __STDC_IEC_559__ 1
+#define __STDC_IEC_60559_BFP__ 201404L
+#define __STDC_IEC_559_COMPLEX__ 1
+#define __STDC_IEC_60559_COMPLEX__ 201404L
+#define __STDC_ISO_10646__ 201706L
+#endif

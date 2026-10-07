@@ -1,0 +1,14 @@
+language = "C"
+style = "tag"
+include_guard = "_RLIBC_AIO_GNU_DECLS_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h"]
+[export]
+item_types = ["functions"]
+[export.rename]
+"Aiocb" = "struct aiocb"
+"Aiocb64" = "struct aiocb64"
+"SigEvent" = "struct sigevent"
+"Timespec" = "struct timespec"
+"AioInit" = "struct aioinit"

@@ -1,0 +1,377 @@
+NOTICE
+
+This project is a Rust port of the GNU C Library (glibc 2.43). It contains
+code, data and headers that are derived from, or copied from, third-party
+works. Each component, the files it touches and the notice that applies are
+listed below. The project as a whole is distributed under LGPL-2.1-or-later
+(see LICENSE).
+
+
+1. GNU C Library 2.43
+---------------------
+Licence: GNU Lesser General Public License, version 2.1 or (at your option)
+any later version. Copyright holder: Free Software Foundation, Inc. and the
+other contributors named in the upstream file headers.
+
+Copied verbatim (the upstream file notice is kept at the top of each file):
+  include-static/bits/platform/x86.h        Copyright (C) 2008-2026 Free Software Foundation, Inc.
+  include-static/sys/platform/x86.h         Copyright (C) 2008-2026 Free Software Foundation, Inc.
+  include-static/bits/platform/features.h   Copyright (C) 2024-2026 Free Software Foundation, Inc.
+
+Derived (structure, algorithms, message strings, tables or ABI layouts
+follow glibc sources, rewritten in Rust; the upstream licence applies):
+  crates/rusty-libc-stdlib   rand.rs (random table, 48-bit generator constants), sort.rs
+  crates/rusty-libc-util     getopt, fnmatch, glob, pwd, search, err, wordexp, cpuid
+  crates/rusty-libc-math     complex/*, rounding/hypot_impl.rs, longdouble complex functions, svid compatibility
+  crates/rusty-libc-signal   psiginfo message strings, ucontext/setjmp structure
+  crates/rusty-libc-pthread  cond, rwlock, barrier, once, sem, forced-unwind cancellation
+  crates/rusty-libc-regex    parse, nfa, exec, collation contractions, step/advance
+  crates/rusty-libc-net      inet, ns_* and dn_* functions, res_debug, netgroups, rcmd, getaddrinfo_a
+  crates/rusty-libc-fortify  the _chk functions and abort messages
+  crates/rusty-libc-stdio    translit.rs (C-locale transliteration table), printf extension registry, ftw
+  crates/rusty-libc-iconv    charset, composition, CJK and transliteration tables, gconv layouts
+  crates/rusty-libc-ipc      aio, mq, notify
+  crates/rusty-libc-extra    ftw/nftw, argp, spawn-related code, ttyent, fstab and related files
+  crates/rusty-libc-locale   archive reader, category loader, collation, gettext, catgets, grouping
+  crates/rusty-libc-wchar    Charset::Other, wide-character tables
+  crates/rusty-libc-rpc      Sun RPC and XDR (see entry 2)
+  crates/rusty-libc-sys      legacy-versioned cfget/cfset speed functions
+  crates/rusty-libc-core     NSS plug-in loading and enumeration (nssmod), netgroup and alias parsing layout
+  crates/rusty-libc-time     strftime.rs (and wcsftime in rusty-libc-wchar wtime.rs)
+  crates/rusty-libc-ctype    __ctype32_* tables (data measured from glibc)
+  crates/rusty-libc-ldso     glibc elf/ and sprof behaviour read as reference (no code carried over)
+  crates/rusty-libc-cabi     compatibility symbol shims for old symbol versions
+Source of this inventory: the project's own derived-code records, the file
+headers listed above, and the glibc 2.43 source tree.
+
+The glibc source tree distributes the following additional notices for
+files that have copyright owners other than the Free Software Foundation
+(glibc LICENSES file). The sections that apply to components listed below
+are reproduced verbatim in entries 2 to 6 and 8.
+
+
+2. Sun RPC (rpcsrc-4.0 as distributed in glibc sunrpc/)
+-------------------------------------------------------
+Files: include-static/rpc/*.h (notice kept in each file); crates/rusty-libc-rpc
+(Rust translation).
+Copyright (c) 2010, Oracle America, Inc.   Licence: BSD-3-clause style.
+crates/rusty-libc-rpc/src/des.rs: the cipher core (permutation tables, key
+schedule, S-boxes) is written from the FIPS 46-3 tables and does not use the
+tables or macros of glibc sunrpc/des_impl.c (Eric Young, LGPL); the wrapper
+functions (cbc_crypt, ecb_crypt, des_setparity, passwd2des, xencrypt,
+xdecrypt) follow sunrpc/des_crypt.c and xcrypt.c, which carry the Oracle
+America notice below.
+
+Copyright (c) 2010, Oracle America, Inc.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above
+      copyright notice, this list of conditions and the following
+      disclaimer in the documentation and/or other materials
+      provided with the distribution.
+    * Neither the name of the "Oracle America, Inc." nor the names of its
+      contributors may be used to endorse or promote products derived
+      from this software without specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+  COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+  INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+  GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+  NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+3. BSD sources (University of California, Regents)
+--------------------------------------------------
+Files: include-static/sys/queue.h (notice kept in the file, Copyright (c)
+1991, 1993 The Regents of the University of California);
+crates/rusty-libc-extra/src/ttyent.rs (structure follows glibc misc/getttyent.c).
+Licence text of the glibc LICENSES file for code incorporated from 4.4 BSD:
+
+Copyright (C) 1991 Regents of the University of California.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+3. [This condition was removed.]
+4. Neither the name of the University nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.
+
+
+4. BIND 4.9.5 resolver code (UC Berkeley, Digital Equipment Corporation, Internet Software Consortium)
+------------------------------------------------------------------------------------------------------
+Files: crates/rusty-libc-net (inet_network, ns_name_*, dn_*, inet_pton/ntop,
+nsap functions, res_debug and related; behaviour and structure follow the
+ISC/BSD-licensed resolver sources of glibc, rewritten in Rust).
+
+The DNS resolver code, taken from BIND 4.9.5, is copyrighted by UC
+Berkeley, by Digital Equipment Corporation and by Internet Software
+Consortium.  The DEC portions are under the following license:
+
+Portions Copyright (C) 1993 by Digital Equipment Corporation.
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies, and
+that the name of Digital Equipment Corporation not be used in
+advertising or publicity pertaining to distribution of the document or
+software without specific, written prior permission.
+
+THE SOFTWARE IS PROVIDED ``AS IS'' AND DIGITAL EQUIPMENT CORP.
+DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE, INCLUDING ALL
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS.  IN NO EVENT SHALL
+DIGITAL EQUIPMENT CORPORATION BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING
+FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,
+NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION
+WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+The ISC portions are under the following license:
+
+Portions Copyright (c) 1996-1999 by Internet Software Consortium.
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND INTERNET SOFTWARE CONSORTIUM DISCLAIMS
+ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL INTERNET SOFTWARE
+CONSORTIUM BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS
+ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS
+SOFTWARE.
+
+
+5. WIDE Project (rcmd)
+----------------------
+Files: crates/rusty-libc-net/src/rcmd.rs (structure follows glibc inet/rcmd.c,
+which is under a UCB copyright and the following notice).
+
+Copyright (C) 1998 WIDE Project.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+3. Neither the name of the project nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE PROJECT AND CONTRIBUTORS ``AS IS'' AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE PROJECT OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.
+
+
+6. Sun fdlibm
+-------------
+Files: crates/rusty-libc-math (expm1 follows the fdlibm algorithm).
+
+Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+
+Developed at SunPro, a Sun Microsystems, Inc. business.
+Permission to use, copy, modify, and distribute this
+software is freely granted, provided that this notice
+is preserved.
+
+
+7. ARM optimized-routines
+-------------------------
+Files: crates/rusty-libc-math/src/exp/data.rs (tables and polynomial
+coefficients from math/exp_data.c, log_data.c, pow_log_data.c, log2_data.c,
+exp2f_data.c, logf_data.c, log2f_data.c and powf_log2_data.c), dexp.rs,
+dlog.rs, dpow.rs, fexp.rs (algorithms of math/exp.c, exp2.c, exp10.c, log.c,
+log2.c, pow.c, expf.c, exp2f.c, logf.c, log2f.c, powf.c), ffast.rs and
+flog.rs (EXP2F/LOGF tables), common.rs (helpers of math/math_config.h).
+Upstream: https://github.com/ARM-software/optimized-routines, commit 503fafe.
+Upstream file headers: "Copyright (c) <years>, Arm Limited." with the SPDX
+identifier "MIT OR Apache-2.0 WITH LLVM-exception" (years 2017 to 2026 across
+the files listed above; the repository LICENSE states "Copyright (c)
+1999-2022, Arm Limited.").
+Licence: MIT OR Apache-2.0 WITH LLVM-exception; the MIT alternative is chosen
+for every file listed. The text below is the MIT licence from the upstream
+LICENSE file:
+
+MIT License
+-----------
+
+Copyright (c) 1999-2022, Arm Limited.
+Copyright (c) 2017-2026, Arm Limited. (per-file years of the files listed above)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+8. Inner Net License (Craig Metz): getaddrinfo, getnameinfo
+-----------------------------------------------------------
+Files: crates/rusty-libc-net/src/gai.rs (getaddrinfo, freeaddrinfo,
+getnameinfo: the service/protocol table, service tuples, address list
+handling, RFC 3484 label and precedence tables and the destination sorting
+rule order follow glibc nss/getaddrinfo.c and nss/getnameinfo.c, rewritten
+in Rust).
+This software is Copyright 1996 by Craig Metz, All Rights Reserved.
+The two glibc files also carry the Free Software Foundation LGPL-2.1-or-later
+notice (entry 1).
+
+The Inner Net License, Version 2.00
+
+  The author(s) grant permission for redistribution and use in source and
+binary forms, with or without modification, of the software and documentation
+provided that the following conditions are met:
+
+0. If you receive a version of the software that is specifically labelled
+   as not being for redistribution (check the version message and/or README),
+   you are not permitted to redistribute that version of the software in any
+   way or form.
+1. All terms of the all other applicable copyrights and licenses must be
+   followed.
+2. Redistributions of source code must retain the authors' copyright
+   notice(s), this list of conditions, and the following disclaimer.
+3. Redistributions in binary form must reproduce the authors' copyright
+   notice(s), this list of conditions, and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+4. [The copyright holder has authorized the removal of this clause.]
+5. Neither the name(s) of the author(s) nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY ITS AUTHORS AND CONTRIBUTORS ``AS IS'' AND ANY
+EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE AUTHORS OR CONTRIBUTORS BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+  If these license terms cause you a real problem, contact the author.
+
+
+9. Unicode data
+---------------
+Files: crates/rusty-libc-wchar, crates/rusty-libc-ctype and
+crates/rusty-libc-locale tables (character classes, case mappings, display
+widths, combining classes) and crates/rusty-libc-iconv tables (character
+set mappings, transliteration). They are generated from the output of the
+reference glibc 2.43 (C.UTF-8 locale, gconv modules), whose Unicode data is
+derived from UnicodeData.txt, DerivedCoreProperties.txt, EastAsianWidth.txt
+and HangulSyllableType.txt of Unicode 17.0.0. Those files carry
+"Copyright 2025 Unicode, Inc." and are licensed under the Unicode License
+v3, reproduced here as distributed in glibc localedata/unicode-gen:
+
+UNICODE LICENSE V3
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright © 1991-2025 Unicode, Inc.
+
+NOTICE TO USER: Carefully read the following legal agreement. BY
+DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of data files and any associated documentation (the "Data Files") or
+software and any associated documentation (the "Software") to deal in the
+Data Files or Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, and/or sell
+copies of the Data Files or Software, and to permit persons to whom the
+Data Files or Software are furnished to do so, provided that either (a)
+this copyright and permission notice appear with all copies of the Data
+Files or Software, or (b) this copyright and permission notice appear in
+associated Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+THIRD PARTY RIGHTS.
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+FILES OR SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall
+not be used in advertising or otherwise to promote the sale, use or other
+dealings in these Data Files or Software without prior written
+authorization of the copyright holder.
+
+Locale source files of glibc (localedata/locales) are marked "The Free
+Software Foundation does not claim any copyright interest in the locale data
+contained in this file"; character set mapping tables (localedata/charmaps,
+gconv modules) are facts about the mappings. No locale source file or charmap
+text is included in this project.
+
+
+10. Published algorithms and facts (no notice required)
+-------------------------------------------------------
+Eisel-Lemire fast path (D. Lemire, 2021), Borges (2019) hypot, Joldes-Muller-
+Popescu double-double arithmetic, Chebyshev and Taylor tables generated by
+the scripts in crates/rusty-libc-math, ABI constants (limits, errno, socket
+and ioctl numbers, struct layouts), and character set mappings probed from
+the reference system. Third-party libraries are not included.

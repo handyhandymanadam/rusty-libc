@@ -1,0 +1,13 @@
+language = "C"
+style = "tag"
+include_guard = "_RLIBC_SYS_ACCT_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h", "stdint.h"]
+after_includes = '''
+#define ACCT_COMM 16
+#define ACCT_BYTEORDER 0x00
+#define AHZ 100
+'''
+[export]
+[fn]

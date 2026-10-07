@@ -1,0 +1,35 @@
+[package]
+name = "rusty-libc-cabi"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rusty-libc-core = { path = "../rusty-libc-core" }
+rusty-libc-malloc = { path = "../rusty-libc-malloc" }
+rusty-libc-stdio = { path = "../rusty-libc-stdio" }
+rusty-libc-ctype = { path = "../rusty-libc-ctype" }
+rusty-libc-stdlib = { path = "../rusty-libc-stdlib" }
+rusty-libc-sys = { path = "../rusty-libc-sys" }
+rusty-libc-util = { path = "../rusty-libc-util" }
+rusty-libc-time = { path = "../rusty-libc-time" }
+rusty-libc-wchar = { path = "../rusty-libc-wchar" }
+rusty-libc-math = { path = "../rusty-libc-math" }
+rusty-libc-regex = { path = "../rusty-libc-regex" }
+rusty-libc-pthread = { path = "../rusty-libc-pthread" }
+rusty-libc-signal = { path = "../rusty-libc-signal" }
+rusty-libc-net = { path = "../rusty-libc-net" }
+rusty-libc-iconv = { path = "../rusty-libc-iconv" }
+rusty-libc-fortify = { path = "../rusty-libc-fortify" }
+rusty-libc-locale = { path = "../rusty-libc-locale" }
+rusty-libc-extra = { path = "../rusty-libc-extra" }
+rusty-libc-ipc = { path = "../rusty-libc-ipc" }
+rusty-libc-rpc = { path = "../rusty-libc-rpc" }
+
+[features]
+exports = ["rusty-libc-core/export-mem", "rusty-libc-core/export-errno", "rusty-libc-malloc/export", "rusty-libc-stdio/export", "rusty-libc-ctype/export", "rusty-libc-stdlib/export", "rusty-libc-sys/export", "rusty-libc-util/export", "rusty-libc-time/export", "rusty-libc-wchar/export", "rusty-libc-math/export", "rusty-libc-regex/export", "rusty-libc-pthread/export", "rusty-libc-signal/export", "rusty-libc-net/export", "rusty-libc-iconv/export", "rusty-libc-fortify/export", "rusty-libc-locale/export", "rusty-libc-extra/export", "rusty-libc-ipc/export", "rusty-libc-rpc/export"]
+runtime = ["exports", "rusty-libc-core/start", "rusty-libc-pthread/unwind"]
+shared = ["exports", "rusty-libc-core/start", "rusty-libc-core/shared", "rusty-libc-sys/shared", "rusty-libc-extra/shared", "rusty-libc-regex/shared", "rusty-libc-math/svid", "rusty-libc-pthread/unwind-dl"]

@@ -1,0 +1,101 @@
+language = "C"
+include_guard = "_RLIBC_WCHAR_H"
+usize_is_size_t = true
+no_includes = true
+sys_includes = ["stddef.h", "stdint.h", "stdarg.h"]
+after_includes = """
+#define __need_wint_t
+#include <stddef.h>
+#undef __need_wint_t
+#ifndef ____mbstate_t_defined
+#define ____mbstate_t_defined 1
+typedef struct { int __count; union { wint_t __wch; char __wchb[4]; } __value; } __mbstate_t;
+#endif
+#ifndef __mbstate_t_defined
+#define __mbstate_t_defined 1
+typedef __mbstate_t mbstate_t;
+#endif
+#if !defined _BITS_TYPES_LOCALE_T_H && !defined _RLIBC_LOCALE_T
+#define _BITS_TYPES_LOCALE_T_H 1
+#define _RLIBC_LOCALE_T
+typedef struct __locale_struct *__locale_t;
+typedef __locale_t locale_t;
+#endif
+
+#ifndef __FILE_defined
+#define __FILE_defined 1
+#include <bits/types/struct_FILE.h>
+typedef struct _IO_FILE FILE;
+#endif
+
+#define WEOF (0xffffffffu)
+#define WCHAR_MAX __WCHAR_MAX__
+#define WCHAR_MIN (-__WCHAR_MAX__ - 1)
+
+#if __GLIBC_USE (C23_STRTOL)
+# define __RLIBC_C23(n) __asm__("__isoc23_" #n)
+# define __RLIBC_C23_AS(n) __asm__("__isoc23_" #n)
+#else
+# define __RLIBC_C23(n)
+# define __RLIBC_C23_AS(n)
+#endif
+#if __GLIBC_USE (C23_STRTOL)
+# define __RLIBC_WSCANF(n) __asm__("__isoc23_" #n)
+#else
+# define __RLIBC_WSCANF(n) __asm__("__isoc99_" #n)
+#endif
+wint_t fgetwc(FILE *);
+wint_t getwc(FILE *);
+wint_t fgetwc_unlocked(FILE *);
+wint_t getwc_unlocked(FILE *);
+wint_t fputwc(wchar_t, FILE *);
+wint_t putwc(wchar_t, FILE *);
+wint_t fputwc_unlocked(wchar_t, FILE *);
+wint_t putwc_unlocked(wchar_t, FILE *);
+int fwscanf(FILE *, const wchar_t *, ...) __RLIBC_WSCANF(fwscanf);
+int wscanf(const wchar_t *, ...) __RLIBC_WSCANF(wscanf);
+int swscanf(const wchar_t *, const wchar_t *, ...) __RLIBC_WSCANF(swscanf);
+int vfwscanf(FILE *, const wchar_t *, va_list) __RLIBC_WSCANF(vfwscanf);
+int vwscanf(const wchar_t *, va_list) __RLIBC_WSCANF(vwscanf);
+int vswscanf(const wchar_t *, const wchar_t *, va_list) __RLIBC_WSCANF(vswscanf);
+
+long wcstol(const wchar_t *, wchar_t **, int) __RLIBC_C23(wcstol);
+long wcstol_l(const wchar_t *, wchar_t **, int, locale_t) __RLIBC_C23(wcstol_l);
+long long wcstoll(const wchar_t *, wchar_t **, int) __RLIBC_C23(wcstoll);
+long long wcstoll_l(const wchar_t *, wchar_t **, int, locale_t) __RLIBC_C23(wcstoll_l);
+unsigned long wcstoul(const wchar_t *, wchar_t **, int) __RLIBC_C23(wcstoul);
+unsigned long wcstoul_l(const wchar_t *, wchar_t **, int, locale_t) __RLIBC_C23(wcstoul_l);
+unsigned long long wcstoull(const wchar_t *, wchar_t **, int) __RLIBC_C23(wcstoull);
+unsigned long long wcstoull_l(const wchar_t *, wchar_t **, int, locale_t) __RLIBC_C23(wcstoull_l);
+long long wcstoq(const wchar_t *, wchar_t **, int) __RLIBC_C23_AS(wcstoll);
+unsigned long long wcstouq(const wchar_t *, wchar_t **, int) __RLIBC_C23_AS(wcstoull);
+intmax_t wcstoimax(const wchar_t *, wchar_t **, int) __RLIBC_C23(wcstoimax);
+uintmax_t wcstoumax(const wchar_t *, wchar_t **, int) __RLIBC_C23(wcstoumax);
+long double wcstold(const wchar_t *, wchar_t **);
+long double wcstold_l(const wchar_t *, wchar_t **, locale_t);
+float wcstof32(const wchar_t *, wchar_t **);
+double wcstof64(const wchar_t *, wchar_t **);
+double wcstof32x(const wchar_t *, wchar_t **);
+float wcstof32_l(const wchar_t *, wchar_t **, locale_t);
+double wcstof64_l(const wchar_t *, wchar_t **, locale_t);
+double wcstof32x_l(const wchar_t *, wchar_t **, locale_t);
+long double wcstof64x(const wchar_t *, wchar_t **);
+long double wcstof64x_l(const wchar_t *, wchar_t **, locale_t);
+_Float128 wcstof128(const wchar_t *, wchar_t **);
+_Float128 wcstof128_l(const wchar_t *, wchar_t **, locale_t);
+struct tm;
+size_t wcsftime(wchar_t *, size_t, const wchar_t *, const struct tm *);
+size_t wcsftime_l(wchar_t *, size_t, const wchar_t *, const struct tm *, locale_t);
+"""
+trailer = """
+#if __GLIBC_USE (ISOC23) && defined __glibc_const_generic && !defined _LIBC
+# define wcschr(WCS, WC) __glibc_const_generic (WCS, const wchar_t *, wcschr (WCS, WC))
+# define wcsrchr(WCS, WC) __glibc_const_generic (WCS, const wchar_t *, wcsrchr (WCS, WC))
+# define wcspbrk(WCS, ACCEPT) __glibc_const_generic (WCS, const wchar_t *, wcspbrk (WCS, ACCEPT))
+# define wcsstr(HAYSTACK, NEEDLE) __glibc_const_generic (HAYSTACK, const wchar_t *, wcsstr (HAYSTACK, NEEDLE))
+# define wmemchr(S, C, N) __glibc_const_generic (S, const wchar_t *, wmemchr (S, C, N))
+#endif
+"""
+
+[export]
+exclude = ["FILE", "locale_t", "wcswcs", "wcstold", "wcstold_l", "wcstof64x", "wcstof64x_l", "wcstof128", "wcstof128_l", "wcsftime", "wcsftime_l"]

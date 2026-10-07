@@ -1,0 +1,575 @@
+{
+ "soname": "libresolv.so.2",
+ "verdefs": [
+  {
+   "name": "GLIBC_2.2.5",
+   "parent": null
+  },
+  {
+   "name": "GLIBC_2.3.2",
+   "parent": "GLIBC_2.2.5"
+  },
+  {
+   "name": "GLIBC_2.9",
+   "parent": "GLIBC_2.3.2"
+  },
+  {
+   "name": "GLIBC_PRIVATE",
+   "parent": "GLIBC_2.9"
+  }
+ ],
+ "symbols": [
+  {
+   "name": "inet_net_pton",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 1138
+  },
+  {
+   "name": "ns_parse_ttl",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 404
+  },
+  {
+   "name": "_gethtent",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 83
+  },
+  {
+   "name": "res_gethostbyname2",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 106
+  },
+  {
+   "name": "__p_time",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 103
+  },
+  {
+   "name": "__dn_count_labels",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 310
+  },
+  {
+   "name": "ns_datetosecs",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 1418
+  },
+  {
+   "name": "__fp_resstat",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 142
+  },
+  {
+   "name": "__p_cdname",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 17
+  },
+  {
+   "name": "ns_name_rollback",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 56
+  },
+  {
+   "name": "__res_close",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 39
+  },
+  {
+   "name": "ns_samedomain",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 472
+  },
+  {
+   "name": "__res_isourserver",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 329
+  },
+  {
+   "name": "__p_class_syms",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "OBJECT",
+   "bind": "GLOBAL",
+   "size": 168
+  },
+  {
+   "name": "__p_cdnname",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 169
+  },
+  {
+   "name": "_getlong",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 15
+  },
+  {
+   "name": "__b64_ntop",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 329
+  },
+  {
+   "name": "res_send_setqhook",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 23
+  },
+  {
+   "name": "__p_secstodate",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 233
+  },
+  {
+   "name": "__hostalias",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 135
+  },
+  {
+   "name": "ns_sprintrr",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 106
+  },
+  {
+   "name": "__loc_ntoa",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 1109
+  },
+  {
+   "name": "ns_put32",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 9
+  },
+  {
+   "name": "__p_rcode",
+   "version": "GLIBC_2.3.2",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 122
+  },
+  {
+   "name": "ns_get32",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 11
+  },
+  {
+   "name": "_gethtbyname",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 14
+  },
+  {
+   "name": "__sym_ston",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 122
+  },
+  {
+   "name": "__p_type_syms",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "OBJECT",
+   "bind": "GLOBAL",
+   "size": 1104
+  },
+  {
+   "name": "__b64_pton",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 666
+  },
+  {
+   "name": "res_gethostbyname",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 106
+  },
+  {
+   "name": "ns_makecanon",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 9
+  },
+  {
+   "name": "_gethtbyname2",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 319
+  },
+  {
+   "name": "res_send_setrhook",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 23
+  },
+  {
+   "name": "__res_hostalias",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 127
+  },
+  {
+   "name": "__sym_ntop",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 128
+  },
+  {
+   "name": "__sym_ntos",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 145
+  },
+  {
+   "name": "__p_class",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 122
+  },
+  {
+   "name": "__ns_get16",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 15
+  },
+  {
+   "name": "ns_sprintrrf",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 8171
+  },
+  {
+   "name": "__putlong",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 11
+  },
+  {
+   "name": "ns_initparse",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 340
+  },
+  {
+   "name": "_getshort",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 15
+  },
+  {
+   "name": "ns_msg_getflag",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 33
+  },
+  {
+   "name": "__res_queriesmatch",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 9
+  },
+  {
+   "name": "ns_samename",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 9
+  },
+  {
+   "name": "__p_option",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 472
+  },
+  {
+   "name": "_res_opcodes",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "OBJECT",
+   "bind": "GLOBAL",
+   "size": 128
+  },
+  {
+   "name": "__fp_query",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 17
+  },
+  {
+   "name": "ns_subdomain",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 55
+  },
+  {
+   "name": "__p_fqnname",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 126
+  },
+  {
+   "name": "_sethtent",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 86
+  },
+  {
+   "name": "ns_put16",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 14
+  },
+  {
+   "name": "__putshort",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 12
+  },
+  {
+   "name": "__loc_aton",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 1367
+  },
+  {
+   "name": "ns_get16",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 15
+  },
+  {
+   "name": "ns_name_ntol",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 345
+  },
+  {
+   "name": "ns_format_ttl",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 683
+  },
+  {
+   "name": "inet_neta",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 287
+  },
+  {
+   "name": "ns_parserr",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 660
+  },
+  {
+   "name": "inet_net_ntop",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 558
+  },
+  {
+   "name": "__p_query",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 24
+  },
+  {
+   "name": "_gethtbyaddr",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 279
+  },
+  {
+   "name": "__res_nameinquery",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 9
+  },
+  {
+   "name": "__fp_nquery",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 1982
+  },
+  {
+   "name": "res_gethostbyaddr",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 123
+  },
+  {
+   "name": "__p_type",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 106
+  },
+  {
+   "name": "__p_fqname",
+   "version": "GLIBC_2.2.5",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 115
+  },
+  {
+   "name": "ns_skiprr",
+   "version": "GLIBC_2.9",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 205
+  },
+  {
+   "name": "__ns_get32",
+   "version": "GLIBC_PRIVATE",
+   "default": true,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 11
+  }
+ ]
+}

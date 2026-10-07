@@ -1,0 +1,45 @@
+#![allow(dead_code)]
+
+pub const EPERM: i32 = 1;
+pub const ENOENT: i32 = 2;
+pub const ESRCH: i32 = 3;
+pub const EINTR: i32 = 4;
+pub const EIO: i32 = 5;
+pub const E2BIG: i32 = 7;
+pub const ENOEXEC: i32 = 8;
+pub const EBADF: i32 = 9;
+pub const ECHILD: i32 = 10;
+pub const EAGAIN: i32 = 11;
+pub const ENOMEM: i32 = 12;
+pub const EACCES: i32 = 13;
+pub const EFAULT: i32 = 14;
+pub const EBUSY: i32 = 16;
+pub const EEXIST: i32 = 17;
+pub const ENODEV: i32 = 19;
+pub const ENOTDIR: i32 = 20;
+pub const EISDIR: i32 = 21;
+pub const EINVAL: i32 = 22;
+pub const ENOTTY: i32 = 25;
+pub const ERANGE: i32 = 34;
+pub const ENAMETOOLONG: i32 = 36;
+pub const ENOSYS: i32 = 38;
+pub const ENOTSUP: i32 = 95;
+pub const ETIMEDOUT: i32 = 110;
+pub const ESTALE: i32 = 116;
+
+pub const SYS_CHDIR: usize = 80;
+pub const SYS_FCHDIR: usize = 81;
+pub const SYS_SETPGID: usize = 109;
+pub const SYS_SETSID_NR: usize = 112;
+pub const SYS_GETUID_NR: usize = 102;
+pub const SYS_GETGID_NR: usize = 104;
+pub const SYS_SETRESUID: usize = 117;
+pub const SYS_SETRESGID: usize = 119;
+pub const SYS_GETPGID: usize = 121;
+pub const SYS_SCHED_SETPARAM: usize = 142;
+pub const SYS_SCHED_SETSCHEDULER: usize = 144;
+pub const SYS_WAITID: usize = 247;
+pub const SYS_PRLIMIT64: usize = 302;
+pub const SYS_CLOSE_RANGE: usize = 436;
+pub const TIOCSPGRP: usize = 0x5410;
+pub const SYS_CLOCK_GETTIME_NR: usize = 228;

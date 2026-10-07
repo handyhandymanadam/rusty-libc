@@ -1,0 +1,19 @@
+{
+ "soname": "libanl.so.1",
+ "verdefs": [
+  {
+   "name": "GLIBC_2.2.5",
+   "parent": null
+  }
+ ],
+ "symbols": [
+  {
+   "name": "__libanl_version_placeholder",
+   "version": "GLIBC_2.2.5",
+   "default": false,
+   "type": "FUNC",
+   "bind": "GLOBAL",
+   "size": 5
+  }
+ ]
+}

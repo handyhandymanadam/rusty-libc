@@ -1,0 +1,12 @@
+[package]
+name = "rusty-libc-math"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusty-libc-core = { path = "../rusty-libc-core" }
+
+[features]
+export = []
+svid = []
