@@ -15,6 +15,8 @@ pub mod reloc;
 pub mod sys;
 pub mod tls;
 pub mod util;
+#[path = "../../rusty-libc-core/src/tunables.rs"]
+mod tunables;
 
 use elf::*;
 use map::*;
@@ -212,32 +214,6 @@ unsafe fn relocate_self() -> usize {
     base
 }
 
-const UNSECURE_ENVVARS: &[&[u8]] = &[
-    b"GCONV_PATH", b"GETCONF_DIR", b"GLIBC_TUNABLES", b"HOSTALIASES", b"LD_AUDIT", b"LD_BIND_NOT", b"LD_BIND_NOW", b"LD_DEBUG",
-    b"LD_DEBUG_OUTPUT", b"LD_DYNAMIC_WEAK", b"LD_LIBRARY_PATH", b"LD_ORIGIN_PATH", b"LD_PRELOAD", b"LD_PROFILE", b"LD_PROFILE_OUTPUT",
-    b"LD_SHOW_AUXV", b"LD_VERBOSE", b"LD_WARN", b"LOCALDOMAIN", b"LOCPATH", b"MALLOC_ARENA_MAX", b"MALLOC_ARENA_TEST",
-    b"MALLOC_MMAP_MAX_", b"MALLOC_MMAP_THRESHOLD_", b"MALLOC_PERTURB_", b"MALLOC_TOP_PAD_", b"MALLOC_TRACE",
-    b"MALLOC_TRIM_THRESHOLD_", b"NIS_PATH", b"NLSPATH", b"RESOLV_HOST_CONF", b"RES_OPTIONS", b"TMPDIR", b"TZDIR",
-];
-
-unsafe fn scrub_unsecure_env(envp: *mut *mut u8) {
-    let mut w = envp;
-    let mut r = envp;
-    while !(*r).is_null() {
-        let v = cstr(*r);
-        let name = match v.iter().position(|&c| c == b'=') {
-            Some(p) => &v[..p],
-            None => v,
-        };
-        if !UNSECURE_ENVVARS.contains(&name) {
-            *w = *r;
-            w = w.add(1);
-        }
-        r = r.add(1);
-    }
-    *w = core::ptr::null_mut();
-}
-
 fn env_value<'a>(s: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     if s.len() > name.len() && &s[..name.len()] == name && s[name.len()] == b'=' {
         Some(&s[name.len() + 1..])
@@ -276,6 +252,21 @@ unsafe fn make_ldso_map(base: usize) -> *mut LinkMap {
     scan_phdrs(m);
     parse_dynamic(m);
     m
+}
+
+unsafe fn join_names(a: *const u8, b: &[u8]) -> *const u8 {
+    unsafe {
+        if a.is_null() {
+            return dup(b);
+        }
+        let a = cstr(a);
+        let p = alloc_perm(a.len() + 1 + b.len() + 1, 1);
+        core::ptr::copy_nonoverlapping(a.as_ptr(), p, a.len());
+        *p.add(a.len()) = b':';
+        core::ptr::copy_nonoverlapping(b.as_ptr(), p.add(a.len() + 1), b.len());
+        *p.add(a.len() + 1 + b.len()) = 0;
+        p
+    }
 }
 
 unsafe fn add_global(m: *mut LinkMap) {
@@ -633,10 +624,11 @@ pub struct RDebug {
     pub brk: usize,
     pub state: i32,
     pub ldbase: usize,
+    pub r_next: *mut RDebug,
 }
 
 #[unsafe(no_mangle)]
-pub static mut _r_debug: RDebug = RDebug { version: 1, map: core::ptr::null_mut(), brk: 0, state: 0, ldbase: 0 };
+pub static mut _r_debug: RDebug = RDebug { version: 1, map: core::ptr::null_mut(), brk: 0, state: 0, ldbase: 0, r_next: core::ptr::null_mut() };
 
 #[unsafe(no_mangle)]
 pub static mut __libc_stack_end: usize = 0;
@@ -775,6 +767,21 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
         a = a.add(2);
     }
     let _ = at_base;
+    s.stack_exec = (0..at_phnum).map(|i| &*(at_phdr as *const Phdr).add(i)).find(|p| p.typ == PT_GNU_STACK).is_none_or(|p| p.flags & PF_X != 0);
+
+    let mut tunables_env = false;
+    if !s.secure {
+        if let Some(v) = tunables::find_env(envp) {
+            tunables_env = true;
+            let t = tunables::parse(v, &mut |w| tunables::warning_text(&w, v, &mut |b| Out::new(2).bytes(b)));
+            if t.enable_secure {
+                s.secure = true;
+                __libc_enable_secure = 1;
+            }
+            s.map32 = t.prefer_map_32bit_exec;
+            s.execstack_mode = t.execstack;
+        }
+    }
 
     let mut e = envp;
     let mut debug_libs = false;
@@ -803,9 +810,7 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
                 }
             }
         }
-        if !s.secure && (env_value(v, b"LD_PREFER_MAP_32BIT_EXEC").is_some_and(|x| !x.is_empty())
-            || env_value(v, b"GLIBC_TUNABLES").is_some_and(|x| x.split(|&c| c == b':').any(|t| t == b"glibc.cpu.prefer_map_32bit_exec=1")))
-        {
+        if !s.secure && env_value(v, b"LD_PREFER_MAP_32BIT_EXEC").is_some_and(|x| !x.is_empty()) {
             s.map32 = true;
         }
         if !s.secure && env_value(v, b"LD_BIND_NOW").is_some_and(|x| !x.is_empty()) {
@@ -835,7 +840,7 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
     s.debug = debug_libs;
     profile::configure(prof_name, prof_out);
     if s.secure {
-        scrub_unsecure_env(envp);
+        tunables::scrub_unsecure_env(envp);
     }
 
     marks[2] = core::arch::x86_64::_rdtsc();
@@ -897,7 +902,7 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
                 b"--preload" => s.preload = value,
                 b"--audit" => {
                     if !s.secure {
-                        s.audit = value;
+                        s.audit = join_names(s.audit, cstr(value));
                     }
                 }
                 b"--argv0" => argv0_override = value,
@@ -1064,6 +1069,17 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
     (*main).is_main = true;
     (*main).refcount = 1;
     s.main_map = main;
+    match s.execstack_mode {
+        0 if s.stack_exec => {
+            Out::new(2).bytes(b"Fatal glibc error: executable stack is not allowed\n");
+            sys::exit(127);
+        }
+        2 if map::make_stack_executable() != 0 => {
+            Out::new(2).bytes(b"Fatal glibc error: cannot enable executable stack as tunable requires");
+            sys::exit(127);
+        }
+        _ => {}
+    }
     add_global(main);
     if sysinfo != 0 {
         let v = make_vdso_map(sysinfo);
@@ -1086,6 +1102,14 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
     }
     add_global(ldso);
     order_chain();
+    for off in [(*main).audit_str, (*main).depaudit_str] {
+        if off != 0 {
+            let name = cstr((*main).strtab.add(off as usize - 1));
+            if !name.is_empty() && !(s.secure && name.contains(&b'/')) {
+                s.audit = join_names(s.audit, name);
+            }
+        }
+    }
     if !s.audit.is_null() {
         audit::load(cstr(s.audit), false);
     }
@@ -1178,6 +1202,17 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
         audit::announce_open();
     }
 
+    if tunables_env && !s.secure {
+        let fl = lookup::Flags { plt: false, skip: core::ptr::null_mut(), newest: false };
+        for i in 0..s.nglobal {
+            let one = [s.global[i]];
+            if let Some(f) = lookup::lookup(b"environ", None, &[&one], &fl) {
+                if (*f.sym).info & 0xf == STT_OBJECT {
+                    *(lookup::sym_addr(&f) as *mut *mut *mut u8) = envp;
+                }
+            }
+        }
+    }
     let mut i = s.nglobal;
     while i > 0 {
         i -= 1;
@@ -1205,6 +1240,7 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
             die(format_args!("{}", Bytes(&tmp[..l])));
         }
     }
+    rtld_malloc_arm();
     profile::start();
     marks[6] = core::arch::x86_64::_rdtsc();
     _r_debug.map = s.head;
@@ -1284,6 +1320,25 @@ unsafe fn check_versions() -> bool {
         }
     }
     true
+}
+
+pub(crate) unsafe fn bind_rtld_malloc() {
+    unsafe {
+        let s = st();
+        let g = core::slice::from_raw_parts((&raw const s.global) as *const *mut LinkMap, s.nglobal);
+        let fl = lookup::Flags { plt: false, skip: core::ptr::null_mut(), newest: true };
+        let mut addr = [0usize; 3];
+        for (i, name) in [&b"malloc"[..], &b"calloc"[..], &b"free"[..]].iter().enumerate() {
+            match lookup::lookup(name, None, &[g], &fl) {
+                Some(f) if (*f.sym).info & 0xf != STT_TLS => {
+                    let a = lookup::sym_addr(&f);
+                    addr[i] = if (*f.sym).info & 0xf == STT_GNU_IFUNC { reloc::call_resolver(a) } else { a };
+                }
+                _ => return,
+            }
+        }
+        rtld_malloc_init(addr[0], addr[1], addr[2]);
+    }
 }
 
 unsafe fn trace_loaded(main: *mut LinkMap, ldso: *mut LinkMap, base: usize) {

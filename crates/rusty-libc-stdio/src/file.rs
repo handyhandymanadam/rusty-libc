@@ -1283,7 +1283,7 @@ pub(crate) unsafe fn ungetc_force(c: c_int, f: *mut File) -> c_int {
             (*f).rend = 0;
             (*f).flags |= F_RDMODE;
         }
-        if (*f).rpos > 0 && *(*f).buf.add((*f).rpos - 1) == c as u8 {
+        if (*f).nunget == 0 && (*f).rpos > 0 && *(*f).buf.add((*f).rpos - 1) == c as u8 {
             (*f).rpos -= 1;
         } else if unget_room(f) {
             if (*f).ubuf.is_null() {
@@ -1423,10 +1423,10 @@ pub unsafe fn write_bytes(f: *mut File, src: *const u8, n: usize) -> usize {
 
 pub(crate) unsafe fn write_bytes_raw(f: *mut File, src: *const u8, n: usize) -> usize {
     unsafe {
-        if (*f).flags & F_WRMODE == 0 && !start_write(f) {
+        if n == 0 {
             return 0;
         }
-        if n == 0 {
+        if (*f).flags & F_WRMODE == 0 && !start_write(f) {
             return 0;
         }
         if (*f).flags & F_APPEND != 0 && (*f).flags & F_MEM == 0 {
@@ -1658,10 +1658,36 @@ pub unsafe fn fflush(f: *mut File) -> c_int {
         if (*f).flags & F_WRMODE != 0 {
             return if flush_write(f) { 0 } else { EOF };
         }
-        if (*f).flags & F_RDMODE != 0 {
-            discard_input(f, true);
+        if (*f).flags & F_RDMODE != 0 && !sync_input(f) {
+            return EOF;
         }
         0
+    }
+}
+
+unsafe fn sync_input(f: *mut File) -> bool {
+    unsafe {
+        let mut unread = ((*f).rend - (*f).rpos) + (*f).nunget;
+        if !(*f).wide.is_null() {
+            unread += (*(*f).wide).tshift;
+        }
+        if unread > 0
+            && (*f).flags & F_NOSEEK == 0
+            && let Err(e) = raw_seek(f, -(unread as i64), 1)
+            && e != 29
+        {
+            (*f).nunget = 0;
+            sync_unget(f);
+            errno::set(e);
+            return false;
+        }
+        (*f).rpos = 0;
+        (*f).rend = 0;
+        (*f).nunget = 0;
+        sync_unget(f);
+        drop_wpush(f);
+        (*f).flags &= !F_RDMODE;
+        true
     }
 }
 

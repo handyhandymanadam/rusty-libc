@@ -33,6 +33,13 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::ExternEnd,
+            Item::Gate(&[
+                Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function", items: &[
+                    Item::ExternBegin,
+                    Item::Include("<bits/mqueue2.h>"),
+                    Item::ExternEnd,
+                ] },
+            ], ""),
             Item::Blank,
         ]},
     ],

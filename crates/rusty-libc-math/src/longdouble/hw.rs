@@ -19,6 +19,15 @@ pub fn fistp_i64(x: F80) -> i64 {
     o
 }
 
+pub fn fadd(x: F80, y: F80) -> F80 {
+    let mut o = F80::ZERO;
+    unsafe {
+        asm!("fld tbyte ptr [{x}]", "fld tbyte ptr [{y}]", "faddp st(1), st", "fstp tbyte ptr [{o}]",
+            x = in(reg) x.0.as_ptr(), y = in(reg) y.0.as_ptr(), o = in(reg) o.0.as_mut_ptr(), out("st(0)") _, out("st(1)") _, options(nostack));
+    }
+    o
+}
+
 pub fn fsqrt(x: F80) -> F80 {
     let mut o = F80::ZERO;
     unsafe {

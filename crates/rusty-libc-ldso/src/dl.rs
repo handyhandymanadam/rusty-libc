@@ -22,9 +22,19 @@ pub struct ErrBuf {
     state: u8,
     len: usize,
     text: [u8; 512],
+    ext: *mut u8,
+    ext_cap: usize,
 }
 pub const ERRBUF_SIZE: usize = core::mem::size_of::<ErrBuf>();
-static mut EARLY_ERR: ErrBuf = ErrBuf { state: 0, len: 0, text: [0; 512] };
+static mut EARLY_ERR: ErrBuf = ErrBuf { state: 0, len: 0, text: [0; 512], ext: null_mut(), ext_cap: 0 };
+
+pub unsafe fn free_errbuf(p: *mut u8) {
+    let b = p as *mut ErrBuf;
+    if !(*b).ext.is_null() {
+        free_blk((*b).ext, (*b).ext_cap, 16);
+    }
+    free_blk(p, ERRBUF_SIZE, 16);
+}
 
 unsafe fn err_buf() -> *mut ErrBuf {
     if !tls::ready() {
@@ -37,24 +47,48 @@ unsafe fn err_buf() -> *mut ErrBuf {
     *slot as *mut ErrBuf
 }
 
+unsafe fn err_room(b: *mut ErrBuf, n: usize) -> *mut u8 {
+    if n + 1 <= (*b).text.len() {
+        return (*b).text.as_mut_ptr();
+    }
+    if n + 1 > (*b).ext_cap {
+        let cap = (n + 1).next_power_of_two();
+        let p = alloc_blk(cap, 16);
+        if p.is_null() {
+            return (*b).text.as_mut_ptr();
+        }
+        if !(*b).ext.is_null() {
+            free_blk((*b).ext, (*b).ext_cap, 16);
+        }
+        (*b).ext = p;
+        (*b).ext_cap = cap;
+    }
+    (*b).ext
+}
+
+unsafe fn err_text(b: *mut ErrBuf) -> *mut u8 {
+    if (*b).len + 1 > (*b).text.len() && !(*b).ext.is_null() { (*b).ext } else { (*b).text.as_mut_ptr() }
+}
+
 unsafe fn publish_error() {
     let e = error_str();
-    let n = e.len().min(511);
     let b = err_buf();
-    core::ptr::copy_nonoverlapping(e.as_ptr(), (*b).text.as_mut_ptr(), n);
-    (*b).text[n] = 0;
+    let room = err_room(b, e.len());
+    let n = if room == (*b).text.as_mut_ptr() { e.len().min(511) } else { e.len() };
+    core::ptr::copy_nonoverlapping(e.as_ptr(), room, n);
+    *room.add(n) = 0;
     (*b).len = n;
     (*b).state = 1;
 }
 
 unsafe fn fail(args: core::fmt::Arguments) {
     use core::fmt::Write;
-    struct W<'a>(&'a mut [u8], usize);
-    impl Write for W<'_> {
+    struct W(*mut u8, usize, usize);
+    impl Write for W {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
             for &c in s.as_bytes() {
-                if self.1 < self.0.len() - 1 {
-                    self.0[self.1] = c;
+                if self.1 < self.2 {
+                    unsafe { *self.0.add(self.1) = c };
                     self.1 += 1;
                 }
             }
@@ -62,10 +96,14 @@ unsafe fn fail(args: core::fmt::Arguments) {
         }
     }
     let b = err_buf();
-    let mut w = W(&mut (*b).text, 0);
+    let mut c = Count(0);
+    let _ = c.write_fmt(args);
+    let room = err_room(b, c.0);
+    let limit = if room == (*b).text.as_mut_ptr() { 511 } else { c.0 };
+    let mut w = W(room, 0, limit);
     let _ = w.write_fmt(args);
     let n = w.1;
-    (*b).text[n] = 0;
+    *room.add(n) = 0;
     (*b).len = n;
     (*b).state = 1;
 }
@@ -82,7 +120,7 @@ pub unsafe extern "C" fn __libc_ldso_dlerror() -> *const c_char {
     let b = err_buf();
     if (*b).state == 1 {
         (*b).state = 2;
-        (*b).text.as_ptr() as *const c_char
+        err_text(b) as *const c_char
     } else {
         (*b).state = 0;
         null()
@@ -215,6 +253,13 @@ pub unsafe fn open_object(name: Option<&[u8]>, mode: c_int, caller: usize) -> *m
         return null_mut();
     }
     let first_new = if tail_before.is_null() { s.head } else { (*tail_before).l_next };
+    if (*root).opening && first_new.is_null() {
+        if mode & RTLD_GLOBAL != 0 {
+            promote_global(root);
+        }
+        (*root).refcount += 1;
+        return root;
+    }
     if root == s.main_map {
         set_error(format_args!("{}: cannot dynamically load {}", Bytes(name), if (*root).flags_1 & 0x0800_0000 != 0 { "position-independent executable" } else { "executable" }));
         return null_mut();
@@ -262,6 +307,7 @@ pub unsafe fn open_object(name: Option<&[u8]>, mode: c_int, caller: usize) -> *m
     let mut cur = first_new;
     while !cur.is_null() {
         (*cur).dlopened = true;
+        (*cur).opening = true;
         if (*cur).scope.is_null() {
             (*cur).scope = (*root).scope;
             (*cur).nscope = (*root).nscope;
@@ -271,6 +317,7 @@ pub unsafe fn open_object(name: Option<&[u8]>, mode: c_int, caller: usize) -> *m
         }
         if mode & 0x2 != 0 && !crate::profile::enabled() {
             (*cur).bind_now = true;
+            (*cur).rtld_now = true;
         }
         cur = (*cur).l_next;
     }
@@ -297,6 +344,9 @@ pub unsafe fn open_object(name: Option<&[u8]>, mode: c_int, caller: usize) -> *m
     crate::_r_debug.state = 1;
     crate::_dl_debug_state();
     crate::audit::activity(crate::audit::LA_ACT_ADD);
+    for &m in &list[..n] {
+        crate::audit::objopen(m);
+    }
     for i in (0..n).rev() {
         if !reloc::relocate(list[i]) {
             discard_from(first_new);
@@ -310,7 +360,6 @@ pub unsafe fn open_object(name: Option<&[u8]>, mode: c_int, caller: usize) -> *m
     for &m in &list[..n] {
         protect_relro(m);
         ADDS += 1;
-        crate::audit::objopen(m);
         for k in 0..(*m).nneeded {
             (*(*(*m).needed.add(k))).refcount += 1;
         }
@@ -322,6 +371,11 @@ pub unsafe fn open_object(name: Option<&[u8]>, mode: c_int, caller: usize) -> *m
     crate::_r_debug.state = 0;
     crate::_dl_debug_state();
     crate::audit::activity(crate::audit::LA_ACT_CONSISTENT);
+    let mut cur = first_new;
+    while !cur.is_null() {
+        (*cur).opening = false;
+        cur = (*cur).l_next;
+    }
     crate::init_tree(root, false);
     root
 }
@@ -578,7 +632,8 @@ pub unsafe fn symbol_lookup(handle: *mut c_void, name: &[u8], ver: Option<&VerRe
                 return tls_symbol_address(&f);
             }
             let a = sym_addr(&f);
-            if t == STT_GNU_IFUNC { reloc::call_resolver(a) } else { a }
+            let a = if t == STT_GNU_IFUNC { reloc::call_resolver(a) } else { a };
+            if crate::audit::active() { crate::audit::symbind_dlsym(map_of_addr(caller), f.sym, f.map, name, a) } else { a }
         }
         None => {
             let vtext: &[u8] = match ver {
@@ -675,7 +730,7 @@ unsafe fn addr_info(addr: usize, info: *mut DlInfo, sym_out: *mut *const Sym, ma
     for i in 0..n {
         let s = (*m).symtab.add(i);
         let t = (*s).info & 0xf;
-        let a = (*m).l_addr.wrapping_add((*s).value as usize);
+        let a = crate::lookup::sym_value_addr((*m).l_addr, s);
         if t == STT_TLS || addr < a {
             continue;
         }
@@ -686,13 +741,13 @@ unsafe fn addr_info(addr: usize, info: *mut DlInfo, sym_out: *mut *const Sym, ma
         if (*s).shndx == SHN_UNDEF && (*s).value == 0 {
             continue;
         }
-        if best.is_null() || a > (*m).l_addr.wrapping_add((*best).value as usize) || (a == (*m).l_addr.wrapping_add((*best).value as usize) && (*s).info >> 4 == STB_GLOBAL && (*best).info >> 4 != STB_GLOBAL) {
+        if best.is_null() || a > crate::lookup::sym_value_addr((*m).l_addr, best) || (a == crate::lookup::sym_value_addr((*m).l_addr, best) && (*s).info >> 4 == STB_GLOBAL && (*best).info >> 4 != STB_GLOBAL) {
             best = s;
         }
     }
     if !best.is_null() {
         (*info).dli_sname = (*m).strtab.add((*best).name as usize) as *const c_char;
-        (*info).dli_saddr = (*m).l_addr.wrapping_add((*best).value as usize) as *mut c_void;
+        (*info).dli_saddr = crate::lookup::sym_value_addr((*m).l_addr, best) as *mut c_void;
         if !sym_out.is_null() {
             *sym_out = best;
         }

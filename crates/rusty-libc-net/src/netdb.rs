@@ -219,9 +219,20 @@ fn scan_status(h: *mut c_int, r: Scan) -> i32 {
 }
 
 unsafe fn by_key<T>(db: &[u8], func: &[u8], res: *mut T, result: *mut *mut T, h_errnop: *mut c_int, files: &dyn Fn() -> i32, call: &dyn Fn(usize, *mut c_int) -> i32) -> c_int {
+    unsafe { by_key_dns(db, func, res, result, h_errnop, files, call, None) }
+}
+
+unsafe fn by_key_dns<T>(db: &[u8], func: &[u8], res: *mut T, result: *mut *mut T, h_errnop: *mut c_int, files: &dyn Fn() -> i32, call: &dyn Fn(usize, *mut c_int) -> i32, dns: Option<&dyn Fn(*mut c_int) -> i32>) -> c_int {
     unsafe {
         let any = core::cell::Cell::new(false);
-        let status = rusty_libc_core::nssent::dispatch(
+        let dns_any = |e: *mut c_int| {
+            any.set(true);
+            match dns {
+                Some(d) => d(e),
+                None => NSS_UNAVAIL,
+            }
+        };
+        let status = rusty_libc_core::nssent::dispatch_dns(
             db,
             func,
             &|| {
@@ -233,6 +244,7 @@ unsafe fn by_key<T>(db: &[u8], func: &[u8], res: *mut T, result: *mut *mut T, h_
                 call(f, en)
             },
             None,
+            if dns.is_some() { Some(&dns_any) } else { None },
         );
         *result = if status == NSS_SUCCESS { res } else { core::ptr::null_mut() };
         if !h_errnop.is_null() && status != NSS_SUCCESS && !any.get() {
@@ -276,7 +288,13 @@ impl OutBuf {
 
 fn files_hosts(name: &[u8], af: c_int, v4mapped: bool, out: &mut HostData) -> SrcResult {
     let multi = nss::host_conf_multi();
-    let Ok(mut r) = nss::open_db(Db::Hosts) else { return (Status::Unavail, NO_DATA) };
+    let mut r = match nss::open_db(Db::Hosts) {
+        Ok(r) => r,
+        Err(e) => {
+            errno::set(e);
+            return (if e == EAGAIN { Status::TryAgain } else { Status::Unavail }, out.h);
+        }
+    };
     let fit = out.fit.map(|(addr, len)| {
         let pad = (8 - addr % 8) % 8;
         Fit { base: 32, addr: addr + pad, len: len.saturating_sub(pad) }
@@ -368,6 +386,10 @@ fn files_hosts(name: &[u8], af: c_int, v4mapped: bool, out: &mut HostData) -> Sr
 }
 
 fn dns_hosts(cfg: &dns::Config, name: &[u8], af: c_int, out: &mut HostData) -> SrcResult {
+    if !crate::resolv::hostname_ok(name) {
+        out.h = HOST_NOT_FOUND;
+        return (Status::NotFound, HOST_NOT_FOUND);
+    }
     let mut best: Option<c_int> = None;
     let mut any = false;
     let fams: &[c_int] = match af {
@@ -408,7 +430,7 @@ fn dns_hosts(cfg: &dns::Config, name: &[u8], af: c_int, out: &mut HostData) -> S
 pub(crate) fn src_lookup(e: &Entry, name: &[u8], af: c_int, v4mapped: bool, out: &mut HostData) -> (Status, c_int) {
     match e.src {
         Source::Files => files_hosts(name, af, v4mapped, out),
-        Source::Dns => dns_hosts(&dns::default_config(), name, af, out),
+        Source::Dns => dns_hosts(&crate::resolv::current_config(), name, af, out),
         Source::Module => module_hosts(e.module_name(), name, af, out),
     }
 }
@@ -687,6 +709,7 @@ pub fn lookup_name(name: &[u8], af: c_int, v4mapped: bool, out: &mut HostData) -
         }
     }
     out.any = any;
+    out.unavail = any && status == Status::Unavail;
     if out.einval {
         Err(out.h)
     } else if status == Status::Success {
@@ -764,7 +787,7 @@ fn digits_dots(name: &[u8], af: c_int, use_inet6: bool) -> Result<Option<(Addr, 
 }
 
 fn use_inet6() -> bool {
-    dns::default_config().options & dns::RES_USE_INET6 != 0
+    crate::resolv::current_config().options & dns::RES_USE_INET6 != 0
 }
 
 unsafe fn no_sources(h_errnop: *mut c_int) -> c_int {
@@ -781,6 +804,15 @@ unsafe fn no_sources(h_errnop: *mut c_int) -> c_int {
 
 unsafe fn hostbyname_r(func: u8, name: *const c_char, af: c_int, res: *mut hostent, buf: *mut c_char, buflen: usize, result: *mut *mut hostent, h_errnop: *mut c_int) -> c_int {
     unsafe {
+        let rc = hostbyname_r_body(func, name, af, res, buf, buflen, result, h_errnop);
+        errno::set(rc);
+        rc
+    }
+}
+
+unsafe fn hostbyname_r_body(func: u8, name: *const c_char, af: c_int, res: *mut hostent, buf: *mut c_char, buflen: usize, result: *mut *mut hostent, h_errnop: *mut c_int) -> c_int {
+    unsafe {
+        nss::hconf_init();
         *result = core::ptr::null_mut();
         if name.is_null() {
             *h_errnop = HOST_NOT_FOUND;
@@ -856,7 +888,13 @@ unsafe fn hostbyname_r(func: u8, name: *const c_char, af: c_int, res: *mut hoste
                     return no_sources(h_errnop);
                 }
                 *h_errnop = h;
-                if h == TRY_AGAIN { EAGAIN } else { 0 }
+                if h == TRY_AGAIN {
+                    EAGAIN
+                } else if data.unavail {
+                    errno::get()
+                } else {
+                    0
+                }
             }
         }
     }
@@ -875,6 +913,15 @@ pub unsafe extern "C" fn gethostbyname2_r(name: *const c_char, af: c_int, res: *
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn gethostbyaddr_r(addr: *const c_void, len: u32, af: c_int, res: *mut hostent, buf: *mut c_char, buflen: usize, result: *mut *mut hostent, h_errnop: *mut c_int) -> c_int {
     unsafe {
+        let rc = hostbyaddr_r_body(addr, len, af, res, buf, buflen, result, h_errnop);
+        errno::set(rc);
+        rc
+    }
+}
+
+unsafe fn hostbyaddr_r_body(addr: *const c_void, len: u32, af: c_int, res: *mut hostent, buf: *mut c_char, buflen: usize, result: *mut *mut hostent, h_errnop: *mut c_int) -> c_int {
+    unsafe {
+        nss::hconf_init();
         *result = core::ptr::null_mut();
         let af = if af == AF_UNSPEC { AF_INET } else { af };
         if !((af == AF_INET6 && len >= 16) || (af == AF_INET && len >= 4)) {
@@ -909,7 +956,11 @@ pub unsafe extern "C" fn gethostbyaddr_r(addr: *const c_void, len: u32, af: c_in
                 Source::Files => {
                     let mut found = Status::NotFound;
                     let fit = Fit::new(32, buf, buflen);
-                    if let Ok(mut r) = nss::open_db(Db::Hosts) {
+                    let opened = nss::open_db(Db::Hosts);
+                    if let Err(e) = &opened {
+                        errno::set(*e);
+                    }
+                    if let Ok(mut r) = opened {
                         if !fit.pre_ok() {
                             range_err = true;
                         }
@@ -950,14 +1001,14 @@ pub unsafe extern "C" fn gethostbyaddr_r(addr: *const c_void, len: u32, af: c_in
                 }
                 Source::Dns => {
                     any = true;
-                    match dns::lookup_addr(&dns::default_config(), af, a) {
+                    match dns::lookup_addr(&crate::resolv::current_config(), af, a) {
                         Ok(n) => {
                             name = Some(n);
                             Status::Success
                         }
                         Err(he) => {
                             h_out = he.h;
-                            if he.h == TRY_AGAIN { Status::TryAgain } else { Status::NotFound }
+                            Status::NotFound
                         }
                     }
                 }
@@ -1014,7 +1065,13 @@ pub unsafe extern "C" fn gethostbyaddr_r(addr: *const c_void, len: u32, af: c_in
             }
             _ => {
                 *h_errnop = h_out;
-                if h_out == TRY_AGAIN { EAGAIN } else { 0 }
+                if status == Status::TryAgain && h_out != NETDB_INTERNAL {
+                    EAGAIN
+                } else if status == Status::Unavail {
+                    errno::get()
+                } else {
+                    0
+                }
             }
         }
     }
@@ -1236,7 +1293,7 @@ pub unsafe extern "C" fn getprotobynumber_r(proto: c_int, res: *mut protoent, bu
 pub unsafe extern "C" fn getnetbyname_r(name: *const c_char, res: *mut netent, buf: *mut c_char, buflen: usize, result: *mut *mut netent, h_errnop: *mut c_int) -> c_int {
     unsafe {
         let nm = cbytes(name);
-        by_key(
+        by_key_dns(
             b"networks",
             b"getnetbyname_r",
             res,
@@ -1256,6 +1313,14 @@ pub unsafe extern "C" fn getnetbyname_r(name: *const c_char, res: *mut netent, b
                 let f: unsafe extern "C" fn(*const c_char, *mut netent, *mut c_char, usize, *mut c_int, *mut c_int) -> c_int = core::mem::transmute(f);
                 f(name, res, buf, buflen, en, h_errnop)
             },
+            Some(&|en| {
+                if dns::net_name_query_refused(&crate::resolv::current_config(), nm) {
+                    *en = ECONNREFUSED;
+                    NSS_UNAVAIL
+                } else {
+                    NSS_NOTFOUND
+                }
+            }),
         )
     }
 }
@@ -1263,7 +1328,7 @@ pub unsafe extern "C" fn getnetbyname_r(name: *const c_char, res: *mut netent, b
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getnetbyaddr_r(net: u32, ty: c_int, res: *mut netent, buf: *mut c_char, buflen: usize, result: *mut *mut netent, h_errnop: *mut c_int) -> c_int {
     unsafe {
-        by_key(
+        by_key_dns(
             b"networks",
             b"getnetbyaddr_r",
             res,
@@ -1280,6 +1345,15 @@ pub unsafe extern "C" fn getnetbyaddr_r(net: u32, ty: c_int, res: *mut netent, b
                 let f: unsafe extern "C" fn(u32, c_int, *mut netent, *mut c_char, usize, *mut c_int, *mut c_int) -> c_int = core::mem::transmute(f);
                 f(net, ty, res, buf, buflen, en, h_errnop)
             },
+            Some(&|_en| {
+                if ty != AF_INET {
+                    return NSS_UNAVAIL;
+                }
+                let olderr = errno::get();
+                let refused = dns::net_addr_query_refused(&crate::resolv::current_config(), net);
+                errno::set(olderr);
+                if refused { NSS_UNAVAIL } else { NSS_NOTFOUND }
+            }),
         )
     }
 }

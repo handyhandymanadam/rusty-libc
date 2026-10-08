@@ -338,7 +338,17 @@ impl Converter {
         let pt = names::parse(to).ok_or(OpenError::UnknownCharset)?;
         let pf = names::parse(from).ok_or(OpenError::UnknownCharset)?;
         let resolve = |p: &names::Parsed| -> Option<Cs> {
-            if p.key() == b"//" { names::lookup_key(b"ANSI_X3.4-1968//") } else { names::lookup_key(p.key()) }
+            if p.key() == b"//" {
+                let d = rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE);
+                let cs: &[u8] = if d.is_null() { b"ANSI_X3.4-1968" } else { unsafe { (*d).bytes(14) } };
+                let mut buf = [0u8; 64];
+                let n = cs.len().min(60);
+                buf[..n].copy_from_slice(&cs[..n]);
+                buf[n..n + 2].copy_from_slice(b"//");
+                names::parse(&buf[..n + 2]).and_then(|q| names::lookup_key(q.key()))
+            } else {
+                names::lookup_key(p.key())
+            }
         };
         let (cto, cfrom) = (resolve(&pt).ok_or(OpenError::UnknownCharset)?, resolve(&pf).ok_or(OpenError::UnknownCharset)?);
         let internal = |c: Cs| matches!(c, Cs::Special(SP_INTERNAL));

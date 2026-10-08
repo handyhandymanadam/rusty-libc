@@ -53,27 +53,7 @@ pub static HDR: Header = Header {
             Item::Block { head: r#"struct lconv
 "#, body: &["", "  char *decimal_point;", "  char *thousands_sep;", "  char *grouping;", "  char *int_curr_symbol;", "  char *currency_symbol;", "  char *mon_decimal_point;", "  char *mon_thousands_sep;", "  char *mon_grouping;", "  char *positive_sign;", "  char *negative_sign;", "  char int_frac_digits;", "  char frac_digits;", "  char p_cs_precedes;", "  char p_sep_by_space;", "  char n_cs_precedes;", "  char n_sep_by_space;", "  char p_sign_posn;", "  char n_sign_posn;", "  char int_p_cs_precedes;", "  char int_p_sep_by_space;", "  char int_n_cs_precedes;", "  char int_n_sep_by_space;", "  char int_p_sign_posn;", "  char int_n_sign_posn;", ""], tail: "" },
             Item::Blank,
-            Item::Gate(&[
-                Branch { head: "ifndef _RLIBC_LOCALE_STRUCT", items: &[
-                    Item::Consts(&[
-                        ("_RLIBC_LOCALE_STRUCT", V::Dec(1)),
-                    ]),
-                    Item::Decl("struct __locale_data;"),
-                    Item::Block { head: r#"struct __locale_struct
-"#, body: &["", "  struct __locale_data *__locales[13];", "  const unsigned short int *__ctype_b;", "  const int *__ctype_tolower;", "  const int *__ctype_toupper;", "  const char *__names[13];", ""], tail: "" },
-                ] },
-            ], ""),
-            Item::Blank,
-            Item::Gate(&[
-                Branch { head: "if !defined _BITS_TYPES_LOCALE_T_H && !defined _RLIBC_LOCALE_T", items: &[
-                    Item::Consts(&[
-                        ("_BITS_TYPES_LOCALE_T_H", V::Dec(1)),
-                        ("_RLIBC_LOCALE_T", V::Txt("")),
-                    ]),
-                    Item::Typedef("struct __locale_struct *", "__locale_t"),
-                    Item::Typedef("__locale_t", "locale_t"),
-                ] },
-            ], ""),
+            Item::Include("<bits/types/locale_t.h>"),
             Item::Blank,
             Item::Consts(&[
                 ("LC_GLOBAL_LOCALE", V::Txt("((locale_t) -1L)")),

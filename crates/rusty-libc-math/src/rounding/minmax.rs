@@ -1,5 +1,4 @@
 use super::fp::{EDOM, ERANGE, Fp, set_errno};
-use crate::export_alias;
 
 fn fmax_fmin<F: Fp>(x: F, y: F, want_max: bool) -> F {
     if !x.is_nan_() && !y.is_nan_() {
@@ -205,29 +204,42 @@ pub extern "C" fn __iseqsigf(x: f32, y: f32) -> i32 {
     iseqsig_impl(x, y)
 }
 
-export_alias!(fn(x: f64, y: f64) -> f64; fmax => fmaxf64, fmaxf32x);
-export_alias!(fn(x: f32, y: f32) -> f32; fmaxf => fmaxf32);
-export_alias!(fn(x: f64, y: f64) -> f64; fmin => fminf64, fminf32x);
-export_alias!(fn(x: f32, y: f32) -> f32; fminf => fminf32);
-export_alias!(fn(x: f64, y: f64) -> f64; fmaxmag => fmaxmagf64, fmaxmagf32x);
-export_alias!(fn(x: f32, y: f32) -> f32; fmaxmagf => fmaxmagf32);
-export_alias!(fn(x: f64, y: f64) -> f64; fminmag => fminmagf64, fminmagf32x);
-export_alias!(fn(x: f32, y: f32) -> f32; fminmagf => fminmagf32);
-export_alias!(fn(x: f64, y: f64) -> f64; fmaximum => fmaximumf64, fmaximumf32x);
-export_alias!(fn(x: f32, y: f32) -> f32; fmaximumf => fmaximumf32);
-export_alias!(fn(x: f64, y: f64) -> f64; fminimum => fminimumf64, fminimumf32x);
-export_alias!(fn(x: f32, y: f32) -> f32; fminimumf => fminimumf32);
-export_alias!(fn(x: f64, y: f64) -> f64; fmaximum_num => fmaximum_numf64, fmaximum_numf32x);
-export_alias!(fn(x: f32, y: f32) -> f32; fmaximum_numf => fmaximum_numf32);
-export_alias!(fn(x: f64, y: f64) -> f64; fminimum_num => fminimum_numf64, fminimum_numf32x);
-export_alias!(fn(x: f32, y: f32) -> f32; fminimum_numf => fminimum_numf32);
-export_alias!(fn(x: f64, y: f64) -> f64; fmaximum_mag => fmaximum_magf64, fmaximum_magf32x);
-export_alias!(fn(x: f32, y: f32) -> f32; fmaximum_magf => fmaximum_magf32);
-export_alias!(fn(x: f64, y: f64) -> f64; fminimum_mag => fminimum_magf64, fminimum_magf32x);
-export_alias!(fn(x: f32, y: f32) -> f32; fminimum_magf => fminimum_magf32);
-export_alias!(fn(x: f64, y: f64) -> f64; fmaximum_mag_num => fmaximum_mag_numf64, fmaximum_mag_numf32x);
-export_alias!(fn(x: f32, y: f32) -> f32; fmaximum_mag_numf => fmaximum_mag_numf32);
-export_alias!(fn(x: f64, y: f64) -> f64; fminimum_mag_num => fminimum_mag_numf64, fminimum_mag_numf32x);
-export_alias!(fn(x: f32, y: f32) -> f32; fminimum_mag_numf => fminimum_mag_numf32);
-export_alias!(fn(x: f64, y: f64) -> f64; fdim => fdimf64, fdimf32x);
-export_alias!(fn(x: f32, y: f32) -> f32; fdimf => fdimf32);
+macro_rules! alias_body {
+    (@go $t:ty; $body:ident($($arg:expr),*);) => {};
+    (@go $t:ty; $body:ident($($arg:expr),*); $alias:ident $(, $rest:ident)*) => {
+        #[cfg_attr(feature = "export", unsafe(no_mangle))]
+        pub extern "C" fn $alias(x: $t, y: $t) -> $t {
+            $body(x, y $(, $arg)*)
+        }
+        alias_body!(@go $t; $body($($arg),*); $($rest),*);
+    };
+    ($t:ty; $body:ident($($arg:expr),*) => $($alias:ident),+ $(,)?) => {
+        alias_body!(@go $t; $body($($arg),*); $($alias),+);
+    };
+}
+alias_body!(f64; fmax_fmin(true) => fmaxf64, fmaxf32x);
+alias_body!(f32; fmax_fmin(true) => fmaxf32);
+alias_body!(f64; fmax_fmin(false) => fminf64, fminf32x);
+alias_body!(f32; fmax_fmin(false) => fminf32);
+alias_body!(f64; magnitude(true) => fmaxmagf64, fmaxmagf32x);
+alias_body!(f32; magnitude(true) => fmaxmagf32);
+alias_body!(f64; magnitude(false) => fminmagf64, fminmagf32x);
+alias_body!(f32; magnitude(false) => fminmagf32);
+alias_body!(f64; maximum(true, false, false) => fmaximumf64, fmaximumf32x);
+alias_body!(f32; maximum(true, false, false) => fmaximumf32);
+alias_body!(f64; maximum(false, false, false) => fminimumf64, fminimumf32x);
+alias_body!(f32; maximum(false, false, false) => fminimumf32);
+alias_body!(f64; maximum(true, false, true) => fmaximum_numf64, fmaximum_numf32x);
+alias_body!(f32; maximum(true, false, true) => fmaximum_numf32);
+alias_body!(f64; maximum(false, false, true) => fminimum_numf64, fminimum_numf32x);
+alias_body!(f32; maximum(false, false, true) => fminimum_numf32);
+alias_body!(f64; maximum(true, true, false) => fmaximum_magf64, fmaximum_magf32x);
+alias_body!(f32; maximum(true, true, false) => fmaximum_magf32);
+alias_body!(f64; maximum(false, true, false) => fminimum_magf64, fminimum_magf32x);
+alias_body!(f32; maximum(false, true, false) => fminimum_magf32);
+alias_body!(f64; maximum(true, true, true) => fmaximum_mag_numf64, fmaximum_mag_numf32x);
+alias_body!(f32; maximum(true, true, true) => fmaximum_mag_numf32);
+alias_body!(f64; maximum(false, true, true) => fminimum_mag_numf64, fminimum_mag_numf32x);
+alias_body!(f32; maximum(false, true, true) => fminimum_mag_numf32);
+alias_body!(f64; fdim_impl() => fdimf64, fdimf32x);
+alias_body!(f32; fdim_impl() => fdimf32);

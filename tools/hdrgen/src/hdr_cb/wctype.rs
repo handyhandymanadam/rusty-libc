@@ -22,16 +22,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
             Item::Typedef("__mbstate_t", "mbstate_t"),
         ] },
     ], ""),
-    Item::Gate(&[
-        Branch { head: "if !defined _BITS_TYPES_LOCALE_T_H && !defined _RLIBC_LOCALE_T", items: &[
-            Item::ConstsFlat(&[
-                ("_BITS_TYPES_LOCALE_T_H", V::Dec(1)),
-                ("_RLIBC_LOCALE_T", V::Txt("")),
-            ]),
-            Item::Typedef("struct __locale_struct *", "__locale_t"),
-            Item::Typedef("__locale_t", "locale_t"),
-        ] },
-    ], ""),
+    Item::Include("<bits/types/locale_t.h>"),
     Item::Blank,
     Item::Consts(&[
         ("WEOF", V::Txt("(0xffffffffu)")),

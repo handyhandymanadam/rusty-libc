@@ -671,3 +671,12 @@ pub unsafe extern "C" fn wcstof128_l(_s: *const wchar_t, _endptr: *mut *mut wcha
 }
 
 
+rusty_libc_core::tail_alias!(__wcscoll_l => wcscoll_l);
+rusty_libc_core::tail_alias!(__wcsxfrm_l => wcsxfrm_l);
+rusty_libc_core::tail_alias!(__wcstod_l => wcstod_l);
+rusty_libc_core::tail_alias!(__wcstof_l => wcstof_l);
+rusty_libc_core::tail_alias!(__wcstold_l => wcstold_l);
+rusty_libc_core::tail_alias!(__wcstol_l => wcstol_l);
+rusty_libc_core::tail_alias!(__wcstoll_l => wcstoll_l);
+rusty_libc_core::tail_alias!(__wcstoul_l => wcstoul_l);
+rusty_libc_core::tail_alias!(__wcstoull_l => wcstoull_l);

@@ -122,6 +122,7 @@ pub const ENOENT: i32 = 2;
 pub const EAGAIN: i32 = 11;
 pub const ENOMEM: i32 = 12;
 pub const EINVAL: i32 = 22;
+pub const EBUSY: i32 = 16;
 pub const ENOSPC: i32 = 28;
 pub const ERANGE: i32 = 34;
 pub const EAFNOSUPPORT: i32 = 97;

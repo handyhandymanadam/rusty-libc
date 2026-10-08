@@ -1,4 +1,5 @@
 use crate::auxv;
+use rusty_libc_core::tunables;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -163,10 +164,39 @@ fn compute() -> [CpuidFeature; LEAVES] {
     if t[1].cpuid_array[1] & FSGSBASE != 0 && auxv::get(AT_HWCAP2).unwrap_or(0) & HWCAP2_FSGSBASE != 0 {
         active[1][1] |= FSGSBASE;
     }
+    apply_tunables(&mut active, &t);
     for i in 0..LEAVES {
         t[i].active_array = active[i];
     }
     t
+}
+
+fn apply_tunables(active: &mut Masks, t: &[CpuidFeature; LEAVES]) {
+    let p = unsafe { rusty_libc_core::env::getenv(b"GLIBC_TUNABLES") } as *const u8;
+    if p.is_null() || auxv::get(auxv::AT_SECURE).unwrap_or(0) != 0 {
+        return;
+    }
+    let mut n = 0;
+    while unsafe { *p.add(n) } != 0 {
+        n += 1;
+    }
+    let v = unsafe { core::slice::from_raw_parts(p, n) };
+    let tun = tunables::parse(v, &mut |_| {});
+    if tun.enable_secure {
+        return;
+    }
+    if let Some(list) = tun.hwcaps {
+        tunables::hwcaps_items(list, |name, disable| {
+            if let Some(&(_, leaf, reg, bit, both)) = tunables::HWCAP_FEATURES.iter().find(|f| f.0 == name) {
+                let m = 1u32 << bit;
+                if disable {
+                    active[leaf][reg] &= !m;
+                } else if both {
+                    active[leaf][reg] |= t[leaf].cpuid_array[reg] & m;
+                }
+            }
+        });
+    }
 }
 
 static STATE: AtomicU8 = AtomicU8::new(0);

@@ -209,6 +209,9 @@ pub fn acos(x: F128) -> F128 {
 
 fn atan2_special(y: F128, x: F128, pi_form: bool) -> Option<F128> {
     if x.is_nan() || y.is_nan() {
+        if !pi_form {
+            return super::narrow::pick_nan(super::narrow::Rule::SoftFp, &[y, x]);
+        }
         return Some(nan2(y, x));
     }
     let (yn, xn) = (y.is_neg(), x.is_neg());
@@ -243,7 +246,19 @@ pub fn atan2(y: F128, x: F128) -> F128 {
     if let Some(r) = atan2_special(y, x, false) {
         return r;
     }
-    fin(&atan2_ext(y.to_ext(), x.to_ext()), Exact::Less)
+    let (ey, ex) = (y.to_ext(), x.to_ext());
+    if !x.is_neg() && ey.e - ex.e < -300 {
+        let mut w = arith::div_exact(y.is_neg(), &ey, &ex);
+        if !w.sticky {
+            w = Wide { hi: w.hi - 1, lo: u128::MAX, sticky: true, ..w }.normalize();
+        }
+        let r = round_wide_f128(&w);
+        if r.is_zero() {
+            erange();
+        }
+        return r;
+    }
+    fin(&atan2_ext(ey, ex), Exact::Less)
 }
 
 pub fn atan2pi(y: F128, x: F128) -> F128 {

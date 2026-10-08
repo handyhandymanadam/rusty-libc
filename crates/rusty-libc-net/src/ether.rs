@@ -122,35 +122,134 @@ pub unsafe extern "C" fn ether_line(line: *const c_char, addr: *mut ether_addr, 
     }
 }
 
+#[repr(C)]
+struct EtherEnt {
+    e_name: *const c_char,
+    e_addr: ether_addr,
+}
+
+fn ethers_dispatch(func: &[u8], files: &mut dyn FnMut() -> i32, call: &mut dyn FnMut(usize) -> i32) -> i32 {
+    use rusty_libc_core::nssmod::{self as m, ACT_CONTINUE, ACT_RETURN};
+    let order = m::order(b"ethers");
+    let mut status = m::NSS_UNAVAIL;
+    for src in &order.e[..order.n] {
+        if rusty_libc_core::nssent::is_files(src) {
+            status = files();
+        } else {
+            let f = if src.is(b"dns") { 0 } else { m::function(src.name(), func) };
+            if f == 0 {
+                if src.action(m::NSS_UNAVAIL) != ACT_CONTINUE {
+                    break;
+                }
+                continue;
+            }
+            status = call(f);
+            if !(-2..=1).contains(&status) {
+                status = m::NSS_UNAVAIL;
+            }
+        }
+        if src.action(status) == ACT_RETURN {
+            break;
+        }
+    }
+    status
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ether_hostton(hostname: *const c_char, addr: *mut ether_addr) -> c_int {
     let h = unsafe { cbytes(hostname) };
-    let Ok(mut r) = nss::open_db(Db::Ethers) else { return -1 };
-    while let Some(l) = r.next_entry() {
-        if let Some((a, n)) = parse_line(l) {
-            if n == h {
-                unsafe { (*addr).ether_addr_octet = a };
-                return 0;
+    let found = core::cell::Cell::new(None::<[u8; 6]>);
+    let status = ethers_dispatch(
+        b"gethostton_r",
+        &mut || {
+            let mut r = match nss::open_db(Db::Ethers) {
+                Ok(r) => r,
+                Err(e) => {
+                    rusty_libc_core::errno::set(e);
+                    return -1;
+                }
+            };
+            while let Some(l) = r.next_entry() {
+                if let Some((a, n)) = parse_line(l) {
+                    if n == h {
+                        found.set(Some(a));
+                        return 1;
+                    }
+                }
             }
+            0
+        },
+        &mut |f| {
+            let f: unsafe extern "C" fn(*const c_char, *mut EtherEnt, *mut c_char, c_int, *mut c_int) -> c_int = unsafe { core::mem::transmute(f) };
+            let mut ent = EtherEnt { e_name: core::ptr::null(), e_addr: ether_addr { ether_addr_octet: [0; 6] } };
+            let mut buf = [0u8; 1024];
+            let mut e: c_int = 0;
+            let st = unsafe { f(hostname, &mut ent, buf.as_mut_ptr().cast(), 1024, &mut e) };
+            if st == 1 {
+                found.set(Some(ent.e_addr.ether_addr_octet));
+            }
+            st
+        },
+    );
+    match (status, found.get()) {
+        (1, Some(a)) => {
+            unsafe { (*addr).ether_addr_octet = a };
+            0
         }
+        _ => -1,
     }
-    -1
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ether_ntohost(hostname: *mut c_char, addr: *const ether_addr) -> c_int {
     let want = unsafe { (*addr).ether_addr_octet };
-    let Ok(mut r) = nss::open_db(Db::Ethers) else { return -1 };
-    while let Some(l) = r.next_entry() {
-        if let Some((a, n)) = parse_line(l) {
-            if a == want {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(n.as_ptr(), hostname as *mut u8, n.len());
-                    *hostname.add(n.len()) = 0;
+    let name = core::cell::RefCell::new(None::<([u8; 1024], usize)>);
+    let keep = |n: &[u8]| {
+        let mut b = [0u8; 1024];
+        let l = n.len().min(1023);
+        b[..l].copy_from_slice(&n[..l]);
+        *name.borrow_mut() = Some((b, l));
+    };
+    let status = ethers_dispatch(
+        b"getntohost_r",
+        &mut || {
+            let mut r = match nss::open_db(Db::Ethers) {
+                Ok(r) => r,
+                Err(e) => {
+                    rusty_libc_core::errno::set(e);
+                    return -1;
                 }
-                return 0;
+            };
+            while let Some(l) = r.next_entry() {
+                if let Some((a, n)) = parse_line(l) {
+                    if a == want {
+                        keep(n);
+                        return 1;
+                    }
+                }
             }
+            0
+        },
+        &mut |f| {
+            let f: unsafe extern "C" fn(*const ether_addr, *mut EtherEnt, *mut c_char, usize, *mut c_int) -> c_int = unsafe { core::mem::transmute(f) };
+            let mut ent = EtherEnt { e_name: core::ptr::null(), e_addr: ether_addr { ether_addr_octet: [0; 6] } };
+            let mut buf = [0u8; 1024];
+            let mut e: c_int = 0;
+            let st = unsafe { f(addr, &mut ent, buf.as_mut_ptr().cast(), 1024, &mut e) };
+            if st == 1 && !ent.e_name.is_null() {
+                keep(unsafe { cbytes(ent.e_name) });
+            }
+            st
+        },
+    );
+    match (status, name.into_inner()) {
+        (1, Some((b, l))) => {
+            unsafe {
+                core::ptr::copy_nonoverlapping(b.as_ptr(), hostname as *mut u8, l);
+                *hostname.add(l) = 0;
+            }
+            0
         }
+        _ => -1,
     }
-    -1
 }

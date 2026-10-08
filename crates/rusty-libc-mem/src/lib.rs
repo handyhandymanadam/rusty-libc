@@ -39,3 +39,13 @@ pub use mem::*;
 pub use search::*;
 pub use str::*;
 
+#[macro_export]
+macro_rules! tail_alias {
+    ($alias:ident => $real:path) => {
+        #[cfg_attr(feature = "export", unsafe(no_mangle))]
+        #[unsafe(naked)]
+        pub unsafe extern "C" fn $alias() {
+            core::arch::naked_asm!("jmp {f}", f = sym $real)
+        }
+    };
+}

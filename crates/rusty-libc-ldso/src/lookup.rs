@@ -208,7 +208,11 @@ pub unsafe fn lookup_hashed(name: &[u8], gh: u32, ver: Option<&VerRef>, scopes: 
 }
 
 pub unsafe fn sym_addr(f: &Found) -> usize {
-    unsafe { (*f.map).l_addr.wrapping_add((*f.sym).value as usize) }
+    unsafe { sym_value_addr((*f.map).l_addr, f.sym) }
+}
+
+pub unsafe fn sym_value_addr(l_addr: usize, sym: *const Sym) -> usize {
+    unsafe { if (*sym).shndx == SHN_ABS { (*sym).value as usize } else { l_addr.wrapping_add((*sym).value as usize) } }
 }
 
 pub unsafe fn ref_version(m: *mut LinkMap, idx: usize) -> Option<VerRef> {

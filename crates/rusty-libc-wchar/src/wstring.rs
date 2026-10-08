@@ -661,3 +661,5 @@ pub fn lcpy(dst: &mut [u32], src: &[u32]) -> usize {
     l
 }
 
+rusty_libc_core::tail_alias!(__wcscasecmp_l => wcscasecmp_l);
+rusty_libc_core::tail_alias!(__wcsncasecmp_l => wcsncasecmp_l);

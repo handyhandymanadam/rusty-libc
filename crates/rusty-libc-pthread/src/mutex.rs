@@ -591,7 +591,7 @@ unsafe fn trylock_full(m: *mut Mutex, id: i32, kind: i32) -> c_int {
                 if robust {
                     clear_pending(head);
                 }
-                return EBUSY;
+                return if ty == PTHREAD_MUTEX_ERRORCHECK_NP { EDEADLK } else { EBUSY };
             }
             match f.compare_exchange(0, id as u32, Ordering::Acquire, Ordering::Relaxed) {
                 Ok(_) => {}

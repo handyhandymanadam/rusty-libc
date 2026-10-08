@@ -429,7 +429,7 @@ pub unsafe extern "C" fn cfmakeraw(t: *mut termios) {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn tcdrain(fd: c_int) -> c_int {
-    unsafe { sci(syscall3(SYS_IOCTL, fd as usize, TCSBRK, 1)) }
+    unsafe { sci(rusty_libc_core::tls::syscall_cp(SYS_IOCTL, fd as usize, TCSBRK, 1, 0, 0, 0)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

@@ -145,12 +145,18 @@ extern "C" fn entry(sp: *const usize) -> ! {
             p = p.add(1);
         }
         let mut aux = p.add(1) as *const usize;
+        let mut secure = false;
         while *aux != 0 {
             if *aux == 33 {
                 SYSINFO_EHDR.store(*aux.add(1), Ordering::Relaxed);
+            } else if *aux == 23 {
+                secure = *aux.add(1) != 0;
             }
             aux = aux.add(2);
         }
+        crate::tunables::init_static(envp as *mut *mut u8, secure, &mut |b| {
+            let _ = crate::unistd::write(2, b);
+        });
         apply_irel();
         run_hooks(argc, argv, envp);
         crate::process::atexit(call_fini);

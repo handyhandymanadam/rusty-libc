@@ -21,6 +21,7 @@ mod shadow;
 mod stdio;
 mod stdio_ext;
 mod stdlib;
+mod strings;
 mod string;
 mod sys_acct;
 mod sys_epoll;
@@ -80,7 +81,7 @@ pub static ALL: &[(&str, Text)] = &[
     ("dirent", Text { header: None, after_includes: Some((dirent::AFTER_INCLUDES, dirent::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("err", Text { header: None, after_includes: Some((err::AFTER_INCLUDES, err::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("errno", Text { header: None, after_includes: Some((errno::AFTER_INCLUDES, errno::AFTER_INCLUDES_CHOMP)), trailer: Some((errno::TRAILER, errno::TRAILER_CHOMP)) }),
-    ("fcntl", Text { header: None, after_includes: Some((fcntl::AFTER_INCLUDES, fcntl::AFTER_INCLUDES_CHOMP)), trailer: None }),
+    ("fcntl", Text { header: None, after_includes: Some((fcntl::AFTER_INCLUDES, fcntl::AFTER_INCLUDES_CHOMP)), trailer: Some((fcntl::TRAILER, fcntl::TRAILER_CHOMP)) }),
     ("fnmatch", Text { header: None, after_includes: Some((fnmatch::AFTER_INCLUDES, fnmatch::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("getopt_ext", Text { header: None, after_includes: Some((getopt_ext::AFTER_INCLUDES, getopt_ext::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("glob", Text { header: None, after_includes: Some((glob::AFTER_INCLUDES, glob::AFTER_INCLUDES_CHOMP)), trailer: None }),
@@ -88,7 +89,7 @@ pub static ALL: &[(&str, Text)] = &[
     ("iconv", Text { header: None, after_includes: Some((iconv::AFTER_INCLUDES, iconv::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("libgen", Text { header: None, after_includes: Some((libgen::AFTER_INCLUDES, libgen::AFTER_INCLUDES_CHOMP)), trailer: Some((libgen::TRAILER, libgen::TRAILER_CHOMP)) }),
     ("malloc", Text { header: None, after_includes: Some((malloc::AFTER_INCLUDES, malloc::AFTER_INCLUDES_CHOMP)), trailer: None }),
-    ("poll", Text { header: None, after_includes: Some((poll::AFTER_INCLUDES, poll::AFTER_INCLUDES_CHOMP)), trailer: None }),
+    ("poll", Text { header: None, after_includes: Some((poll::AFTER_INCLUDES, poll::AFTER_INCLUDES_CHOMP)), trailer: Some((poll::TRAILER, poll::TRAILER_CHOMP)) }),
     ("pwd", Text { header: None, after_includes: Some((pwd::AFTER_INCLUDES, pwd::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("sched", Text { header: None, after_includes: Some((sched::AFTER_INCLUDES, sched::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("search", Text { header: None, after_includes: Some((search::AFTER_INCLUDES, search::AFTER_INCLUDES_CHOMP)), trailer: None }),
@@ -97,6 +98,7 @@ pub static ALL: &[(&str, Text)] = &[
     ("stdio_ext", Text { header: None, after_includes: Some((stdio_ext::AFTER_INCLUDES, stdio_ext::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("stdlib", Text { header: None, after_includes: Some((stdlib::AFTER_INCLUDES, stdlib::AFTER_INCLUDES_CHOMP)), trailer: Some((stdlib::TRAILER, stdlib::TRAILER_CHOMP)) }),
     ("string", Text { header: None, after_includes: Some((string::AFTER_INCLUDES, string::AFTER_INCLUDES_CHOMP)), trailer: Some((string::TRAILER, string::TRAILER_CHOMP)) }),
+    ("strings", Text { header: None, after_includes: Some((strings::AFTER_INCLUDES, strings::AFTER_INCLUDES_CHOMP)), trailer: Some((strings::TRAILER, strings::TRAILER_CHOMP)) }),
     ("sys_acct", Text { header: None, after_includes: Some((sys_acct::AFTER_INCLUDES, sys_acct::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("sys_epoll", Text { header: None, after_includes: Some((sys_epoll::AFTER_INCLUDES, sys_epoll::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("sys_eventfd", Text { header: None, after_includes: Some((sys_eventfd::AFTER_INCLUDES, sys_eventfd::AFTER_INCLUDES_CHOMP)), trailer: None }),
@@ -114,7 +116,7 @@ pub static ALL: &[(&str, Text)] = &[
     ("sys_random", Text { header: None, after_includes: Some((sys_random::AFTER_INCLUDES, sys_random::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("sys_reboot", Text { header: None, after_includes: Some((sys_reboot::AFTER_INCLUDES, sys_reboot::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("sys_resource", Text { header: None, after_includes: Some((sys_resource::AFTER_INCLUDES, sys_resource::AFTER_INCLUDES_CHOMP)), trailer: None }),
-    ("sys_select", Text { header: None, after_includes: Some((sys_select::AFTER_INCLUDES, sys_select::AFTER_INCLUDES_CHOMP)), trailer: None }),
+    ("sys_select", Text { header: None, after_includes: Some((sys_select::AFTER_INCLUDES, sys_select::AFTER_INCLUDES_CHOMP)), trailer: Some((sys_select::TRAILER, sys_select::TRAILER_CHOMP)) }),
     ("sys_signalfd", Text { header: None, after_includes: Some((sys_signalfd::AFTER_INCLUDES, sys_signalfd::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("sys_stat", Text { header: None, after_includes: Some((sys_stat::AFTER_INCLUDES, sys_stat::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("sys_statfs", Text { header: None, after_includes: Some((sys_statfs::AFTER_INCLUDES, sys_statfs::AFTER_INCLUDES_CHOMP)), trailer: None }),
@@ -136,7 +138,7 @@ pub static ALL: &[(&str, Text)] = &[
     ("types", Text { header: None, after_includes: Some((types::AFTER_INCLUDES, types::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("uchar", Text { header: None, after_includes: Some((uchar::AFTER_INCLUDES, uchar::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("ulimit", Text { header: None, after_includes: Some((ulimit::AFTER_INCLUDES, ulimit::AFTER_INCLUDES_CHOMP)), trailer: None }),
-    ("unistd", Text { header: None, after_includes: Some((unistd::AFTER_INCLUDES, unistd::AFTER_INCLUDES_CHOMP)), trailer: None }),
+    ("unistd", Text { header: None, after_includes: Some((unistd::AFTER_INCLUDES, unistd::AFTER_INCLUDES_CHOMP)), trailer: Some((unistd::TRAILER, unistd::TRAILER_CHOMP)) }),
     ("utime", Text { header: None, after_includes: Some((utime::AFTER_INCLUDES, utime::AFTER_INCLUDES_CHOMP)), trailer: None }),
     ("wchar", Text { header: None, after_includes: Some((wchar::AFTER_INCLUDES, wchar::AFTER_INCLUDES_CHOMP)), trailer: Some((wchar::TRAILER, wchar::TRAILER_CHOMP)) }),
     ("wctype", Text { header: None, after_includes: Some((wctype::AFTER_INCLUDES, wctype::AFTER_INCLUDES_CHOMP)), trailer: None }),

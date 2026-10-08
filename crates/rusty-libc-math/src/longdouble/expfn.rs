@@ -323,6 +323,13 @@ pub fn compoundnl_impl(x: F80, n: i64) -> F80 {
     if x.is_zero_() {
         return one(false);
     }
+    if n == 1 && !e.neg && e.e >= 64 {
+        let r = crate::longdouble::hw::fadd(x, one(false));
+        if is_inf(r) {
+            erange();
+        }
+        return r;
+    }
     let l = log1p_ext(e).mul(crate::longdouble::consts::LOG2E);
     fin(&exp2_ext(l.mul(Ext::from_i64(n))), Exact::IfClose)
 }

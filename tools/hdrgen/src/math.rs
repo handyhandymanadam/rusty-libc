@@ -192,6 +192,7 @@ impl Math {
         walk(&self.src, &mut files);
         files.sort();
         let export_alias = Regex::new(r"(?m)^export_alias!\((?:unsafe )?fn\(([^)]*)\) -> ([^;]+);\s*(\w+)\s*=>\s*([\w\s,]+)\);").unwrap();
+        let alias_body = Regex::new(r"(?m)^alias_body!\((f64|f32);[^=]*=>\s*([\w\s,]+)\);").unwrap();
         let float_aliases = Regex::new(r"(?ms)^float_aliases! \{\n(.*?)^\}\n").unwrap();
         let blk_re = Regex::new(r"(?s)(f64|f32) => \{(.*?)\n    \}").unwrap();
         let ent_re = Regex::new(r"(\w+) = (\w+)\(([^)]*)\);").unwrap();
@@ -206,6 +207,16 @@ impl Math {
                     let a = a.trim();
                     if !a.is_empty() {
                         found.insert(a.to_string(), proto(a, &ret, &ps));
+                    }
+                }
+            }
+            for m in alias_body.captures_iter(&text) {
+                let ty = m[1].to_string();
+                let ps = vec![("x".to_string(), ty.clone()), ("y".to_string(), ty.clone())];
+                for a in m[2].replace('\n', " ").split(',') {
+                    let a = a.trim();
+                    if !a.is_empty() {
+                        found.insert(a.to_string(), proto(a, &ty, &ps));
                     }
                 }
             }
@@ -256,6 +267,9 @@ impl Math {
             }
             let n = format!("lgamma{sfx}_r");
             found.insert(n.clone(), format!("{ty} {n}({ty} x, int *signgamp);"));
+        }
+        for (n, ty) in [("sincosf32", "_Float32"), ("sincosf64", "_Float64"), ("sincosf32x", "_Float32x")] {
+            found.insert(n.into(), format!("void {n}({ty} x, {ty} *s, {ty} *c);"));
         }
         found.insert("nexttoward".into(), "double nexttoward(double x, long double y);".into());
         found.insert("nexttowardf".into(), "float nexttowardf(float x, long double y);".into());

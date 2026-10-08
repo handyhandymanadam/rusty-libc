@@ -92,6 +92,7 @@ mod bits_types___sigset_t;
 mod bits_types___sigval_t;
 mod bits_types_clock_t;
 mod bits_types_clockid_t;
+mod bits_types___locale_t;
 mod bits_types_locale_t;
 mod bits_types_siginfo_t;
 mod bits_types_sigset_t;
@@ -176,6 +177,27 @@ mod sys_vfs;
 mod sys_vlimit;
 mod sys_vt;
 mod sys_platform_x86;
+mod bits_string_fortified;
+mod bits_strings_fortified;
+mod bits_stdio2;
+mod bits_stdio2_decl;
+mod bits_wchar2;
+mod bits_wchar2_decl;
+mod bits_unistd;
+mod bits_unistd_decl;
+mod bits_poll2;
+mod bits_fcntl2;
+mod bits_fcntl_linux_fortify;
+mod bits_socket2;
+mod bits_select2;
+mod bits_select_decl;
+mod bits_syslog;
+mod bits_syslog_decl;
+mod bits_mqueue2;
+mod bits_setjmp2;
+mod bits_inet_fortified;
+mod bits_inet_fortified_decl;
+mod bits_stdlib;
 
 use crate::model::Header;
 
@@ -272,6 +294,7 @@ pub static ALL: &[&Header] = &[
     &bits_types___sigval_t::HDR,
     &bits_types_clock_t::HDR,
     &bits_types_clockid_t::HDR,
+    &bits_types___locale_t::HDR,
     &bits_types_locale_t::HDR,
     &bits_types_siginfo_t::HDR,
     &bits_types_sigset_t::HDR,
@@ -356,4 +379,25 @@ pub static ALL: &[&Header] = &[
     &sys_vlimit::HDR,
     &sys_vt::HDR,
     &sys_platform_x86::HDR,
+    &bits_string_fortified::HDR,
+    &bits_strings_fortified::HDR,
+    &bits_stdio2::HDR,
+    &bits_stdio2_decl::HDR,
+    &bits_wchar2::HDR,
+    &bits_wchar2_decl::HDR,
+    &bits_unistd::HDR,
+    &bits_unistd_decl::HDR,
+    &bits_poll2::HDR,
+    &bits_fcntl2::HDR,
+    &bits_fcntl_linux_fortify::HDR,
+    &bits_socket2::HDR,
+    &bits_select2::HDR,
+    &bits_select_decl::HDR,
+    &bits_syslog::HDR,
+    &bits_syslog_decl::HDR,
+    &bits_mqueue2::HDR,
+    &bits_setjmp2::HDR,
+    &bits_inet_fortified::HDR,
+    &bits_inet_fortified_decl::HDR,
+    &bits_stdlib::HDR,
 ];

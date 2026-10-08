@@ -93,8 +93,11 @@ pub extern "C" fn powrf(x: f32, y: f32) -> f32 {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn pownf(x: f32, n: c_longlong) -> f32 {
-    if x.is_nan() && n != 0 {
-        return if odd_as_float(n) {
+    if x.is_nan() {
+        let signaling = x.to_bits() & (1 << 22) == 0;
+        return if n == 0 {
+            if signaling { x + x } else { 1.0 }
+        } else if odd_as_float(n) {
             let y = f32::from_bits(x.to_bits() & !(1 << 31));
             y + y
         } else {
@@ -111,6 +114,9 @@ pub extern "C" fn rootnf(x: f32, n: c_longlong) -> f32 {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn compoundnf(x: f32, n: c_longlong) -> f32 {
+    if x.is_nan() && n == 0 && x.to_bits() & (1 << 22) == 0 {
+        return x + x;
+    }
     out32(expfn::compoundn(F128::from_f32(x), n))
 }
 

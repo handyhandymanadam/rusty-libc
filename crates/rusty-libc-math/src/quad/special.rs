@@ -427,7 +427,7 @@ pub fn jn(n: i32, x: F128) -> F128 {
         sign = !sign;
     }
     if x.is_inf() {
-        return F128::zero(sign);
+        return F128::zero(sign && nn != 1);
     }
     if x.is_zero() {
         return if nn == 0 { F128::ONE } else { F128::zero(sign_of_zero_jn(x, n)) };

@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Include("<bits/types/locale_t.h>"),
     Item::Consts(&[
         ("EXIT_FAILURE", V::Dec(1)),
         ("EXIT_SUCCESS", V::Dec(0)),
@@ -74,6 +75,11 @@ pub static TRAILER: &[Item] = &[
     Item::Gate(&[
         Branch { head: "if __GLIBC_USE (ISOC23) && defined __glibc_const_generic && !defined _LIBC", items: &[
             Item::Raw(Reason::GlibcMacro, "# define bsearch(KEY, BASE, NMEMB, SIZE, COMPAR) __glibc_const_generic (BASE, const void *, bsearch (KEY, BASE, NMEMB, SIZE, COMPAR))"),
+        ] },
+    ], ""),
+    Item::Gate(&[
+        Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function", items: &[
+            Item::Include("<bits/stdlib.h>"),
         ] },
     ], ""),
 ];

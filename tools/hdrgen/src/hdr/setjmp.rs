@@ -36,6 +36,11 @@ pub static HDR: Header = Header {
                     Item::Decl("extern void siglongjmp (sigjmp_buf __env, int __val) __attribute__ ((__noreturn__));"),
                 ] },
             ], ""),
+            Item::Gate(&[
+                Branch { head: "if __USE_FORTIFY_LEVEL > 0", items: &[
+                    Item::Include("<bits/setjmp2.h>"),
+                ] },
+            ], ""),
         ]},
     ],
 };

@@ -260,6 +260,12 @@ fn div_residual<const F: bool>(th: f64, b: f64, a: f64) -> f64 {
     }
 }
 
+#[cold]
+#[inline(never)]
+fn ratio_one() -> f64 {
+    1.0
+}
+
 #[inline(always)]
 pub fn atan2_pair<const F: bool>(ay: f64, ax: f64, xneg: bool) -> D {
     let big = if ay > ax { ay } else { ax };
@@ -275,6 +281,7 @@ pub fn atan2_pair<const F: bool>(ay: f64, ax: f64, xneg: bool) -> D {
     let (a, b) = if swap { (ax, ay) } else { (ay, ax) };
     let rb = 1.0 / b;
     let th = a * rb;
+    let th = if th > 1.0 { ratio_one() } else { th };
     let tl = div_residual::<F>(th, b, a) * rb;
     let (s, lo) = atan_unit::<F>(th, tl);
     match (swap, xneg) {

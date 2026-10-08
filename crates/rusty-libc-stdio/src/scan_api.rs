@@ -27,7 +27,16 @@ impl Src for FileSrc {
         unsafe { file::consume(self.0, n) };
     }
     unsafe fn orient_ok(&mut self) -> bool {
-        unsafe { file::narrow_ok(self.0) }
+        unsafe {
+            if !file::narrow_ok(self.0) {
+                return false;
+            }
+            if (*self.0).flags & file::F_READ == 0 {
+                rusty_libc_core::errno::set(9);
+                return false;
+            }
+            true
+        }
     }
 }
 

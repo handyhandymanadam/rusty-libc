@@ -1,12 +1,20 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Include("<bits/types/locale_t.h>"),
+    Item::Blank,
+    Item::Include("<bits/endian.h>"),
     Item::Gate(&[
-        Branch { head: "ifndef _RLIBC_LOCALE_T", items: &[
-            Item::ConstsFlat(&[
-                ("_RLIBC_LOCALE_T", V::Txt("")),
-            ]),
-            Item::Typedef("struct __locale_struct *", "locale_t"),
+        Branch { head: "ifndef _ISbit", items: &[
+            Item::Gate(&[
+                Branch { head: "if __BYTE_ORDER == __BIG_ENDIAN", items: &[
+                    Item::Raw(Reason::GlibcMacro, "# define _ISbit(bit) (1 << (bit))"),
+                ] },
+                Branch { head: "else", items: &[
+                    Item::Raw(Reason::GlibcMacro, "# define _ISbit(bit) ((bit) < 8 ? ((1 << (bit)) << 8) : ((1 << (bit)) >> 8))"),
+                ] },
+            ], ""),
+            Item::Block { head: "enum\n", body: &["", "  _ISupper = _ISbit (0),", "  _ISlower = _ISbit (1),", "  _ISalpha = _ISbit (2),", "  _ISdigit = _ISbit (3),", "  _ISxdigit = _ISbit (4),", "  _ISspace = _ISbit (5),", "  _ISprint = _ISbit (6),", "  _ISgraph = _ISbit (7),", "  _ISblank = _ISbit (8),", "  _IScntrl = _ISbit (9),", "  _ISpunct = _ISbit (10),", "  _ISalnum = _ISbit (11)", ""], tail: "" },
         ] },
     ], ""),
     Item::Blank,

@@ -121,6 +121,13 @@ pub fn in_class_wc(class: usize, wc: u32) -> bool {
 }
 
 pub fn sb_chars(k: Mb) -> [u64; 4] {
+    if k == Mb::Utf8 {
+        return [!0, !0, 0, 0];
+    }
+    sb_chars_decoded(k)
+}
+
+pub(crate) fn sb_chars_decoded(k: Mb) -> [u64; 4] {
     let mut s = [0u64; 4];
     for b in 0..=255u32 {
         let ok = matches!(decode_cs(cs_of(k), &[b as u8]), Decoded::Char(_, 1));

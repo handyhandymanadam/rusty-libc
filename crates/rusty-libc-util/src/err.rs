@@ -123,6 +123,31 @@ pub(crate) unsafe fn name_bytes<'a>(p: *const c_char) -> &'a [u8] {
     }
 }
 
+unsafe fn write_stderr(src: *const u8, n: usize) -> usize {
+    unsafe {
+        let e = file::stderr_ptr();
+        if (*e).flags & file::F_WIDE == 0 {
+            return file::write_bytes(e, src, n);
+        }
+        let mut st: rusty_libc_wchar::mbstate_t = core::mem::zeroed();
+        let mut done = 0;
+        while done < n {
+            let mut wc: rusty_libc_wchar::wchar_t = 0;
+            let k = rusty_libc_wchar::mbyte::mbrtowc(&mut wc, src.add(done).cast(), n - done, &mut st);
+            let k = match k {
+                k if k >= usize::MAX - 1 => return done,
+                0 => 1,
+                k => k,
+            };
+            if rusty_libc_stdio::wfile::putwc_raw(e, wc as rusty_libc_wchar::wint_t) == rusty_libc_wchar::WEOF {
+                return done;
+            }
+            done += k;
+        }
+        n
+    }
+}
+
 pub(crate) struct Out {
     buf: [u8; 1024],
     n: usize,
@@ -135,7 +160,7 @@ impl Out {
     }
     pub(crate) fn flush(&mut self) {
         if self.n > 0 {
-            let n = unsafe { file::write_bytes(file::stderr_ptr(), self.buf.as_ptr(), self.n) };
+            let n = unsafe { write_stderr(self.buf.as_ptr(), self.n) };
             if n != self.n {
                 self.ok = false;
             }
@@ -153,7 +178,7 @@ impl Sink for Out {
             self.flush();
         }
         if bytes.len() >= self.buf.len() {
-            let n = unsafe { file::write_bytes(file::stderr_ptr(), bytes.as_ptr(), bytes.len()) };
+            let n = unsafe { write_stderr(bytes.as_ptr(), bytes.len()) };
             if n != bytes.len() {
                 self.ok = false;
             }

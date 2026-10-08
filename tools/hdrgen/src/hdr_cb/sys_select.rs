@@ -22,3 +22,22 @@ pub static AFTER_INCLUDES: &[Item] = &[
 ];
 pub const AFTER_INCLUDES_CHOMP: bool = false;
 
+pub static TRAILER: &[Item] = &[
+    Item::Gate(&[
+        Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __GNUC__", items: &[
+            Item::Gate(&[
+                Branch { head: "ifndef __FD_SETSIZE", items: &[
+                    Item::Raw(Reason::GlibcMacro, "# define __FD_SETSIZE 1024"),
+                ] },
+            ], ""),
+            Item::Include("<bits/select2.h>"),
+            Item::Undef("FD_SET"),
+            Item::Raw(Reason::StdMacro, "# define FD_SET(fd, set) ((void)(((set)->fds_bits)[__FD_ELT(fd)] |= __FD_MASK(fd)))"),
+            Item::Undef("FD_CLR"),
+            Item::Raw(Reason::StdMacro, "# define FD_CLR(fd, set) ((void)(((set)->fds_bits)[__FD_ELT(fd)] &= ~__FD_MASK(fd)))"),
+            Item::Undef("FD_ISSET"),
+            Item::Raw(Reason::StdMacro, "# define FD_ISSET(fd, set) ((((set)->fds_bits)[__FD_ELT(fd)] & __FD_MASK(fd)) != 0)"),
+        ] },
+    ], ""),
+];
+pub const TRAILER_CHOMP: bool = false;

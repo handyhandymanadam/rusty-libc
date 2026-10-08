@@ -145,7 +145,7 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::Decl("extern int regcomp (regex_t *__restrict __preg, const char *__restrict __pattern, int __cflags);"),
             Item::Decl(r#"extern int regexec (const regex_t *__restrict __preg, const char *__restrict __String, size_t __nmatch,
-                    regmatch_t __pmatch[__restrict], int __eflags);"#),
+                    regmatch_t __pmatch[__restrict_arr], int __eflags);"#),
             Item::Decl("extern size_t regerror (int __errcode, const regex_t *__restrict __preg, char *__restrict __errbuf, size_t __errbuf_size);"),
             Item::Decl("extern void regfree (regex_t *__preg);"),
             Item::Blank,

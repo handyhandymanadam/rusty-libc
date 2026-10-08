@@ -41,6 +41,7 @@ pub struct WideTables {
     pub toupper: *const u8,
     pub tolower: *const u8,
     pub width: *const u8,
+    pub inpunct: *const u8,
 }
 
 pub static WIDE_SPECIAL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

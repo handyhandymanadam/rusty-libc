@@ -32,3 +32,5 @@ pub unsafe extern "C" fn wcsftime_l(s: *mut wchar_t, maxsize: usize, format: *co
     unsafe { wcsftime_with(s.cast(), maxsize, format.cast(), tp, loc as usize, WC) }
 }
 
+
+rusty_libc_core::tail_alias!(__wcsftime_l => wcsftime_l);

@@ -234,7 +234,7 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isiz
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn close(fd: c_int) -> c_int {
-    rc(unsafe { syscall::syscall1(nr::CLOSE, fd as usize) })
+    rc(unsafe { rusty_libc_core::tls::syscall_cp(nr::CLOSE, fd as usize, 0, 0, 0, 0, 0) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

@@ -155,6 +155,9 @@ pub unsafe extern "C" fn __res_ninit(st: *mut ResState) -> c_int {
             s.dnsrch[i] = s.defdname.as_mut_ptr().add(off);
             off += b.len() + 1;
         }
+        if st == __res_state() {
+            INIT_SNAP = Some(config_of(st));
+        }
         0
     }
 }
@@ -226,6 +229,34 @@ unsafe fn config_of(st: *mut ResState) -> Config {
             }
         }
         c
+    }
+}
+
+#[thread_local]
+static mut INIT_SNAP: Option<Config> = None;
+
+fn same_config(a: &Config, b: &Config) -> bool {
+    a.nservers == b.nservers
+        && a.servers[..a.nservers] == b.servers[..b.nservers]
+        && a.nsearch == b.nsearch
+        && (0..a.nsearch).all(|i| a.search[i].as_bytes() == b.search[i].as_bytes())
+        && a.ndots == b.ndots
+        && a.timeout_ms == b.timeout_ms
+        && a.attempts == b.attempts
+        && a.options == b.options
+}
+
+pub fn current_config() -> Config {
+    unsafe {
+        let st = __res_state();
+        if (*st).options & dns::RES_INIT as c_ulong == 0 {
+            __res_ninit(st);
+        }
+        let c = config_of(st);
+        match &*(&raw const INIT_SNAP) {
+            Some(snap) if same_config(snap, &c) => dns::default_config(),
+            _ => c,
+        }
     }
 }
 
@@ -750,10 +781,14 @@ fn pton_buf(dn: &[u8]) -> Option<[u8; wire::MAXCDNAME + 2]> {
     Some(b)
 }
 
+pub(crate) fn hostname_ok(name: &[u8]) -> bool {
+    let Some(b) = pton_buf(name) else { return false };
+    !(b[0] > 0 && b[1] == b'-') && binary_hnok(&b)
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn res_hnok(dn: *const c_char) -> c_int {
-    let Some(b) = pton_buf(unsafe { cbytes(dn) }) else { return 0 };
-    (!(b[0] > 0 && b[1] == b'-') && binary_hnok(&b)) as c_int
+    hostname_ok(unsafe { cbytes(dn) }) as c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

@@ -212,6 +212,7 @@ struct Engine<'a, S: Src, A: PtrArgs, F: FmtChar> {
     nu: Option<rusty_libc_core::locale::Numeric>,
     read_in: usize,
     c: c_int,
+    inchar_errno: c_int,
     done: c_int,
     strptr: *mut *mut u8,
     slots: SlotList,
@@ -232,12 +233,14 @@ impl<S: Src, A: PtrArgs, F: FmtChar> Engine<'_, S, A, F> {
     unsafe fn inchar(&mut self) -> c_int {
         unsafe {
             if self.c == EOF {
-                errno::set(4);
+                errno::set(self.inchar_errno);
                 return EOF;
             }
             self.c = self.src.get();
             if self.c != EOF {
                 self.read_in += 1;
+            } else {
+                self.inchar_errno = errno::get();
             }
             self.c
         }
@@ -344,6 +347,7 @@ impl<S: Src, A: PtrArgs, F: FmtChar> Engine<'_, S, A, F> {
                 return None;
             }
             let d = &*d;
+            let map = rusty_libc_wchar::wctype::trans_by_name(b"to_inpunct");
             for n in 0..10usize {
                 if S::WIDE {
                     let p = d.cstr(31 + n) as *const u32;
@@ -354,6 +358,24 @@ impl<S: Src, A: PtrArgs, F: FmtChar> Engine<'_, S, A, F> {
                     let pat = d.bytes(20 + n);
                     if !pat.is_empty() && c_int::from(pat[0]) == *c && self.match_rest(pat, c, width, true) {
                         return Some(n as u32);
+                    }
+                }
+                if !map.is_null() {
+                    let w = rusty_libc_wchar::wctype::map_by_desc(u32::from(b'0') + n as u32, map);
+                    if w != u32::from(b'0') + n as u32 {
+                        if S::WIDE {
+                            if *c as u32 == w {
+                                return Some(n as u32);
+                            }
+                        } else {
+                            let mut b = [0u8; 6];
+                            if let Some(k) = rusty_libc_wchar::mbyte::encode_char(w, &mut b)
+                                && c_int::from(b[0]) == *c
+                                && self.match_rest(&b[..k], c, width, true)
+                            {
+                                return Some(n as u32);
+                            }
+                        }
                     }
                 }
             }
@@ -1454,7 +1476,7 @@ unsafe fn read_int<F: FmtChar>(f: &mut *const F) -> i64 {
 
 pub unsafe fn scan<S: Src, A: PtrArgs, F: FmtChar>(src: &mut S, fmt: *const F, args: &mut A, mode: u32) -> c_int {
     unsafe {
-        let mut e = Engine { src, args, mode, nu: None, read_in: 0, c: 0, done: 0, strptr: null_mut(), slots: SlotList { p: null_mut(), len: 0, cap: 0 }, _f: core::marker::PhantomData };
+        let mut e = Engine { src, args, mode, nu: None, read_in: 0, c: 0, inchar_errno: 0, done: 0, strptr: null_mut(), slots: SlotList { p: null_mut(), len: 0, cap: 0 }, _f: core::marker::PhantomData };
         let mut skip_space = false;
         match e.body(fmt, &mut skip_space) {
             Ok(()) => {

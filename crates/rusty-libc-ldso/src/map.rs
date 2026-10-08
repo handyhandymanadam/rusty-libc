@@ -1,3 +1,4 @@
+use crate::audit;
 use crate::elf::*;
 use crate::sys;
 use crate::util::*;
@@ -74,6 +75,10 @@ pub struct LinkMap {
     pub flags: u64,
     pub flags_1: u64,
     pub bind_now: bool,
+    pub audit_str: u64,
+    pub depaudit_str: u64,
+    pub rtld_now: bool,
+    pub lazy_plt: bool,
     pub textrel: bool,
     pub dyn_adjusted: bool,
     pub rpath: *const u8,
@@ -96,6 +101,7 @@ pub struct LinkMap {
     pub ino: u64,
     pub relocated: bool,
     pub init_called: bool,
+    pub opening: bool,
     pub fini_called: bool,
     pub is_main: bool,
     pub is_ldso: bool,
@@ -109,6 +115,7 @@ pub struct LinkMap {
     pub unloading: bool,
     pub removed: bool,
     pub copy_done: bool,
+    pub copy_mask: u64,
     pub refcount: usize,
     pub scope: *mut *mut LinkMap,
     pub nscope: usize,
@@ -149,13 +156,17 @@ pub struct State {
     pub secure: bool,
     pub map32: bool,
     pub started: bool,
+    pub stack_exec: bool,
+    pub execstack_mode: u8,
+    pub hard_error: bool,
     pub lenient: bool,
     pub debug: bool,
     pub bind_now_env: bool,
     pub trace: bool,
     pub prog_name: *const u8,
     pub page_size: usize,
-    pub error: [u8; 512],
+    pub error: *mut u8,
+    pub error_cap: usize,
     pub error_len: usize,
     pub ldso_base: usize,
     pub audit: *const u8,
@@ -181,13 +192,17 @@ pub static mut STATE: State = State {
     secure: false,
     map32: false,
     started: false,
+    stack_exec: true,
+    execstack_mode: 1,
+    hard_error: false,
     lenient: false,
     debug: false,
     bind_now_env: false,
     trace: false,
     prog_name: null(),
     page_size: 4096,
-    error: [0; 512],
+    error: null_mut(),
+    error_cap: 512,
     error_len: 0,
     ldso_base: 0,
     audit: null(),
@@ -201,36 +216,55 @@ pub fn st() -> &'static mut State {
     unsafe { &mut *(&raw mut STATE) }
 }
 
+static mut ERR0: [u8; 512] = [0; 512];
+
+pub struct Count(pub usize);
+impl core::fmt::Write for Count {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.0 += s.len();
+        Ok(())
+    }
+}
+
 pub fn set_error(args: core::fmt::Arguments) {
     use core::fmt::Write;
-    struct W<'a>(&'a mut [u8], usize);
-    impl Write for W<'_> {
+    struct W(*mut u8, usize);
+    impl Write for W {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            for &c in s.as_bytes() {
-                if self.1 < self.0.len() - 1 {
-                    self.0[self.1] = c;
-                    self.1 += 1;
-                }
-            }
+            unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), self.0.add(self.1), s.len()) };
+            self.1 += s.len();
             Ok(())
         }
     }
     let s = st();
-    let mut w = W(&mut s.error, 0);
+    let mut c = Count(0);
+    let _ = c.write_fmt(args);
+    if s.error.is_null() {
+        s.error = (&raw mut ERR0) as *mut u8;
+    }
+    if c.0 + 1 > s.error_cap {
+        let cap = (c.0 + 1).next_power_of_two();
+        s.error = unsafe { alloc_perm(cap, 1) };
+        s.error_cap = cap;
+    }
+    let mut w = W(s.error, 0);
     let _ = w.write_fmt(args);
     let n = w.1;
-    s.error[n] = 0;
+    unsafe { *s.error.add(n) = 0 };
     s.error_len = n;
 }
 
 pub fn error_str() -> &'static [u8] {
     let s = st();
-    unsafe { core::slice::from_raw_parts((&raw const s.error) as *const u8, s.error_len) }
+    if s.error.is_null() {
+        return &[];
+    }
+    unsafe { core::slice::from_raw_parts(s.error as *const u8, s.error_len) }
 }
 
 pub unsafe fn new_map() -> *mut LinkMap {
     unsafe {
-        let m = alloc_perm(core::mem::size_of::<LinkMap>(), 16) as *mut LinkMap;
+        let m = alloc_calloc(core::mem::size_of::<LinkMap>(), 16) as *mut LinkMap;
         (*m).l_real = m;
         m
     }
@@ -305,6 +339,8 @@ pub unsafe fn parse_dynamic(m: *mut LinkMap) {
                 DT_VERNEEDNUM => (*m).verneednum = v,
                 DT_FLAGS => (*m).flags = v as u64,
                 DT_FLAGS_1 => (*m).flags_1 = v as u64,
+                DT_AUDIT => (*m).audit_str = v as u64 + 1,
+                DT_DEPAUDIT => (*m).depaudit_str = v as u64 + 1,
                 DT_BIND_NOW => (*m).bind_now = true,
                 DT_TEXTREL => (*m).textrel = true,
                 DT_SYMBOLIC => (*m).flags |= DF_SYMBOLIC,
@@ -494,8 +530,21 @@ fn page_up(x: usize) -> usize {
     (x + sys::PAGE - 1) & !(sys::PAGE - 1)
 }
 
+pub unsafe fn make_stack_executable() -> isize {
+    unsafe {
+        let page = crate::__libc_stack_end & !(sys::PAGE - 1);
+        let r = sys::mprotect(page, sys::PAGE, sys::PROT_READ | sys::PROT_WRITE | sys::PROT_EXEC | 0x0100_0000 );
+        if r == 0 {
+            st().stack_exec = true;
+        }
+        r
+    }
+}
+
 fn errno_text(e: isize) -> &'static str {
     match -e {
+        1 => "Operation not permitted",
+        22 => "Invalid argument",
         2 => "No such file or directory",
         13 => "Permission denied",
         12 => "Cannot allocate memory",
@@ -569,6 +618,14 @@ unsafe fn map_fd(fd: isize, name: *const u8, loader: *mut LinkMap) -> *mut LinkM
             }
         }
         let ph = core::slice::from_raw_parts(phbuf as *const Phdr, phn);
+        if !st().stack_exec && ph.iter().find(|p| p.typ == PT_GNU_STACK).is_none_or(|p| p.flags & PF_X != 0) {
+            let err = if !st().started && st().execstack_mode == 1 { make_stack_executable() } else { -22 };
+            if err != 0 {
+                set_error(format_args!("cannot enable executable stack as shared object requires: {}", errno_text(err)));
+                st().hard_error = true;
+                return null_mut();
+            }
+        }
         let (mut lo, mut hi) = (usize::MAX, 0usize);
         for p in ph {
             if p.typ == PT_LOAD {
@@ -776,7 +833,26 @@ pub(crate) unsafe fn expand(elem: &[u8], requester: *mut LinkMap, out: &mut Path
     }
 }
 
-unsafe fn try_dirs(list: &[u8], name: &[u8], requester: *mut LinkMap, found_err: &mut bool) -> *mut LinkMap {
+unsafe fn probe_found(fd: isize) -> *mut LinkMap {
+    unsafe {
+        if PROBE_IDENT {
+            let (dev, ino) = sys::fstat_id(fd);
+            sys::close(fd);
+            let mut cur = st().head;
+            while !cur.is_null() {
+                if (*cur).dev == dev && (*cur).ino == ino && dev != 0 && !(*cur).unloading {
+                    return cur;
+                }
+                cur = (*cur).l_next;
+            }
+            return 1 as *mut LinkMap;
+        }
+        sys::close(fd);
+        1 as *mut LinkMap
+    }
+}
+
+unsafe fn try_dirs(list: &[u8], name: &[u8], requester: *mut LinkMap, loader: *mut LinkMap, code: u32, found_err: &mut bool) -> *mut LinkMap {
     unsafe {
         let probe = PROBE_ONLY;
         for elem in list.split(|&c| c == b':') {
@@ -795,30 +871,30 @@ unsafe fn try_dirs(list: &[u8], name: &[u8], requester: *mut LinkMap, found_err:
             core::ptr::copy_nonoverlapping(name.as_ptr(), path.ptr().add(n + 1), name.len());
             let plen = n + 1 + name.len();
             *path.ptr().add(plen) = 0;
-            let fd = sys::open(path.ptr());
+            let mut openp = path.ptr() as *const u8;
+            if !probe && audit::wants_objsearch() {
+                let r = audit::objsearch(openp, loader, code);
+                if r.is_null() {
+                    continue;
+                }
+                if r != openp && cstr(r) != cstr(openp) {
+                    openp = r;
+                }
+            }
+            let fd = sys::open(openp);
             if fd < 0 {
                 continue;
             }
             if probe {
-                if PROBE_IDENT {
-                    let (dev, ino) = sys::fstat_id(fd);
-                    sys::close(fd);
-                    let mut cur = st().head;
-                    while !cur.is_null() {
-                        if (*cur).dev == dev && (*cur).ino == ino && dev != 0 && !(*cur).unloading {
-                            return cur;
-                        }
-                        cur = (*cur).l_next;
-                    }
-                    return 1 as *mut LinkMap;
-                }
-                sys::close(fd);
-                return 1 as *mut LinkMap;
+                return probe_found(fd);
             }
             let m = map_fd(fd, dup(core::slice::from_raw_parts(path.ptr(), plen)), requester);
             sys::close(fd);
             if !m.is_null() {
                 return m;
+            }
+            if st().hard_error {
+                return null_mut();
             }
             *found_err = true;
         }
@@ -1001,8 +1077,26 @@ pub unsafe fn load_library(name: &[u8], requester: *mut LinkMap) -> *mut LinkMap
 
 unsafe fn load_library_search(name: &[u8], requester: *mut LinkMap) -> *mut LinkMap {
     unsafe {
+        let asked = name;
+        let mut name = name;
+        if !PROBE_ONLY && audit::wants_objsearch() && !requester.is_null() {
+            let mut buf = PathBuf::new();
+            buf.grow(0, name.len() + 1);
+            core::ptr::copy_nonoverlapping(name.as_ptr(), buf.ptr(), name.len());
+            *buf.ptr().add(name.len()) = 0;
+            let orig = buf.ptr() as *const u8;
+            let r = audit::objsearch(orig, requester, audit::LA_SER_ORIG);
+            if r.is_null() {
+                set_error(format_args!("{}: cannot open shared object file: No such file or directory", Bytes(name)));
+                return null_mut();
+            }
+            if r != orig {
+                name = cstr(r);
+            }
+        }
         let mut m: *mut LinkMap = null_mut();
         let mut bad = false;
+        st().hard_error = false;
         if name.contains(&b'/') {
             let mut path = PathBuf::new();
             if name.len() >= 4095 {
@@ -1010,7 +1104,17 @@ unsafe fn load_library_search(name: &[u8], requester: *mut LinkMap) -> *mut Link
                 return null_mut();
             }
             let n = expand(name, requester, &mut path);
-            m = map_file(path.ptr(), dup(core::slice::from_raw_parts(path.ptr(), n)), requester);
+            m = if PROBE_ONLY {
+                let fd = sys::open(path.ptr());
+                if fd < 0 {
+                    set_error(format_args!("cannot open shared object file: {}", errno_text(fd)));
+                    null_mut()
+                } else {
+                    probe_found(fd)
+                }
+            } else {
+                map_file(path.ptr(), dup(core::slice::from_raw_parts(path.ptr(), n)), requester)
+            };
             if m.is_null() {
                 let e = error_str();
                 let mut tmp = [0u8; 400];
@@ -1020,26 +1124,36 @@ unsafe fn load_library_search(name: &[u8], requester: *mut LinkMap) -> *mut Link
             }
         } else {
             let mut r = requester;
-            while m.is_null() && !r.is_null() {
+            while m.is_null() && !r.is_null() && !st().hard_error {
                 if !(*r).rpath.is_null() && (*r).runpath.is_null() {
-                    m = try_dirs(cstr((*r).rpath), name, r, &mut bad);
+                    m = try_dirs(cstr((*r).rpath), name, r, requester, audit::LA_SER_RUNPATH, &mut bad);
                 }
                 r = (*r).loader;
             }
-            if m.is_null() && !st().library_path.is_null() {
-                m = try_dirs(cstr(st().library_path), name, requester, &mut bad);
+            if m.is_null() && !st().hard_error && !st().library_path.is_null() {
+                m = try_dirs(cstr(st().library_path), name, requester, if requester.is_null() { st().main_map } else { requester }, audit::LA_SER_LIBPATH, &mut bad);
             }
-            if m.is_null() && !requester.is_null() && !(*requester).runpath.is_null() {
-                m = try_dirs(cstr((*requester).runpath), name, requester, &mut bad);
+            if m.is_null() && !st().hard_error && !requester.is_null() && !(*requester).runpath.is_null() {
+                m = try_dirs(cstr((*requester).runpath), name, requester, requester, audit::LA_SER_RUNPATH, &mut bad);
             }
-            if m.is_null() && !PROBE_ONLY_SKIP_CACHE {
+            if m.is_null() && !st().hard_error && !PROBE_ONLY_SKIP_CACHE {
                 if let Some(path) = cache_lookup(name) {
                     let mut dir = PathBuf::new();
                     if path.len() < MAX_PATH - 1 {
                         dir.grow(0, path.len() + 1);
                         core::ptr::copy_nonoverlapping(path.as_ptr(), dir.ptr(), path.len());
                         *dir.ptr().add(path.len()) = 0;
-                        let fd = sys::open(dir.ptr());
+                        let mut openp = dir.ptr() as *const u8;
+                        let mut vetoed = false;
+                        if !PROBE_ONLY && audit::wants_objsearch() {
+                            let r = audit::objsearch(openp, if requester.is_null() { st().main_map } else { requester }, audit::LA_SER_CONFIG);
+                            if r.is_null() {
+                                vetoed = true;
+                            } else if r != openp && cstr(r) != cstr(openp) {
+                                openp = r;
+                            }
+                        }
+                        let fd = if vetoed { -1 } else { sys::open(openp) };
                         if fd >= 0 {
                             if PROBE_ONLY {
                                 sys::close(fd);
@@ -1051,10 +1165,16 @@ unsafe fn load_library_search(name: &[u8], requester: *mut LinkMap) -> *mut Link
                     }
                 }
             }
-            if m.is_null() {
-                m = try_dirs(DEFAULT_DIRS, name, requester, &mut bad);
+            if m.is_null() && !st().hard_error {
+                m = try_dirs(DEFAULT_DIRS, name, requester, if requester.is_null() { st().main_map } else { requester }, audit::LA_SER_DEFAULT, &mut bad);
             }
-            if m.is_null() {
+            if m.is_null() && st().hard_error {
+                let e = error_str();
+                let mut tmp = [0u8; 400];
+                let l = e.len().min(399);
+                tmp[..l].copy_from_slice(&e[..l]);
+                set_error(format_args!("{}: {}", Bytes(name), Bytes(&tmp[..l])));
+            } else if m.is_null() {
                 set_error(format_args!("{}: cannot open shared object file: No such file or directory", Bytes(name)));
             }
         }
@@ -1065,7 +1185,7 @@ unsafe fn load_library_search(name: &[u8], requester: *mut LinkMap) -> *mut Link
             link_map(m);
         }
         if !PROBE_ONLY && (*m).req_name.is_null() {
-            (*m).req_name = dup(name);
+            (*m).req_name = dup(asked);
         }
         m
     }

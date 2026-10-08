@@ -3964,3 +3964,8 @@ pub unsafe extern "C" fn __strtok_r(s: *mut c_char, delim: *const c_char, savept
     unsafe { strtok_r(s, delim, saveptr) }
 }
 
+
+crate::tail_alias!(__strcoll_l => strcoll_l);
+crate::tail_alias!(__strxfrm_l => strxfrm_l);
+crate::tail_alias!(__strcasecmp_l => strcasecmp_l);
+crate::tail_alias!(__strncasecmp_l => strncasecmp_l);

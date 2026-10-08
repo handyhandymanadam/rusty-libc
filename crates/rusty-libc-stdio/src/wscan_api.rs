@@ -57,6 +57,10 @@ unsafe fn stream_scan_u(f: *mut FILE, format: *const wchar_t, va: &mut VaList, m
         if !wfile::wide_ok(f) {
             return scan::EOF;
         }
+        if (*f).flags & crate::file::F_READ == 0 {
+            rusty_libc_core::errno::set(9);
+            return scan::EOF;
+        }
         scan_run_fmt::<WFileSrc, u32>(&mut WFileSrc(f), format as *const u32, va, mode)
     }
 }

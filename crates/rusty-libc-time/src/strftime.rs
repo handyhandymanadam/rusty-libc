@@ -2079,3 +2079,4 @@ fn _unused() {
     let _ = errno::get();
 }
 
+rusty_libc_core::tail_alias!(__strftime_l => strftime_l);

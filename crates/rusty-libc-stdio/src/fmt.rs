@@ -89,12 +89,18 @@ impl FmtChar for u32 {
     }
 }
 
+#[cold]
+#[inline(never)]
+fn tag_zero(wc: u32) -> Option<usize> {
+    if (wc >> 7) == (0xe0000 >> 7) { Some(0) } else { None }
+}
+
 pub trait Sink {
     const WIDE: bool = false;
     fn put_wide(&mut self, w: &[u32]) -> bool {
         for &c in w {
             let mut b = [0u8; 6];
-            let Some(n) = rusty_libc_wchar::mbyte::encode_char(c, &mut b) else {
+            let Some(n) = rusty_libc_wchar::mbyte::encode_char(c, &mut b).or_else(|| tag_zero(c)) else {
                 errno::set(EILSEQ);
                 return false;
             };
@@ -172,6 +178,7 @@ struct Flags {
 
 struct Spec {
     flags: Flags,
+    pad0: bool,
     width: usize,
     prec: Option<usize>,
     len: Len,
@@ -485,7 +492,7 @@ impl<S: Sink> Out<'_, S> {
         if !S::WIDE {
             for &c in w {
                 let mut b = [0u8; 6];
-                let Some(n) = rusty_libc_wchar::mbyte::encode_char(c, &mut b) else {
+                let Some(n) = rusty_libc_wchar::mbyte::encode_char(c, &mut b).or_else(|| tag_zero(c)) else {
                     errno::set(EILSEQ);
                     self.failed = true;
                     return;
@@ -589,7 +596,7 @@ unsafe fn small_fill(dst: *mut u8, byte: u8, n: usize) {
     }
 }
 
-fn write_num<S: Sink>(o: &mut Out<S>, n: &Num, width: usize, left: bool, zero_pad: bool) {
+fn write_num<S: Sink>(o: &mut Out<S>, n: &Num, width: usize, left: bool, zero_pad: bool, rpad: u8) {
     let mut len = n.sign.len() + n.prefix.len() + n.zeros + n.body.len() + n.tail.len();
     for p in &n.mid {
         len += piece_len(p);
@@ -626,8 +633,8 @@ fn write_num<S: Sink>(o: &mut Out<S>, n: &Num, width: usize, left: bool, zero_pa
                 }
             }
             copy(n.tail, &mut k);
-            if left {
-                fill(b' ', pad, &mut k);
+            if left && rpad != 0 {
+                fill(rpad, pad, &mut k);
             }
             o.put(core::slice::from_raw_parts(base, k));
         }
@@ -651,8 +658,8 @@ fn write_num<S: Sink>(o: &mut Out<S>, n: &Num, width: usize, left: bool, zero_pa
         }
     }
     o.put(n.tail);
-    if left {
-        o.rep(b' ', pad);
+    if left && rpad != 0 {
+        o.rep(rpad, pad);
     }
 }
 
@@ -710,7 +717,7 @@ pub unsafe fn format_builtin<S: Sink, A: Args, F: FmtChar>(sink: &mut S, fmt: *c
             }
             let bare = F::at(fmt, bj);
             let is_bare = matches!(bare, b's' | b'd' | b'i' | b'u' | b'x' | b'c');
-            let mut spec = Spec { flags: Flags::default(), width: if is_bare { bw } else { 0 }, prec: None, len: Len::None, conv: if is_bare { bare } else { 0 }, conv_raw: if is_bare { F::raw(fmt, bj) } else { 0 }, wide_fmt: F::WIDE };
+            let mut spec = Spec { flags: Flags::default(), pad0: false, width: if is_bare { bw } else { 0 }, prec: None, len: Len::None, conv: if is_bare { bare } else { 0 }, conv_raw: if is_bare { F::raw(fmt, bj) } else { 0 }, wide_fmt: F::WIDE };
             let mut pos: Option<usize> = None;
             if is_bare {
                 i = bj;
@@ -734,6 +741,8 @@ pub unsafe fn format_builtin<S: Sink, A: Args, F: FmtChar>(sink: &mut S, fmt: *c
                     }
                     i += 1;
                 }
+                let explicit_minus = spec.flags.left;
+                let mut neg_width_arg = false;
                 if F::at(fmt, i) == b'*' {
                     i += 1;
                     let mut wpos = None;
@@ -745,6 +754,7 @@ pub unsafe fn format_builtin<S: Sink, A: Args, F: FmtChar>(sink: &mut S, fmt: *c
                     let w = val_i(args.get(Kind::Int, wpos)) as u32 as i32;
                     if w < 0 {
                         spec.flags.left = true;
+                        neg_width_arg = true;
                         spec.width = (i64::from(w)).unsigned_abs() as usize;
                     } else {
                         spec.width = w as usize;
@@ -793,6 +803,7 @@ pub unsafe fn format_builtin<S: Sink, A: Args, F: FmtChar>(sink: &mut S, fmt: *c
                 if positional_seen {
                     slow = true;
                 }
+                spec.pad0 = neg_width_arg && spec.flags.zero && !explicit_minus && slow;
                 if conv != 0 && spec.len == Len::H && !matches!(conv, b'd' | b'i' | b'u' | b'o' | b'x' | b'X' | b'n' | b'b' | b'B' | b'%') {
                     slow = true;
                 }
@@ -940,7 +951,7 @@ unsafe fn convert<S: Sink, A: Args>(o: &mut Out<S>, s: &Spec, pos: Option<usize>
                     }
                 } else if wide_arg {
                     let mut b = [0u8; 6];
-                    let Some(n) = rusty_libc_wchar::mbyte::encode_char(v, &mut b) else {
+                    let Some(n) = rusty_libc_wchar::mbyte::encode_char(v, &mut b).or_else(|| tag_zero(v)) else {
                         errno::set(EILSEQ);
                         o.failed = true;
                         return false;
@@ -1162,6 +1173,16 @@ fn emit_int_loc<S: Sink>(o: &mut Out<S>, s: &Spec, sign: &[u8], prefix: &[u8], m
     }
 }
 
+fn float_rpad(s: &Spec) -> u8 {
+    if !s.pad0 {
+        b' '
+    } else if matches!(s.conv, b'a' | b'A') {
+        0
+    } else {
+        b'0'
+    }
+}
+
 fn write_pieces_loc<S: Sink>(o: &mut Out<S>, s: &Spec, sign: &[u8], p: &float::Pieces, zero_pad: bool) {
     let nu = rusty_libc_core::locale::numeric();
     let hex = s.conv | 0x20 == b'a';
@@ -1212,8 +1233,9 @@ fn write_pieces_loc<S: Sink>(o: &mut Out<S>, s: &Spec, sign: &[u8], p: &float::P
         put_zeros(o, tr, p.frac_zeros);
         put_txt(o, tr, &p.tail[..p.tail_len]);
     }
-    if left {
-        o.rep(b' ', width);
+    let rpad = float_rpad(s);
+    if left && rpad != 0 {
+        o.rep(rpad, width);
     }
 }
 
@@ -1282,7 +1304,7 @@ fn emit_int<S: Sink>(o: &mut Out<S>, s: &Spec, sign: &[u8], prefix: &[u8], mag: 
         return;
     }
     let n = Num { sign, prefix, zeros, body: digits, tail: b"", mid: [Piece::None; 5] };
-    write_num(o, &n, s.width, s.flags.left, zero_pad);
+    write_num(o, &n, s.width, s.flags.left, zero_pad, b' ');
 }
 
 struct WBuf {
@@ -1378,7 +1400,7 @@ unsafe fn emit_str<S: Sink>(o: &mut Out<S>, s: &Spec, p: usize, wide: bool) {
             let mut k = 0usize;
             while *w.add(k) != 0 && bytes < limit {
                 let mut b = [0u8; 6];
-                let Some(n) = rusty_libc_wchar::mbyte::encode_char(*w.add(k), &mut b) else {
+                let Some(n) = rusty_libc_wchar::mbyte::encode_char(*w.add(k), &mut b).or_else(|| tag_zero(*w.add(k))) else {
                     errno::set(EILSEQ);
                     o.failed = true;
                     return;
@@ -1531,7 +1553,7 @@ fn emit_float<S: Sink>(o: &mut Out<S>, s: &Spec, v: Val) {
             (_, true) => b"NAN",
         };
         let n = Num { sign, prefix: b"", zeros: 0, body: text, tail: b"", mid: [Piece::None; 5] };
-        write_num(o, &n, s.width, f.left, false);
+        write_num(o, &n, s.width, f.left, false, b' ');
         return;
     }
     let is_ld = matches!(v, Val::LD(_));
@@ -1614,7 +1636,7 @@ fn write_pieces<S: Sink>(o: &mut Out<S>, s: &Spec, sign: &[u8], p: &float::Piece
             Piece::Zeros(p.frac_zeros),
         ],
     };
-    write_num(o, &n, s.width, s.flags.left, zero_pad);
+    write_num(o, &n, s.width, s.flags.left, zero_pad, float_rpad(s));
 }
 
 #[allow(clippy::collapsible_if)]

@@ -5,6 +5,11 @@ use crate::util::*;
 use core::ptr::null_mut;
 
 pub const LAV_CURRENT: u32 = 2;
+pub const LA_SER_ORIG: u32 = 0x01;
+pub const LA_SER_LIBPATH: u32 = 0x02;
+pub const LA_SER_RUNPATH: u32 = 0x04;
+pub const LA_SER_CONFIG: u32 = 0x08;
+pub const LA_SER_DEFAULT: u32 = 0x40;
 pub const LA_ACT_CONSISTENT: u32 = 0;
 pub const LA_ACT_ADD: u32 = 1;
 pub const LA_ACT_DELETE: u32 = 2;
@@ -16,6 +21,7 @@ pub const MAX_AUDIT: usize = 8;
 pub struct Lib {
     pub map: *mut LinkMap,
     pub version: u32,
+    pub f_objsearch: usize,
     pub f_activity: usize,
     pub f_objopen: usize,
     pub f_preinit: usize,
@@ -25,10 +31,11 @@ pub struct Lib {
     pub f_pltexit: usize,
 }
 
-const NO_LIB: Lib = Lib { map: null_mut(), version: 0, f_activity: 0, f_objopen: 0, f_preinit: 0, f_symbind64: 0, f_objclose: 0, f_pltenter: 0, f_pltexit: 0 };
+const NO_LIB: Lib = Lib { map: null_mut(), version: 0, f_objsearch: 0, f_activity: 0, f_objopen: 0, f_preinit: 0, f_symbind64: 0, f_objclose: 0, f_pltenter: 0, f_pltexit: 0 };
 
 pub const LA_SYMB_NOPLTENTER: u32 = 1;
 pub const LA_SYMB_NOPLTEXIT: u32 = 2;
+pub const LA_SYMB_DLSYM: u32 = 0x08;
 pub const LA_SYMB_ALTVALUE: u32 = 0x10;
 
 pub struct Audit {
@@ -49,6 +56,30 @@ pub fn au() -> &'static mut Audit {
 #[inline(always)]
 pub fn active() -> bool {
     au().ready && au().n != 0
+}
+
+#[inline(always)]
+pub fn wants_objsearch() -> bool {
+    active() && au().libs[..au().n].iter().any(|l| l.f_objsearch != 0)
+}
+
+pub unsafe fn objsearch(mut name: *const u8, l: *mut LinkMap, code: u32) -> *const u8 {
+    unsafe {
+        if l.is_null() || code == 0 || !wants_objsearch() || in_audit_closure(l) || is_audit_map(l) {
+            return name;
+        }
+        for i in 0..au().n {
+            let f = au().libs[i].f_objsearch;
+            if f != 0 {
+                let f: unsafe extern "C" fn(*const u8, *mut usize, u32) -> *const u8 = core::mem::transmute(f);
+                name = f(name, &raw mut (*l).audit_cookie[i], code);
+                if name.is_null() {
+                    return name;
+                }
+            }
+        }
+        name
+    }
 }
 
 unsafe fn find_fn(m: *mut LinkMap, name: &[u8]) -> usize {
@@ -163,6 +194,7 @@ pub unsafe fn announce_open() {
                 continue;
             }
             l.version = v;
+            l.f_objsearch = find_fn(l.map, b"la_objsearch");
             l.f_activity = find_fn(l.map, b"la_activity");
             l.f_objopen = find_fn(l.map, b"la_objopen");
             l.f_preinit = find_fn(l.map, b"la_preinit");
@@ -205,6 +237,10 @@ pub unsafe fn announce_preinit() {
             }
         }
     }
+}
+
+pub unsafe fn plt_hooks_for(m: *mut LinkMap) -> bool {
+    unsafe { active() && au().libs[..au().n].iter().any(|l| l.f_pltenter != 0 || l.f_pltexit != 0) && !in_audit_closure(m) }
 }
 
 pub unsafe fn in_audit_closure(m: *mut LinkMap) -> bool {
@@ -345,6 +381,36 @@ pub unsafe fn symbind(sym: *const Sym, defmap: *mut LinkMap, refmap: *mut LinkMa
                 addr = new;
             }
         }
+        addr
+    }
+}
+
+pub unsafe fn symbind_dlsym(caller: *mut LinkMap, sym: *const Sym, defmap: *mut LinkMap, name: &[u8], mut addr: usize) -> usize {
+    unsafe {
+        let caller = if caller.is_null() { st().main_map } else { caller };
+        if !active() || defmap.is_null() || caller.is_null() || !((*caller).audit_any_plt || (*defmap).audit_any_plt) {
+            return addr;
+        }
+        let ndx = (sym as usize - (*defmap).symtab as usize) / core::mem::size_of::<Sym>();
+        let mut nbuf = [0u8; 256];
+        let n = name.len().min(255);
+        nbuf[..n].copy_from_slice(&name[..n]);
+        let mut copy = *sym;
+        copy.value = addr as u64;
+        let mut alt = 0u32;
+        for i in 0..au().n {
+            let l = au().libs[i];
+            if l.f_symbind64 != 0 && ((*caller).audit_flags[i] & LA_FLG_BINDFROM != 0 || (*defmap).audit_flags[i] & LA_FLG_BINDTO != 0) {
+                let f: unsafe extern "C" fn(*const Sym, u32, *mut usize, *mut usize, *mut u32, *const u8) -> usize = core::mem::transmute(l.f_symbind64);
+                let mut flags = alt | LA_SYMB_DLSYM;
+                let new = f(&copy, ndx as u32, &raw mut (*caller).audit_cookie[i], &raw mut (*defmap).audit_cookie[i], &mut flags, nbuf.as_ptr());
+                if new as u64 != copy.value {
+                    alt = LA_SYMB_ALTVALUE;
+                    copy.value = new as u64;
+                }
+            }
+        }
+        addr = copy.value as usize;
         addr
     }
 }

@@ -6,12 +6,18 @@ pub static HDR: Header = Header {
         Item::Guard { name: "_RLIBC_CDEFS_H", value: "1", end: "", items: &[
             Item::Raw(Reason::GlibcMacro, "#define __ASMNAME(cname) __ASMNAME2 (__USER_LABEL_PREFIX__, cname)"),
             Item::Raw(Reason::GlibcMacro, "#define __ASMNAME2(prefix,cname) __STRING (prefix) cname"),
-            Item::Raw(Reason::GlibcMacro, "#define __BEGIN_DECLS "),
+            Item::Gate(&[
+                Branch { head: "ifdef __cplusplus", items: &[Item::Consts(&[("__BEGIN_DECLS", V::Txt("extern \"C\" {"))])] },
+                Branch { head: "else", items: &[Item::Consts(&[("__BEGIN_DECLS", V::Sp(" "))])] },
+            ], ""),
             Item::Consts(&[
                 ("__COLD", V::Txt("__attribute__ ((__cold__))")),
             ]),
             Item::Raw(Reason::GlibcMacro, "#define __CONCAT(x,y) x ## y"),
-            Item::Raw(Reason::GlibcMacro, "#define __END_DECLS "),
+            Item::Gate(&[
+                Branch { head: "ifdef __cplusplus", items: &[Item::Consts(&[("__END_DECLS", V::Txt("}"))])] },
+                Branch { head: "else", items: &[Item::Consts(&[("__END_DECLS", V::Sp(" "))])] },
+            ], ""),
             Item::Raw(Reason::GlibcMacro, "#define __GLIBC_USE(F) __GLIBC_USE_ ## F"),
             Item::Consts(&[
                 ("__GLIBC_USE_IEC_60559_BFP_EXT", V::Dec(1)),
@@ -118,13 +124,49 @@ pub static HDR: Header = Header {
             Item::Raw(Reason::GlibcMacro, "#define __glibc_likely(cond) __builtin_expect ((cond), 1)"),
             Item::Raw(Reason::GlibcMacro, "#define __glibc_macro_warning(message) __glibc_macro_warning1 (GCC warning message)"),
             Item::Raw(Reason::GlibcMacro, "#define __glibc_macro_warning1(message) _Pragma (#message)"),
-            Item::Raw(Reason::GlibcMacro, "#define __glibc_objsize(__o) __bos (__o)"),
-            Item::Raw(Reason::GlibcMacro, "#define __glibc_objsize0(__o) __bos0 (__o)"),
+            Item::Gate(&[
+                Branch { head: "if __USE_FORTIFY_LEVEL == 3 && __GNUC__ >= 12", items: &[
+                    Item::Raw(Reason::GlibcMacro, "# define __glibc_objsize0(__o) __builtin_dynamic_object_size (__o, 0)"),
+                    Item::Raw(Reason::GlibcMacro, "# define __glibc_objsize(__o) __builtin_dynamic_object_size (__o, 1)"),
+                ] },
+                Branch { head: "else", items: &[
+                    Item::Raw(Reason::GlibcMacro, "# define __glibc_objsize(__o) __bos (__o)"),
+                    Item::Raw(Reason::GlibcMacro, "# define __glibc_objsize0(__o) __bos0 (__o)"),
+                ] },
+            ], ""),
+            Item::Gate(&[
+                Branch { head: "if __USE_FORTIFY_LEVEL > 0", items: &[
+                    Item::Raw(Reason::GlibcMacro, "# define __glibc_safe_len_cond(__l, __s, __osz) ((__l) <= (__osz) / (__s))"),
+                    Item::Raw(Reason::GlibcMacro, "# define __glibc_unsigned_or_positive(__l) ((__typeof (__l)) 0 < (__typeof (__l)) -1 || (__builtin_constant_p (__l) && (__l) > 0))"),
+                    Item::Raw(Reason::GlibcMacro, "# define __glibc_safe_or_unknown_len(__l, __s, __osz) ((__builtin_constant_p (__osz) && (__osz) == (__SIZE_TYPE__) -1) || (__glibc_unsigned_or_positive (__l) && __builtin_constant_p (__glibc_safe_len_cond ((__SIZE_TYPE__) (__l), (__s), (__osz))) && __glibc_safe_len_cond ((__SIZE_TYPE__) (__l), (__s), (__osz))))"),
+                    Item::Raw(Reason::GlibcMacro, "# define __glibc_unsafe_len(__l, __s, __osz) (__glibc_unsigned_or_positive (__l) && __builtin_constant_p (__glibc_safe_len_cond ((__SIZE_TYPE__) (__l), __s, __osz)) && !__glibc_safe_len_cond ((__SIZE_TYPE__) (__l), __s, __osz))"),
+                    Item::Consts(&[
+                        ("__fortify_use_clang", V::Dec(0)),
+                    ]),
+                    Item::Raw(Reason::GlibcMacro, "# define __fortify_clang_warning(__c, __msg)"),
+                    Item::Raw(Reason::GlibcMacro, "# define __fortify_clang_warning_only_if_bos0_lt(__n, __buf, __complaint)"),
+                    Item::Raw(Reason::GlibcMacro, "# define __fortify_clang_warning_only_if_bos0_lt2(__n, __buf, __div, complaint)"),
+                    Item::Raw(Reason::GlibcMacro, "# define __fortify_clang_warning_only_if_bos_lt(__n, __buf, __complaint)"),
+                    Item::Raw(Reason::GlibcMacro, "# define __fortify_clang_warning_only_if_bos_lt2(__n, __buf, div, __complaint)"),
+                    Item::Raw(Reason::GlibcMacro, "# define __fortify_clang_overload_arg(__type, __attr, __name) __type __attr __name"),
+                    Item::Raw(Reason::GlibcMacro, "# define __fortify_clang_overload_arg0(__type, __attr, __name) __fortify_clang_overload_arg (__type, __attr, __name)"),
+                    Item::Raw(Reason::GlibcMacro, "# define __fortify_clang_warn_if_src_too_large(__dest, __src)"),
+                    Item::Raw(Reason::GlibcMacro, "# define __fortify_clang_warn_if_dest_too_small(__dest, __len)"),
+                    Item::Raw(Reason::GlibcMacro, "# define __fortify_clang_warn_if_dest_too_small0(__dest, __len)"),
+                    Item::Raw(Reason::GlibcMacro, "# define __glibc_fortify(f, __l, __s, __osz, ...) (__glibc_safe_or_unknown_len (__l, __s, __osz) ? __ ## f ## _alias (__VA_ARGS__) : (__glibc_unsafe_len (__l, __s, __osz) ? __ ## f ## _chk_warn (__VA_ARGS__, __osz) : __ ## f ## _chk (__VA_ARGS__, __osz)))"),
+                    Item::Raw(Reason::GlibcMacro, "# define __glibc_fortify_n(f, __l, __s, __osz, ...) (__glibc_safe_or_unknown_len (__l, __s, __osz) ? __ ## f ## _alias (__VA_ARGS__) : (__glibc_unsafe_len (__l, __s, __osz) ? __ ## f ## _chk_warn (__VA_ARGS__, (__osz) / (__s)) : __ ## f ## _chk (__VA_ARGS__, (__osz) / (__s))))"),
+                ] },
+            ], ""),
             Item::Raw(Reason::GlibcMacro, "#define __glibc_unlikely(cond) __builtin_expect ((cond), 0)"),
             Item::Raw(Reason::GlibcMacro, "#define __nonnull(params) __attribute_nonnull__ (params)"),
             Item::Consts(&[
                 ("__ptr_t", V::Txt("void *")),
-                ("__restrict_arr", V::Txt("__restrict")),
+            ]),
+            Item::Gate(&[
+                Branch { head: "ifdef __cplusplus", items: &[Item::Consts(&[("__restrict_arr", V::Sp(" "))])] },
+                Branch { head: "else", items: &[Item::Consts(&[("__restrict_arr", V::Txt("__restrict"))])] },
+            ], ""),
+            Item::Consts(&[
                 ("__returns_nonnull", V::Txt("__attribute__ ((__returns_nonnull__))")),
             ]),
             Item::Raw(Reason::GlibcMacro, "#define __stub___compat_bdflush "),
@@ -138,7 +180,14 @@ pub static HDR: Header = Header {
             Item::Raw(Reason::GlibcMacro, "#define __va_arg_pack() __builtin_va_arg_pack ()"),
             Item::Raw(Reason::GlibcMacro, "#define __va_arg_pack_len() __builtin_va_arg_pack_len ()"),
             Item::Raw(Reason::Attribute, "#define __warnattr(msg) __attribute__((__warning__ (msg)))"),
-            Item::Raw(Reason::GlibcMacro, "#define __wur "),
+            Item::Gate(&[
+                Branch { head: "if defined __USE_FORTIFY_LEVEL && __USE_FORTIFY_LEVEL > 0", items: &[
+                    Item::Raw(Reason::GlibcMacro, "# define __wur __attribute_warn_unused_result__"),
+                ] },
+                Branch { head: "else", items: &[
+                    Item::Raw(Reason::GlibcMacro, "# define __wur "),
+                ] },
+            ], ""),
             Item::Blank,
         ]},
     ],

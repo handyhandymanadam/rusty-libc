@@ -54,6 +54,7 @@ pub struct State {
     key: usize,
     pub foreign_bytes: usize,
     small_bytes: usize,
+    grow_first: bool,
 }
 
 pub static LOCK: rusty_libc_core::lock::RawMutex = rusty_libc_core::lock::RawMutex::new();
@@ -88,6 +89,7 @@ static STATE: Global = Global(UnsafeCell::new(State {
     key: 0,
     foreign_bytes: 0,
     small_bytes: 0,
+    grow_first: false,
 }));
 
 #[inline(always)]
@@ -572,6 +574,12 @@ unsafe fn alloc_chunk(s: &mut State, size: usize) -> *mut u8 {
                 return mem2chunk(m);
             }
         }
+        if s.grow_first && s.grow(size) {
+            let c = s.alloc_from_top(size);
+            if !c.is_null() {
+                return c;
+            }
+        }
         s.consolidate();
         let c = s.take_from_bins(size);
         if !c.is_null() {
@@ -936,11 +944,13 @@ unsafe fn memalign_nl(align: usize, n: usize) -> *mut u8 {
             set_enomem();
             return null_mut();
         };
+        let s = st();
+        s.grow_first = true;
         let m = malloc_nl(req);
+        s.grow_first = false;
         if m.is_null() {
             return m;
         }
-        let s = st();
         let mut c = mem2chunk(m);
         let head = rd(c, 8);
         let mut total = head & !FLAGS;
@@ -961,7 +971,7 @@ unsafe fn memalign_nl(align: usize, n: usize) -> *mut u8 {
             let lead_chunk = c;
             c = nc;
             total -= lead;
-            free_nl(chunk2mem(lead_chunk));
+            s.free_merge(lead_chunk, lead);
         } else if head & IS_MMAPPED != 0 {
             return m;
         }
@@ -970,9 +980,8 @@ unsafe fn memalign_nl(align: usize, n: usize) -> *mut u8 {
             wr(c, 8, size | (h & PREV_INUSE));
             let r = c.add(size);
             wr(r, 8, (total - size) | PREV_INUSE);
-            free_nl(chunk2mem(r));
+            s.free_merge(r, total - size);
         }
-        let _ = s;
         chunk2mem(c)
     }
 }

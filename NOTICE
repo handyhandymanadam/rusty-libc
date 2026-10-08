@@ -17,9 +17,14 @@ Copied verbatim (the upstream file notice is kept at the top of each file):
   tools/hdrgen/src/hdr/bits_platform_x86.rs        (header bits/platform/x86.h)       Copyright (C) 2008-2026 Free Software Foundation, Inc.
   tools/hdrgen/src/hdr/sys_platform_x86.rs         (header sys/platform/x86.h)        Copyright (C) 2008-2026 Free Software Foundation, Inc.
   tools/hdrgen/src/hdr/bits_platform_features.rs   (header bits/platform/features.h) Copyright (C) 2024-2026 Free Software Foundation, Inc.
+  tools/hdrgen/src/hdr/bits_*2.rs, bits_*_fortified*.rs, bits_*_decl.rs, bits_stdlib.rs, bits_syslog.rs, bits_unistd.rs, bits_fcntl_linux_fortify.rs
+                                                   (the 21 fortify wrapper headers bits/fcntl2.h, bits/stdio2.h, bits/string_fortified.h, ...) Copyright (C) Free Software Foundation, Inc. (years as stated in each file)
 
 Derived (structure, algorithms, message strings, tables or ABI layouts
 follow glibc sources, rewritten in Rust; the upstream licence applies):
+  tools/hdrgen/src/hdr    bits_rlibc_cdefs.rs (from misc/sys/cdefs.h), bits_rlibc_features.rs and features.rs (from include/features.h),
+                          pthread.rs (C++ cleanup class), bits_types___locale_t.rs (struct __locale_struct): C text derived from glibc headers
+  tools/hdrgen/src/hdr_cb ctype.rs (_ISbit and the _IS* enum, from ctype.h)
   crates/rusty-libc-stdlib   rand.rs (random table, 48-bit generator constants), sort.rs
   crates/rusty-libc-util     getopt, fnmatch, glob, pwd, search, err, wordexp, cpuid
   crates/rusty-libc-math     complex/*, rounding/hypot_impl.rs, longdouble complex functions, svid compatibility
@@ -386,6 +391,7 @@ see tools/hdrgen/Cargo.lock for the complete list and versions:
                      headers it writes are not covered by its licence)
   regex-lite         MIT OR Apache-2.0
   serde_json         MIT OR Apache-2.0
+  syn                MIT OR Apache-2.0
 Their transitive dependencies are licensed MIT and/or Apache-2.0 (some also
 Unlicense or Apache-2.0 WITH LLVM-exception; unicode-ident adds Unicode-3.0),
 as stated in each crate's own metadata.

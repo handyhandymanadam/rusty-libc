@@ -531,6 +531,9 @@ pub fn send_query(cfg: &Config, q: &[u8], ans: &mut [u8]) -> Result<usize, SendE
             }
             match r {
                 Ok(n) => {
+                    if cfg.options & RES_TRUSTAD == 0 && n >= 4 {
+                        ans[3] &= !0x20;
+                    }
                     let rc = Header::parse(&ans[..n]).map(|h| h.rcode()).unwrap_or(FORMERR);
                     if rc == SERVFAIL || rc == NOTIMP || rc == REFUSED {
                         bad[..n].copy_from_slice(&ans[..n]);
@@ -702,6 +705,7 @@ pub struct HostData {
     pub called: bool,
     pub any: bool,
     pub einval: bool,
+    pub unavail: bool,
 }
 
 impl HostData {
@@ -721,6 +725,7 @@ impl HostData {
             called: false,
             any: false,
             einval: false,
+            unavail: false,
         }
     }
     pub fn push(&mut self, a: Addr) {
@@ -838,6 +843,36 @@ pub fn lookup_addr(cfg: &Config, family: c_int, addr: &[u8]) -> Result<Buf<256>,
     let mut ans = [0u8; 4096];
     let n = query(cfg, rn.as_bytes(), C_IN, T_PTR, &mut ans)?;
     collect_ptr(&ans[..n], rn.as_bytes()).ok_or(HErr { h: NO_DATA, rcode: 0, refused_conn: false })
+}
+
+pub fn net_name_query_refused(cfg: &Config, name: &[u8]) -> bool {
+    let mut ans = [0u8; 1024];
+    matches!(search(cfg, name, C_IN, T_PTR, &mut ans), Err(HErr { refused_conn: true, .. }))
+}
+
+pub fn net_addr_query_refused(cfg: &Config, net: u32) -> bool {
+    let b = net.to_be_bytes();
+    let first = b.iter().position(|&x| x != 0).unwrap_or(4);
+    let mut q = Buf::<80>::new();
+    match first {
+        4 => {
+            q.push_all(b"0.0.0.0");
+        }
+        _ => {
+            for _ in 0..first {
+                q.push_all(b"0.");
+            }
+            for i in (first..4).rev() {
+                q.push_u32(b[i] as u32);
+                if i != first {
+                    q.push(b'.');
+                }
+            }
+        }
+    }
+    q.push_all(b".in-addr.arpa");
+    let mut ans = [0u8; 1024];
+    matches!(query(cfg, q.as_bytes(), C_IN, T_PTR, &mut ans), Err(HErr { refused_conn: true, .. }))
 }
 
 #[allow(dead_code)]

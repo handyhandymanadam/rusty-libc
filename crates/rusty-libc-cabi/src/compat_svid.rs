@@ -341,6 +341,24 @@ fn raw_fix(d: &Desc, a: &Args, z: Val, errno_before: c_int) -> Val {
         errno::set(errno_before);
     }
     let mut z = z;
+    if d.finite && d.ty == Ty::L {
+        match d.stem {
+            "log" | "log2" | "log10" if a.x.is_nan() => feraise(FE_INVALID),
+            "y0" | "y1" if a.x.is_zero() => {
+                restore_flags(a.flags_before);
+                if a.x.neg() {
+                    feraise(FE_INVALID);
+                    z = Val { b: [0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0xff, 0, 0, 0, 0, 0, 0], ty: Ty::L };
+                } else {
+                    z = Val { b: [0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0xff, 0, 0, 0, 0, 0, 0], ty: Ty::L };
+                }
+            }
+            "scalb" if a.x.is_nan() && a.y.is_inf() && a.y.neg() => {
+                z = Val { b: [0, 0, 0, 0, 0, 0, 0, 0xf8, 0xff, 0x7f, 0, 0, 0, 0, 0, 0], ty: Ty::L };
+            }
+            _ => {}
+        }
+    }
     if d.stem == "gamma_r" {
         unsafe {
             match d.ty {

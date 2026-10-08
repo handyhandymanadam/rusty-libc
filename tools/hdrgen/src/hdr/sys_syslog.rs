@@ -129,6 +129,13 @@ pub static HDR: Header = Header {
             Item::ExternBegin,
             Item::Include("<bits/rlibc-syslogcalls.h>"),
             Item::ExternEnd,
+            Item::Gate(&[
+                Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function", items: &[
+                    Item::ExternBegin,
+                    Item::Include("<bits/syslog.h>"),
+                    Item::ExternEnd,
+                ] },
+            ], ""),
             Item::Blank,
         ]},
     ],

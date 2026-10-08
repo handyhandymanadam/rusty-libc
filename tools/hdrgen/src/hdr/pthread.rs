@@ -95,23 +95,106 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::ExternEnd,
             Item::Blank,
-            Item::Raw(Reason::GlibcMacro, r#"#define pthread_cleanup_push(routine, arg) \
+            Item::Raw(Reason::GlibcMacro, r#"#if defined __GNUC__ && defined __EXCEPTIONS
+# ifdef __cplusplus
+class __pthread_cleanup_class
+{
+  void (*__cancel_routine) (void *);
+  void *__cancel_arg;
+  int __do_it;
+  int __cancel_type;
+
+ public:
+  __pthread_cleanup_class (void (*__fct) (void *), void *__arg)
+    : __cancel_routine (__fct), __cancel_arg (__arg), __do_it (1) { }
+  ~__pthread_cleanup_class () { if (__do_it) __cancel_routine (__cancel_arg); }
+  void __setdoit (int __newval) { __do_it = __newval; }
+  void __defer () { pthread_setcanceltype (PTHREAD_CANCEL_DEFERRED,
+					   &__cancel_type); }
+  void __restore () const { pthread_setcanceltype (__cancel_type, 0); }
+};
+
+#  define pthread_cleanup_push(routine, arg) \
+  do { \
+    __pthread_cleanup_class __clframe (routine, arg)
+
+#  define pthread_cleanup_pop(execute) \
+    __clframe.__setdoit (execute); \
+  } while (0)
+
+#  ifdef __USE_GNU
+#   define pthread_cleanup_push_defer_np(routine, arg) \
+  do { \
+    __pthread_cleanup_class __clframe (routine, arg); \
+    __clframe.__defer ()
+
+#   define pthread_cleanup_pop_restore_np(execute) \
+    __clframe.__restore (); \
+    __clframe.__setdoit (execute); \
+  } while (0)
+#  endif
+# else
+struct __pthread_cleanup_frame
+{
+  void (*__cancel_routine) (void *);
+  void *__cancel_arg;
+  int __do_it;
+  int __cancel_type;
+};
+
+__extern_inline void
+__pthread_cleanup_routine (struct __pthread_cleanup_frame *__frame)
+{
+  if (__frame->__do_it)
+    __frame->__cancel_routine (__frame->__cancel_arg);
+}
+
+#  define pthread_cleanup_push(routine, arg) \
+  do { \
+    struct __pthread_cleanup_frame __clframe \
+      __attribute__ ((__cleanup__ (__pthread_cleanup_routine))) \
+      = { .__cancel_routine = (routine), .__cancel_arg = (arg), \
+	  .__do_it = 1 };
+
+#  define pthread_cleanup_pop(execute) \
+    __clframe.__do_it = (execute); \
+  } while (0)
+
+#  ifdef __USE_GNU
+#   define pthread_cleanup_push_defer_np(routine, arg) \
+  do { \
+    struct __pthread_cleanup_frame __clframe \
+      __attribute__ ((__cleanup__ (__pthread_cleanup_routine))) \
+      = { .__cancel_routine = (routine), .__cancel_arg = (arg), \
+	  .__do_it = 1 }; \
+    (void) pthread_setcanceltype (PTHREAD_CANCEL_DEFERRED, \
+				  &__clframe.__cancel_type)
+
+#   define pthread_cleanup_pop_restore_np(execute) \
+    (void) pthread_setcanceltype (__clframe.__cancel_type, NULL); \
+    __clframe.__do_it = (execute); \
+  } while (0)
+#  endif
+# endif
+#else
+#define pthread_cleanup_push(routine, arg) \
   do { \
     struct _pthread_cleanup_buffer __buffer; \
-    _pthread_cleanup_push (&__buffer, (routine), (arg));"#),
-            Item::Blank,
-            Item::Raw(Reason::GlibcMacro, r#"#define pthread_cleanup_pop(execute) \
+    _pthread_cleanup_push (&__buffer, (routine), (arg));
+
+#define pthread_cleanup_pop(execute) \
     _pthread_cleanup_pop (&__buffer, (execute)); \
-  } while (0)"#),
-            Item::Blank,
-            Item::Raw(Reason::GlibcMacro, r#"#define pthread_cleanup_push_defer_np(routine, arg) \
+  } while (0)
+
+#define pthread_cleanup_push_defer_np(routine, arg) \
   do { \
     struct _pthread_cleanup_buffer __buffer; \
-    _pthread_cleanup_push_defer (&__buffer, (routine), (arg));"#),
-            Item::Blank,
-            Item::Raw(Reason::GlibcMacro, r#"#define pthread_cleanup_pop_restore_np(execute) \
+    _pthread_cleanup_push_defer (&__buffer, (routine), (arg));
+
+#define pthread_cleanup_pop_restore_np(execute) \
     _pthread_cleanup_pop_restore (&__buffer, (execute)); \
-  } while (0)"#),
+  } while (0)
+#endif"#),
             Item::Blank,
         ]},
     ],

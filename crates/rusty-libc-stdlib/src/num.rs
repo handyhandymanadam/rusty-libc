@@ -757,3 +757,10 @@ pub unsafe extern "C" fn strtof128_l(_s: *const c_char, _endptr: *mut *mut c_cha
 }
 
 
+rusty_libc_core::tail_alias!(__strtod_l => strtod_l);
+rusty_libc_core::tail_alias!(__strtof_l => strtof_l);
+rusty_libc_core::tail_alias!(__strtold_l => strtold_l);
+rusty_libc_core::tail_alias!(__strtol_l => strtol_l);
+rusty_libc_core::tail_alias!(__strtoll_l => strtoll_l);
+rusty_libc_core::tail_alias!(__strtoul_l => strtoul_l);
+rusty_libc_core::tail_alias!(__strtoull_l => strtoull_l);

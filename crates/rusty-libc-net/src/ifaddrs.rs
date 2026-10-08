@@ -288,8 +288,9 @@ pub fn scope_id_from_text(s: &[u8]) -> Option<u32> {
 
 pub fn scopeid_pton(addr: &[u8; 16], s: &[u8]) -> Option<u32> {
     let ll = addr[0] == 0xfe && addr[1] & 0xc0 == 0x80;
+    let mc_nodelocal = addr[0] == 0xff && addr[1] & 0xf == 1;
     let mc_ll = addr[0] == 0xff && addr[1] & 0xf == 2;
-    if ll || mc_ll {
+    if ll || mc_nodelocal || mc_ll {
         if let Some(i) = name_to_index(s) {
             return Some(i);
         }
@@ -308,6 +309,21 @@ pub fn scopeid_pton(addr: &[u8; 16], s: &[u8]) -> Option<u32> {
         }
     }
     Some(v as u32)
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __inet6_scopeid_pton(address: *const in6_addr, scope: *const c_char, result: *mut u32) -> c_int {
+    let (a, s) = unsafe { ((*address).s6_addr, core::slice::from_raw_parts(scope as *const u8, cstrlen(scope))) };
+    match scopeid_pton(&a, s) {
+        Some(id) => {
+            unsafe { *result = id };
+            0
+        }
+        None => {
+            errno::set(EINVAL);
+            -1
+        }
+    }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -609,3 +625,4 @@ pub unsafe extern "C" fn freeifaddrs(ifa: *mut ifaddrs) {
         unsafe { rusty_libc_malloc::free(ifa as *mut c_void) };
     }
 }
+

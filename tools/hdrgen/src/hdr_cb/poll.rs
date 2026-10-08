@@ -21,3 +21,11 @@ pub static AFTER_INCLUDES: &[Item] = &[
 ];
 pub const AFTER_INCLUDES_CHOMP: bool = false;
 
+pub static TRAILER: &[Item] = &[
+    Item::Gate(&[
+        Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function", items: &[
+            Item::Include("<bits/poll2.h>"),
+        ] },
+    ], ""),
+];
+pub const TRAILER_CHOMP: bool = false;

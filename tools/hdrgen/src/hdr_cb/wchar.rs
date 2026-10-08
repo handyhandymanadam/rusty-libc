@@ -22,16 +22,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
             Item::Typedef("__mbstate_t", "mbstate_t"),
         ] },
     ], ""),
-    Item::Gate(&[
-        Branch { head: "if !defined _BITS_TYPES_LOCALE_T_H && !defined _RLIBC_LOCALE_T", items: &[
-            Item::ConstsFlat(&[
-                ("_BITS_TYPES_LOCALE_T_H", V::Dec(1)),
-                ("_RLIBC_LOCALE_T", V::Txt("")),
-            ]),
-            Item::Typedef("struct __locale_struct *", "__locale_t"),
-            Item::Typedef("__locale_t", "locale_t"),
-        ] },
-    ], ""),
+    Item::Include("<bits/types/locale_t.h>"),
     Item::Blank,
     Item::Gate(&[
         Branch { head: "ifndef __FILE_defined", items: &[
@@ -60,7 +51,10 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ] },
     ], ""),
     Item::Gate(&[
-        Branch { head: "if __GLIBC_USE (C23_STRTOL)", items: &[
+        Branch { head: "if __GLIBC_USE (DEPRECATED_SCANF)", items: &[
+            Item::Raw(Reason::GlibcMacro, "# define __RLIBC_WSCANF(n)"),
+        ] },
+        Branch { head: "elif __GLIBC_USE (C23_STRTOL)", items: &[
             Item::Raw(Reason::GlibcMacro, r#"# define __RLIBC_WSCANF(n) __asm__("__isoc23_" #n)"#),
         ] },
         Branch { head: "else", items: &[
@@ -120,6 +114,12 @@ pub static TRAILER: &[Item] = &[
             Item::Raw(Reason::GlibcMacro, "# define wcspbrk(WCS, ACCEPT) __glibc_const_generic (WCS, const wchar_t *, wcspbrk (WCS, ACCEPT))"),
             Item::Raw(Reason::GlibcMacro, "# define wcsstr(HAYSTACK, NEEDLE) __glibc_const_generic (HAYSTACK, const wchar_t *, wcsstr (HAYSTACK, NEEDLE))"),
             Item::Raw(Reason::GlibcMacro, "# define wmemchr(S, C, N) __glibc_const_generic (S, const wchar_t *, wmemchr (S, C, N))"),
+        ] },
+    ], ""),
+    Item::Gate(&[
+        Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function", items: &[
+            Item::Include("<bits/wchar2-decl.h>"),
+            Item::Include("<bits/wchar2.h>"),
         ] },
     ], ""),
 ];

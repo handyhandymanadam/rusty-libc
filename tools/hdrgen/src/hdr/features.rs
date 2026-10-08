@@ -346,8 +346,48 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Consts(&[
                 ("__USE_TIME_BITS64", V::Dec(1)),
-                ("__USE_FORTIFY_LEVEL", V::Dec(0)),
             ]),
+            Item::Gate(&[
+                Branch { head: "if defined _FORTIFY_SOURCE && _FORTIFY_SOURCE > 0", items: &[
+                    Item::Gate(&[
+                        Branch { head: "if !defined __OPTIMIZE__ || __OPTIMIZE__ <= 0", items: &[
+                            Item::Raw(Reason::Other, "#  warning _FORTIFY_SOURCE requires compiling with optimization (-O)"),
+                        ] },
+                        Branch { head: "elif _FORTIFY_SOURCE > 2 && defined __GNUC__ && __GNUC__ >= 12", items: &[
+                            Item::Gate(&[
+                                Branch { head: "if _FORTIFY_SOURCE > 3", items: &[
+                                    Item::Raw(Reason::Other, "#   warning _FORTIFY_SOURCE > 3 is treated like 3 on this platform"),
+                                ] },
+                            ], ""),
+                            Item::Consts(&[
+                                ("__USE_FORTIFY_LEVEL", V::Dec(3)),
+                            ]),
+                        ] },
+                        Branch { head: "elif _FORTIFY_SOURCE > 1", items: &[
+                            Item::Gate(&[
+                                Branch { head: "if _FORTIFY_SOURCE > 2", items: &[
+                                    Item::Raw(Reason::Other, "#   warning _FORTIFY_SOURCE > 2 is treated like 2 on this platform"),
+                                ] },
+                            ], ""),
+                            Item::Consts(&[
+                                ("__USE_FORTIFY_LEVEL", V::Dec(2)),
+                            ]),
+                        ] },
+                        Branch { head: "else", items: &[
+                            Item::Consts(&[
+                                ("__USE_FORTIFY_LEVEL", V::Dec(1)),
+                            ]),
+                        ] },
+                    ], ""),
+                ] },
+            ], ""),
+            Item::Gate(&[
+                Branch { head: "ifndef __USE_FORTIFY_LEVEL", items: &[
+                    Item::Consts(&[
+                        ("__USE_FORTIFY_LEVEL", V::Dec(0)),
+                    ]),
+                ] },
+            ], ""),
             Item::Blank,
             Item::Consts(&[
                 ("__GNU_LIBRARY__", V::Dec(6)),

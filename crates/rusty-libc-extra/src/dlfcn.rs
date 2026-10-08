@@ -1,6 +1,7 @@
 use crate::consts::EINVAL;
 use core::ffi::{CStr, c_char, c_int, c_long, c_void};
 use core::ptr::null_mut;
+use core::sync::atomic::{AtomicU32, Ordering};
 use rusty_libc_core::syscall::{self, syscall1, syscall3};
 
 pub const RTLD_LAZY: c_int = 0x00001;
@@ -50,6 +51,34 @@ static mut MAIN_MAP: LinkMap = LinkMap { l_addr: 0, l_name: c"".as_ptr(), l_ld: 
 
 fn main_handle() -> *mut c_void {
     (&raw mut MAIN_MAP).cast()
+}
+
+const STUB_NAMES: [&[u8]; 8] =
+    [b"libc.so.6", b"libm.so.6", b"libpthread.so.0", b"libdl.so.2", b"librt.so.1", b"libutil.so.1", b"libanl.so.1", b"libresolv.so.2"];
+
+const fn stub_map(name: &'static core::ffi::CStr) -> LinkMap {
+    LinkMap { l_addr: 0, l_name: name.as_ptr(), l_ld: null_mut(), l_next: null_mut(), l_prev: null_mut() }
+}
+
+static mut STUB_MAPS: [LinkMap; 8] = [
+    stub_map(c"libc.so.6"),
+    stub_map(c"libm.so.6"),
+    stub_map(c"libpthread.so.0"),
+    stub_map(c"libdl.so.2"),
+    stub_map(c"librt.so.1"),
+    stub_map(c"libutil.so.1"),
+    stub_map(c"libanl.so.1"),
+    stub_map(c"libresolv.so.2"),
+];
+
+static STUB_OPEN: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+
+fn stub_handle(i: usize) -> *mut c_void {
+    (&raw mut STUB_MAPS).cast::<LinkMap>().wrapping_add(i).cast()
+}
+
+fn stub_index(handle: *mut c_void) -> Option<usize> {
+    (0..STUB_NAMES.len()).find(|&i| stub_handle(i) == handle)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -202,6 +231,15 @@ unsafe fn open_impl(file: *const c_char, mode: c_int) -> *mut c_void {
             succeed();
             return main_handle();
         }
+        if let Some(i) = STUB_NAMES.iter().position(|n| *n == name) {
+            if mode & RTLD_NOLOAD != 0 {
+                succeed();
+                return null_mut();
+            }
+            STUB_OPEN[i].fetch_add(1, Ordering::Relaxed);
+            succeed();
+            return stub_handle(i);
+        }
         if !name.contains(&b'/') {
             fail(name, "cannot open shared object file", ENOENT_);
             return null_mut();
@@ -262,6 +300,11 @@ pub unsafe extern "C" fn dlclose(handle: *mut c_void) -> c_int {
     if handle == main_handle() {
         succeed();
         0
+    } else if let Some(i) = stub_index(handle)
+        && STUB_OPEN[i].try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_ok()
+    {
+        succeed();
+        0
     } else {
         fail(b"", "shared object not open", 0);
         -1
@@ -298,7 +341,7 @@ unsafe fn sym_impl(handle: *mut c_void, name: *const c_char, version: Option<*co
             fail(b"", "RTLD_NEXT used in code not dynamically loaded", 0);
             return null_mut();
         }
-        if !handle.is_null() && handle != main_handle() {
+        if !handle.is_null() && handle != main_handle() && stub_index(handle).is_none() {
             fail(b"", "invalid handle", 0);
             return null_mut();
         }
@@ -401,8 +444,13 @@ pub unsafe extern "C" fn dladdr1(addr: *const c_void, info: *mut DlInfo, extra: 
 pub unsafe extern "C" fn dlinfo(handle: *mut c_void, request: c_int, arg: *mut c_void) -> c_int {
     unsafe {
         begin();
-        if handle != main_handle() {
+        let stub = stub_index(handle);
+        if handle != main_handle() && stub.is_none() {
             fail(b"", "invalid handle", 0);
+            return -1;
+        }
+        if stub.is_some() && request != RTLD_DI_LMID && request != RTLD_DI_LINKMAP {
+            fail(b"", "unsupported dlinfo request", 0);
             return -1;
         }
         match request {
@@ -410,7 +458,7 @@ pub unsafe extern "C" fn dlinfo(handle: *mut c_void, request: c_int, arg: *mut c
                 *(arg as *mut c_long) = 0;
             }
             RTLD_DI_LINKMAP => {
-                *(arg as *mut *mut LinkMap) = (&raw mut MAIN_MAP).cast();
+                *(arg as *mut *mut LinkMap) = handle.cast();
             }
             RTLD_DI_ORIGIN => {
                 let mut buf = [0u8; 4096];

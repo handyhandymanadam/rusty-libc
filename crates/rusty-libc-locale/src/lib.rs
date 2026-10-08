@@ -661,3 +661,7 @@ pub unsafe extern "C" fn __uselocale(loc: *mut LocaleStruct) -> *mut LocaleStruc
 }
 
 
+rusty_libc_core::tail_alias!(__newlocale => newlocale);
+rusty_libc_core::tail_alias!(__duplocale => duplocale);
+rusty_libc_core::tail_alias!(__freelocale => freelocale);
+rusty_libc_core::tail_alias!(__nl_langinfo_l => nl_langinfo_l);

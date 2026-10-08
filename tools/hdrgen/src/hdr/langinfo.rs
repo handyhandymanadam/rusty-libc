@@ -11,16 +11,7 @@ pub static HDR: Header = Header {
             Item::ExternBegin,
             Item::Blank,
             Item::Typedef("int", "nl_item"),
-            Item::Gate(&[
-                Branch { head: "if !defined _BITS_TYPES_LOCALE_T_H && !defined _RLIBC_LOCALE_T", items: &[
-                    Item::Consts(&[
-                        ("_BITS_TYPES_LOCALE_T_H", V::Dec(1)),
-                        ("_RLIBC_LOCALE_T", V::Txt("")),
-                    ]),
-                    Item::Typedef("struct __locale_struct *", "__locale_t"),
-                    Item::Typedef("__locale_t", "locale_t"),
-                ] },
-            ], ""),
+            Item::Include("<bits/types/locale_t.h>"),
             Item::Blank,
             Item::Consts(&[
                 ("ABDAY_1", V::Dec(131072)),

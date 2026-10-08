@@ -160,8 +160,8 @@ struct Parser<'a> {
     sbc: Set,
     icase: bool,
     ucache: V<(u32, V<Seq>)>,
-    cased: V<(u32, u32)>,
-    cased_done: bool,
+    cased: Option<mbset::Cased>,
+    cased_own: Option<(V<(u32, u32)>, mbset::Ranges)>,
 }
 
 fn set_bit(s: &mut Set, c: u8) {
@@ -777,14 +777,20 @@ impl<'a> Parser<'a> {
         self.tree_of_seqs(&seqs)
     }
 
-    fn cased(&mut self) -> &V<(u32, u32)> {
-        if !self.cased_done {
-            let mut v: V<(u32, u32)> = V::new();
-            rusty_libc_wchar::wctype::upper_changed(&mut |c, u| v.push((c, u)));
-            self.cased = v;
-            self.cased_done = true;
+    fn cased(&mut self) -> (&[(u32, u32)], &[(u32, u32)]) {
+        if self.cased.is_none() && self.cased_own.is_none() {
+            self.cased = mbset::cased_cached();
+            if self.cased.is_none() {
+                let (mut v, mut k): (V<(u32, u32)>, mbset::Ranges) = (V::new(), V::new());
+                mbset::cased_compute(&mut v, &mut k);
+                self.cased_own = Some((v, k));
+            }
         }
-        &self.cased
+        match (&self.cased, &self.cased_own) {
+            (Some(c), _) => (c.pairs, c.kept),
+            (None, Some((v, k))) => (&v[..], &k[..]),
+            (None, None) => (&[], &[]),
+        }
     }
 
     fn same_upper(&mut self, want: u32, out: &mut V<Seq>) {
@@ -795,15 +801,17 @@ impl<'a> Parser<'a> {
             {
                 out.push(s);
             }
-            let n = self.cased().len();
-            for i in 0..n {
-                let (t, u) = self.cased()[i];
+            for &(t, u) in self.cased().0 {
                 if u == want
                     && let Some(s) = mbset::seq_of(mb, t)
                 {
                     out.push(s);
                 }
             }
+            return;
+        }
+        if mb != Mb::Utf8 {
+            mbset::collect_folded(mb, &mut |_, up, _| up == want, out);
             return;
         }
         let mut pred = |c: u32, _n: usize| charset::upper_wc(c) == want;
@@ -1202,7 +1210,18 @@ impl<'a> Parser<'a> {
         let (mb, icase, sbc) = (self.mb, self.icase, self.sbc);
         let sb = acc.sb;
         let mut build = |seqs: &mut V<Seq>| {
-            if icase {
+            if icase && mb != Mb::Utf8 {
+                mbset::collect_folded(
+                    mb,
+                    &mut |_, x, single| {
+                        if single >= 0 && set_has(&sbc, single as u8) {
+                            return set_has(&sb, single as u8);
+                        }
+                        has_complex && Self::complex_member(&acc, &coll, x)
+                    },
+                    seqs,
+                );
+            } else if icase {
                 let mut pred = |c: u32, _n: usize| -> bool {
                     let x = charset::upper_wc(c);
                     let mut b = [0u8; 6];
@@ -1280,17 +1299,9 @@ impl<'a> Parser<'a> {
             }
             mbset::normalize(&mut s_set);
             let mut res: mbset::Ranges = V::new();
-            let n = self.cased().len();
-            let mut points: V<(u32, u32)> = V::new();
-            for i in 0..n {
-                let (t, _) = self.cased()[i];
-                points.push((t, t));
-            }
-            mbset::normalize(&mut points);
-            let kept = mbset::complement(&points, &[(0, 0x10ffff)]);
-            res.extend_from_slice(&mbset::clip(&s_set, &kept));
-            for i in 0..n {
-                let (t, u) = self.cased()[i];
+            let (pairs, kept) = self.cased();
+            res.extend_from_slice(&mbset::clip(&s_set, kept));
+            for &(t, u) in pairs {
                 if mbset::contains(&s_set, u) {
                     res.push((t, t));
                 }
@@ -1786,8 +1797,8 @@ pub fn parse(pattern: &[u8], syntax: u64, trans: Option<&[u8; 256]>) -> Result<P
         sbc,
         icase,
         ucache: V::new(),
-        cased: V::new(),
-        cased_done: false,
+        cased: None,
+        cased_own: None,
     };
     let mut tok = p.fetch_token(syntax | RE_CARET_ANCHORS_HERE);
     let tree = p.parse_reg_exp(&mut tok, 0)?;

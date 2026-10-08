@@ -1,4 +1,4 @@
-use core::ffi::c_void;
+use core::ffi::{c_char, c_void};
 use rusty_libc_core::errno;
 use rusty_libc_malloc::{free, malloc, realloc};
 
@@ -310,3 +310,88 @@ pub unsafe extern "C" fn __nss_hash(key: *const c_void, len: usize) -> u32 {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[allow(non_upper_case_globals)]
 pub static _libc_intl_domainname: [u8; 5] = *b"libc\0";
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AllocBuffer {
+    pub current: usize,
+    pub end: usize,
+}
+
+const FAILED_BUFFER: AllocBuffer = AllocBuffer { current: 0, end: 0 };
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __libc_alloc_buffer_create_failure(_start: *mut c_void, size: usize) -> ! {
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    let mut n = size;
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let _ = rusty_libc_core::unistd::write(2, b"Fatal glibc error: invalid allocation buffer of size ");
+    let _ = rusty_libc_core::unistd::write(2, &digits[i..]);
+    let _ = rusty_libc_core::unistd::write(2, b"\n");
+    rusty_libc_core::process::abort()
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __libc_alloc_buffer_allocate(size: usize, pptr: *mut *mut c_void) -> AllocBuffer {
+    unsafe {
+        let p = malloc(size);
+        *pptr = p;
+        if p.is_null() {
+            return FAILED_BUFFER;
+        }
+        let current = p as usize;
+        match current.checked_add(size) {
+            Some(end) => AllocBuffer { current, end },
+            None => __libc_alloc_buffer_create_failure(p, size),
+        }
+    }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __libc_alloc_buffer_alloc_array(buf: *mut AllocBuffer, element_size: usize, align: usize, count: usize) -> *mut c_void {
+    unsafe {
+        let current = (*buf).current;
+        let aligned = current.wrapping_add(align.wrapping_sub(1)) & align.wrapping_neg();
+        if let Some(size) = element_size.checked_mul(count) {
+            let new_current = aligned.wrapping_add(size);
+            if aligned >= current && new_current >= size && new_current <= (*buf).end {
+                (*buf).current = new_current;
+                return aligned as *mut c_void;
+            }
+        }
+        *buf = FAILED_BUFFER;
+        core::ptr::null_mut()
+    }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __libc_alloc_buffer_copy_bytes(mut buf: AllocBuffer, src: *const c_void, len: usize) -> AllocBuffer {
+    unsafe {
+        if len > buf.end.wrapping_sub(buf.current) {
+            return FAILED_BUFFER;
+        }
+        let dst = buf.current as *mut u8;
+        buf.current = buf.current.wrapping_add(len);
+        if !dst.is_null() {
+            core::ptr::copy_nonoverlapping(src as *const u8, dst, len);
+        }
+        buf
+    }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __libc_alloc_buffer_copy_string(buf: AllocBuffer, src: *const c_char) -> AllocBuffer {
+    unsafe {
+        let len = core::ffi::CStr::from_ptr(src).to_bytes_with_nul().len();
+        __libc_alloc_buffer_copy_bytes(buf, src.cast(), len)
+    }
+}
+

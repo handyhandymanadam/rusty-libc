@@ -429,10 +429,133 @@ pub fn add_features_include(files: &mut BTreeMap<String, String>) {
     }
 }
 
+fn frag_include(line: &str, frags: &BTreeMap<String, bool>) -> bool {
+    let Some(r) = line.strip_prefix('#') else { return false };
+    let Some(r) = r.trim_start().strip_prefix("include") else { return false };
+    let name = r.trim().trim_start_matches(['<', '"']);
+    let name = name.split(['>', '"']).next().unwrap_or("");
+    frags.get(name).copied().unwrap_or(false)
+}
+
+fn extern_c_start(text: &str, from: usize, frags: &BTreeMap<String, bool>) -> (usize, bool, usize) {
+    let mut depth = 0i32;
+    let mut after = from;
+    let mut in_comment = false;
+    let mut cont = false;
+    let mut first_c: Option<usize> = None;
+    let mut has_paren = false;
+    let mut guard_end = text.len();
+    let mut off = from;
+    for line in text[from..].split_inclusive('\n') {
+        let end = off + line.len();
+        let t = line.trim_start();
+        let body = t.trim_end();
+        if in_comment {
+            if body.contains("*/") {
+                in_comment = false;
+            }
+        } else if cont {
+            cont = body.ends_with('\\');
+            if !cont && depth == 0 {
+                after = end;
+            }
+        } else if body.is_empty() || body.starts_with("//") {
+        } else if body.starts_with("/*") {
+            if !body.contains("*/") {
+                in_comment = true;
+            }
+        } else if frag_include(body, frags) {
+            if first_c.is_none() {
+                first_c = Some(after);
+            }
+            has_paren = true;
+        } else if let Some(d) = body.strip_prefix('#') {
+            let d = d.trim_start();
+            if d.starts_with("if") {
+                depth += 1;
+            } else if d.starts_with("endif") {
+                depth -= 1;
+                if depth < 0 {
+                    guard_end = off;
+                    break;
+                }
+            }
+            cont = body.ends_with('\\');
+            if !cont && depth == 0 {
+                after = end;
+            }
+        } else {
+            if first_c.is_none() {
+                first_c = Some(after);
+            }
+            if body.contains('(') {
+                has_paren = true;
+            }
+        }
+        off = end;
+    }
+    (first_c.unwrap_or(after), has_paren, guard_end)
+}
+
+fn guarded(text: &str) -> bool {
+    text.contains("extern \"C\"") || text.contains("__BEGIN_DECLS")
+}
+
+pub fn add_extern_c(files: &mut BTreeMap<String, String>) {
+    let mut frags: BTreeMap<String, bool> = files
+        .iter()
+        .filter(|(p, t)| p.starts_with("bits/") && !guarded(t))
+        .map(|(p, t)| (p.clone(), extern_c_start(t, 0, &BTreeMap::new()).1))
+        .collect();
+    loop {
+        let more: Vec<String> = files
+            .iter()
+            .filter(|(p, t)| frags.get(*p) == Some(&false) && extern_c_start(t, 0, &frags).1)
+            .map(|(p, _)| p.clone())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        for p in more {
+            frags.insert(p, true);
+        }
+    }
+    for (path, text) in files.iter_mut() {
+        let top = path.split('/').next().unwrap_or("");
+        if top == "bits" || top == "gnu" || !path.ends_with(".h") || guarded(text) {
+            continue;
+        }
+        let Some(from) = find_guard(text) else { continue };
+        let (at, has_decl, end) = extern_c_start(text, from, &frags);
+        if !has_decl || end < at || end >= text.len() {
+            continue;
+        }
+        let (head, tail) = text.split_at(end);
+        let close = tail.find('\n').map_or(tail.len(), |i| i + 1);
+        let (endif, trailer) = tail.split_at(close);
+        let mut t = String::with_capacity(text.len() + 64);
+        t.push_str(&head[..at]);
+        t.push_str("__BEGIN_DECLS\n");
+        t.push_str(&head[at..]);
+        t.push_str("__END_DECLS\n");
+        t.push_str(endif);
+        if !trailer.trim().is_empty() {
+            t.push_str("__BEGIN_DECLS\n");
+            t.push_str(trailer);
+            if !trailer.ends_with('\n') {
+                t.push('\n');
+            }
+            t.push_str("__END_DECLS\n");
+        }
+        *text = t;
+    }
+}
+
 pub fn post_passes(files: &mut BTreeMap<String, String>) {
     add_attributes(files);
     untypedef(files);
     add_features_include(files);
+    add_extern_c(files);
 }
 
 pub fn full_tree(root: &Path, tmp: &Path) -> BTreeMap<String, String> {

@@ -7,6 +7,11 @@ pub static HDR: Header = Header {
             Item::Include("<stdint.h>"),
             Item::Include("<netinet/in.h>"),
             Item::Include("<bits/rlibc-net-inet.h>"),
+            Item::Gate(&[
+                Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function", items: &[
+                    Item::Include("<bits/inet-fortified.h>"),
+                ] },
+            ], ""),
         ]},
     ],
 };

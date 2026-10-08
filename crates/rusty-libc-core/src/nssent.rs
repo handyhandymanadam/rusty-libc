@@ -229,7 +229,11 @@ pub trait MergeOps {
     fn restore(&mut self) -> i32;
 }
 
-pub fn dispatch(db: &[u8], func: &[u8], files: &dyn Fn() -> i32, call: &dyn Fn(usize, *mut i32) -> i32, mut merge: Option<&mut dyn MergeOps>) -> i32 {
+pub fn dispatch(db: &[u8], func: &[u8], files: &dyn Fn() -> i32, call: &dyn Fn(usize, *mut i32) -> i32, merge: Option<&mut dyn MergeOps>) -> i32 {
+    dispatch_dns(db, func, files, call, merge, None)
+}
+
+pub fn dispatch_dns(db: &[u8], func: &[u8], files: &dyn Fn() -> i32, call: &dyn Fn(usize, *mut i32) -> i32, mut merge: Option<&mut dyn MergeOps>, dns: Option<&dyn Fn(*mut i32) -> i32>) -> i32 {
     let order = nssmod::order(db);
     let mut status = NSS_UNAVAIL;
     let mut do_merge = false;
@@ -237,15 +241,19 @@ pub fn dispatch(db: &[u8], func: &[u8], files: &dyn Fn() -> i32, call: &dyn Fn(u
         if is_files(src) {
             status = files();
         } else {
-            let f = if src.is(b"dns") { 0 } else { nssmod::function(src.name(), func) };
-            if f == 0 {
+            let is_dns = src.is(b"dns");
+            let f = if is_dns { 0 } else { nssmod::function(src.name(), func) };
+            if f == 0 && !(is_dns && dns.is_some()) {
                 if src.action(NSS_UNAVAIL) != ACT_CONTINUE {
                     break;
                 }
                 continue;
             }
             let mut e: i32 = 0;
-            status = call(f, &mut e);
+            status = match dns {
+                Some(d) if is_dns => d(&mut e),
+                _ => call(f, &mut e),
+            };
             if !(-2..=1).contains(&status) {
                 status = NSS_UNAVAIL;
             }

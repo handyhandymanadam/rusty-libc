@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Include("<bits/types/locale_t.h>"),
     Item::Gate(&[
         Branch { head: "ifdef __USE_MISC", items: &[
             Item::Include("<strings.h>"),
@@ -30,6 +31,15 @@ pub static TRAILER: &[Item] = &[
     ], ""),
     Item::Raw(Reason::GlibcMacro, "#define strdupa(s) (__extension__ ({ const char *__old = (s); size_t __len = strlen (__old) + 1; char *__new = (char *) __builtin_alloca (__len); (char *) memcpy (__new, __old, __len); }))"),
     Item::Raw(Reason::GlibcMacro, r#"#define strndupa(s, n) (__extension__ ({ const char *__old = (s); size_t __len = strnlen (__old, (n)); char *__new = (char *) __builtin_alloca (__len + 1); __new[__len] = '\0'; (char *) memcpy (__new, __old, __len); }))"#),
+    Item::Gate(&[
+        Branch { head: "if __GNUC_PREREQ (3,4)", items: &[
+            Item::Gate(&[
+                Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function", items: &[
+                    Item::Include("<bits/string_fortified.h>"),
+                ] },
+            ], ""),
+        ] },
+    ], ""),
 ];
 pub const TRAILER_CHOMP: bool = false;
 

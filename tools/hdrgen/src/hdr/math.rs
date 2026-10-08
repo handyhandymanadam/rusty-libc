@@ -196,12 +196,32 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
-            Item::Raw(Reason::StdMacro, "#define fpclassify(x) __builtin_fpclassify (FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, x)"),
             Item::Raw(Reason::StdMacro, "#define signbit(x) __builtin_signbit (x)"),
-            Item::Raw(Reason::StdMacro, "#define isfinite(x) __builtin_isfinite (x)"),
-            Item::Raw(Reason::StdMacro, "#define isnormal(x) __builtin_isnormal (x)"),
-            Item::Raw(Reason::StdMacro, "#define isnan(x) __builtin_isnan (x)"),
-            Item::Raw(Reason::StdMacro, "#define isinf(x) __builtin_isinf_sign (x)"),
+            Item::Gate(&[
+                Branch { head: "if defined __SUPPORT_SNAN__", items: &[
+                    Item::Gate(&[
+                        Branch { head: "ifdef __RLIBC_MATH_FLOATN", items: &[
+                            Item::Raw(Reason::Generic, r#"# define __MATH_TG(x, func, args) _Generic ((x), float: func ## f args, _Float32: func ## f args, default: func args, \
+                                   long double: func ## l args, _Float64x: func ## l args, _Float128: func ## f128 args)"#),
+                        ] },
+                        Branch { head: "else", items: &[
+                            Item::Raw(Reason::Generic, "# define __MATH_TG(x, func, args) _Generic ((x), float: func ## f args, default: func args, long double: func ## l args)"),
+                        ] },
+                    ], ""),
+                    Item::Raw(Reason::StdMacro, "# define fpclassify(x) __MATH_TG ((x), __fpclassify, (x))"),
+                    Item::Raw(Reason::StdMacro, "# define isfinite(x) __MATH_TG ((x), __finite, (x))"),
+                    Item::Raw(Reason::StdMacro, "# define isnormal(x) (fpclassify (x) == FP_NORMAL)"),
+                    Item::Raw(Reason::StdMacro, "# define isnan(x) __MATH_TG ((x), __isnan, (x))"),
+                    Item::Raw(Reason::StdMacro, "# define isinf(x) __MATH_TG ((x), __isinf, (x))"),
+                ] },
+                Branch { head: "else", items: &[
+                    Item::Raw(Reason::StdMacro, "# define fpclassify(x) __builtin_fpclassify (FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, x)"),
+                    Item::Raw(Reason::StdMacro, "# define isfinite(x) __builtin_isfinite (x)"),
+                    Item::Raw(Reason::StdMacro, "# define isnormal(x) __builtin_isnormal (x)"),
+                    Item::Raw(Reason::StdMacro, "# define isnan(x) __builtin_isnan (x)"),
+                    Item::Raw(Reason::StdMacro, "# define isinf(x) __builtin_isinf_sign (x)"),
+                ] },
+            ], ""),
             Item::Raw(Reason::StdMacro, "#define isgreater(x, y) __builtin_isgreater (x, y)"),
             Item::Raw(Reason::StdMacro, "#define isgreaterequal(x, y) __builtin_isgreaterequal (x, y)"),
             Item::Raw(Reason::StdMacro, "#define isless(x, y) __builtin_isless (x, y)"),

@@ -62,7 +62,7 @@ pub unsafe fn bind_ex(m: *mut LinkMap, idx: usize, plt: bool, copy: bool, audit:
         let bindt = (*sym).info >> 4;
         let vis = (*sym).other & 3;
         if bindt == STB_LOCAL || vis != STV_DEFAULT {
-            let mut addr = (*m).l_addr.wrapping_add((*sym).value as usize);
+            let mut addr = sym_value_addr((*m).l_addr, sym);
             if (*sym).info & 0xf == STT_GNU_IFUNC && (*sym).shndx != 0 && !NOIFUNC && !copy {
                 addr = call_resolver(addr);
             }
@@ -82,7 +82,7 @@ pub unsafe fn bind_ex(m: *mut LinkMap, idx: usize, plt: bool, copy: bool, audit:
                 addr = call_resolver(addr);
             }
             (*found.map).used = true;
-            if audit && !copy && t != STT_TLS && crate::audit::active() {
+            if audit && plt && !copy && t != STT_TLS && crate::audit::active() {
                 addr = crate::audit::symbind(found.sym, found.map, m, name, addr, plt);
             }
             if (*found.map).dlopened && !(*found.map).nodelete && found.map != m {
@@ -155,7 +155,7 @@ unsafe fn apply(m: *mut LinkMap, r: &Rela, plt_table: bool) -> bool {
             R_X86_64_RELATIVE => *place = l.wrapping_add(a),
             R_X86_64_IRELATIVE => *place = call_resolver(l.wrapping_add(a) as usize) as u64,
             R_X86_64_64 | R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
-                if ty == R_X86_64_JUMP_SLOT && idx != 0 && !(*m).bind_now && (!st().bind_now_env || crate::profile::enabled()) && !(*m).pltgot.is_null() {
+                if ty == R_X86_64_JUMP_SLOT && idx != 0 && lazy_plt(m) && !(*m).pltgot.is_null() {
                     *place = (*place).wrapping_add(l);
                     (*m).lazy_pending = true;
                     return true;
@@ -167,7 +167,7 @@ unsafe fn apply(m: *mut LinkMap, r: &Rela, plt_table: bool) -> bool {
                 match bind(m, idx, ty == R_X86_64_JUMP_SLOT, false) {
                     Some(res) => *place = if ty == R_X86_64_64 { (res.addr as u64).wrapping_add(a) } else { res.addr as u64 },
                     None => {
-                        if ty == R_X86_64_JUMP_SLOT && !(*m).bind_now && (!st().bind_now_env || crate::profile::enabled()) && !(*m).pltgot.is_null() {
+                        if ty == R_X86_64_JUMP_SLOT && lazy_plt(m) && !(*m).pltgot.is_null() {
                             *place = (*place).wrapping_add(l);
                             (*m).lazy_pending = true;
                         } else {
@@ -188,6 +188,9 @@ unsafe fn apply(m: *mut LinkMap, r: &Rela, plt_table: bool) -> bool {
                 let Some(res) = bind(m, idx, false, true) else { return false };
                 if res.map.is_null() {
                     return true;
+                }
+                if !(*res.map).relocated && !(*res.map).is_ldso && res.map != m && !relocate(res.map) {
+                    return false;
                 }
                 let n = (*(*m).symtab.add(idx)).size.min((*res.sym).size) as usize;
                 core::ptr::copy_nonoverlapping(res.addr as *const u8, place as *mut u8, n);
@@ -261,13 +264,32 @@ pub unsafe fn apply_copy_relocs(m: *mut LinkMap) -> bool {
             return true;
         }
         let n = (*m).relasz / core::mem::size_of::<Rela>();
+        let mut k = 0u32;
+        let mut all = true;
         for i in 0..n {
             let r = &*(*m).rela.add(i);
-            if (r.info & 0xffff_ffff) as u32 == R_X86_64_COPY && !apply(m, r, false) {
-                return false;
+            if (r.info & 0xffff_ffff) as u32 != R_X86_64_COPY {
+                continue;
             }
+            let mut skip = false;
+            if k < 64 && (r.info >> 32) != 0 {
+                if let Some(res) = bind(m, (r.info >> 32) as usize, false, true) {
+                    skip = !res.map.is_null() && !(*res.map).relocated && !(*res.map).is_ldso && res.map != m && !crate::audit::in_audit_closure(res.map);
+                }
+            }
+            if skip {
+                all = false;
+            } else {
+                if !apply(m, r, false) {
+                    return false;
+                }
+                if k < 64 {
+                    (*m).copy_mask |= 1 << k;
+                }
+            }
+            k += 1;
         }
-        (*m).copy_done = true;
+        (*m).copy_done = all;
         true
     }
 }
@@ -322,6 +344,7 @@ unsafe fn setup_lazy_got(m: *mut LinkMap) {
             if crate::profile::enabled() {
                 crate::profile::note_map(m);
             }
+            crate::plt::init_vector_level();
             *(*m).pltgot.add(2) = crate::plt::_dl_runtime_profile as usize;
         } else {
             *(*m).pltgot.add(2) = _dl_runtime_resolve as usize;
@@ -329,10 +352,20 @@ unsafe fn setup_lazy_got(m: *mut LinkMap) {
     }
 }
 
+unsafe fn lazy_plt_decide(m: *mut LinkMap) -> bool {
+    unsafe { (!st().bind_now_env || crate::profile::enabled()) && !(*m).rtld_now && (!(*m).bind_now || crate::audit::plt_hooks_for(m)) }
+}
+
+#[inline(always)]
+unsafe fn lazy_plt(m: *mut LinkMap) -> bool {
+    unsafe { (*m).lazy_plt }
+}
+
 unsafe fn relocate_body(m: *mut LinkMap) -> bool {
     unsafe {
+        (*m).lazy_plt = lazy_plt_decide(m);
         let t1 = core::arch::x86_64::_rdtsc();
-        if (*m).pltrelsz != 0 && !(*m).pltgot.is_null() && !(*m).bind_now && (!st().bind_now_env || crate::profile::enabled()) {
+        if (*m).pltrelsz != 0 && !(*m).pltgot.is_null() && lazy_plt(m) {
             setup_lazy_got(m);
         }
         if (*m).relrsz != 0 {
@@ -341,10 +374,17 @@ unsafe fn relocate_body(m: *mut LinkMap) -> bool {
         let t2 = core::arch::x86_64::_rdtsc();
         PHASE_CYCLES[1] += t2 - t1;
         let n = (*m).relasz / core::mem::size_of::<Rela>();
+        let mut k = 0u32;
         for i in 0..n {
             let r = &*(*m).rela.add(i);
             let ty = (r.info & 0xffff_ffff) as u32;
-            if ty == R_X86_64_IRELATIVE || (ty == R_X86_64_COPY && (*m).copy_done) {
+            if ty == R_X86_64_COPY {
+                if (*m).copy_done || (k < 64 && (*m).copy_mask >> k & 1 != 0) {
+                    k += 1;
+                    continue;
+                }
+                k += 1;
+            } else if ty == R_X86_64_IRELATIVE {
                 continue;
             }
             if !apply(m, r, false) {

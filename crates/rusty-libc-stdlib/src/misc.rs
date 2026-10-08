@@ -355,16 +355,21 @@ fn pop_component(b: &mut Buf) {
     b.len = if i > 1 { i - 1 } else { s.len().min(1) };
 }
 
+#[derive(Clone, Copy)]
+struct Seg {
+    p: *const u8,
+    len: usize,
+    pos: usize,
+}
+
 unsafe fn resolve(path: &[u8], rpath: &mut Buf) -> Result<(), i32> {
     unsafe {
         if path.is_empty() {
             return Err(ENOENT);
         }
-        let mut work = Buf::new();
-        if !work.push(path) {
-            return Err(ENOMEM);
-        }
-        let mut pos = 0usize;
+        let mut segs = [Seg { p: path.as_ptr(), len: path.len(), pos: 0 }; MAXSYMLINKS as usize + 2];
+        let mut nseg = 1usize;
+        let mut targets = [const { Buf::new() }; MAXSYMLINKS as usize + 1];
         if path[0] == b'/' {
             if !rpath.push(b"/") {
                 return Err(ENOMEM);
@@ -384,24 +389,32 @@ unsafe fn resolve(path: &[u8], rpath: &mut Buf) -> Result<(), i32> {
         }
         let mut links = 0u32;
         loop {
-            let w = work.slice();
-            while pos < w.len() && w[pos] == b'/' {
-                pos += 1;
+            let top = &mut segs[nseg - 1];
+            let w = core::slice::from_raw_parts(top.p, top.len);
+            while top.pos < w.len() && w[top.pos] == b'/' {
+                top.pos += 1;
             }
-            if pos >= w.len() {
-                break;
+            if top.pos >= w.len() {
+                nseg -= 1;
+                if nseg == 0 {
+                    break;
+                }
+                continue;
             }
-            let start = pos;
-            while pos < w.len() && w[pos] != b'/' {
-                pos += 1;
+            let start = top.pos;
+            while top.pos < w.len() && w[top.pos] != b'/' {
+                top.pos += 1;
             }
-            let name = &w[start..pos];
+            let name = &w[start..top.pos];
             if name == b"." {
                 continue;
             }
             if name == b".." {
                 pop_component(rpath);
                 continue;
+            }
+            if name.len() >= PATH_MAX {
+                return Err(ENAMETOOLONG);
             }
             if rpath.len > 1 && !rpath.push(b"/") {
                 return Err(ENOMEM);
@@ -434,11 +447,11 @@ unsafe fn resolve(path: &[u8], rpath: &mut Buf) -> Result<(), i32> {
                         return Err(ELOOP);
                     }
                     lb.len = n;
-                    let mut nw = Buf::new();
-                    if !nw.push(lb.slice()) || !nw.push(&work.slice()[pos..]) {
-                        return Err(ENOMEM);
-                    }
-                    if lb.slice().first() == Some(&b'/') {
+                    let absolute = lb.slice().first() == Some(&b'/');
+                    segs[nseg] = Seg { p: lb.p, len: n, pos: 0 };
+                    nseg += 1;
+                    targets[links as usize - 1] = lb;
+                    if absolute {
                         rpath.len = 0;
                         if !rpath.push(b"/") {
                             return Err(ENOMEM);
@@ -449,11 +462,9 @@ unsafe fn resolve(path: &[u8], rpath: &mut Buf) -> Result<(), i32> {
                             rpath.len -= 1;
                         }
                     }
-                    work = nw;
-                    pos = 0;
                 }
                 Err(EINVAL) => {
-                    if pos < work.len {
+                    if segs[..nseg].iter().any(|g| g.pos < g.len) {
                         let mut st = [0u64; 18];
                         let r = syscall::syscall2(syscall::SYS_STAT, cp as usize, st.as_mut_ptr() as usize);
                         if let Some(e) = raw_err(r) {

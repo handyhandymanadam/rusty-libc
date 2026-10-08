@@ -6,7 +6,7 @@ no_includes = true
 sys_includes = ["stddef.h"]
 [export]
 item_types = ["functions"]
-exclude = ["rl_syscall_cancel_arch", "rl_clone", "rl_sigreturn", "rl_cancel_start", "rl_cancel_end", "pthread_sigqueue"]
+exclude = ["rl_syscall_cancel_arch", "rl_clone", "rl_sigreturn", "rl_cancel_start", "rl_cancel_end", "pthread_sigqueue", "__pthread_cleanup_routine"]
 [export.rename]
 "PthreadT" = "pthread_t"
 "PthreadAttr" = "pthread_attr_t"

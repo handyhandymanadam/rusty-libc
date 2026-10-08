@@ -20,7 +20,10 @@ pub mod shared;
 pub mod string;
 pub mod syscall;
 pub mod tls;
+pub mod tunables;
 pub mod unistd;
 pub mod x87;
 
 pub use errno::Errno;
+
+pub use rusty_libc_mem::tail_alias;

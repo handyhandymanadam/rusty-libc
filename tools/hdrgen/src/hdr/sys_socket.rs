@@ -376,6 +376,13 @@ pub static HDR: Header = Header {
             Item::Raw(Reason::StdMacro, "#define CMSG_LEN(len) (CMSG_ALIGN (sizeof (struct cmsghdr)) + (len))"),
             Item::Blank,
             Item::Include("<bits/rlibc-net-sock.h>"),
+            Item::Gate(&[
+                Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function", items: &[
+                    Item::Raw(Reason::GlibcMacro, "# define __SOCKADDR_ARG struct sockaddr *__restrict"),
+                    Item::Raw(Reason::GlibcMacro, "# define __CONST_SOCKADDR_ARG const struct sockaddr *"),
+                    Item::Include("<bits/socket2.h>"),
+                ] },
+            ], ""),
         ]},
     ],
 };

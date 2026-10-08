@@ -8,4 +8,4 @@ sys_includes = ["stdint.h"]
 "feature = ext" = "__RLIBC_MATH_EXT"
 "feature = floatn" = "__RLIBC_MATH_FLOATN"
 [export]
-exclude = ["EDOM", "ERANGE", "F80Arg", "nexttoward", "nexttowardf"]
+exclude = ["EDOM", "ERANGE", "F80Arg", "nexttoward", "nexttowardf", "sincosf32", "sincosf32x", "sincosf64"]

@@ -1,4 +1,5 @@
 #![no_std]
+#![feature(linkage)]
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_snake_case)]
 

@@ -110,6 +110,12 @@ pub static TRAILER: &[Item] = &[
             ]),
         ] },
     ], ""),
+    Item::Gate(&[
+        Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function", items: &[
+            Item::Include("<bits/stdio2-decl.h>"),
+            Item::Include("<bits/stdio2.h>"),
+        ] },
+    ], ""),
 ];
 pub const TRAILER_CHOMP: bool = false;
 

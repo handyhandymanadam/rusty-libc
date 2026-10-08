@@ -111,7 +111,15 @@ const SG_NAMES: EntNames = EntNames { db: b"gshadow", set: b"setsgent", get: b"g
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getsgnam_r(name: *const c_char, resbuf: *mut Sgrp, buffer: *mut c_char, buflen: usize, result: *mut *mut Sgrp) -> c_int {
     unsafe {
-        let status = db_lookup::<Sgrp>(resbuf, buffer.cast(), buflen, &|r| !is_nis(name) && cstr_eq(name, r.sg_namp));
+        let status = nss_dispatch(
+            b"gshadow",
+            b"getsgnam_r",
+            &|| db_lookup::<Sgrp>(resbuf, buffer.cast(), buflen, &|r| !is_nis(name) && cstr_eq(name, r.sg_namp)),
+            &|f, en| {
+                let f: unsafe extern "C" fn(*const c_char, *mut Sgrp, *mut c_char, usize, *mut c_int) -> c_int = core::mem::transmute(f);
+                f(name, resbuf, buffer, buflen, en)
+            },
+        );
         finish_r(status, resbuf, result)
     }
 }

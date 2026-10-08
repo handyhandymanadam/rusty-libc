@@ -381,12 +381,23 @@ pub unsafe extern "C" fn wctrans(name: *const c_char) -> *const i32 {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn wctrans_l(name: *const c_char, _locale: locale_t) -> *const i32 {
-    unsafe { wctrans(name) }
+pub unsafe extern "C" fn wctrans_l(name: *const c_char, locale: locale_t) -> *const i32 {
+    unsafe {
+        let name = CStr::from_ptr(name).to_bytes();
+        if name == b"to_inpunct" {
+            return inpunct_of(wtab(ctype_of(locale as usize), false));
+        }
+        trans_by_name(name)
+    }
+}
+
+fn inpunct_of(w: Option<&rusty_libc_core::locale::WideTables>) -> *const i32 {
+    w.map_or(core::ptr::null(), |w| w.inpunct.cast())
 }
 
 pub fn trans_by_name(name: &[u8]) -> *const i32 {
     match name {
+        b"to_inpunct" => inpunct_of(wtab(core::ptr::null(), true)),
         b"tolower" => &TRANS[0],
         b"toupper" => &TRANS[1],
         b"totitle" if charset() != Charset::C => &TRANS[2],
@@ -411,8 +422,10 @@ pub fn map_by_desc(wc: u32, desc: *const i32) -> u32 {
         to_upper(wc)
     } else if core::ptr::eq(desc, &TRANS[2]) {
         to_title(wc)
-    } else {
+    } else if desc.is_null() {
         wc
+    } else {
+        unsafe { rusty_libc_core::locale::trans_lookup(desc.cast(), wc) }
     }
 }
 
@@ -443,3 +456,9 @@ pub unsafe extern "C" fn wcswidth(s: *const wchar_t, n: usize) -> c_int {
 }
 
 
+rusty_libc_core::tail_alias!(__towlower_l => towlower_l);
+rusty_libc_core::tail_alias!(__towupper_l => towupper_l);
+rusty_libc_core::tail_alias!(__iswctype_l => iswctype_l);
+rusty_libc_core::tail_alias!(__wctype_l => wctype_l);
+rusty_libc_core::tail_alias!(__wctrans_l => wctrans_l);
+rusty_libc_core::tail_alias!(__towctrans_l => towctrans_l);

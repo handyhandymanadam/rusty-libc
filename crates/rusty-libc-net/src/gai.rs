@@ -256,7 +256,14 @@ fn convert(found: &mut Found, fam: c_int, req_family: c_int, d: &HostData) {
     found.got_ipv6 = fam == AF_INET6;
 }
 
+fn module_has_lookup(e: &nss::Entry, req_family: c_int, flags: c_int) -> bool {
+    use rusty_libc_core::nssmod::function;
+    let m = e.module_name();
+    (req_family == AF_UNSPEC && function(m, b"gethostbyname4_r") != 0) || (flags & AI_CANONNAME != 0 && function(m, b"gethostbyname3_r") != 0) || function(m, b"gethostbyname2_r") != 0
+}
+
 fn get_nss_addresses(name: &[u8], req_family: c_int, flags: c_int, found: &mut Found) -> Result<(), c_int> {
+    nss::hconf_init();
     let order = nss::hosts_order();
     let mut no_data = 0;
     let mut no_inet6_data = 0;
@@ -270,12 +277,23 @@ fn get_nss_addresses(name: &[u8], req_family: c_int, flags: c_int, found: &mut F
             (h == NO_DATA) as c_int
         }
     };
+    let mut do_merge = false;
+    let mut h_internal = false;
     for e in &order.e[..order.n] {
         *found = Found { at: found.at, n: 0, canon: None, got_ipv6: false };
+        if do_merge {
+            errno::set(EBUSY);
+            break;
+        }
         no_data = 0;
         let mut hd = HostData::new();
-        if req_family == AF_UNSPEC {
+        if e.src == Source::Module && !module_has_lookup(e, req_family, flags) {
+            status = Status::Unavail;
+            h_internal = true;
+            errno::set(EBUSY);
+        } else if req_family == AF_UNSPEC {
             let (st, h) = netdb::src_lookup(e, name, AF_UNSPEC, false, &mut hd);
+            h_internal = h == NETDB_INTERNAL;
             status = st;
             if st == Status::Success {
                 no_data = 1;
@@ -297,6 +315,7 @@ fn get_nss_addresses(name: &[u8], req_family: c_int, flags: c_int, found: &mut F
             if req_family == AF_INET6 {
                 let mut d6 = HostData::new();
                 let (st, h) = netdb::src_lookup(e, name, AF_INET6, false, &mut d6);
+                h_internal = h == NETDB_INTERNAL;
                 if st == Status::Success {
                     convert(found, AF_INET6, req_family, &d6);
                     if flags & AI_CANONNAME != 0 && found.canon.is_none() && d6.have_canon {
@@ -313,6 +332,7 @@ fn get_nss_addresses(name: &[u8], req_family: c_int, flags: c_int, found: &mut F
             if need4 {
                 let mut d4 = HostData::new();
                 let (st, h) = netdb::src_lookup(e, name, AF_INET, false, &mut d4);
+                h_internal = h == NETDB_INTERNAL;
                 status = st;
                 if st == Status::Success {
                     convert(found, AF_INET, req_family, &d4);
@@ -339,6 +359,12 @@ fn get_nss_addresses(name: &[u8], req_family: c_int, flags: c_int, found: &mut F
         if e.action(status) == Action::Return {
             break;
         }
+        if e.action(status) == Action::Merge {
+            do_merge = true;
+        }
+    }
+    if matches!(status, Status::TryAgain | Status::Unavail) && h_internal {
+        return Err(EAI_SYSTEM);
     }
     if found.n > 0 {
         return Ok(());

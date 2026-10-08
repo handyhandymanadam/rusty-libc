@@ -154,6 +154,131 @@ pub fn other_chars() -> &'static [Ch] {
     r
 }
 
+#[derive(Clone, Copy)]
+pub struct Fold {
+    pub up: u32,
+    pub single: i16,
+}
+
+struct FoldCache {
+    key: usize,
+    ptr: *mut Fold,
+    len: usize,
+}
+
+static FOLD_LOCK: AtomicBool = AtomicBool::new(false);
+static mut FOLDS: FoldCache = FoldCache { key: 0, ptr: core::ptr::null_mut(), len: 0 };
+
+fn other_folds(k: Mb, chars: &'static [Ch]) -> &'static [Fold] {
+    let key = rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE) as usize;
+    while FOLD_LOCK.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let c = unsafe { &mut *core::ptr::addr_of_mut!(FOLDS) };
+    if c.key != key || c.ptr.is_null() || c.len != chars.len() {
+        c.ptr = core::ptr::null_mut();
+        c.len = 0;
+        if !chars.is_empty() {
+            let p = unsafe { rusty_libc_malloc::malloc(chars.len() * core::mem::size_of::<Fold>()) } as *mut Fold;
+            if !p.is_null() {
+                for (i, ch) in chars.iter().enumerate() {
+                    let up = charset::upper_wc(ch.wc);
+                    let single = if up == ch.wc {
+                        if ch.n == 1 { i16::from(ch.b[0]) } else { -1 }
+                    } else {
+                        let mut b = [0u8; 6];
+                        if let Some(1) = charset::encode(k, up, &mut b) { i16::from(b[0]) } else { -1 }
+                    };
+                    unsafe { p.add(i).write(Fold { up, single }) };
+                }
+                c.ptr = p;
+                c.len = chars.len();
+                c.key = key;
+            }
+        }
+    }
+    let r: &'static [Fold] = if c.ptr.is_null() { &[] } else { unsafe { core::slice::from_raw_parts(c.ptr, c.len) } };
+    FOLD_LOCK.store(false, Ordering::Release);
+    r
+}
+
+#[derive(Clone, Copy)]
+pub struct Cased {
+    pub pairs: &'static [(u32, u32)],
+    pub kept: &'static [(u32, u32)],
+}
+
+pub fn cased_compute(pairs: &mut V<(u32, u32)>, kept: &mut Ranges) {
+    rusty_libc_wchar::wctype::upper_changed(&mut |c, u| pairs.push((c, u)));
+    let mut points: Ranges = V::new();
+    for &(t, _) in pairs.iter() {
+        points.push((t, t));
+    }
+    normalize(&mut points);
+    *kept = complement(&points, &[(0, 0x10ffff)]);
+}
+
+const CASED_SLOTS: usize = 8;
+
+struct CasedEntry {
+    key: (usize, u8),
+    cased: Cased,
+}
+
+static CASED_LOCK: AtomicBool = AtomicBool::new(false);
+static mut CASED: [Option<CasedEntry>; CASED_SLOTS] = [const { None }; CASED_SLOTS];
+
+fn cased_find(key: (usize, u8)) -> Option<Cased> {
+    while CASED_LOCK.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let slots = unsafe { &*core::ptr::addr_of!(CASED) };
+    let r = slots.iter().flatten().find(|e| e.key == key).map(|e| e.cased);
+    CASED_LOCK.store(false, Ordering::Release);
+    r
+}
+
+fn leak<T: Copy>(v: &[T]) -> Option<&'static [T]> {
+    if v.is_empty() {
+        return Some(&[]);
+    }
+    let p = unsafe { rusty_libc_malloc::malloc(core::mem::size_of_val(v)) } as *mut T;
+    if p.is_null() {
+        return None;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(v.as_ptr(), p, v.len());
+        Some(core::slice::from_raw_parts(p, v.len()))
+    }
+}
+
+pub fn cased_cached() -> Option<Cased> {
+    let key = (rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE) as usize, rusty_libc_wchar::charset() as u8);
+    if let Some(c) = cased_find(key) {
+        return Some(c);
+    }
+    let mut pairs: V<(u32, u32)> = V::new();
+    let mut kept: Ranges = V::new();
+    cased_compute(&mut pairs, &mut kept);
+    if pairs.oom || kept.oom {
+        return None;
+    }
+    let cased = Cased { pairs: leak(&pairs)?, kept: leak(&kept)? };
+    while CASED_LOCK.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let slots = unsafe { &mut *core::ptr::addr_of_mut!(CASED) };
+    let mut r = None;
+    if let Some(e) = slots.iter().flatten().find(|e| e.key == key) {
+        r = Some(e.cased);
+    } else if let Some(slot) = slots.iter_mut().find(|s| s.is_none()) {
+        *slot = Some(CasedEntry { key, cased });
+        r = Some(cased);
+    }
+    CASED_LOCK.store(false, Ordering::Release);
+    r
+}
+
 pub fn collect(k: Mb, singles: bool, limit: u32, pred: &mut dyn FnMut(u32, usize) -> bool, out: &mut V<Seq>) {
     match k {
         Mb::Utf8 => {
@@ -180,22 +305,47 @@ pub fn collect(k: Mb, singles: bool, limit: u32, pred: &mut dyn FnMut(u32, usize
         _ => {
             for c in other_chars() {
                 if (c.n > 1 || singles) && pred(c.wc, c.n as usize) {
-                    let n = c.n as usize;
-                    if let Some(last) = out.last_mut()
-                        && last.n == c.n
-                        && last.r[..n - 1].iter().zip(c.b.iter()).all(|(r, &b)| *r == (b, b))
-                        && last.r[n - 1].1.checked_add(1) == Some(c.b[n - 1])
-                    {
-                        last.r[n - 1].1 = c.b[n - 1];
-                        continue;
-                    }
-                    let mut s = Seq { r: [(0, 0); 6], n: c.n };
-                    for i in 0..n {
-                        s.r[i] = (c.b[i], c.b[i]);
-                    }
-                    out.push(s);
+                    push_char(out, c);
                 }
             }
+        }
+    }
+}
+
+fn push_char(out: &mut V<Seq>, c: &Ch) {
+    let n = c.n as usize;
+    if let Some(last) = out.last_mut()
+        && last.n == c.n
+        && last.r[..n - 1].iter().zip(c.b.iter()).all(|(r, &b)| *r == (b, b))
+        && last.r[n - 1].1.checked_add(1) == Some(c.b[n - 1])
+    {
+        last.r[n - 1].1 = c.b[n - 1];
+        return;
+    }
+    let mut s = Seq { r: [(0, 0); 6], n: c.n };
+    for i in 0..n {
+        s.r[i] = (c.b[i], c.b[i]);
+    }
+    out.push(s);
+}
+
+pub fn collect_folded(k: Mb, pred: &mut dyn FnMut(u32, u32, i16) -> bool, out: &mut V<Seq>) {
+    let chars = other_chars();
+    let folds = other_folds(k, chars);
+    if folds.len() != chars.len() {
+        for c in chars {
+            let up = charset::upper_wc(c.wc);
+            let mut b = [0u8; 6];
+            let single = if let Some(1) = charset::encode(k, up, &mut b) { i16::from(b[0]) } else { -1 };
+            if pred(c.wc, up, single) {
+                push_char(out, c);
+            }
+        }
+        return;
+    }
+    for (c, f) in chars.iter().zip(folds.iter()) {
+        if pred(c.wc, f.up, f.single) {
+            push_char(out, c);
         }
     }
 }

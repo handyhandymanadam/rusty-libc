@@ -241,7 +241,8 @@ static CACHE: Cache = Cache {
 fn file_sig(path: &[u8; 200]) -> [u64; 3] {
     let mut st = [0u64; 18];
     let r = unsafe { crate::syscall::syscall2(crate::syscall::SYS_STAT, path.as_ptr() as usize, st.as_mut_ptr() as usize) };
-    if crate::syscall::check(r).is_err() {
+    if let Err(e) = crate::syscall::check(r) {
+        crate::errno::set(e.0);
         return [u64::MAX; 3];
     }
     [st[1], st[11] ^ (st[6] << 32), st[12]]

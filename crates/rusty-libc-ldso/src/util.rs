@@ -211,9 +211,68 @@ impl core::fmt::Display for Bytes<'_> {
 
 static ALLOC_LOCK: Lock = Lock::new();
 const CHUNK: usize = 256 * 1024;
+const ARENA: usize = 64 * 1024;
 static mut BUMP: usize = 0;
 static mut BUMP_END: usize = 0;
 static mut FREE: [usize; 48] = [0; 48];
+
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::*};
+static RT_MALLOC: AtomicUsize = AtomicUsize::new(0);
+static RT_FREE: AtomicUsize = AtomicUsize::new(0);
+static RT_CALLOC: AtomicUsize = AtomicUsize::new(0);
+static RT_ARMED: AtomicBool = AtomicBool::new(false);
+static RT_TRIED: AtomicBool = AtomicBool::new(false);
+static mut OWN: [(usize, usize); 256] = [(0, 0); 256];
+static mut NOWN: usize = 0;
+static mut BBUMP: usize = 0;
+static mut BEND: usize = 0;
+
+pub fn rtld_malloc_arm() {
+    RT_ARMED.store(true, Release);
+}
+
+pub fn rtld_malloc_init(malloc: usize, calloc: usize, free: usize) {
+    RT_MALLOC.store(malloc, Release);
+    RT_FREE.store(free, Release);
+    RT_CALLOC.store(calloc, Release);
+}
+
+fn rt_calloc() -> usize {
+    let c = RT_CALLOC.load(Acquire);
+    if c != 0 || !RT_ARMED.load(Acquire) || RT_TRIED.swap(true, AcqRel) {
+        return c;
+    }
+    unsafe { crate::bind_rtld_malloc() };
+    RT_CALLOC.load(Acquire)
+}
+
+unsafe fn ext_alloc(size: usize, zero: bool) -> *mut u8 {
+    unsafe {
+        let p = if zero {
+            let f: unsafe extern "C" fn(usize, usize) -> *mut u8 = core::mem::transmute(RT_CALLOC.load(Acquire));
+            f(1, size)
+        } else {
+            let f: unsafe extern "C" fn(usize) -> *mut u8 = core::mem::transmute(RT_MALLOC.load(Acquire));
+            f(size)
+        };
+        if p.is_null() {
+            crate::die(format_args!("cannot allocate memory"));
+        }
+        p
+    }
+}
+
+pub unsafe fn alloc_ext(size: usize, align: usize, zero: bool) -> *mut u8 {
+    unsafe {
+        if rt_calloc() != 0 { ext_alloc(size, zero) } else { alloc_blk(size, align) }
+    }
+}
+
+pub unsafe fn alloc_calloc(size: usize, align: usize) -> *mut u8 {
+    unsafe {
+        if align <= 16 && rt_calloc() != 0 { ext_alloc(size, true) } else { alloc_perm(size, align) }
+    }
+}
 
 fn align_up(x: usize, a: usize) -> usize {
     (x + a - 1) & !(a - 1)
@@ -225,6 +284,25 @@ unsafe fn map_anon(len: usize) -> usize {
         crate::die(format_args!("cannot allocate memory"));
     }
     r as usize
+}
+
+unsafe fn map_own(len: usize) -> usize {
+    unsafe {
+        let r = map_anon(len);
+        if NOWN == OWN.len() {
+            crate::die(format_args!("cannot allocate memory"));
+        }
+        OWN[NOWN] = (r, len);
+        NOWN += 1;
+        r
+    }
+}
+
+fn is_own(p: usize) -> bool {
+    ALLOC_LOCK.lock();
+    let r = unsafe { (0..NOWN).any(|i| p >= OWN[i].0 && p < OWN[i].0 + OWN[i].1) };
+    ALLOC_LOCK.unlock();
+    r
 }
 
 pub unsafe fn alloc_perm(size: usize, align: usize) -> *mut u8 {
@@ -274,15 +352,34 @@ unsafe fn alloc_blk_locked(size: usize, align: usize) -> *mut u8 {
         }
         let n = 1usize << c;
         if n >= CHUNK / 4 {
-            return align_up(map_anon(n + align), align) as *mut u8;
+            return align_up(map_own(n + align), align) as *mut u8;
         }
-        alloc_perm_locked(n, n.min(4096).max(align))
+        let a = n.min(4096).max(align);
+        let mut p = align_up(BBUMP, a);
+        if p + n > BEND {
+            if NOWN == OWN.len() {
+                crate::die(format_args!("cannot allocate memory"));
+            }
+            BBUMP = alloc_perm_locked(ARENA, 64) as usize;
+            BEND = BBUMP + ARENA;
+            OWN[NOWN] = (BBUMP, ARENA);
+            NOWN += 1;
+            p = align_up(BBUMP, a);
+        }
+        BBUMP = p + n;
+        p as *mut u8
     }
 }
 
 pub unsafe fn free_blk(p: *mut u8, size: usize, align: usize) {
     unsafe {
         if p.is_null() {
+            return;
+        }
+        let rf = RT_FREE.load(Acquire);
+        if rf != 0 && !is_own(p as usize) {
+            let f: unsafe extern "C" fn(*mut u8) = core::mem::transmute(rf);
+            f(p);
             return;
         }
         let c = class_of(size, align);

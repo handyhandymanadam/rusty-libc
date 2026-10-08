@@ -693,7 +693,8 @@ fn bk_at(env: &Env, s: usize, budget: &mut u64) -> Result<Option<(usize, V<Reg>)
                 }
             } else if nd.kind == K_BACKREF {
                 let g = nd.arg as usize + 1;
-                if g < nreg && regs[g].so != -1 && regs[g].eo != -1 {
+                if nd.constraint != 0 && next_bad(nd.constraint, env.ctx_at(idx)) {
+                } else if g < nreg && regs[g].so != -1 && regs[g].eo != -1 {
                     let len = (regs[g].eo - regs[g].so) as usize;
                     if len == 0 {
                         eps.push(cur);

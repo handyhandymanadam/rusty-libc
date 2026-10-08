@@ -145,7 +145,7 @@ pub unsafe extern "C" fn init_block(tp: usize) {
         TLS_LOCK.lock();
         let t = tls();
         let cap = t.nmods + 64;
-        let dtv = alloc_blk((cap + 2) * core::mem::size_of::<Dtv>(), 16) as *mut Dtv;
+        let dtv = alloc_ext((cap + 2) * core::mem::size_of::<Dtv>(), 16, true) as *mut Dtv;
         (*dtv).val = cap;
         let d = dtv.add(1);
         (*d).val = t.generation;
@@ -185,7 +185,7 @@ pub unsafe extern "C" fn free_block(tp: usize) {
         *((tp + 8) as *mut usize) = 0;
         let eb = (tp + 0x48) as *mut usize;
         if *eb != 0 {
-            free_blk(*eb as *mut u8, crate::dl::ERRBUF_SIZE, 16);
+            crate::dl::free_errbuf(*eb as *mut u8);
             *eb = 0;
         }
         TLS_LOCK.unlock();
@@ -213,7 +213,7 @@ unsafe fn tls_get_addr_slow(ti: *const TlsIndex) -> usize {
                 crate::die(format_args!("TLS lookup for an unknown module"));
             }
             let ncap = (id + 32).max(cap * 2);
-            let nd = alloc_blk((ncap + 2) * core::mem::size_of::<Dtv>(), 16) as *mut Dtv;
+            let nd = alloc_ext((ncap + 2) * core::mem::size_of::<Dtv>(), 16, true) as *mut Dtv;
             (*nd).val = ncap;
             let nd = nd.add(1);
             for i in 0..=cap {
@@ -240,8 +240,9 @@ unsafe fn tls_get_addr_slow(ti: *const TlsIndex) -> usize {
                 (*e).to_free = 0;
             } else {
                 t.mods[id].forced_dynamic = true;
-                let raw = alloc_blk(md.memsz + md.align, md.align.max(16));
+                let raw = alloc_ext(md.memsz + md.align, md.align.max(16), false);
                 let p = align_up(raw as usize, md.align.max(1));
+                core::ptr::write_bytes(p as *mut u8, 0, md.memsz);
                 core::ptr::copy_nonoverlapping(md.image as *const u8, p as *mut u8, md.filesz);
                 (*e).val = p;
                 (*e).to_free = raw as usize;
@@ -292,7 +293,9 @@ unsafe fn init_static_for(tp: usize, id: usize) {
         TLS_LOCK.lock();
         let md = tls().mods[id];
         if md.live && md.is_static {
-            core::ptr::copy_nonoverlapping(md.image as *const u8, (tp - md.offset) as *mut u8, md.filesz);
+            let p = (tp - md.offset) as *mut u8;
+            core::ptr::copy_nonoverlapping(md.image as *const u8, p, md.filesz);
+            core::ptr::write_bytes(p.add(md.filesz), 0, md.memsz - md.filesz);
             let d = *((tp + 8) as *const usize) as *mut Dtv;
             if !d.is_null() && id <= (*d.sub(1)).val {
                 (*d.add(id)).val = tp - md.offset;

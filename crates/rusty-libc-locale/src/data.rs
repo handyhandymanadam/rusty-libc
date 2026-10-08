@@ -171,7 +171,8 @@ unsafe fn wide_tables(ptr: *const u8, len: usize) -> *const WideTables {
         if w.is_null() {
             return core::ptr::null();
         }
-        *w = WideTables { class, toupper: tu, tolower: tl, width: tw };
+        let inpunct = find(&mp, b"to_inpunct").and_then(|i| tab(moff + i)).unwrap_or(core::ptr::null());
+        *w = WideTables { class, toupper: tu, tolower: tl, width: tw, inpunct };
         w
     }
 }

@@ -741,7 +741,7 @@ pub fn hypot(x: F128, y: F128) -> F128 {
         if (x.is_inf() || y.is_inf()) && !x.is_snan() && !y.is_snan() {
             return F128::INF;
         }
-        return arith::add(x, y);
+        return arith::add(y, x);
     }
     if x.is_zero() {
         return y.abs();

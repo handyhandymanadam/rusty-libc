@@ -205,3 +205,13 @@ pub static AFTER_INCLUDES: &[Item] = &[
 ];
 pub const AFTER_INCLUDES_CHOMP: bool = false;
 
+pub static TRAILER: &[Item] = &[
+    Item::Gate(&[
+        Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function", items: &[
+            Item::Raw(Reason::GlibcMacro, "# define __OPEN_NEEDS_MODE(oflag) (((oflag) & 0100) != 0 || ((oflag) & 0x410000) == 0x410000)"),
+            Item::Include("<bits/fcntl-linux-fortify.h>"),
+            Item::Include("<bits/fcntl2.h>"),
+        ] },
+    ], ""),
+];
+pub const TRAILER_CHOMP: bool = false;

@@ -573,7 +573,7 @@ impl Order {
     }
 }
 
-fn convert(o: &rusty_libc_core::nssmod::Order) -> Order {
+fn convert(o: &rusty_libc_core::nssmod::Order, keep_unloadable: bool) -> Order {
     use rusty_libc_core::nssmod::{self as m, ACT_RETURN};
     let mut r = Order { e: [Entry::new(Source::Files, default_actions()); 8], n: 0 };
     for s in &o.e[..o.n] {
@@ -581,7 +581,7 @@ fn convert(o: &rusty_libc_core::nssmod::Order) -> Order {
             Some(Source::Files)
         } else if s.is(b"dns") {
             Some(Source::Dns)
-        } else if m::supported() && s.len > 0 {
+        } else if s.len > 0 && (keep_unloadable || m::supported()) {
             Some(Source::Module)
         } else {
             None
@@ -604,12 +604,12 @@ fn convert(o: &rusty_libc_core::nssmod::Order) -> Order {
 }
 
 pub fn parse_order(spec: &[u8]) -> Option<Order> {
-    let o = convert(&rusty_libc_core::nssmod::parse_sources(spec)?);
+    let o = convert(&rusty_libc_core::nssmod::parse_sources(spec)?, false);
     if o.n == 0 { None } else { Some(o) }
 }
 
 pub fn order_for(name: &[u8]) -> Option<Order> {
-    let o = convert(&rusty_libc_core::nssmod::order(name));
+    let o = convert(&rusty_libc_core::nssmod::order(name), true);
     if o.n == 0 { None } else { Some(o) }
 }
 
@@ -642,6 +642,17 @@ impl<T: Copy> Cached<T> {
     }
 }
 
+static HCONF_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn hconf_init() {
+    if HCONF_DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    if let Err(e) = LineReader::open(&etc_path(b"/host.conf")) {
+        rusty_libc_core::errno::set(e);
+    }
+}
+
 static HOST_MULTI: Spin<Cached<bool>> = Spin::new(Cached { path: Buf::new(), sig: [0; 3], val: false, valid: false });
 
 pub fn validate_service_line(spec: &[u8]) -> bool {
@@ -670,7 +681,7 @@ pub unsafe extern "C" fn __nss_configure_lookup(dbname: *const c_char, string: *
 }
 
 pub fn hosts_order() -> Order {
-    convert(&rusty_libc_core::nssmod::order(b"hosts"))
+    convert(&rusty_libc_core::nssmod::order(b"hosts"), true)
 }
 
 pub fn host_conf_multi() -> bool {
