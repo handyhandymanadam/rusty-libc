@@ -1,0 +1,8 @@
+use crate::model::*;
+
+pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Block { head: "enum ", body: &["", "  UNAME26 = 0x0020000,", "  ADDR_NO_RANDOMIZE = 0x0040000,", "  FDPIC_FUNCPTRS = 0x0080000,", "  MMAP_PAGE_ZERO = 0x0100000,", "  ADDR_COMPAT_LAYOUT = 0x0200000,", "  READ_IMPLIES_EXEC = 0x0400000,", "  ADDR_LIMIT_32BIT = 0x0800000,", "  SHORT_INODE = 0x1000000,", "  WHOLE_SECONDS = 0x2000000,", "  STICKY_TIMEOUTS = 0x4000000,", "  ADDR_LIMIT_3GB = 0x8000000", ""], tail: "" },
+    Item::Block { head: "enum ", body: &["", "  PER_LINUX = 0x0000,", "  PER_LINUX_32BIT = 0x0000 | ADDR_LIMIT_32BIT,", "  PER_LINUX_FDPIC = 0x0000 | FDPIC_FUNCPTRS,", "  PER_SVR4 = 0x0001 | STICKY_TIMEOUTS | MMAP_PAGE_ZERO,", "  PER_SVR3 = 0x0002 | STICKY_TIMEOUTS | SHORT_INODE,", "  PER_BSD = 0x0006,", "  PER_LINUX32 = 0x0008,", "  PER_LINUX32_3GB = 0x0008 | ADDR_LIMIT_3GB,", "  PER_MASK = 0x00ff", ""], tail: "" },
+];
+pub const AFTER_INCLUDES_CHOMP: bool = false;
+

@@ -4,23 +4,5 @@ include_guard = "_RLIBC_SYS_SELECT_H"
 usize_is_size_t = true
 no_includes = true
 sys_includes = ["stddef.h", "stdint.h"]
-after_includes = '''
-#define FD_SETSIZE 1024
-#define NFDBITS 64
-
-typedef long int __fd_mask;
-#define __NFDBITS (8 * (int)sizeof(__fd_mask))
-typedef struct {
-  __fd_mask fds_bits[1024 / (8 * (int)sizeof(__fd_mask))];
-} fd_set;
-typedef __fd_mask fd_mask;
-#define __FD_MASK(d) ((__fd_mask)(1UL << ((d) % __NFDBITS)))
-#define FD_SET(fd, set) ((void)(((set)->fds_bits)[(fd) / __NFDBITS] |= __FD_MASK(fd)))
-#define FD_CLR(fd, set) ((void)(((set)->fds_bits)[(fd) / __NFDBITS] &= ~__FD_MASK(fd)))
-#define FD_ISSET(fd, set) ((((set)->fds_bits)[(fd) / __NFDBITS] & __FD_MASK(fd)) != 0)
-#define FD_ZERO(set) \
-  do { unsigned int __i; fd_set *__arr = (set); \
-       for (__i = 0; __i < sizeof(fd_set) / sizeof(__fd_mask); ++__i) __arr->fds_bits[__i] = 0; } while (0)
-'''
 [export]
 [fn]

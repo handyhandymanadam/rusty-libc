@@ -3,68 +3,6 @@ include_guard = "_RLIBC_STDLIB_H"
 usize_is_size_t = true
 no_includes = true
 sys_includes = ["stddef.h", "stdint.h"]
-after_includes = """
-#define EXIT_FAILURE 1
-#define EXIT_SUCCESS 0
-#define RAND_MAX 2147483647
-#define MB_CUR_MAX (__ctype_get_mb_cur_max ())
-
-#ifdef __USE_MISC
-# include <sys/types.h>
-#endif
-#if (defined __USE_XOPEN || defined __USE_XOPEN2K8) && !defined _RLIBC_SYS_WAIT_H
-# include <bits/waitflags.h>
-# include <bits/waitstatus.h>
-#endif
-
-#ifndef __STRICT_ANSI__
-# include <alloca.h>
-#endif
-
-#if __GLIBC_USE (C23_STRTOL)
-# define __RLIBC_C23(n) __asm__("__isoc23_" #n)
-#else
-# define __RLIBC_C23(n)
-#endif
-long strtol(const char *, char **, int) __RLIBC_C23(strtol);
-long long strtoll(const char *, char **, int) __RLIBC_C23(strtoll);
-unsigned long strtoul(const char *, char **, int) __RLIBC_C23(strtoul);
-unsigned long long strtoull(const char *, char **, int) __RLIBC_C23(strtoull);
-long strtol_l(const char *, char **, int, void *) __RLIBC_C23(strtol_l);
-long long strtoll_l(const char *, char **, int, void *) __RLIBC_C23(strtoll_l);
-unsigned long strtoul_l(const char *, char **, int, void *) __RLIBC_C23(strtoul_l);
-unsigned long long strtoull_l(const char *, char **, int, void *) __RLIBC_C23(strtoull_l);
-long long strtoq(const char *, char **, int) __RLIBC_C23(strtoll);
-unsigned long long strtouq(const char *, char **, int) __RLIBC_C23(strtoull);
-long double strtold(const char *, char **);
-long double strtold_l(const char *, char **, void *);
-float strtof32(const char *, char **);
-double strtof64(const char *, char **);
-double strtof32x(const char *, char **);
-float strtof32_l(const char *, char **, void *);
-double strtof64_l(const char *, char **, void *);
-double strtof32x_l(const char *, char **, void *);
-long double strtof64x(const char *, char **);
-char *qecvt(long double, int, int *, int *);
-char *qfcvt(long double, int, int *, int *);
-char *qgcvt(long double, int, char *);
-int qecvt_r(long double, int, int *, int *, char *, size_t);
-int qfcvt_r(long double, int, int *, int *, char *, size_t);
-int strfroml(char *, size_t, const char *, long double);
-int strfromf32(char *, size_t, const char *, float);
-int strfromf64(char *, size_t, const char *, double);
-int strfromf32x(char *, size_t, const char *, double);
-int strfromf64x(char *, size_t, const char *, long double);
-long double strtof64x_l(const char *, char **, void *);
-_Float128 strtof128(const char *, char **);
-_Float128 strtof128_l(const char *, char **, void *);
-int strfromf128(char *, size_t, const char *, _Float128);
-"""
-trailer = """
-#if __GLIBC_USE (ISOC23) && defined __glibc_const_generic && !defined _LIBC
-# define bsearch(KEY, BASE, NMEMB, SIZE, COMPAR) __glibc_const_generic (BASE, const void *, bsearch (KEY, BASE, NMEMB, SIZE, COMPAR))
-#endif
-"""
 
 [export]
 exclude = ["strtold", "strtold_l", "strtof64x", "strtof64x_l", "qecvt", "qfcvt", "qgcvt", "qecvt_r", "qfcvt_r", "strfroml", "strfromf32", "strfromf64", "strfromf32x", "strfromf64x", "strtof128", "strtof128_l", "strfromf128"]

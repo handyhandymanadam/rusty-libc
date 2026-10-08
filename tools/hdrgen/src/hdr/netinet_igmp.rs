@@ -1,0 +1,43 @@
+use crate::model::*;
+
+pub static HDR: Header = Header {
+    path: "netinet/igmp.h",
+    items: &[
+        Item::Guard { name: "_NETINET_IGMP_H", value: "1", end: "", items: &[
+            Item::Include("<features.h>"),
+            Item::Include("<sys/types.h>"),
+            Item::Include("<stdint.h>"),
+            Item::Include("<netinet/in.h>"),
+            Item::ExternBegin,
+            Item::Blank,
+            Item::Block { head: "struct igmp ", body: &["", "  uint8_t igmp_type;", "  uint8_t igmp_code;", "  uint16_t igmp_cksum;", "  struct in_addr igmp_group;", ""], tail: "" },
+            Item::Consts(&[
+                ("IGMP_AWAKENING_MEMBER", V::Dec(5)),
+                ("IGMP_DELAYING_MEMBER", V::Dec(1)),
+                ("IGMP_DVMRP", V::Hex(0x13)),
+                ("IGMP_HOST_LEAVE_MESSAGE", V::Txt("IGMP_V2_LEAVE_GROUP")),
+                ("IGMP_HOST_MEMBERSHIP_QUERY", V::Txt("IGMP_MEMBERSHIP_QUERY")),
+                ("IGMP_HOST_MEMBERSHIP_REPORT", V::Txt("IGMP_V1_MEMBERSHIP_REPORT")),
+                ("IGMP_HOST_NEW_MEMBERSHIP_REPORT", V::Txt("IGMP_V2_MEMBERSHIP_REPORT")),
+                ("IGMP_IDLE_MEMBER", V::Dec(2)),
+                ("IGMP_LAZY_MEMBER", V::Dec(3)),
+                ("IGMP_MAX_HOST_REPORT_DELAY", V::Dec(10)),
+                ("IGMP_MEMBERSHIP_QUERY", V::Hex(0x11)),
+                ("IGMP_MINLEN", V::Dec(8)),
+                ("IGMP_MRDISC_ADV", V::Hex(0x30)),
+                ("IGMP_MTRACE", V::Hex(0x1f)),
+                ("IGMP_MTRACE_RESP", V::Hex(0x1e)),
+                ("IGMP_PIM", V::Hex(0x14)),
+                ("IGMP_SLEEPING_MEMBER", V::Dec(4)),
+                ("IGMP_TIMER_SCALE", V::Dec(10)),
+                ("IGMP_TRACE", V::Hex(0x15)),
+                ("IGMP_V1_MEMBERSHIP_REPORT", V::Hex(0x12)),
+                ("IGMP_V2_LEAVE_GROUP", V::Hex(0x17)),
+                ("IGMP_V2_MEMBERSHIP_REPORT", V::Hex(0x16)),
+                ("IGMP_v1_ROUTER", V::Dec(1)),
+                ("IGMP_v2_ROUTER", V::Dec(2)),
+            ]),
+            Item::ExternEnd,
+        ]},
+    ],
+};

@@ -3,14 +3,6 @@ include_guard = "_RLIBC_UTIME_H"
 usize_is_size_t = true
 no_includes = true
 sys_includes = ["stddef.h"]
-after_includes = """
-#include <bits/types/time_t.h>
-
-struct utimbuf {
-  time_t actime;
-  time_t modtime;
-};
-"""
 
 [export]
 exclude = ["Timespec", "Timeval", "Itimerval", "Itimerspec", "Timezone", "Utimbuf", "Timeb", "Sigval", "SigevUn", "Sigevent", "Tm",

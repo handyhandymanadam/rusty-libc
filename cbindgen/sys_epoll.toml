@@ -4,46 +4,5 @@ include_guard = "_RLIBC_SYS_EPOLL_H"
 usize_is_size_t = true
 no_includes = true
 sys_includes = ["stddef.h", "stdint.h"]
-after_includes = '''
-#define EPOLL_CLOEXEC 0x80000
-#define EPOLLIN 1U
-#define EPOLLPRI 2U
-#define EPOLLOUT 4U
-#define EPOLLRDNORM 64U
-#define EPOLLRDBAND 128U
-#define EPOLLWRNORM 256U
-#define EPOLLWRBAND 512U
-#define EPOLLMSG 1024U
-#define EPOLLERR 8U
-#define EPOLLHUP 16U
-#define EPOLLRDHUP 0x2000U
-#define EPOLLEXCLUSIVE 0x10000000U
-#define EPOLLWAKEUP 0x20000000U
-#define EPOLLONESHOT 0x40000000U
-#define EPOLLET 0x80000000U
-#define EPOLL_CTL_ADD 1
-#define EPOLL_CTL_DEL 2
-#define EPOLL_CTL_MOD 3
-#define EPOLL_IOC_TYPE 0x8A
-#define EPIOCSPARAMS 0x40088a01UL
-#define EPIOCGPARAMS 0x80088a02UL
-
-typedef union epoll_data {
-  void *ptr;
-  int fd;
-  uint32_t u32;
-  uint64_t u64;
-} epoll_data_t;
-struct epoll_event {
-  uint32_t events;
-  epoll_data_t data;
-} __attribute__((__packed__));
-struct epoll_params {
-  uint32_t busy_poll_usecs;
-  uint16_t busy_poll_budget;
-  uint8_t prefer_busy_poll;
-  uint8_t __pad;
-};
-'''
 [export]
 [fn]

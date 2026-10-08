@@ -2,42 +2,5 @@ language = "C"
 include_guard = "_RLIBC_CTYPE_H"
 no_includes = true
 sys_includes = ["stdint.h"]
-after_includes = """
-#ifndef _RLIBC_LOCALE_T
-#define _RLIBC_LOCALE_T
-typedef struct __locale_struct *locale_t;
-#endif
-
-int isalnum(int);
-int isalpha(int);
-int isblank(int);
-int iscntrl(int);
-int isdigit(int);
-int isgraph(int);
-int islower(int);
-int isprint(int);
-int ispunct(int);
-int isspace(int);
-int isupper(int);
-int isxdigit(int);
-int isalnum_l(int, locale_t);
-int isalpha_l(int, locale_t);
-int isblank_l(int, locale_t);
-int iscntrl_l(int, locale_t);
-int isdigit_l(int, locale_t);
-int isgraph_l(int, locale_t);
-int islower_l(int, locale_t);
-int isprint_l(int, locale_t);
-int ispunct_l(int, locale_t);
-int isspace_l(int, locale_t);
-int isupper_l(int, locale_t);
-int isxdigit_l(int, locale_t);
-int tolower_l(int, locale_t);
-int toupper_l(int, locale_t);
-#if !defined __STRICT_ANSI__ || defined _GNU_SOURCE || defined _DEFAULT_SOURCE
-# define isascii_l(c, l) __isascii_l ((c), (l))
-# define toascii_l(c, l) __toascii_l ((c), (l))
-#endif
-"""
 [export]
 exclude = ["tolower_l", "toupper_l"]

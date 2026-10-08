@@ -3,9 +3,5 @@ include_guard = "_LIBGEN_H"
 usize_is_size_t = true
 documentation = false
 no_includes = true
-after_includes = """
-#include <string.h>
-"""
-trailer = """#define basename __xpg_basename"""
 [fn]
 no_return = "__attribute__((noreturn))"

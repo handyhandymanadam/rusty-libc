@@ -57,7 +57,8 @@ ld -shared -soname ld-linux-x86-64.so.2 -e _start --version-script=$SH/ld.map -B
     --hash-style=both -z noexecstack -z text --no-undefined --eh-frame-hdr \
     --whole-archive "$OUT/work/libours.a" --no-whole-archive "$OUT/work/librt.a" -o "$OUT/ld-linux-x86-64.so.2"
 rm -rf "$OUT/work"
-python3 tools/gen_linkstubs.py "$OUT/link"
+cargo +nightly build --release --manifest-path tools/hdrgen/Cargo.toml --target-dir target/hdrgen
+target/hdrgen/release/hdrgen linkstubs "$OUT/link"
 rm -rf "$OUT/include"
-python3 tools/gen_headers.py "$OUT/include" > "$OUT/gen_headers.log" 2>&1 || { tail -5 "$OUT/gen_headers.log"; exit 1; }
+{ target/hdrgen/release/hdrgen headers --root "$PWD" --out "$OUT/include"; } > "$OUT/gen_headers.log" 2>&1 || { tail -5 "$OUT/gen_headers.log"; exit 1; }
 ls -l "$OUT"

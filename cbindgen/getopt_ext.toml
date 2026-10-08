@@ -3,18 +3,6 @@ include_guard = "_GETOPT_EXT_H"
 usize_is_size_t = true
 documentation = false
 no_includes = true
-after_includes = """
-struct option {
-  const char *name;
-  int has_arg;
-  int *flag;
-  int val;
-};
-
-#define no_argument 0
-#define required_argument 1
-#define optional_argument 2
-"""
 [export.rename]
 "COption" = "struct option"
 [fn]

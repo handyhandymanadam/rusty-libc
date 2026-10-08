@@ -4,11 +4,5 @@ include_guard = "_RLIBC_SYS_SWAP_H"
 usize_is_size_t = true
 no_includes = true
 sys_includes = ["stddef.h", "stdint.h"]
-after_includes = '''
-#define SWAP_FLAG_PREFER 0x8000
-#define SWAP_FLAG_PRIO_MASK 0x7fff
-#define SWAP_FLAG_PRIO_SHIFT 0
-#define SWAP_FLAG_DISCARD 0x10000
-'''
 [export]
 [fn]

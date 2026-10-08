@@ -4,21 +4,5 @@ include_guard = "_RLIBC_SYS_WAIT_H"
 usize_is_size_t = true
 no_includes = true
 sys_includes = ["stddef.h", "stdint.h"]
-after_includes = '''
-#include <bits/waitflags.h>
-#ifdef __USE_XOPEN2K8
-# include <signal.h>
-#endif
-#include <bits/waitstatus.h>
-#define WAIT_ANY -1
-#define WAIT_MYPGRP 0
-
-typedef enum {
-  P_ALL,
-  P_PID,
-  P_PGID,
-  P_PIDFD
-} idtype_t;
-'''
 [export]
 [fn]

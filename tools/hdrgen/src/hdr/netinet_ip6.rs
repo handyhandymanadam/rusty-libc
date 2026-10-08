@@ -1,0 +1,51 @@
+use crate::model::*;
+
+pub static HDR: Header = Header {
+    path: "netinet/ip6.h",
+    items: &[
+        Item::Guard { name: "_RLIBC_NETINET_IP6_H", value: "1", end: "", items: &[
+            Item::Include("<stdint.h>"),
+            Item::Include("<netinet/in.h>"),
+            Item::Blank,
+            Item::Block { head: "struct ip6_hdr ", body: &["", "  union {", "    struct ip6_hdrctl {", "      uint32_t ip6_un1_flow;", "      uint16_t ip6_un1_plen;", "      uint8_t ip6_un1_nxt;", "      uint8_t ip6_un1_hlim;", "    } ip6_un1;", "    uint8_t ip6_un2_vfc;", "  } ip6_ctlun;", "  struct in6_addr ip6_src;", "  struct in6_addr ip6_dst;", ""], tail: "" },
+            Item::Consts(&[
+                ("ip6_vfc", V::Txt("ip6_ctlun.ip6_un2_vfc")),
+                ("ip6_flow", V::Txt("ip6_ctlun.ip6_un1.ip6_un1_flow")),
+                ("ip6_plen", V::Txt("ip6_ctlun.ip6_un1.ip6_un1_plen")),
+                ("ip6_nxt", V::Txt("ip6_ctlun.ip6_un1.ip6_un1_nxt")),
+                ("ip6_hlim", V::Txt("ip6_ctlun.ip6_un1.ip6_un1_hlim")),
+                ("ip6_hops", V::Txt("ip6_ctlun.ip6_un1.ip6_un1_hlim")),
+            ]),
+            Item::Blank,
+            Item::Block { head: "struct ip6_ext ", body: &[" uint8_t ip6e_nxt; uint8_t ip6e_len; "], tail: "" },
+            Item::Block { head: "struct ip6_hbh ", body: &[" uint8_t ip6h_nxt; uint8_t ip6h_len; "], tail: "" },
+            Item::Block { head: "struct ip6_dest ", body: &[" uint8_t ip6d_nxt; uint8_t ip6d_len; "], tail: "" },
+            Item::Block { head: "struct ip6_rthdr ", body: &[" uint8_t ip6r_nxt; uint8_t ip6r_len; uint8_t ip6r_type; uint8_t ip6r_segleft; "], tail: "" },
+            Item::Block { head: "struct ip6_rthdr0 ", body: &[" uint8_t ip6r0_nxt; uint8_t ip6r0_len; uint8_t ip6r0_type; uint8_t ip6r0_segleft; uint32_t ip6r0_reserved; "], tail: "" },
+            Item::Block { head: "struct ip6_frag ", body: &[" uint8_t ip6f_nxt; uint8_t ip6f_reserved; uint16_t ip6f_offlg; uint32_t ip6f_ident; "], tail: "" },
+            Item::Blank,
+            Item::Consts(&[
+                ("IP6F_OFF_MASK", V::Hex(0xf8ff)),
+                ("IP6F_RESERVED_MASK", V::Txt("0x0600")),
+                ("IP6F_MORE_FRAG", V::Txt("0x0100")),
+            ]),
+            Item::Blank,
+            Item::Block { head: "struct ip6_opt ", body: &[" uint8_t ip6o_type; uint8_t ip6o_len; "], tail: "" },
+            Item::Raw(Reason::GlibcMacro, "#define IP6OPT_TYPE(o) ((o) & 0xc0)"),
+            Item::Consts(&[
+                ("IP6OPT_TYPE_SKIP", V::Txt("0x00")),
+                ("IP6OPT_TYPE_DISCARD", V::Hex(0x40)),
+                ("IP6OPT_TYPE_FORCEICMP", V::Hex(0x80)),
+                ("IP6OPT_TYPE_ICMP", V::Hex(0xc0)),
+                ("IP6OPT_TYPE_MUTABLE", V::Hex(0x20)),
+                ("IP6OPT_PAD1", V::Dec(0)),
+                ("IP6OPT_PADN", V::Dec(1)),
+                ("IP6OPT_JUMBO", V::Hex(0xc2)),
+                ("IP6OPT_NSAP_ADDR", V::Hex(0xc3)),
+                ("IP6OPT_TUNNEL_LIMIT", V::Txt("0x04")),
+                ("IP6OPT_ROUTER_ALERT", V::Txt("0x05")),
+                ("IP6OPT_JUMBO_LEN", V::Dec(6)),
+            ]),
+        ]},
+    ],
+};

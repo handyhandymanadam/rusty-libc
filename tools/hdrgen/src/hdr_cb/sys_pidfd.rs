@@ -1,0 +1,40 @@
+use crate::model::*;
+
+pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Consts(&[
+        ("PIDFD_NONBLOCK", V::Dec(2048)),
+        ("PIDFD_THREAD", V::Dec(128)),
+        ("PIDFD_SIGNAL_THREAD", V::Txt("1UL")),
+        ("PIDFD_SIGNAL_THREAD_GROUP", V::Txt("2UL")),
+        ("PIDFD_SIGNAL_PROCESS_GROUP", V::Txt("4UL")),
+        ("PIDFS_IOCTL_MAGIC", V::Txt("0xFF")),
+        ("PIDFD_GET_CGROUP_NAMESPACE", V::Txt("0xff01U")),
+        ("PIDFD_GET_IPC_NAMESPACE", V::Txt("0xff02U")),
+        ("PIDFD_GET_MNT_NAMESPACE", V::Txt("0xff03U")),
+        ("PIDFD_GET_NET_NAMESPACE", V::Txt("0xff04U")),
+        ("PIDFD_GET_PID_NAMESPACE", V::Txt("0xff05U")),
+        ("PIDFD_GET_PID_FOR_CHILDREN_NAMESPACE", V::Txt("0xff06U")),
+        ("PIDFD_GET_TIME_NAMESPACE", V::Txt("0xff07U")),
+        ("PIDFD_GET_TIME_FOR_CHILDREN_NAMESPACE", V::Txt("0xff08U")),
+        ("PIDFD_GET_USER_NAMESPACE", V::Txt("0xff09U")),
+        ("PIDFD_GET_UTS_NAMESPACE", V::Txt("0xff0aU")),
+        ("PIDFD_SELF_THREAD", V::Dec(-10000)),
+        ("PIDFD_SELF_THREAD_GROUP", V::Dec(-10001)),
+        ("PIDFD_SELF", V::Dec(-10000)),
+        ("PIDFD_SELF_PROCESS", V::Dec(-10001)),
+        ("PIDFD_INFO_PID", V::Txt("1UL")),
+        ("PIDFD_INFO_CREDS", V::Txt("2UL")),
+        ("PIDFD_INFO_CGROUPID", V::Txt("4UL")),
+        ("PIDFD_INFO_EXIT", V::Txt("8UL")),
+        ("PIDFD_INFO_COREDUMP", V::Txt("16UL")),
+        ("PIDFD_COREDUMPED", V::Txt("1U")),
+        ("PIDFD_COREDUMP_SKIP", V::Txt("2U")),
+        ("PIDFD_COREDUMP_USER", V::Txt("4U")),
+        ("PIDFD_COREDUMP_ROOT", V::Txt("8U")),
+        ("PIDFD_INFO_SIZE_VER0", V::Dec(64)),
+        ("PIDFD_GET_INFO", V::Txt("0xc048ff0bUL")),
+    ]),
+    Item::Block { head: "struct pidfd_info ", body: &["", "  uint64_t mask;", "  uint64_t cgroupid;", "  uint32_t pid;", "  uint32_t tgid;", "  uint32_t ppid;", "  uint32_t ruid;", "  uint32_t rgid;", "  uint32_t euid;", "  uint32_t egid;", "  uint32_t suid;", "  uint32_t sgid;", "  uint32_t fsuid;", "  uint32_t fsgid;", "  int32_t exit_code;", "  uint32_t coredump_mask;", "  uint32_t __spare1;", ""], tail: "" },
+];
+pub const AFTER_INCLUDES_CHOMP: bool = false;
+

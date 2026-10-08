@@ -18,7 +18,8 @@ sysroot:
 	for o in crti crtn; do rustc +nightly --edition 2021 --crate-type lib --emit obj -C panic=abort -C relocation-model=static -C opt-level=2 \
 		--target x86_64-unknown-linux-gnu -o $(SYSROOT)/lib/$$o.o crates/rusty-libc-cabi/crt/$$o.rs; done
 	rm -f $(SYSROOT)/lib/libm.a && ar crs $(SYSROOT)/lib/libm.a
-	python3 tools/gen_headers.py $(SYSROOT)/include
+	$(CARGO) build --release --manifest-path tools/hdrgen/Cargo.toml --target-dir target/hdrgen
+	target/hdrgen/release/hdrgen headers --root $(CURDIR) --out $(SYSROOT)/include
 
 shared:
 	tools/build-shared.sh

@@ -1,0 +1,42 @@
+use crate::model::*;
+
+pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Consts(&[
+        ("RLIMIT_CPU", V::Dec(0)),
+        ("RLIMIT_FSIZE", V::Dec(1)),
+        ("RLIMIT_DATA", V::Dec(2)),
+        ("RLIMIT_STACK", V::Dec(3)),
+        ("RLIMIT_CORE", V::Dec(4)),
+        ("RLIMIT_RSS", V::Dec(5)),
+        ("RLIMIT_NOFILE", V::Dec(7)),
+        ("RLIMIT_OFILE", V::Dec(7)),
+        ("RLIMIT_AS", V::Dec(9)),
+        ("RLIMIT_NPROC", V::Dec(6)),
+        ("RLIMIT_MEMLOCK", V::Dec(8)),
+        ("RLIMIT_LOCKS", V::Dec(10)),
+        ("RLIMIT_SIGPENDING", V::Dec(11)),
+        ("RLIMIT_MSGQUEUE", V::Dec(12)),
+        ("RLIMIT_NICE", V::Dec(13)),
+        ("RLIMIT_RTPRIO", V::Dec(14)),
+        ("RLIMIT_RTTIME", V::Dec(15)),
+        ("RLIMIT_NLIMITS", V::Dec(16)),
+        ("RLIM_NLIMITS", V::Dec(16)),
+        ("RLIM_INFINITY", V::Txt("0xffffffffffffffffUL")),
+        ("RLIM64_INFINITY", V::Txt("0xffffffffffffffffuLL")),
+        ("RLIM_SAVED_MAX", V::Txt("0xffffffffffffffffUL")),
+        ("RLIM_SAVED_CUR", V::Txt("0xffffffffffffffffUL")),
+        ("RUSAGE_SELF", V::Dec(0)),
+        ("RUSAGE_CHILDREN", V::Dec(-1)),
+        ("RUSAGE_THREAD", V::Dec(1)),
+        ("RUSAGE_LWP", V::Dec(1)),
+        ("PRIO_MIN", V::Dec(-20)),
+        ("PRIO_MAX", V::Dec(20)),
+        ("PRIO_PROCESS", V::Dec(0)),
+        ("PRIO_PGRP", V::Dec(1)),
+        ("PRIO_USER", V::Dec(2)),
+    ]),
+    Item::Blank,
+    Item::Block { head: "struct rlimit64 ", body: &["", "  rlim64_t rlim_cur;", "  rlim64_t rlim_max;", ""], tail: "" },
+];
+pub const AFTER_INCLUDES_CHOMP: bool = false;
+

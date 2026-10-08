@@ -3,16 +3,6 @@ include_guard = "_RLIBC_SYS_TIMEB_H"
 usize_is_size_t = true
 no_includes = true
 sys_includes = ["stddef.h"]
-after_includes = """
-#include <bits/types/time_t.h>
-
-struct timeb {
-  time_t time;
-  unsigned short millitm;
-  short timezone;
-  short dstflag;
-};
-"""
 
 [export]
 exclude = ["Timespec", "Timeval", "Itimerval", "Itimerspec", "Timezone", "Utimbuf", "Timeb", "Sigval", "SigevUn", "Sigevent", "Tm",

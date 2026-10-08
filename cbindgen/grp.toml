@@ -4,28 +4,6 @@ usize_is_size_t = true
 documentation = false
 no_includes = true
 sys_includes = ["stddef.h"]
-after_includes = """
-#ifndef __gid_t_defined
-typedef unsigned int gid_t;
-# define __gid_t_defined
-#endif
-#ifndef __FILE_defined
-#include <bits/types/struct_FILE.h>
-typedef struct _IO_FILE FILE;
-# define __FILE_defined 1
-#endif
-
-#define NSS_BUFLEN_GROUP 1024
-
-struct group {
-  char *gr_name;
-  char *gr_passwd;
-  gid_t gr_gid;
-  char **gr_mem;
-};
-
-int setgroups(size_t __n, const gid_t *__groups);
-"""
 [export.rename]
 "Group" = "struct group"
 "File" = "FILE"

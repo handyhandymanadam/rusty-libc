@@ -4,17 +4,5 @@ include_guard = "_RLIBC_SYS_FILE_H"
 usize_is_size_t = true
 no_includes = true
 sys_includes = ["stddef.h", "stdint.h"]
-after_includes = '''
-#ifdef __USE_MISC
-# include <fcntl.h>
-#endif
-#define L_SET 0
-#define L_INCR 1
-#define L_XTND 2
-#define LOCK_SH 1
-#define LOCK_EX 2
-#define LOCK_UN 8
-#define LOCK_NB 4
-'''
 [export]
 [fn]

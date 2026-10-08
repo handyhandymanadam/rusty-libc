@@ -1,0 +1,41 @@
+use crate::model::*;
+
+pub static HDR: Header = Header {
+    path: "values.h",
+    items: &[
+        Item::Guard { name: "_VALUES_H", value: "1", end: "", items: &[
+            Item::Include("<features.h>"),
+            Item::Include("<limits.h>"),
+            Item::Include("<float.h>"),
+            Item::ExternBegin,
+            Item::Consts(&[
+                ("BITSPERBYTE", V::Txt("CHAR_BIT")),
+                ("CHARBITS", V::Txt("_TYPEBITS (char)")),
+                ("DMAXEXP", V::Txt("DBL_MAX_EXP")),
+                ("DMINEXP", V::Txt("DBL_MIN_EXP")),
+                ("DOUBLEBITS", V::Txt("_TYPEBITS (double)")),
+                ("FLOATBITS", V::Txt("_TYPEBITS (float)")),
+                ("FMAXEXP", V::Txt("FLT_MAX_EXP")),
+                ("FMINEXP", V::Txt("FLT_MIN_EXP")),
+                ("HIBITL", V::Txt("MINLONG")),
+                ("HIBITS", V::Txt("MINSHORT")),
+                ("INTBITS", V::Txt("_TYPEBITS (int)")),
+                ("LONGBITS", V::Txt("_TYPEBITS (long int)")),
+                ("MAXDOUBLE", V::Txt("DBL_MAX")),
+                ("MAXFLOAT", V::Txt("FLT_MAX")),
+                ("MAXINT", V::Txt("INT_MAX")),
+                ("MAXLONG", V::Txt("LONG_MAX")),
+                ("MAXSHORT", V::Txt("SHRT_MAX")),
+                ("MINDOUBLE", V::Txt("DBL_MIN")),
+                ("MINFLOAT", V::Txt("FLT_MIN")),
+                ("MININT", V::Txt("INT_MIN")),
+                ("MINLONG", V::Txt("LONG_MIN")),
+                ("MINSHORT", V::Txt("SHRT_MIN")),
+                ("PTRBITS", V::Txt("_TYPEBITS (char *)")),
+                ("SHORTBITS", V::Txt("_TYPEBITS (short int)")),
+            ]),
+            Item::Raw(Reason::GlibcMacro, "#define _TYPEBITS(type) (sizeof (type) * CHAR_BIT)"),
+            Item::ExternEnd,
+        ]},
+    ],
+};

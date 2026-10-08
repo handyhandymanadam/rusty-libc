@@ -4,32 +4,6 @@ include_guard = "_RLIBC_SYS_STATFS_H"
 usize_is_size_t = true
 no_includes = true
 sys_includes = ["stddef.h", "stdint.h"]
-after_includes = '''
-#ifndef __fsword_t_defined
-#define __fsword_t_defined 1
-typedef long __fsword_t;
-#endif
-#ifndef __fsid_t_defined
-#define __fsid_t_defined 1
-typedef struct {
-  int __val[2];
-} fsid_t;
-#endif
-struct statfs64 {
-  long f_type;
-  long f_bsize;
-  uint64_t f_blocks;
-  uint64_t f_bfree;
-  uint64_t f_bavail;
-  uint64_t f_files;
-  uint64_t f_ffree;
-  fsid_t f_fsid;
-  long f_namelen;
-  long f_frsize;
-  long f_flags;
-  long f_spare[4];
-};
-'''
 [export]
 include = ["statfs"]
 [fn]

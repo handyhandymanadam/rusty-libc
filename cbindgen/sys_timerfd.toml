@@ -4,11 +4,5 @@ include_guard = "_RLIBC_SYS_TIMERFD_H"
 usize_is_size_t = true
 no_includes = true
 sys_includes = ["stddef.h", "stdint.h"]
-after_includes = '''
-#define TFD_CLOEXEC 0x80000
-#define TFD_NONBLOCK 2048
-#define TFD_TIMER_ABSTIME 1
-#define TFD_TIMER_CANCEL_ON_SET 2
-'''
 [export]
 [fn]
