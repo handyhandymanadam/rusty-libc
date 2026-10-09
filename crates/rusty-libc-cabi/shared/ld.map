@@ -21,18 +21,24 @@ GLIBC_2.35 {
 GLIBC_PRIVATE {
   global:
     __libc_enable_secure;
+    __libc_ldso_auxv;
+    __libc_ldso_debug_mask;
+    __libc_ldso_debug_write;
     __libc_ldso_dladdr;
     __libc_ldso_dladdr1;
     __libc_ldso_dlclose;
     __libc_ldso_dlerror;
     __libc_ldso_dlinfo;
+    __libc_ldso_dlmopen;
     __libc_ldso_dlopen;
     __libc_ldso_dlsym;
     __libc_ldso_dlvsym;
     __libc_ldso_find_object;
+    __libc_ldso_fork_child;
     __libc_ldso_init_main;
     __libc_ldso_iterate_phdr;
     __libc_ldso_main_runs_own_init;
+    __libc_ldso_tls_dbslots;
     __libc_ldso_tls_free_block;
     __libc_ldso_tls_info;
     __libc_ldso_tls_init_block;

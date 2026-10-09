@@ -495,7 +495,7 @@ unsafe fn res_gethostbyname2_context(name: *const c_char, af: c_int) -> *mut hos
             }
             return core::ptr::null_mut();
         }
-        getanswer(buf.as_ptr(), n, name, ty)
+        getanswer(buf.as_ptr(), n.min(4096), name, ty)
     }
 }
 
@@ -574,7 +574,7 @@ pub unsafe extern "C" fn __rl_res_gethostbyaddr(addr: *const c_void, len: u32, a
             }
             return core::ptr::null_mut();
         }
-        let hp = getanswer(buf.as_ptr(), n, qbuf.as_ptr() as *const c_char, T_PTR);
+        let hp = getanswer(buf.as_ptr(), n.min(4096), qbuf.as_ptr() as *const c_char, T_PTR);
         if hp.is_null() {
             return core::ptr::null_mut();
         }

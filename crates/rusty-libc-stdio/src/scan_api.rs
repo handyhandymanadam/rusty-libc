@@ -17,7 +17,7 @@ impl Src for FileSrc {
     }
     unsafe fn peek(&mut self) -> (*const u8, usize) {
         unsafe {
-            if (*self.0).nunget > 0 {
+            if (*self.0).nunget() > 0 {
                 return (core::ptr::null(), 0);
             }
             file::fill_buf(self.0).unwrap_or((core::ptr::null(), 0))

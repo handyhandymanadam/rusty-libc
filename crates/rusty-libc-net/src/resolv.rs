@@ -75,9 +75,6 @@ impl ResState {
     }
 }
 
-#[thread_local]
-static mut RESP: ResState = ResState::zero();
-
 #[allow(non_upper_case_globals)]
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub static mut _res: ResState = ResState::zero();
@@ -85,12 +82,34 @@ pub static mut _res: ResState = ResState::zero();
 #[thread_local]
 static mut RESP_PTR: *mut ResState = core::ptr::null_mut();
 
+unsafe extern "C" fn release_resp(obj: *mut c_void) {
+    unsafe {
+        let slot = obj as *mut *mut ResState;
+        let p = *slot;
+        if !p.is_null() && p != &raw mut _res {
+            rusty_libc_malloc::free(p as *mut c_void);
+        }
+        *slot = core::ptr::null_mut();
+    }
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn __res_state() -> *mut ResState {
     unsafe {
         if RESP_PTR.is_null() {
             let main = rusty_libc_core::syscall::syscall0(186) == rusty_libc_core::syscall::syscall0(39);
-            RESP_PTR = if main { &raw mut _res } else { &raw mut RESP };
+            RESP_PTR = &raw mut _res;
+            if !main {
+                let p = rusty_libc_malloc::malloc(core::mem::size_of::<ResState>()) as *mut ResState;
+                if !p.is_null() {
+                    p.write(ResState::zero());
+                    if rusty_libc_core::tls::register_thread_dtor(release_resp, (&raw mut RESP_PTR) as *mut c_void) {
+                        RESP_PTR = p;
+                    } else {
+                        rusty_libc_malloc::free(p as *mut c_void);
+                    }
+                }
+            }
         }
         RESP_PTR
     }
@@ -156,7 +175,10 @@ pub unsafe extern "C" fn __res_ninit(st: *mut ResState) -> c_int {
             off += b.len() + 1;
         }
         if st == __res_state() {
-            INIT_SNAP = Some(config_of(st));
+            let snap = init_snap_slot();
+            if !snap.is_null() {
+                *snap = Some(config_of(st));
+            }
         }
         0
     }
@@ -233,7 +255,35 @@ unsafe fn config_of(st: *mut ResState) -> Config {
 }
 
 #[thread_local]
-static mut INIT_SNAP: Option<Config> = None;
+static mut INIT_SNAP: *mut Option<Config> = core::ptr::null_mut();
+
+unsafe extern "C" fn release_snap(obj: *mut c_void) {
+    unsafe {
+        let slot = obj as *mut *mut Option<Config>;
+        if !(*slot).is_null() {
+            rusty_libc_malloc::free(*slot as *mut c_void);
+        }
+        *slot = core::ptr::null_mut();
+    }
+}
+
+unsafe fn init_snap_slot() -> *mut Option<Config> {
+    unsafe {
+        if INIT_SNAP.is_null() {
+            let p = rusty_libc_malloc::malloc(core::mem::size_of::<Option<Config>>()) as *mut Option<Config>;
+            if p.is_null() {
+                return p;
+            }
+            p.write(None);
+            if !rusty_libc_core::tls::register_thread_dtor(release_snap, (&raw mut INIT_SNAP) as *mut c_void) {
+                rusty_libc_malloc::free(p as *mut c_void);
+                return core::ptr::null_mut();
+            }
+            INIT_SNAP = p;
+        }
+        INIT_SNAP
+    }
+}
 
 fn same_config(a: &Config, b: &Config) -> bool {
     a.nservers == b.nservers
@@ -253,7 +303,10 @@ pub fn current_config() -> Config {
             __res_ninit(st);
         }
         let c = config_of(st);
-        match &*(&raw const INIT_SNAP) {
+        let slot = INIT_SNAP;
+        let none = None;
+        let snapshot: &Option<Config> = if slot.is_null() { &none } else { &*slot };
+        match snapshot {
             Some(snap) if same_config(snap, &c) => dns::default_config(),
             _ => c,
         }
@@ -261,8 +314,18 @@ pub fn current_config() -> Config {
 }
 
 fn herr_result(st: *mut ResState, e: dns::HErr) -> c_int {
+    if e.errno != 0 {
+        errno::set(e.errno);
+    }
     set_herr(st, e.h);
     -1
+}
+
+unsafe fn caller_buffer<'a>(answer: *mut c_uchar, anslen: c_int) -> Option<&'a mut [u8]> {
+    if answer.is_null() || anslen < wire::HFIXEDSZ as c_int {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts_mut(answer, anslen as usize) })
 }
 
 unsafe fn finish_answer(ans: &[u8], n: usize, answer: *mut c_uchar, anslen: c_int) -> c_int {
@@ -276,8 +339,17 @@ pub unsafe extern "C" fn res_nquery(st: *mut ResState, name: *const c_char, clas
     unsafe {
         ensure_init(st);
         let cfg = config_of(st);
+        if let Some(buf) = caller_buffer(answer, anslen) {
+            return match dns::query_adv(&cfg, cbytes(name), class as u16, ty as u16, buf, anslen as usize) {
+                Ok(n) => {
+                    set_herr(st, NETDB_SUCCESS);
+                    n as c_int
+                }
+                Err(e) => herr_result(st, e),
+            };
+        }
         let mut ans = [0u8; 4096];
-        match dns::query(&cfg, cbytes(name), class as u16, ty as u16, &mut ans) {
+        match dns::query_adv(&cfg, cbytes(name), class as u16, ty as u16, &mut ans, anslen.max(0) as usize) {
             Ok(n) => {
                 set_herr(st, NETDB_SUCCESS);
                 finish_answer(&ans, n, answer, anslen)
@@ -292,8 +364,17 @@ pub unsafe extern "C" fn res_nsearch(st: *mut ResState, name: *const c_char, cla
     unsafe {
         ensure_init(st);
         let cfg = config_of(st);
+        if let Some(buf) = caller_buffer(answer, anslen) {
+            return match dns::search_adv(&cfg, cbytes(name), class as u16, ty as u16, buf, anslen as usize) {
+                Ok(n) => {
+                    set_herr(st, NETDB_SUCCESS);
+                    n as c_int
+                }
+                Err(e) => herr_result(st, e),
+            };
+        }
         let mut ans = [0u8; 4096];
-        match dns::search(&cfg, cbytes(name), class as u16, ty as u16, &mut ans) {
+        match dns::search_adv(&cfg, cbytes(name), class as u16, ty as u16, &mut ans, anslen.max(0) as usize) {
             Ok(n) => {
                 set_herr(st, NETDB_SUCCESS);
                 finish_answer(&ans, n, answer, anslen)
@@ -338,9 +419,21 @@ pub unsafe extern "C" fn res_nsend(st: *mut ResState, msg: *const c_uchar, msgle
         ensure_init(st);
         let cfg = config_of(st);
         let m = core::slice::from_raw_parts(msg, msglen.max(0) as usize);
-        let mut ans = [0u8; 4096];
-        match dns::send_query(&cfg, m, &mut ans) {
-            Ok(n) => finish_answer(&ans, n, answer, anslen),
+        let mut own = [0u8; 4096];
+        let (ans, direct) = match caller_buffer(answer, anslen) {
+            Some(b) => (b, true),
+            None => (&mut own[..], false),
+        };
+        let sent = {
+            let mut a = dns::Answer::fixed(ans);
+            match dns::send_query_noaaaa(&cfg, m, &mut a) {
+                Some(r) => r,
+                None => dns::send_query_ans(&cfg, m, &mut a),
+            }
+        };
+        match sent {
+            Ok(n) if direct => n as c_int,
+            Ok(n) => finish_answer(ans, n.min(ans.len()), answer, anslen),
             Err(dns::SendErr::Refused) => {
                 errno::set(ECONNREFUSED);
                 set_herr(st, TRY_AGAIN);
@@ -374,9 +467,8 @@ pub unsafe extern "C" fn res_nmkquery(st: *mut ResState, op: c_int, dname: *cons
         s.id = id;
         let out = core::slice::from_raw_parts_mut(buf, buflen as usize);
         let rd = s.options & dns::RES_RECURSE as c_ulong != 0;
-        let edns = false;
         let mut tmp = [0u8; 1600];
-        let Some(n) = wire::build_query(id, cbytes(dname), ty as u16, class as u16, rd, edns, &mut tmp) else {
+        let Some(n) = wire::build_query(id, cbytes(dname), ty as u16, class as u16, rd, None, &mut tmp) else {
             errno::set(EMSGSIZE);
             set_herr(st, NETDB_INTERNAL);
             return -1;

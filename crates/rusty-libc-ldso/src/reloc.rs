@@ -14,8 +14,8 @@ pub struct Resolved {
     pub addr: usize,
 }
 
-unsafe fn global_scope() -> &'static [*mut LinkMap] {
-    unsafe { core::slice::from_raw_parts((&raw const st().global) as *const *mut LinkMap, st().nglobal) }
+unsafe fn global_scope(m: *mut LinkMap) -> &'static [*mut LinkMap] {
+    unsafe { ns((*m).l_ns as usize).scope() }
 }
 
 unsafe fn own_scope(m: *mut LinkMap) -> &'static [*mut LinkMap] {
@@ -70,7 +70,7 @@ pub unsafe fn bind_ex(m: *mut LinkMap, idx: usize, plt: bool, copy: bool, audit:
         }
         let (name, hash) = cstr_gnu_hash((*m).strtab.add((*sym).name as usize));
         let ver = ref_version(m, idx);
-        let g = global_scope();
+        let g = global_scope(m);
         let own = own_scope(m);
         let xs = extra_scope(m);
         let f = Flags { plt, skip: if copy { m } else { null_mut() }, newest: false };
@@ -258,42 +258,6 @@ unsafe fn apply(m: *mut LinkMap, r: &Rela, plt_table: bool) -> bool {
     }
 }
 
-pub unsafe fn apply_copy_relocs(m: *mut LinkMap) -> bool {
-    unsafe {
-        if (*m).relocated || (*m).copy_done {
-            return true;
-        }
-        let n = (*m).relasz / core::mem::size_of::<Rela>();
-        let mut k = 0u32;
-        let mut all = true;
-        for i in 0..n {
-            let r = &*(*m).rela.add(i);
-            if (r.info & 0xffff_ffff) as u32 != R_X86_64_COPY {
-                continue;
-            }
-            let mut skip = false;
-            if k < 64 && (r.info >> 32) != 0 {
-                if let Some(res) = bind(m, (r.info >> 32) as usize, false, true) {
-                    skip = !res.map.is_null() && !(*res.map).relocated && !(*res.map).is_ldso && res.map != m && !crate::audit::in_audit_closure(res.map);
-                }
-            }
-            if skip {
-                all = false;
-            } else {
-                if !apply(m, r, false) {
-                    return false;
-                }
-                if k < 64 {
-                    (*m).copy_mask |= 1 << k;
-                }
-            }
-            k += 1;
-        }
-        (*m).copy_done = all;
-        true
-    }
-}
-
 pub unsafe fn relocate(m: *mut LinkMap) -> bool {
     unsafe {
         if (*m).relocated {
@@ -374,17 +338,10 @@ unsafe fn relocate_body(m: *mut LinkMap) -> bool {
         let t2 = core::arch::x86_64::_rdtsc();
         PHASE_CYCLES[1] += t2 - t1;
         let n = (*m).relasz / core::mem::size_of::<Rela>();
-        let mut k = 0u32;
         for i in 0..n {
             let r = &*(*m).rela.add(i);
             let ty = (r.info & 0xffff_ffff) as u32;
-            if ty == R_X86_64_COPY {
-                if (*m).copy_done || (k < 64 && (*m).copy_mask >> k & 1 != 0) {
-                    k += 1;
-                    continue;
-                }
-                k += 1;
-            } else if ty == R_X86_64_IRELATIVE {
+            if ty == R_X86_64_IRELATIVE {
                 continue;
             }
             if !apply(m, r, false) {

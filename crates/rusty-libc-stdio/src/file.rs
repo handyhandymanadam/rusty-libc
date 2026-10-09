@@ -8,29 +8,37 @@ use rusty_libc_core::{errno, syscall, unistd};
 pub const BUFSIZ: usize = 8192;
 pub const EOF: c_int = -1;
 
-pub const F_READ: u32 = 1;
-pub const F_WRITE: u32 = 2;
-pub const F_APPEND: u32 = 4;
-pub const F_EOF: u32 = 16;
-pub const F_ERR: u32 = 32;
-pub const F_LBF: u32 = 8;
-pub const F_UNBUF: u32 = 64;
-pub const F_USERBUF: u32 = 128;
-pub const F_DECIDED: u32 = 256;
-pub const F_STATIC: u32 = 512;
-pub const F_RDMODE: u32 = 1024;
-pub const F_WRMODE: u32 = 2048;
-pub const F_NOSEEK: u32 = 4096;
-pub const F_MEM: u32 = 8192;
-pub const F_NOCACHE: u32 = 32768;
-pub const F_WIDE: u32 = 1 << 16;
-pub const F_BYTE: u32 = 1 << 17;
-pub const F_OLDMEM: u32 = 1 << 19;
-pub const F_W32: u32 = 1 << 18;
-pub const F_NOCANCEL: u32 = 1 << 21;
-pub const F_SEEKED: u32 = 1 << 22;
-pub const F_UNGOT: u32 = 1 << 20;
-pub const F_NOEOF: u32 = 16384;
+pub const F_USERBUF: u32 = 0x1;
+pub const F_UNBUF: u32 = 0x2;
+pub const F_NOREAD: u32 = 0x4;
+pub const F_NOWRITE: u32 = 0x8;
+pub const F_EOF: u32 = 0x10;
+pub const F_ERR: u32 = 0x20;
+pub const F_UNGOT: u32 = 0x100;
+pub const F_LBF: u32 = 0x200;
+pub const F_PUTTING: u32 = 0x800;
+pub const F_APPEND: u32 = 0x1000;
+pub const F_READ: u32 = 1 << 16;
+pub const F_WRITE: u32 = 1 << 17;
+pub const F_DECIDED: u32 = 1 << 18;
+pub const F_STATIC: u32 = 1 << 19;
+pub const F_RDMODE: u32 = 1 << 20;
+pub const F_WRMODE: u32 = 1 << 21;
+pub const F_NOSEEK: u32 = 1 << 22;
+pub const F_MEM: u32 = 1 << 23;
+pub const F_NOCACHE: u32 = 1 << 24;
+pub const F_WIDE: u32 = 1 << 25;
+pub const F_BYTE: u32 = 1 << 26;
+pub const F_OLDMEM: u32 = 1 << 27;
+pub const F_W32: u32 = 1 << 28;
+pub const F_NOCANCEL: u32 = 1 << 29;
+pub const F_SEEKED: u32 = 1 << 30;
+pub const F_NOEOF: u32 = 1 << 31;
+
+pub const fn with_access_bits(flags: u32) -> u32 {
+    let f = flags & !(F_NOREAD | F_NOWRITE);
+    f | if f & F_READ == 0 { F_NOREAD } else { 0 } | if f & F_WRITE == 0 { F_NOWRITE } else { 0 }
+}
 
 #[derive(Clone, Copy)]
 pub struct CookieIo {
@@ -45,23 +53,27 @@ pub struct CookieIo {
 pub struct File {
     pub flags: u32,
     pub fd: c_int,
-    pub glibc_ptrs: [usize; 6],
+    pub rptr: *mut u8,
+    pub rend_p: *mut u8,
+    pub rbase: *mut u8,
+    pub wbase: *mut u8,
+    pub wptr: *mut u8,
+    pub wend: *mut u8,
     pub buf: *mut u8,
     pub bufsize: usize,
-    pub rpos: usize,
-    pub rend: usize,
-    pub wpos: usize,
+    pub save_base: *mut u8,
+    pub backup_base: *mut u8,
+    pub save_end: *mut u8,
     pub unget: [u8; 16],
-    pub nunget: usize,
     pub ubuf: *mut u8,
     pub ucap: usize,
     pub shortbuf: [u8; 8],
     pub next: *mut File,
+    pub cookie_pos: i64,
     pub prev: *mut File,
     pub cookie: *mut c_void,
     pub io: CookieIo,
     pub pid: c_int,
-    pub cookie_pos: i64,
     pub wide: *mut crate::wfile::WideInfo,
     pub lock: FLock,
     pub pins: AtomicU32,
@@ -70,28 +82,47 @@ pub struct File {
     pub fork_held: u8,
 }
 
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(File, flags) == 0);
+    assert!(offset_of!(File, rptr) == 8);
+    assert!(offset_of!(File, rend_p) == 16);
+    assert!(offset_of!(File, rbase) == 24);
+    assert!(offset_of!(File, wbase) == 32);
+    assert!(offset_of!(File, wptr) == 40);
+    assert!(offset_of!(File, wend) == 48);
+    assert!(offset_of!(File, buf) == 56);
+    assert!(offset_of!(File, save_base) == 72);
+    assert!(offset_of!(File, save_end) == 88);
+    assert!(offset_of!(File, cookie_pos) == 144);
+};
+
 impl File {
     pub const fn blank(flags: u32, fd: c_int) -> File {
         File {
-            flags,
+            flags: with_access_bits(flags),
             fd,
-            glibc_ptrs: [0; 6],
+            rptr: null_mut(),
+            rend_p: null_mut(),
+            rbase: null_mut(),
+            wbase: null_mut(),
+            wptr: null_mut(),
+            wend: null_mut(),
             buf: null_mut(),
             bufsize: 0,
-            rpos: 0,
-            rend: 0,
-            wpos: 0,
+            save_base: null_mut(),
+            backup_base: null_mut(),
+            save_end: null_mut(),
             unget: [0; 16],
-            nunget: 0,
             ubuf: null_mut(),
             ucap: 1,
             shortbuf: [0; 8],
             next: null_mut(),
+            cookie_pos: -1,
             prev: null_mut(),
             cookie: null_mut(),
             io: CookieIo { read: None, write: None, seek: None, close: None, sync: None },
             pid: 0,
-            cookie_pos: -1,
             wide: null_mut(),
             lock: FLock::new(),
             pins: AtomicU32::new(0),
@@ -102,23 +133,76 @@ impl File {
     }
 
     pub fn reset(&mut self, flags: u32, fd: c_int) {
-        self.flags = flags;
+        self.flags = with_access_bits(flags) & !(F_UNGOT | F_PUTTING);
         self.fd = fd;
         self.buf = null_mut();
         self.bufsize = 0;
-        self.rpos = 0;
-        self.rend = 0;
-        self.wpos = 0;
+        self.rptr = null_mut();
+        self.rend_p = null_mut();
+        self.rbase = null_mut();
+        self.wbase = null_mut();
+        self.wptr = null_mut();
+        self.wend = null_mut();
+        self.save_base = null_mut();
+        self.save_end = null_mut();
         self.unget = [0; 16];
-        self.nunget = 0;
         self.ubuf = null_mut();
         self.ucap = 1;
-        self.flags &= !F_UNGOT;
         self.cookie = null_mut();
         self.io = CookieIo { read: None, write: None, seek: None, close: None, sync: None };
         self.pid = 0;
         self.cookie_pos = -1;
         self.wide = null_mut();
+    }
+
+    #[inline(always)]
+    pub fn rpos(&self) -> usize {
+        (if self.flags & F_UNGOT != 0 { self.save_base } else { self.rptr }) as usize - self.buf as usize
+    }
+    #[inline(always)]
+    pub fn rend(&self) -> usize {
+        (if self.flags & F_UNGOT != 0 { self.save_end } else { self.rend_p }) as usize - self.buf as usize
+    }
+    #[inline(always)]
+    pub fn set_rpos(&mut self, n: usize) {
+        let p = self.buf.wrapping_add(n);
+        if self.flags & F_UNGOT != 0 { self.save_base = p } else { self.rptr = p }
+    }
+    #[inline(always)]
+    pub fn set_read(&mut self, pos: usize, end: usize) {
+        let (p, e) = (self.buf.wrapping_add(pos), self.buf.wrapping_add(end));
+        if self.flags & F_UNGOT != 0 {
+            self.save_base = p;
+            self.save_end = e;
+        } else {
+            self.rptr = p;
+            self.rend_p = e;
+            self.rbase = self.buf;
+        }
+    }
+    #[inline(always)]
+    pub fn nunget(&self) -> usize {
+        if self.flags & F_UNGOT != 0 { self.rend_p as usize - self.rptr as usize } else { 0 }
+    }
+    #[inline(always)]
+    pub fn wpos(&self) -> usize {
+        self.wptr as usize - self.wbase as usize
+    }
+    #[inline(always)]
+    pub fn set_wpos(&mut self, n: usize) {
+        self.wbase = self.buf;
+        self.wptr = self.buf.wrapping_add(n);
+        self.wend = if self.flags & (F_WRMODE | F_UNBUF | F_LBF | F_WIDE) == F_WRMODE && !self.buf.is_null() {
+            self.buf.wrapping_add(self.bufsize)
+        } else {
+            self.buf
+        };
+    }
+    pub fn set_buffer(&mut self, b: *mut u8, size: usize) {
+        self.buf = b;
+        self.bufsize = size;
+        self.set_read(0, 0);
+        self.set_wpos(0);
     }
 }
 
@@ -328,7 +412,7 @@ unsafe fn raw_seek(f: *mut File, off: i64, whence: c_int) -> Result<i64, i32> {
 
 unsafe fn offset(f: *mut File) -> Result<i64, i32> {
     unsafe {
-        let active = (*f).flags & (F_WRMODE | F_SEEKED) != 0 || (*f).flags & F_RDMODE != 0 && ((*f).rpos < (*f).rend || (*f).nunget > 0);
+        let active = (*f).flags & (F_WRMODE | F_SEEKED) != 0 || (*f).flags & F_RDMODE != 0 && ((*f).rpos() < (*f).rend() || (*f).nunget() > 0);
         if (*f).cookie_pos >= 0 && (*f).flags & F_NOCACHE == 0 && (active || (*f).flags & F_MEM != 0) {
             Ok((*f).cookie_pos)
         } else {
@@ -365,8 +449,7 @@ unsafe fn decide(f: *mut File) {
                 (*f).flags |= F_UNBUF;
                 return;
             }
-            (*f).buf = b;
-            (*f).bufsize = size;
+            (*f).set_buffer(b, size);
         }
     }
 }
@@ -381,8 +464,7 @@ unsafe fn prepare(f: *mut File) {
             if b.is_null() {
                 (*f).flags |= F_UNBUF;
             } else {
-                (*f).buf = b;
-                (*f).bufsize = size;
+                (*f).set_buffer(b, size);
             }
         }
     }
@@ -390,13 +472,14 @@ unsafe fn prepare(f: *mut File) {
 
 pub unsafe fn flush_write(f: *mut File) -> bool {
     unsafe {
-        if (*f).flags & F_WRMODE == 0 || (*f).wpos == 0 {
+        if (*f).flags & F_WRMODE == 0 || (*f).wpos() == 0 {
             (*f).flags &= !F_WRMODE;
+            (*f).set_wpos(0);
             reset_wextra(f);
             return true;
         }
         let mut off = 0;
-        let n = (*f).wpos;
+        let n = (*f).wpos();
         while off < n {
             let k = raw_write(f, (*f).buf.add(off), n - off);
             if k < 0 {
@@ -404,22 +487,22 @@ pub unsafe fn flush_write(f: *mut File) -> bool {
                     continue;
                 }
                 (*f).flags |= F_ERR;
-                (*f).wpos = 0;
                 (*f).flags &= !F_WRMODE;
+                (*f).set_wpos(0);
                 reset_wextra(f);
                 return false;
             }
             off += k as usize;
             if (*f).flags & F_MEM != 0 && off < n {
                 (*f).flags |= F_ERR;
-                (*f).wpos = 0;
                 (*f).flags &= !F_WRMODE;
+                (*f).set_wpos(0);
                 reset_wextra(f);
                 return false;
             }
         }
-        (*f).wpos = 0;
         (*f).flags &= !F_WRMODE;
+        (*f).set_wpos(0);
         reset_wextra(f);
         true
     }
@@ -514,13 +597,11 @@ pub(crate) unsafe fn close_popen_fds(keep: c_int) {
 pub(crate) unsafe fn purge(f: *mut File) {
     unsafe {
         reset_wextra(f);
-        (*f).wpos = 0;
-        (*f).rpos = 0;
-        (*f).rend = 0;
-        (*f).nunget = 0;
-        sync_unget(f);
+        drop_unget(f);
         drop_wpush(f);
         (*f).flags &= !(F_RDMODE | F_WRMODE);
+        (*f).set_read(0, 0);
+        (*f).set_wpos(0);
     }
 }
 
@@ -550,7 +631,24 @@ unsafe fn needs_flush(p: *mut File) -> bool {
 
 #[inline]
 unsafe fn has_unread_fd_input(p: *mut File) -> bool {
-    unsafe { (*p).flags & (F_RDMODE | F_MEM) == F_RDMODE && (*p).fd >= 0 && ((*p).rend > (*p).rpos || (*p).nunget > 0) }
+    unsafe { (*p).flags & (F_RDMODE | F_MEM) == F_RDMODE && (*p).fd >= 0 && ((*p).rend() > (*p).rpos() || (*p).nunget() > 0) }
+}
+
+pub unsafe fn freeres() {
+    unsafe {
+        flush_all();
+        let t = LIST.lock();
+        let mut p = OPEN_HEAD;
+        while !p.is_null() {
+            drop_unget(p);
+            if !(*p).buf.is_null() && (*p).flags & F_USERBUF == 0 && (*p).rpos() >= (*p).rend() {
+                rusty_libc_malloc::free((*p).buf.cast());
+                (*p).set_buffer(null_mut(), 0);
+            }
+            p = (*p).next;
+        }
+        LIST.unlock(t);
+    }
 }
 
 pub unsafe fn flush_all() -> bool {
@@ -564,8 +662,8 @@ pub unsafe fn flush_all() -> bool {
                 if (*p).flags & F_WRMODE != 0 && !flush_write(p) {
                     ok = false;
                 }
-                if has_unread_fd_input(p) {
-                    discard_input(p, true);
+                if has_unread_fd_input(p) && !sync_input(p) {
+                    ok = false;
                 }
                 p = (*p).next;
             }
@@ -583,8 +681,8 @@ pub unsafe fn flush_all() -> bool {
                 if (*p).flags & F_WRMODE != 0 && !flush_write(p) {
                     ok = false;
                 }
-                if has_unread_fd_input(p) {
-                    discard_input(p, true);
+                if has_unread_fd_input(p) && !sync_input(p) {
+                    ok = false;
                 }
             }
             cg.disarm();
@@ -613,7 +711,7 @@ extern "C" fn flush_at_exit() {
                     flush_write(p);
                 }
                 if has_unread_fd_input(p) {
-                    discard_input(p, true);
+                    sync_input(p);
                 }
             }
             if got {
@@ -627,8 +725,11 @@ const FORK_LOCK_WAIT: u64 = 150_000_000;
 static FORK_LOCK: RawMutex = RawMutex::new();
 static FORK_REAL: AtomicBool = AtomicBool::new(false);
 
-unsafe fn fork_grab(p: *mut File) {
+pub(crate) unsafe fn fork_grab(p: *mut File) {
     unsafe {
+        if (*p).fork_held != 0 {
+            return;
+        }
         if (*p).lock.lock_timeout(FORK_LOCK_WAIT) {
             if (*p).linked.load(Ordering::Relaxed) {
                 (*p).fork_held = 1;
@@ -716,17 +817,15 @@ unsafe extern "C" fn atfork_child() {
 
 pub(crate) unsafe fn discard_input(f: *mut File, sync: bool) {
     unsafe {
-        let mut unread = ((*f).rend - (*f).rpos) + (*f).nunget;
+        let mut unread = ((*f).rend() - (*f).rpos()) + (*f).nunget();
         if !(*f).wide.is_null() {
             unread += (*(*f).wide).tshift;
         }
         if sync && unread > 0 && (*f).flags & F_NOSEEK == 0 {
             let _ = raw_seek(f, -(unread as i64), 1);
         }
-        (*f).rpos = 0;
-        (*f).rend = 0;
-        (*f).nunget = 0;
-        sync_unget(f);
+        drop_unget(f);
+        (*f).set_read(0, 0);
         drop_wpush(f);
         (*f).flags &= !F_RDMODE;
     }
@@ -740,20 +839,19 @@ unsafe fn start_write(f: *mut File) -> bool {
             return false;
         }
         if (*f).flags & F_RDMODE != 0 {
-            let unread = ((*f).rend - (*f).rpos) + (*f).nunget.min((*f).rpos);
+            let unread = ((*f).rend() - (*f).rpos()) + (*f).nunget().min((*f).rpos());
             let keep_ahead = (*f).flags & F_WIDE != 0 && !(*f).wide.is_null() && !(*(*f).wide).wbuf && (*(*f).wide).ahead;
             if unread > 0 && (*f).flags & F_NOSEEK == 0 && !keep_ahead {
                 let _ = raw_seek(f, -(unread as i64), 1);
             }
-            (*f).rpos = 0;
-            (*f).rend = 0;
-            (*f).nunget = 0;
-            sync_unget(f);
+            drop_unget(f);
+            (*f).set_read(0, 0);
             drop_wpush(f);
             (*f).flags &= !F_RDMODE;
         }
         prepare(f);
-        (*f).flags |= F_WRMODE;
+        (*f).flags |= F_WRMODE | F_PUTTING;
+        (*f).set_wpos(0);
         true
     }
 }
@@ -775,6 +873,7 @@ pub(crate) unsafe fn underflow_keep(f: *mut File, keep: usize) -> bool {
         if (*f).flags & F_EOF != 0 {
             return false;
         }
+        drop_unget(f);
         prepare(f);
         if (*f).flags & (F_LBF | F_UNBUF) != 0 {
             flush_line_buffered();
@@ -784,27 +883,23 @@ pub(crate) unsafe fn underflow_keep(f: *mut File, keep: usize) -> bool {
                 let size = if keep > 0 { 8 } else { 1 };
                 let b = rusty_libc_malloc::malloc(size) as *mut u8;
                 if b.is_null() {
-                    (*f).buf = (*f).shortbuf.as_mut_ptr();
-                    (*f).bufsize = size;
+                    (*f).set_buffer((*f).shortbuf.as_mut_ptr(), size);
                     (*f).flags |= F_USERBUF;
                 } else {
-                    (*f).buf = b;
-                    (*f).bufsize = size;
+                    (*f).set_buffer(b, size);
                 }
             }
             if keep > 0 {
-                core::ptr::copy((*f).buf.add((*f).rpos), (*f).buf, keep);
+                core::ptr::copy((*f).buf.add((*f).rpos()), (*f).buf, keep);
             }
-            (*f).rpos = 0;
-            (*f).rend = keep;
+            (*f).set_read(0, keep);
             let k = raw_read(f, (*f).buf.add(keep), 1);
             return finish_read(f, k, keep);
         }
         if keep > 0 {
-            core::ptr::copy((*f).buf.add((*f).rpos), (*f).buf, keep);
+            core::ptr::copy((*f).buf.add((*f).rpos()), (*f).buf, keep);
         }
-        (*f).rpos = 0;
-        (*f).rend = keep;
+        (*f).set_read(0, keep);
         let k = raw_read(f, (*f).buf.add(keep), (*f).bufsize - keep);
         finish_read(f, k, keep)
     }
@@ -813,8 +908,8 @@ pub(crate) unsafe fn underflow_keep(f: *mut File, keep: usize) -> bool {
 unsafe fn finish_read(f: *mut File, k: isize, keep: usize) -> bool {
     unsafe {
         if k > 0 {
-            (*f).rend = keep + k as usize;
-            (*f).flags |= F_RDMODE;
+            (*f).set_read(0, keep + k as usize);
+            (*f).flags = ((*f).flags | F_RDMODE) & !F_PUTTING;
             true
         } else if k == 0 {
             if (*f).flags & F_NOEOF == 0 {
@@ -847,7 +942,7 @@ pub(crate) unsafe fn narrow_ok(f: *mut File) -> bool {
 unsafe fn pending_out(f: *mut File) -> i64 {
     unsafe {
         let extra = if (*f).wide.is_null() { 0 } else { (*(*f).wide).extra };
-        ((*f).wpos as i64 - extra as i64).max(0)
+        ((*f).wpos() as i64 - extra as i64).max(0)
     }
 }
 
@@ -1047,13 +1142,9 @@ pub(crate) unsafe fn close_keep(f: *mut File) -> c_int {
         if !(*f).buf.is_null() && (*f).flags & F_USERBUF == 0 {
             rusty_libc_malloc::free((*f).buf.cast());
         }
-        (*f).buf = null_mut();
-        (*f).bufsize = 0;
-        (*f).rpos = 0;
-        (*f).rend = 0;
-        (*f).wpos = 0;
-        (*f).nunget = 0;
-        sync_unget(f);
+        drop_unget(f);
+        (*f).flags &= !(F_RDMODE | F_WRMODE);
+        (*f).set_buffer(null_mut(), 0);
         drop_wpush(f);
         (*f).fd = -1;
         result
@@ -1162,43 +1253,64 @@ unsafe fn close_stream(f: *mut File, pinned: bool) -> c_int {
     }
 }
 
-#[inline(always)]
-unsafe fn sync_unget(f: *mut File) {
+#[inline]
+pub(crate) unsafe fn drop_unget(f: *mut File) {
     unsafe {
-        (*f).flags = ((*f).flags & !F_UNGOT) | (u32::from((*f).nunget != 0) << 20);
-        if (*f).nunget == 0 && !(*f).ubuf.is_null() {
+        if (*f).flags & F_UNGOT != 0 {
+            (*f).flags &= !F_UNGOT;
+            (*f).rptr = (*f).save_base;
+            (*f).rend_p = (*f).save_end;
+            (*f).rbase = (*f).buf;
+            (*f).save_base = null_mut();
+            (*f).save_end = null_mut();
+        }
+        if !(*f).ubuf.is_null() {
             rusty_libc_malloc::free((*f).ubuf.cast());
             (*f).ubuf = null_mut();
         }
-        if (*f).nunget == 0 {
-            (*f).ucap = 1;
+        (*f).ucap = 1;
+    }
+}
+
+#[inline(always)]
+unsafe fn unget_done(f: *mut File) {
+    unsafe {
+        if (*f).flags & F_UNGOT != 0 && (*f).rptr >= (*f).rend_p {
+            drop_unget(f);
         }
     }
 }
 
-#[inline]
-unsafe fn ubyte(f: *mut File, i: usize) -> u8 {
-    unsafe { if (*f).ubuf.is_null() { (*f).unget[i] } else { *(*f).ubuf.add(i) } }
-}
-
-unsafe fn unget_room(f: *mut File) -> bool {
+unsafe fn push_byte(f: *mut File, c: u8) -> bool {
     unsafe {
-        if (*f).nunget < (*f).ucap {
-            return true;
+        if (*f).flags & F_UNGOT == 0 {
+            let area = (*f).unget.as_mut_ptr();
+            (*f).save_base = (*f).rptr;
+            (*f).save_end = (*f).rend_p;
+            (*f).rbase = area;
+            (*f).rend_p = area.add((*f).ucap);
+            (*f).rptr = (*f).rend_p;
+            (*f).flags |= F_UNGOT;
         }
-        let newcap = (*f).ucap * 2;
-        let p = rusty_libc_malloc::malloc(newcap) as *mut u8;
-        if p.is_null() {
-            return false;
+        if (*f).rptr <= (*f).rbase {
+            let n = (*f).nunget();
+            let newcap = (*f).ucap * 2;
+            let p = rusty_libc_malloc::malloc(newcap) as *mut u8;
+            if p.is_null() {
+                return false;
+            }
+            core::ptr::copy_nonoverlapping((*f).rptr, p.add(newcap - n), n);
+            if !(*f).ubuf.is_null() {
+                rusty_libc_malloc::free((*f).ubuf.cast());
+            }
+            (*f).ubuf = p;
+            (*f).ucap = newcap;
+            (*f).rbase = p;
+            (*f).rend_p = p.add(newcap);
+            (*f).rptr = p.add(newcap - n);
         }
-        for i in 0..(*f).nunget {
-            *p.add(i) = ubyte(f, i);
-        }
-        if !(*f).ubuf.is_null() {
-            rusty_libc_malloc::free((*f).ubuf.cast());
-        }
-        (*f).ubuf = p;
-        (*f).ucap = newcap;
+        (*f).rptr = (*f).rptr.sub(1);
+        *(*f).rptr = c;
         true
     }
 }
@@ -1206,9 +1318,9 @@ unsafe fn unget_room(f: *mut File) -> bool {
 #[inline]
 pub unsafe fn getc(f: *mut File) -> c_int {
     unsafe {
-        if (*f).flags & (F_RDMODE | F_WIDE | F_UNGOT) == F_RDMODE && (*f).rpos < (*f).rend {
-            let c = *(*f).buf.add((*f).rpos);
-            (*f).rpos += 1;
+        if (*f).flags & F_WIDE == 0 && (*f).rptr < (*f).rend_p {
+            let c = *(*f).rptr;
+            (*f).rptr = (*f).rptr.add(1);
             return c_int::from(c);
         }
         getc_slow(f)
@@ -1221,43 +1333,57 @@ unsafe fn getc_slow(f: *mut File) -> c_int {
         if !narrow_ok(f) {
             return EOF;
         }
-        if (*f).nunget > 0 {
-            (*f).nunget -= 1;
-            let b = ubyte(f, (*f).nunget);
-            sync_unget(f);
-            return c_int::from(b);
-        }
-        if (*f).flags & F_RDMODE != 0 && (*f).rpos < (*f).rend {
-            let c = *(*f).buf.add((*f).rpos);
-            (*f).rpos += 1;
-            return c_int::from(c);
-        }
-        if !underflow(f) {
+        unget_done(f);
+        if (*f).rptr >= (*f).rend_p && !underflow(f) {
             return EOF;
         }
-        let c = *(*f).buf.add((*f).rpos);
-        (*f).rpos += 1;
+        let c = *(*f).rptr;
+        (*f).rptr = (*f).rptr.add(1);
+        unget_done(f);
         c_int::from(c)
     }
 }
 
+pub unsafe fn peekc(f: *mut File) -> c_int {
+    unsafe {
+        if !narrow_ok(f) {
+            return EOF;
+        }
+        unget_done(f);
+        if (*f).rptr >= (*f).rend_p && !underflow(f) {
+            return EOF;
+        }
+        c_int::from(*(*f).rptr)
+    }
+}
+
+#[inline]
 pub unsafe fn fill_buf(f: *mut File) -> Option<(*const u8, usize)> {
+    unsafe {
+        if (*f).flags & (F_WIDE | F_BYTE) == F_BYTE && (*f).rptr < (*f).rend_p {
+            return Some(((*f).rptr, (*f).rend_p as usize - (*f).rptr as usize));
+        }
+        fill_buf_slow(f)
+    }
+}
+
+#[inline(never)]
+unsafe fn fill_buf_slow(f: *mut File) -> Option<(*const u8, usize)> {
     unsafe {
         if !narrow_ok(f) {
             return None;
         }
-        if (*f).flags & F_RDMODE != 0 && (*f).rpos < (*f).rend {
-            return Some(((*f).buf.add((*f).rpos), (*f).rend - (*f).rpos));
-        }
-        if !underflow(f) {
+        unget_done(f);
+        if (*f).rptr >= (*f).rend_p && !underflow(f) {
             return None;
         }
-        Some(((*f).buf.add((*f).rpos), (*f).rend - (*f).rpos))
+        Some(((*f).rptr, (*f).rend_p as usize - (*f).rptr as usize))
     }
 }
 
+#[inline]
 pub unsafe fn consume(f: *mut File, n: usize) {
-    unsafe { (*f).rpos += n };
+    unsafe { (*f).rptr = (*f).rptr.add(n) };
 }
 
 pub unsafe fn ungetc(c: c_int, f: *mut File) -> c_int {
@@ -1278,22 +1404,15 @@ pub(crate) unsafe fn ungetc_force(c: c_int, f: *mut File) -> c_int {
         if (*f).flags & F_WRMODE != 0 && !flush_write(f) {
             return EOF;
         }
+        unget_done(f);
         if (*f).flags & F_RDMODE == 0 {
-            (*f).rpos = 0;
-            (*f).rend = 0;
+            (*f).set_read(0, 0);
             (*f).flags |= F_RDMODE;
         }
-        if (*f).nunget == 0 && (*f).rpos > 0 && *(*f).buf.add((*f).rpos - 1) == c as u8 {
-            (*f).rpos -= 1;
-        } else if unget_room(f) {
-            if (*f).ubuf.is_null() {
-                (*f).unget[(*f).nunget] = c as u8;
-            } else {
-                *(*f).ubuf.add((*f).nunget) = c as u8;
-            }
-            (*f).nunget += 1;
-            sync_unget(f);
-        } else {
+        (*f).flags &= !F_PUTTING;
+        if (*f).flags & F_UNGOT == 0 && (*f).rptr > (*f).buf && (*f).rptr <= (*f).buf.wrapping_add((*f).bufsize) && *(*f).rptr.sub(1) == c as u8 {
+            (*f).rptr = (*f).rptr.sub(1);
+        } else if !push_byte(f, c as u8) {
             return EOF;
         }
         (*f).flags &= !F_EOF;
@@ -1307,18 +1426,12 @@ pub unsafe fn read_bytes(f: *mut File, dst: *mut u8, n: usize) -> usize {
             return 0;
         }
         let mut got = 0;
-        while got < n && (*f).nunget > 0 {
-            (*f).nunget -= 1;
-            let b = ubyte(f, (*f).nunget);
-            sync_unget(f);
-            *dst.add(got) = b;
-            got += 1;
-        }
         while got < n {
-            if (*f).flags & F_RDMODE != 0 && (*f).rpos < (*f).rend {
-                let k = ((*f).rend - (*f).rpos).min(n - got);
-                rusty_libc_mem::memcpy(dst.add(got).cast(), (*f).buf.add((*f).rpos).cast(), k);
-                (*f).rpos += k;
+            unget_done(f);
+            if (*f).rptr < (*f).rend_p {
+                let k = ((*f).rend_p as usize - (*f).rptr as usize).min(n - got);
+                rusty_libc_mem::memcpy(dst.add(got).cast(), (*f).rptr.cast(), k);
+                (*f).rptr = (*f).rptr.add(k);
                 got += k;
                 continue;
             }
@@ -1345,8 +1458,7 @@ pub unsafe fn read_bytes(f: *mut File, dst: *mut u8, n: usize) -> usize {
                     flush_line_buffered();
                 }
                 let count = if block >= 128 { want - want % block } else { want };
-                (*f).rpos = 0;
-                (*f).rend = 0;
+                (*f).set_read(0, 0);
                 let k = raw_read(f, dst.add(got), count);
                 if k > 0 {
                     got += k as usize;
@@ -1371,10 +1483,9 @@ pub unsafe fn read_bytes(f: *mut File, dst: *mut u8, n: usize) -> usize {
 pub unsafe fn putc(c: c_int, f: *mut File) -> c_int {
     unsafe {
         let b = c as u8;
-        let fl = (*f).flags;
-        if fl & (F_WRMODE | F_UNBUF | F_WIDE) == F_WRMODE && (*f).wpos < (*f).bufsize && !(fl & F_LBF != 0 && b == b'\n') {
-            *(*f).buf.add((*f).wpos) = b;
-            (*f).wpos += 1;
+        if (*f).wptr < (*f).wend {
+            *(*f).wptr = b;
+            (*f).wptr = (*f).wptr.add(1);
             return c_int::from(b);
         }
         putc_slow(b, f)
@@ -1384,6 +1495,20 @@ pub unsafe fn putc(c: c_int, f: *mut File) -> c_int {
 #[inline(never)]
 unsafe fn putc_slow(b: u8, f: *mut File) -> c_int {
     unsafe {
+        if (*f).flags & (F_WRMODE | F_UNBUF | F_WIDE | F_LBF) == F_WRMODE | F_LBF && b != b'\n' && (*f).wpos() < (*f).bufsize {
+            *(*f).wptr = b;
+            (*f).wptr = (*f).wptr.add(1);
+            return c_int::from(b);
+        }
+        if (*f).flags & (F_WRMODE | F_UNBUF | F_WIDE | F_LBF) == F_WRMODE && !(*f).buf.is_null() && (*f).wpos() >= (*f).bufsize {
+            if !flush_write(f) {
+                return EOF;
+            }
+            (*f).flags |= F_WRMODE;
+            (*f).set_wpos(1);
+            *(*f).buf = b;
+            return c_int::from(b);
+        }
         if (*f).flags & F_WIDE != 0 {
             let w = (*f).wide;
             if !(*w).putting || (*f).flags & F_W32 != 0 {
@@ -1392,11 +1517,12 @@ unsafe fn putc_slow(b: u8, f: *mut File) -> c_int {
             if write_bytes_raw(f, &b, 1) != 1 {
                 return EOF;
             }
-            if (*f).wpos == 0 {
+            let wpos = (*f).wpos();
+            if wpos == 0 {
                 (*w).raw = 0;
             } else {
-                let at = (*w).raw.min((*f).wpos - 1);
-                core::slice::from_raw_parts_mut((*f).buf.add(at), (*f).wpos - at).rotate_right(1);
+                let at = (*w).raw.min(wpos - 1);
+                core::slice::from_raw_parts_mut((*f).buf.add(at), wpos - at).rotate_right(1);
                 (*w).raw = at + 1;
             }
             return c_int::from(b);
@@ -1463,10 +1589,10 @@ pub(crate) unsafe fn write_bytes_raw(f: *mut File, src: *const u8, n: usize) -> 
             }
         }
         let mut done = 0usize;
-        let space = (*f).bufsize - (*f).wpos;
+        let space = (*f).bufsize - (*f).wpos();
         let k = space.min(n);
-        rusty_libc_mem::memcpy((*f).buf.add((*f).wpos).cast(), src.cast(), k);
-        (*f).wpos += k;
+        rusty_libc_mem::memcpy((*f).wptr.cast(), src.cast(), k);
+        (*f).wptr = (*f).wptr.add(k);
         done += k;
         if done == n {
             if lbf && flush_upto > 0 {
@@ -1478,6 +1604,7 @@ pub(crate) unsafe fn write_bytes_raw(f: *mut File, src: *const u8, n: usize) -> 
             return done;
         }
         (*f).flags |= F_WRMODE;
+        (*f).set_wpos(0);
         let rest = n - done;
         let block = (*f).bufsize;
         let direct = if block >= 128 { rest - rest % block } else { rest };
@@ -1503,7 +1630,7 @@ pub(crate) unsafe fn write_bytes_raw(f: *mut File, src: *const u8, n: usize) -> 
         let rem = n - done;
         if rem > 0 {
             rusty_libc_mem::memcpy((*f).buf.cast(), src.add(done).cast(), rem);
-            (*f).wpos = rem;
+            (*f).set_wpos(rem);
             done += rem;
         }
         if lbf && flush_upto > 0 && !flush_write(f) {
@@ -1522,7 +1649,7 @@ pub unsafe fn tell(f: *mut File) -> i64 {
         if !(*f).wide.is_null()
             && (*(*f).wide).cs == crate::wfile::WCs::Utf8
             && (*f).flags & F_WRMODE != 0
-            && (*f).wpos > 4 * (*(*f).wide).pchars
+            && (*f).wpos() > 4 * (*(*f).wide).pchars
         {
             return 4_294_967_295;
         }
@@ -1574,7 +1701,7 @@ unsafe fn tell_bytes(f: *mut File) -> i64 {
             }
             base + pending_out(f)
         } else if (*f).flags & F_RDMODE != 0 {
-            let p = base - (((*f).rend - (*f).rpos) + (*f).nunget) as i64;
+            let p = base - (((*f).rend() - (*f).rpos()) + (*f).nunget()) as i64;
             if p < 0 {
                 errno::set(29);
                 return -1;
@@ -1609,38 +1736,34 @@ unsafe fn seek_bytes(f: *mut File, off: i64, whence: c_int) -> c_int {
         let mut off = off;
         let reading = (*f).flags & F_RDMODE != 0;
         if reading && whence == 1 {
-            off -= (((*f).rend - (*f).rpos) + (*f).nunget) as i64;
+            off -= (((*f).rend() - (*f).rpos()) + (*f).nunget()) as i64;
         }
         if reading && whence != 2 && (*f).cookie_pos >= 0 && (*f).flags & F_NOSEEK == 0 {
             let here = (*f).cookie_pos;
             let target = if whence == 0 { off } else { here + off };
-            let start = here - (*f).rend as i64;
+            let start = here - (*f).rend() as i64;
             if target >= start && target < here {
-                (*f).rpos = (target - start) as usize;
-                (*f).nunget = 0;
-                sync_unget(f);
+                drop_unget(f);
+                (*f).set_rpos((target - start) as usize);
                 drop_wpush(f);
-                (*f).flags &= !F_EOF;
+                (*f).flags &= !(F_EOF | F_PUTTING);
                 return 0;
             }
         }
         match raw_seek(f, off, whence) {
             Ok(_) => {
                 if reading {
-                    (*f).rpos = 0;
-                    (*f).rend = 0;
-                    (*f).nunget = 0;
-                    sync_unget(f);
+                    drop_unget(f);
+                    (*f).set_read(0, 0);
                     drop_wpush(f);
                     (*f).flags &= !F_RDMODE;
                 }
-                (*f).flags &= !F_EOF;
+                (*f).flags &= !(F_EOF | F_PUTTING);
                 (*f).flags |= F_SEEKED;
                 0
             }
             Err(e) => {
-                (*f).nunget = 0;
-                sync_unget(f);
+                drop_unget(f);
                 drop_wpush(f);
                 errno::set(e);
                 -1
@@ -1667,24 +1790,22 @@ pub unsafe fn fflush(f: *mut File) -> c_int {
 
 unsafe fn sync_input(f: *mut File) -> bool {
     unsafe {
-        let mut unread = ((*f).rend - (*f).rpos) + (*f).nunget;
+        let mut unread = ((*f).rend() - (*f).rpos()) + (*f).nunget();
         if !(*f).wide.is_null() {
             unread += (*(*f).wide).tshift;
         }
-        if unread > 0
-            && (*f).flags & F_NOSEEK == 0
-            && let Err(e) = raw_seek(f, -(unread as i64), 1)
-            && e != 29
-        {
-            (*f).nunget = 0;
-            sync_unget(f);
-            errno::set(e);
-            return false;
+        if unread > 0 {
+            let r = if (*f).flags & F_NOSEEK != 0 { Err(29) } else { raw_seek(f, -(unread as i64), 1) };
+            if let Err(e) = r {
+                if (*f).wide.is_null() {
+                    drop_unget(f);
+                }
+                errno::set(e);
+                return e == 29;
+            }
         }
-        (*f).rpos = 0;
-        (*f).rend = 0;
-        (*f).nunget = 0;
-        sync_unget(f);
+        drop_unget(f);
+        (*f).set_read(0, 0);
         drop_wpush(f);
         (*f).flags &= !F_RDMODE;
         true
@@ -1706,9 +1827,9 @@ pub unsafe fn setvbuf(f: *mut File, buf: *mut c_char, mode: c_int, size: usize) 
         if !(*f).buf.is_null() && (*f).flags & F_USERBUF == 0 {
             rusty_libc_malloc::free((*f).buf.cast());
         }
-        (*f).buf = null_mut();
-        (*f).bufsize = 0;
-        (*f).flags &= !(F_LBF | F_UNBUF | F_USERBUF);
+        (*f).flags &= !(F_LBF | F_UNBUF | F_USERBUF | F_RDMODE | F_WRMODE);
+        drop_unget(f);
+        (*f).set_buffer(null_mut(), 0);
         note_used();
         (*f).flags |= F_DECIDED;
         match mode {
@@ -1718,8 +1839,7 @@ pub unsafe fn setvbuf(f: *mut File, buf: *mut c_char, mode: c_int, size: usize) 
         }
         if mode != 2 {
             if !buf.is_null() && size > 0 {
-                (*f).buf = buf.cast();
-                (*f).bufsize = size;
+                (*f).set_buffer(buf.cast(), size);
                 (*f).flags |= F_USERBUF;
             } else if size > 0 {
                 (*f).bufsize = size;

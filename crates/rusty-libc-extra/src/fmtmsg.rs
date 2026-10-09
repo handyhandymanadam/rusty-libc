@@ -28,7 +28,7 @@ static LOCK: RawMutex = RawMutex::new();
 
 struct Sev {
     severity: c_int,
-    name: *mut u8,
+    name: *const u8,
     next: *mut Sev,
 }
 static mut USER: *mut Sev = core::ptr::null_mut();
@@ -39,7 +39,7 @@ unsafe fn cstr<'a>(p: *const c_char) -> &'a [u8] {
     unsafe { core::ffi::CStr::from_ptr(p).to_bytes() }
 }
 
-unsafe fn set_severity(severity: c_int, name: Option<&[u8]>) -> bool {
+unsafe fn set_severity(severity: c_int, name: Option<*const u8>) -> bool {
     unsafe {
         LOCK.lock_always();
         let ok = (|| {
@@ -49,19 +49,11 @@ unsafe fn set_severity(severity: c_int, name: Option<&[u8]>) -> bool {
                 if (*node).severity == severity {
                     match name {
                         Some(n) => {
-                            let copy = rusty_libc_malloc::malloc(n.len() + 1) as *mut u8;
-                            if copy.is_null() {
-                                return false;
-                            }
-                            core::ptr::copy_nonoverlapping(n.as_ptr(), copy, n.len());
-                            *copy.add(n.len()) = 0;
-                            rusty_libc_malloc::free((*node).name.cast());
-                            (*node).name = copy;
+                            (*node).name = n;
                             return true;
                         }
                         None => {
                             *link = (*node).next;
-                            rusty_libc_malloc::free((*node).name.cast());
                             rusty_libc_malloc::free(node.cast());
                             return true;
                         }
@@ -71,15 +63,10 @@ unsafe fn set_severity(severity: c_int, name: Option<&[u8]>) -> bool {
             }
             let Some(n) = name else { return false };
             let node = rusty_libc_malloc::malloc(core::mem::size_of::<Sev>()) as *mut Sev;
-            let copy = rusty_libc_malloc::malloc(n.len() + 1) as *mut u8;
-            if node.is_null() || copy.is_null() {
-                rusty_libc_malloc::free(node.cast());
-                rusty_libc_malloc::free(copy.cast());
+            if node.is_null() {
                 return false;
             }
-            core::ptr::copy_nonoverlapping(n.as_ptr(), copy, n.len());
-            *copy.add(n.len()) = 0;
-            node.write(Sev { severity, name: copy, next: core::ptr::null_mut() });
+            node.write(Sev { severity, name: n, next: core::ptr::null_mut() });
             *link = node;
             true
         })();
@@ -167,7 +154,14 @@ unsafe fn init_from_env() {
                     let consumed = endp as usize - buf.as_ptr() as usize;
                     if consumed != 0 && consumed < probe.len() && probe[consumed] == b',' && level > MM_INFO {
                         let name = &rest[consumed + 1..];
-                        set_severity(level, Some(name));
+                        let copy = rusty_libc_malloc::malloc(name.len() + 1) as *mut u8;
+                        if !copy.is_null() {
+                            core::ptr::copy_nonoverlapping(name.as_ptr(), copy, name.len());
+                            *copy.add(name.len()) = 0;
+                            if !set_severity(level, Some(copy)) {
+                                rusty_libc_malloc::free(copy.cast());
+                            }
+                        }
                     }
                 }
                 s = &s[end..];
@@ -303,7 +297,7 @@ pub unsafe extern "C" fn addseverity(severity: c_int, string: *const c_char) -> 
         if severity <= MM_INFO {
             return MM_NOTOK;
         }
-        let ok = set_severity(severity, if string.is_null() { None } else { Some(cstr(string)) });
+        let ok = set_severity(severity, if string.is_null() { None } else { Some(string as *const u8) });
         if ok { MM_OK } else { MM_NOTOK }
     }
 }

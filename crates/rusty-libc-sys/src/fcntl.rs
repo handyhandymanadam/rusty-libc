@@ -220,7 +220,7 @@ crate::unistd::alias!(posix_fadvise64 => posix_fadvise(fd: c_int, offset: i64, l
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn fallocate(fd: c_int, mode: c_int, offset: i64, len: i64) -> c_int {
-    rc(unsafe { syscall::syscall4(nr::FALLOCATE, fd as usize, mode as usize, offset as usize, len as usize) })
+    rc(unsafe { rusty_libc_core::tls::syscall_cp(nr::FALLOCATE, fd as usize, mode as usize, offset as usize, len as usize, 0, 0) })
 }
 crate::unistd::alias!(fallocate64 => fallocate(fd: c_int, mode: c_int, offset: i64, len: i64) -> c_int);
 
@@ -281,7 +281,7 @@ pub extern "C" fn readahead(fd: c_int, offset: i64, count: usize) -> isize {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sync_file_range(fd: c_int, offset: i64, nbytes: i64, flags: c_uint) -> c_int {
-    rc(unsafe { syscall::syscall4(nr::SYNC_FILE_RANGE, fd as usize, offset as usize, nbytes as usize, flags as usize) })
+    rc(unsafe { rusty_libc_core::tls::syscall_cp(nr::SYNC_FILE_RANGE, fd as usize, offset as usize, nbytes as usize, flags as usize, 0, 0) })
 }
 
 pub unsafe extern "C" fn splice(fd_in: c_int, off_in: *mut i64, fd_out: c_int, off_out: *mut i64, len: usize, flags: c_uint) -> isize {

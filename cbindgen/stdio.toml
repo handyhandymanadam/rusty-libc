@@ -5,6 +5,6 @@ no_includes = true
 sys_includes = ["stddef.h", "stdarg.h", "sys/types.h"]
 
 [export]
-exclude = ["off_t", "FILE"]
+exclude = ["off_t", "FILE", "__underflow"]
 [export.rename]
 "Obstack" = "struct obstack"

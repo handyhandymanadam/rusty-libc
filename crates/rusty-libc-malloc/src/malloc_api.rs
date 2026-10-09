@@ -1,5 +1,6 @@
 use crate::heap;
 use core::ffi::{c_int, c_void};
+use core::sync::atomic::Ordering::Relaxed;
 use rusty_libc_core::errno;
 
 #[repr(C)]
@@ -68,14 +69,13 @@ pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> usize {
 
 fn fill_info() -> mallinfo2 {
     let st = unsafe { heap::stats() };
-    let s = heap::st();
     let avail = st.top + st.free_bytes + st.small_bytes;
     mallinfo2 {
         arena: st.arena,
         ordblks: st.free_chunks + 1,
         smblks: st.small_chunks,
-        hblks: s.n_mmaps,
-        hblkhd: s.mmapped_mem,
+        hblks: heap::P.n_mmaps.load(Relaxed),
+        hblkhd: heap::P.mmapped_mem.load(Relaxed),
         usmblks: 0,
         fsmblks: st.small_bytes,
         uordblks: st.arena.saturating_sub(avail),
@@ -124,57 +124,60 @@ pub const M_ARENA_MAX: c_int = -8;
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn mallopt(param: c_int, value: c_int) -> c_int {
     unsafe { heap::ensure_init() };
-    let _g = heap::LOCK.guard();
-    let s = heap::st();
-    match param {
+    let lock = heap::main_lock();
+    let taken = lock.lock();
+    let p = &heap::P;
+    let r = match param {
         M_MXFAST => {
-            s.small_enabled = value != 0;
+            p.small_enabled.store(value != 0, Relaxed);
             1
         }
         M_TRIM_THRESHOLD => {
-            s.trim_threshold = value as usize;
-            s.dynamic_thresholds = false;
+            p.trim_threshold.store(value as usize, Relaxed);
+            p.dynamic_thresholds.store(false, Relaxed);
             1
         }
         M_TOP_PAD => {
-            s.top_pad = value as usize;
-            s.dynamic_thresholds = false;
+            p.top_pad.store(value as usize, Relaxed);
+            p.dynamic_thresholds.store(false, Relaxed);
             1
         }
         M_MMAP_THRESHOLD => {
             if (0..=32 * 1024 * 1024).contains(&value) {
-                s.mmap_threshold = value as usize;
-                s.dynamic_thresholds = false;
+                p.mmap_threshold.store(value as usize, Relaxed);
+                p.dynamic_thresholds.store(false, Relaxed);
             }
             1
         }
         M_MMAP_MAX => {
-            s.mmap_max = value as usize;
-            s.dynamic_thresholds = false;
+            p.mmap_max.store(value as usize, Relaxed);
+            p.dynamic_thresholds.store(false, Relaxed);
             1
         }
         M_CHECK_ACTION => {
-            s.check_action = value;
+            p.check_action.store(value, Relaxed);
             1
         }
         M_PERTURB => {
-            s.perturb = value as u8;
+            p.perturb.store(value as u8, Relaxed);
             1
         }
         M_ARENA_TEST => {
             if value > 0 {
-                s.arena_test = value;
+                p.arena_test.store(value as usize, Relaxed);
             }
             1
         }
         M_ARENA_MAX => {
             if value > 0 {
-                s.arena_max = value;
+                p.arena_max.store(value as usize, Relaxed);
             }
             1
         }
         _ => 1,
-    }
+    };
+    lock.unlock(taken);
+    r
 }
 
 fn put_num(buf: &mut [u8], at: &mut usize, label: &[u8], v: usize) {
@@ -203,26 +206,53 @@ fn put_num(buf: &mut [u8], at: &mut usize, label: &[u8], v: usize) {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn malloc_stats() {
-    let m = fill_info();
-    let _g = heap::LOCK.guard();
-    let s = heap::st();
-    let mut buf = [0u8; 512];
-    let mut at = 0;
-    let text = |t: &[u8], buf: &mut [u8; 512], at: &mut usize| {
+    let mut buf = [0u8; 160];
+    let text = |t: &[u8], buf: &mut [u8; 160], at: &mut usize| {
         for &b in t {
             buf[*at] = b;
             *at += 1;
         }
     };
-    text(b"Arena 0:\n", &mut buf, &mut at);
-    put_num(&mut buf, &mut at, b"system bytes     = ", m.arena);
-    put_num(&mut buf, &mut at, b"in use bytes     = ", m.uordblks);
+    let out = |buf: &[u8]| {
+        let _ = rusty_libc_core::unistd::write_nocancel(2, buf);
+    };
+    let (mut system, mut in_use) = (0usize, 0usize);
+    let mut i = 0;
+    heap::arenas(|a| {
+        let st = unsafe { heap::arena_stats(a) };
+        let avail = st.top + st.free_bytes + st.small_bytes;
+        let used = st.arena.saturating_sub(avail);
+        let mut at = 0;
+        text(b"Arena ", &mut buf, &mut at);
+        let mut d = [0u8; 20];
+        let mut k = d.len();
+        let mut v = i;
+        loop {
+            k -= 1;
+            d[k] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        text(&d[k..], &mut buf, &mut at);
+        text(b":\n", &mut buf, &mut at);
+        put_num(&mut buf, &mut at, b"system bytes     = ", st.arena);
+        put_num(&mut buf, &mut at, b"in use bytes     = ", used);
+        out(&buf[..at]);
+        system += st.arena;
+        in_use += used;
+        i += 1;
+    });
+    let p = &heap::P;
+    let mmapped = p.mmapped_mem.load(Relaxed);
+    let mut at = 0;
     text(b"Total (incl. mmap):\n", &mut buf, &mut at);
-    put_num(&mut buf, &mut at, b"system bytes     = ", m.arena + s.mmapped_mem);
-    put_num(&mut buf, &mut at, b"in use bytes     = ", m.uordblks + s.mmapped_mem);
-    put_num(&mut buf, &mut at, b"max mmap regions = ", s.n_mmaps);
-    put_num(&mut buf, &mut at, b"max mmap bytes   = ", s.max_mmapped_mem);
-    let _ = rusty_libc_core::unistd::write_nocancel(2, &buf[..at]);
+    put_num(&mut buf, &mut at, b"system bytes     = ", system + mmapped);
+    put_num(&mut buf, &mut at, b"in use bytes     = ", in_use + mmapped);
+    put_num(&mut buf, &mut at, b"max mmap regions = ", p.n_mmaps.load(Relaxed));
+    put_num(&mut buf, &mut at, b"max mmap bytes   = ", p.max_mmapped_mem.load(Relaxed));
+    out(&buf[..at]);
 }
 
 #[allow(dead_code)]

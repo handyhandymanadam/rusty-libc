@@ -881,7 +881,12 @@ unsafe fn strdup_bytes(s: &[u8]) -> *const c_char {
     }
 }
 
-unsafe fn ruserpass(host: *const c_char, aname: &mut *const c_char, apass: &mut *const c_char) -> c_int {
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn ruserpass(host: *const c_char, aname: *mut *const c_char, apass: *mut *const c_char) -> c_int {
+    unsafe { ruserpass_impl(host, &mut *aname, &mut *apass) }
+}
+
+unsafe fn ruserpass_impl(host: *const c_char, aname: &mut *const c_char, apass: &mut *const c_char) -> c_int {
     unsafe {
         let Some(hdir) = secure_getenv(b"HOME") else { return -1 };
         let mut path = Buf::<4200>::new();
@@ -1056,7 +1061,7 @@ pub unsafe extern "C" fn rexec_af(ahost: *mut *mut c_char, rport: c_int, name: *
             freeaddrinfo(res0);
             return -1;
         }
-        ruserpass(canon, &mut name, &mut pass);
+        ruserpass_impl(canon, &mut name, &mut pass);
         loop {
             s = socket((*res0).ai_family, (*res0).ai_socktype, 0);
             if s < 0 {

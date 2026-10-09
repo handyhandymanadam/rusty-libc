@@ -64,7 +64,22 @@ macro_rules! weak_addr {
     }};
 }
 
+#[cfg(not(feature = "shared"))]
 pub(crate) unsafe fn run_hooks(argc: c_int, argv: *mut *mut c_char, envp: *mut *mut c_char) {
+    unsafe { run_hooks_auxv(argc, argv, envp, auxv_after(envp)) }
+}
+
+pub(crate) unsafe fn auxv_after(envp: *mut *mut c_char) -> *const u64 {
+    unsafe {
+        let mut p = envp;
+        while !(*p).is_null() {
+            p = p.add(1);
+        }
+        p.add(1) as *const u64
+    }
+}
+
+pub(crate) unsafe fn run_hooks_auxv(argc: c_int, argv: *mut *mut c_char, envp: *mut *mut c_char, auxv: *const u64) {
     unsafe {
         let misc = weak_addr!("__init_misc");
         if misc != 0 {
@@ -73,12 +88,8 @@ pub(crate) unsafe fn run_hooks(argc: c_int, argv: *mut *mut c_char, envp: *mut *
         }
         let aux = weak_addr!("__init_auxv");
         if aux != 0 {
-            let mut p = envp;
-            while !(*p).is_null() {
-                p = p.add(1);
-            }
             let f: unsafe extern "C" fn(*const u64) = core::mem::transmute(aux);
-            f(p.add(1) as *const u64);
+            f(auxv);
         }
     }
 }

@@ -648,8 +648,122 @@ pub fn hconf_init() {
     if HCONF_DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    if let Err(e) = LineReader::open(&etc_path(b"/host.conf")) {
-        rusty_libc_core::errno::set(e);
+    let mut path = etc_path(b"/host.conf");
+    if let Some(p) = crate::util::getenv(b"RESOLV_HOST_CONF") {
+        path = Buf::new();
+        path.push_all(p);
+        path.push(0);
+    }
+    let h = unsafe { &mut *(&raw mut _res_hconf) };
+    *h = Hconf::ZERO;
+    match LineReader::open(&path) {
+        Ok(mut r) => {
+            let mut buf = [0u8; 256];
+            while unsafe { r.fgets(buf.as_mut_ptr(), buf.len()) } {
+                let n = buf.iter().position(|&c| c == 0 || c == b'\n').unwrap_or(buf.len());
+                hconf_line(h, &buf[..n]);
+            }
+        }
+        Err(e) => rusty_libc_core::errno::set(e),
+    }
+    if let Some(v) = crate::util::getenv(b"RESOLV_MULTI") {
+        hconf_bool(h, v, HCONF_FLAG_MULTI);
+    }
+    if let Some(v) = crate::util::getenv(b"RESOLV_REORDER") {
+        hconf_bool(h, v, HCONF_FLAG_REORDER);
+    }
+    if let Some(v) = crate::util::getenv(b"RESOLV_ADD_TRIM_DOMAINS") {
+        hconf_trim(h, v);
+    }
+    if let Some(v) = crate::util::getenv(b"RESOLV_OVERRIDE_TRIM_DOMAINS") {
+        h.num_trimdomains = 0;
+        hconf_trim(h, v);
+    }
+    unsafe { (&raw mut _res_hconf.initialized).cast::<core::sync::atomic::AtomicI32>().as_ref().unwrap().store(1, core::sync::atomic::Ordering::Release) };
+}
+
+#[repr(C)]
+pub struct Hconf {
+    pub initialized: c_int,
+    unused1: c_int,
+    unused2: [c_int; 4],
+    pub num_trimdomains: c_int,
+    pub trimdomain: [*const c_char; 4],
+    pub flags: u32,
+}
+
+impl Hconf {
+    const ZERO: Hconf = Hconf { initialized: 0, unused1: 0, unused2: [0; 4], num_trimdomains: 0, trimdomain: [core::ptr::null(); 4], flags: 0 };
+}
+
+const HCONF_FLAG_REORDER: u32 = 1 << 3;
+const HCONF_FLAG_MULTI: u32 = 1 << 4;
+
+#[allow(non_upper_case_globals)]
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub static mut _res_hconf: Hconf = Hconf::ZERO;
+
+fn hconf_word(s: &[u8]) -> usize {
+    s.iter().position(|&c| is_space(c) || c == b'#' || c == b',').unwrap_or(s.len())
+}
+
+fn hconf_ws(s: &[u8]) -> &[u8] {
+    &s[s.iter().position(|&c| !is_space(c)).unwrap_or(s.len())..]
+}
+
+fn hconf_bool(h: &mut Hconf, v: &[u8], flag: u32) -> Option<usize> {
+    if v.len() >= 2 && eq_nocase(&v[..2], b"on") {
+        h.flags |= flag;
+        Some(2)
+    } else if v.len() >= 3 && eq_nocase(&v[..3], b"off") {
+        h.flags &= !flag;
+        Some(3)
+    } else {
+        None
+    }
+}
+
+fn hconf_trim(h: &mut Hconf, mut a: &[u8]) {
+    loop {
+        let n = hconf_word(a);
+        if h.num_trimdomains >= 4 {
+            return;
+        }
+        let p = unsafe { rusty_libc_malloc::malloc(n + 1) } as *mut u8;
+        if !p.is_null() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(a.as_ptr(), p, n);
+                *p.add(n) = 0;
+            }
+        }
+        h.trimdomain[h.num_trimdomains as usize] = p as *const c_char;
+        h.num_trimdomains += 1;
+        a = hconf_ws(&a[n..]);
+        if let Some(&(b',' | b';' | b':')) = a.first() {
+            a = hconf_ws(&a[1..]);
+            if a.is_empty() || a[0] == b'#' {
+                return;
+            }
+        }
+        if a.is_empty() || a[0] == b'#' {
+            return;
+        }
+    }
+}
+
+fn hconf_line(h: &mut Hconf, line: &[u8]) {
+    let l = hconf_ws(line);
+    if l.is_empty() || l[0] == b'#' {
+        return;
+    }
+    let n = hconf_word(l);
+    let (cmd, rest) = (&l[..n], hconf_ws(&l[n..]));
+    if eq_nocase(cmd, b"trim") {
+        hconf_trim(h, rest);
+    } else if eq_nocase(cmd, b"multi") {
+        hconf_bool(h, rest, HCONF_FLAG_MULTI);
+    } else if eq_nocase(cmd, b"reorder") {
+        hconf_bool(h, rest, HCONF_FLAG_REORDER);
     }
 }
 

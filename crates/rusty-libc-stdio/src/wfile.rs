@@ -237,12 +237,12 @@ unsafe fn read_core(f: *mut FILE) -> wint_t {
         (*(*f).wide).putting = false;
         (*(*f).wide).ahead = true;
         loop {
-            let have = if (*f).flags & F_RDMODE != 0 { (*f).rend - (*f).rpos } else { 0 };
+            let have = if (*f).flags & F_RDMODE != 0 { (*f).rend() - (*f).rpos() } else { 0 };
             if have > 0 {
-                let bytes = core::slice::from_raw_parts((*f).buf.add((*f).rpos), have);
+                let bytes = core::slice::from_raw_parts((*f).buf.add((*f).rpos()), have);
                 match if cs == WCs::Ccs { ccs_decode((*f).wide, bytes) } else { decode(cs, bytes) } {
                     Decoded::Char(c, n) => {
-                        (*f).rpos += n;
+                        (*f).set_rpos((*f).rpos() + n);
                         return c;
                     }
                     Decoded::Invalid => {
@@ -257,12 +257,9 @@ unsafe fn read_core(f: *mut FILE) -> wint_t {
                 if (*f).flags & file::F_USERBUF == 0 {
                     rusty_libc_malloc::free((*f).buf.cast());
                 }
-                (*f).buf = rusty_libc_malloc::malloc(8) as *mut u8;
-                (*f).bufsize = if (*f).buf.is_null() { 0 } else { 8 };
-                (*f).flags &= !file::F_USERBUF;
-                (*f).rpos = 0;
-                (*f).rend = 0;
-                (*f).flags &= !F_RDMODE;
+                let nb = rusty_libc_malloc::malloc(8) as *mut u8;
+                (*f).flags &= !(file::F_USERBUF | F_RDMODE);
+                (*f).set_buffer(nb, if nb.is_null() { 0 } else { 8 });
                 if (*f).buf.is_null() {
                     (*f).flags |= F_ERR;
                     return WEOF;
@@ -282,13 +279,13 @@ pub unsafe fn getwc_raw(f: *mut FILE) -> wint_t {
     unsafe {
         let fl = (*f).flags;
         if fl & (F_WIDE | F_BYTE | F_RDMODE | F_W32) == (F_WIDE | F_RDMODE)
-            && (*f).rpos < (*f).rend
+            && (*f).rpos() < (*f).rend()
             && (*(*f).wide).npush == 0
             && (*(*f).wide).cs != WCs::Ccs
         {
-            let b = *(*f).buf.add((*f).rpos);
+            let b = *(*f).buf.add((*f).rpos());
             if b < 0x80 {
-                (*f).rpos += 1;
+                (*f).set_rpos((*f).rpos() + 1);
                 return wint_t::from(b);
             }
         }
@@ -306,7 +303,7 @@ unsafe fn getwc_slow(f: *mut FILE) -> wint_t {
         if (*w).npush > 0 {
             (*w).npush -= 1;
             if (*w).npush == 0 && (*w).cs == WCs::Utf8 {
-                (*w).tshift = if (*f).flags & F_RDMODE != 0 { (*f).rpos } else { 0 };
+                (*w).tshift = if (*f).flags & F_RDMODE != 0 { (*f).rpos() } else { 0 };
             }
             return *(*w).push.add((*w).npush);
         }
@@ -337,9 +334,9 @@ pub unsafe fn fgetws_raw(s: *mut wchar_t, n: c_int, f: *mut FILE) -> *mut wchar_
         let max = (n - 1) as usize;
         if first != u32::from(b'\n') {
             while i < max {
-                if (*f).flags & (F_WIDE | F_BYTE | F_RDMODE | F_W32) == (F_WIDE | F_RDMODE) && (*f).rpos < (*f).rend && (*(*f).wide).npush == 0 && (*(*f).wide).cs != WCs::Ccs {
-                    let lim = ((*f).rend - (*f).rpos).min(max - i);
-                    let p = (*f).buf.add((*f).rpos);
+                if (*f).flags & (F_WIDE | F_BYTE | F_RDMODE | F_W32) == (F_WIDE | F_RDMODE) && (*f).rpos() < (*f).rend() && (*(*f).wide).npush == 0 && (*(*f).wide).cs != WCs::Ccs {
+                    let lim = ((*f).rend() - (*f).rpos()).min(max - i);
+                    let p = (*f).buf.add((*f).rpos());
                     let mut k = 0usize;
                     while k < lim {
                         let b = *p.add(k);
@@ -353,7 +350,7 @@ pub unsafe fn fgetws_raw(s: *mut wchar_t, n: c_int, f: *mut FILE) -> *mut wchar_
                             break;
                         }
                     }
-                    (*f).rpos += k;
+                    (*f).set_rpos((*f).rpos() + k);
                     i += k;
                     if bulk_nl {
                         break;
@@ -420,11 +417,11 @@ pub unsafe fn ungetwc_raw(wc: wint_t, f: *mut FILE) -> wint_t {
         if w.is_null() {
             return WEOF;
         }
-        if (*w).npush == 0 && (*f).flags & F_RDMODE != 0 && (*f).rpos > 0 {
+        if (*w).npush == 0 && (*f).flags & F_RDMODE != 0 && (*f).rpos() > 0 {
             let mut enc = [0u8; 16];
             let n = exact_encode((*w).cs, wc, &mut enc);
-            if n > 0 && n <= (*f).rpos && core::slice::from_raw_parts((*f).buf.add((*f).rpos - n), n) == &enc[..n] {
-                (*f).rpos -= n;
+            if n > 0 && n <= (*f).rpos() && core::slice::from_raw_parts((*f).buf.add((*f).rpos() - n), n) == &enc[..n] {
+                (*f).set_rpos((*f).rpos() - n);
                 (*f).flags &= !F_EOF;
                 return wc;
             }
@@ -451,13 +448,13 @@ pub unsafe fn putwc_raw(f: *mut FILE, wc: wint_t) -> wint_t {
         let fl = (*f).flags;
         if fl & (F_WIDE | F_BYTE | F_WRMODE | F_UNBUF | F_W32) == (F_WIDE | F_WRMODE)
             && wc < 0x80
-            && (*f).wpos < (*f).bufsize
+            && (*f).wpos() < (*f).bufsize
             && !(fl & F_LBF != 0 && wc == u32::from(b'\n'))
             && (*(*f).wide).cs != WCs::Raw32
             && (*(*f).wide).cs != WCs::Ccs
         {
-            *(*f).buf.add((*f).wpos) = wc as u8;
-            (*f).wpos += 1;
+            *(*f).wptr = wc as u8;
+            (*f).wptr = (*f).wptr.add(1);
             (*(*f).wide).pchars += 1;
             return wc;
         }
@@ -476,7 +473,7 @@ unsafe fn putwc_slow(f: *mut FILE, wc: wint_t) -> wint_t {
             errno::set(EBADF);
             return WEOF;
         }
-        if wc == WEOF && (!(*(*f).wide).putting || (*f).flags & (F_UNBUF | F_LBF) != 0 || (*f).wpos >= (*f).bufsize) {
+        if wc == WEOF && (!(*(*f).wide).putting || (*f).flags & (F_UNBUF | F_LBF) != 0 || (*f).wpos() >= (*f).bufsize) {
             return if file::flush_write(f) { 0 } else { WEOF };
         }
         let mut enc = [0u8; 16];
@@ -582,6 +579,32 @@ pub unsafe extern "C" fn fgetwc_unlocked(f: *mut FILE) -> wint_t {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getwc_unlocked(f: *mut FILE) -> wint_t {
     unsafe { getwc_raw(f) }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __wuflow(f: *mut FILE) -> wint_t {
+    unsafe { getwc_raw(f) }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __wunderflow(f: *mut FILE) -> wint_t {
+    unsafe {
+        let wc = getwc_raw(f);
+        if wc != WEOF {
+            ungetwc_raw(wc, f);
+        }
+        wc
+    }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __woverflow(f: *mut FILE, wc: wint_t) -> wint_t {
+    unsafe {
+        if (*f).flags & (F_WIDE | F_BYTE) == F_BYTE {
+            return if file::putc(c_int::from(wc as u8), f) == file::EOF { WEOF } else { wc };
+        }
+        putwc_raw(f, wc)
+    }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

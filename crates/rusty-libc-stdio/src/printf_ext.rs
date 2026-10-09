@@ -1226,8 +1226,12 @@ impl Sink for VecSink {
 }
 
 unsafe fn printf_fp_f(fp: *mut File, info: &PrintfInfo, val: Val) -> c_int {
+    unsafe { printf_fp_conv(fp, info, val, b'f') }
+}
+
+unsafe fn printf_fp_conv(fp: *mut File, info: &PrintfInfo, val: Val, conv: u8) -> c_int {
     unsafe {
-        let mini = build_mini(info, b'f');
+        let mini = build_mini(info, conv);
         let mut more: Arr<u8> = Arr::new();
         let mut sink = VecSink { buf: [0; 512], len: 0, more: &mut more };
         let mut a = OneArg(val);
@@ -1238,6 +1242,32 @@ unsafe fn printf_fp_f(fp: *mut File, info: &PrintfInfo, val: Val) -> c_int {
         }
         more.free();
         if ok { n } else { -1 }
+    }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __printf_fp(fp: *mut File, info: *const PrintfInfo, args: *const *const c_void) -> c_int {
+    unsafe {
+        let info = &*info;
+        let a0 = *args;
+        let val = if info.has(INFO_BINARY128) {
+            Val::Q((a0 as *const u128).read_unaligned())
+        } else if info.has(INFO_LONG_DOUBLE) {
+            Val::LD(*(a0 as *const [u8; 16]))
+        } else {
+            Val::D(*(a0 as *const f64))
+        };
+        let sp = if (0..256).contains(&info.spec) { info.spec as u8 } else { b'g' };
+        let conv = match sp {
+            b'e' | b'E' | b'f' | b'F' | b'g' | b'G' => sp,
+            c if c.is_ascii_uppercase() => b'G',
+            _ => b'g',
+        };
+        let mut fi = *info;
+        if fi.has(INFO_BINARY128) {
+            fi.flags &= !INFO_LONG_DOUBLE;
+        }
+        printf_fp_conv(fp, &fi, val, conv)
     }
 }
 

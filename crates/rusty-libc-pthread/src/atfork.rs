@@ -111,6 +111,7 @@ pub unsafe fn fork_with_handlers(raw: impl FnOnce() -> c_int) -> c_int {
         let old = sigprocmask_set(2, u64::MAX);
         let pid = raw();
         if pid == 0 {
+            rusty_libc_core::tls::loader_fork_child();
             rusty_libc_malloc::atfork_child();
             thread::after_fork_child();
             crate::sync::once_fork_child();

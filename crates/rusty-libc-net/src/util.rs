@@ -177,3 +177,95 @@ pub(crate) fn put_str(dst: &mut [u8], off: &mut usize, s: &[u8]) -> Option<*mut 
 pub(crate) fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
 }
+
+pub struct HeapVec<T: Copy> {
+    ptr: *mut T,
+    len: usize,
+    cap: usize,
+}
+
+impl<T: Copy> HeapVec<T> {
+    pub const fn new() -> Self {
+        HeapVec { ptr: core::ptr::null_mut(), len: 0, cap: 0 }
+    }
+
+    pub fn push(&mut self, v: T) -> bool {
+        if self.len == self.cap && !self.grow(1) {
+            return false;
+        }
+        unsafe { self.ptr.add(self.len).write(v) };
+        self.len += 1;
+        true
+    }
+
+    pub fn extend_from(&mut self, s: &[T]) -> bool {
+        if self.cap - self.len < s.len() && !self.grow(s.len()) {
+            return false;
+        }
+        unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), self.ptr.add(self.len), s.len()) };
+        self.len += s.len();
+        true
+    }
+
+    fn grow(&mut self, extra: usize) -> bool {
+        let want = self.len + extra;
+        let mut cap = if self.cap == 0 { 8 } else { self.cap * 2 };
+        while cap < want {
+            cap *= 2;
+        }
+        let bytes = match cap.checked_mul(core::mem::size_of::<T>()) {
+            Some(b) => b,
+            None => return false,
+        };
+        let p = unsafe { rusty_libc_malloc::realloc(self.ptr as *mut c_void, bytes) } as *mut T;
+        if p.is_null() {
+            return false;
+        }
+        self.ptr = p;
+        self.cap = cap;
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+impl HeapVec<u8> {
+    pub fn as_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+impl<T: Copy> core::ops::Deref for HeapVec<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        if self.len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(self.ptr, self.len) } }
+    }
+}
+
+impl<T: Copy> core::ops::DerefMut for HeapVec<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        if self.len == 0 { &mut [] } else { unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) } }
+    }
+}
+
+impl<T: Copy> HeapVec<T> {
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        self
+    }
+}
+
+impl<T: Copy> Drop for HeapVec<T> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { rusty_libc_malloc::free(self.ptr as *mut c_void) };
+        }
+    }
+}
+
+impl<T: Copy> Default for HeapVec<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}

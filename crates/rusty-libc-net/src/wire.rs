@@ -301,22 +301,36 @@ pub fn same_name(a: &[u8], b: &[u8]) -> bool {
     crate::util::eq_nocase(a, b)
 }
 
-pub fn build_query(id: u16, name: &[u8], qtype: u16, qclass: u16, rd: bool, edns: bool, out: &mut [u8]) -> Option<usize> {
+pub const RESOLV_EDNS_BUFFER_SIZE: usize = 1200;
+
+pub fn edns_payload(anslen: usize) -> u16 {
+    anslen.clamp(512, RESOLV_EDNS_BUFFER_SIZE) as u16
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Opt {
+    pub payload: u16,
+    pub dnssec_ok: bool,
+}
+
+pub fn build_query(id: u16, name: &[u8], qtype: u16, qclass: u16, rd: bool, opt: Option<Opt>, out: &mut [u8]) -> Option<usize> {
     if out.len() < HFIXEDSZ + MAXCDNAME + QFIXEDSZ + 11 {
         return None;
     }
-    let h = Header { id, flags: if rd { FLAG_RD } else { 0 }, qdcount: 1, ancount: 0, nscount: 0, arcount: edns as u16 };
+    let h = Header { id, flags: if rd { FLAG_RD } else { 0 }, qdcount: 1, ancount: 0, nscount: 0, arcount: opt.is_some() as u16 };
     h.write(out);
     let (n, _) = name_pton(name, &mut out[HFIXEDSZ..HFIXEDSZ + MAXCDNAME + 1])?;
     let mut p = HFIXEDSZ + n;
     put16(out, p, qtype);
     put16(out, p + 2, qclass);
     p += 4;
-    if edns {
+    if let Some(opt) = opt {
         out[p] = 0;
         put16(out, p + 1, T_OPT);
-        put16(out, p + 3, 1200);
-        out[p + 5..p + 9].fill(0);
+        put16(out, p + 3, opt.payload);
+        out[p + 5] = 0;
+        out[p + 6] = 0;
+        put16(out, p + 7, if opt.dnssec_ok { 0x8000 } else { 0 });
         put16(out, p + 9, 0);
         p += 11;
     }

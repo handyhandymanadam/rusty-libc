@@ -61,27 +61,35 @@ struct PwOps<'a, E: Entry> {
     names: &'static EntNames,
 }
 
+fn reads_files(src: &nssmod::Source, func: &[u8]) -> bool {
+    nssent::is_files(src) && !(src.is(b"compat") && compat_fn(func) != 0)
+}
+
+fn source_fn(src: &nssmod::Source, func: &[u8]) -> usize {
+    if src.is(b"compat") { compat_fn(func) } else { nssmod::function(src.name(), func) }
+}
+
 impl<E: Entry> nssent::EntOps for PwOps<'_, E> {
     fn has(&mut self, src: &nssmod::Source, f: nssent::Fn3) -> bool {
-        if nssent::is_files(src) {
-            return true;
-        }
-        if src.is(b"dns") {
-            return false;
-        }
         let n = match f {
             nssent::Fn3::Set => self.names.set,
             nssent::Fn3::Get => self.names.get,
             nssent::Fn3::End => self.names.end,
         };
-        nssmod::function(src.name(), n) != 0
+        if reads_files(src, n) {
+            return true;
+        }
+        if src.is(b"dns") {
+            return false;
+        }
+        source_fn(src, n) != 0
     }
     fn call_set(&mut self, src: &nssmod::Source, stay: i32) -> i32 {
         unsafe {
-            if nssent::is_files(src) {
+            if reads_files(src, self.names.set) {
                 return setent::<E>(self.slot);
             }
-            let f = nssmod::function(src.name(), self.names.set);
+            let f = source_fn(src, self.names.set);
             if f == 0 {
                 return ST_UNAVAIL;
             }
@@ -91,7 +99,7 @@ impl<E: Entry> nssent::EntOps for PwOps<'_, E> {
     }
     fn call_get(&mut self, src: &nssmod::Source) -> i32 {
         unsafe {
-            if nssent::is_files(src) {
+            if reads_files(src, self.names.get) {
                 if self.slot.is_none() {
                     let saved = errno::get();
                     let st = setent::<E>(self.slot);
@@ -102,7 +110,7 @@ impl<E: Entry> nssent::EntOps for PwOps<'_, E> {
                 }
                 return internal_getent::<E, _>(self.slot.as_mut().unwrap(), self.res, self.buf, self.len);
             }
-            let f = nssmod::function(src.name(), self.names.get);
+            let f = source_fn(src, self.names.get);
             if f == 0 {
                 return ST_UNAVAIL;
             }
@@ -113,11 +121,11 @@ impl<E: Entry> nssent::EntOps for PwOps<'_, E> {
     }
     fn call_end(&mut self, src: &nssmod::Source) {
         unsafe {
-            if nssent::is_files(src) {
+            if reads_files(src, self.names.end) {
                 endent(self.slot);
                 return;
             }
-            let f = nssmod::function(src.name(), self.names.end);
+            let f = source_fn(src, self.names.end);
             if f != 0 {
                 let f: unsafe extern "C" fn() -> c_int = core::mem::transmute(f);
                 f();

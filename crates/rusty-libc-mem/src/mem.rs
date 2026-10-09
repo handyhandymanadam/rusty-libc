@@ -1,4 +1,4 @@
-use crate::simd::{self, PAGE, Sse2, Vector, full, low_bits, pair, same_page};
+use crate::simd::{self, NT_COPY_FROM, PAGE, SET_LARGE_FROM, Sse2, Vector, full, low_bits, pair, same_page};
 use core::arch::asm;
 use core::ffi::{c_int, c_void};
 use core::ptr::null_mut;
@@ -163,8 +163,9 @@ pair!(memcpy_sse2, memcpy_avx2, memcpy_impl, (d: *mut u8, s: *const u8, n: usize
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
-    simd::avx2_front!(
+    simd::avx2_front_x!(
         MEMCPY,
+        [ntc = sym NT_COPY_FROM, large = sym memcpy_large],
         "mov rax, rdi",
         "cmp rdx, 32",
         "ja 20f",
@@ -258,6 +259,8 @@ pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: usize)
         "ret",
         ".p2align 4",
         "50:",
+        "cmp rdx, qword ptr [rip + {ntc}]",
+        "jae {large}",
         "vmovdqu ymm4, [rsi]",
         "vmovdqu ymm5, [rsi + rdx - 128]",
         "vmovdqu ymm6, [rsi + rdx - 96]",
@@ -294,8 +297,9 @@ pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: usize)
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn memmove(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
-    simd::avx2_front!(
+    simd::avx2_front_x!(
         MEMMOVE,
+        [ntc = sym NT_COPY_FROM, large = sym memcpy_large],
         "mov rax, rdi",
         "cmp rdx, 32",
         "ja 20f",
@@ -393,6 +397,8 @@ pub unsafe extern "C" fn memmove(dest: *mut c_void, src: *const c_void, n: usize
         "sub rcx, rsi",
         "cmp rcx, rdx",
         "jb 60f",
+        "cmp rdx, qword ptr [rip + {ntc}]",
+        "jae {large}",
         "vmovdqu ymm4, [rsi]",
         "vmovdqu ymm5, [rsi + rdx - 128]",
         "vmovdqu ymm6, [rsi + rdx - 96]",
@@ -532,11 +538,112 @@ pub(crate) unsafe fn memset_impl<V: Vector>(d: *mut u8, c: c_int, n: usize) -> *
 
 pair!(memset_sse2, memset_avx2, memset_impl, (d: *mut u8, c: c_int, n: usize) -> *mut u8);
 
+pub(crate) unsafe extern "C" fn memcpy_large(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
+    unsafe {
+        let apart = (d as usize).wrapping_sub(s as usize) >= n && (s as usize).wrapping_sub(d as usize) >= n;
+        if apart { copy_streaming(d, s, n) } else { memmove_avx2(d, s, n) }
+    }
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn copy_streaming(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
+    use core::arch::x86_64::*;
+    unsafe {
+        let head0 = _mm256_loadu_si256(s.cast());
+        let head1 = _mm256_loadu_si256(s.add(32).cast());
+        let mut tail = [_mm256_setzero_si256(); 4];
+        for (k, t) in tail.iter_mut().enumerate() {
+            *t = _mm256_loadu_si256(s.add(n - 128 + 32 * k).cast());
+        }
+        let off = (s as usize).wrapping_sub(d as usize);
+        let mut dp = ((d as usize + 64) & !63) as *mut u8;
+        let end = d.add(n - 128);
+        while dp < end {
+            let sp = dp.wrapping_add(off) as *const u8;
+            _mm_prefetch::<_MM_HINT_T0>(sp.wrapping_add(1024).cast());
+            _mm_prefetch::<_MM_HINT_T0>(sp.wrapping_add(1088).cast());
+            let a = _mm256_loadu_si256(sp.cast());
+            let b = _mm256_loadu_si256(sp.add(32).cast());
+            let c = _mm256_loadu_si256(sp.add(64).cast());
+            let e = _mm256_loadu_si256(sp.add(96).cast());
+            _mm256_stream_si256(dp.cast(), a);
+            _mm256_stream_si256(dp.add(32).cast(), b);
+            _mm256_stream_si256(dp.add(64).cast(), c);
+            _mm256_stream_si256(dp.add(96).cast(), e);
+            dp = dp.add(128);
+        }
+        _mm_sfence();
+        _mm256_storeu_si256(d.cast(), head0);
+        _mm256_storeu_si256(d.add(32).cast(), head1);
+        for (k, t) in tail.iter().enumerate() {
+            _mm256_storeu_si256(d.add(n - 128 + 32 * k).cast(), *t);
+        }
+        d
+    }
+}
+
+pub(crate) unsafe extern "C" fn memset_large(d: *mut u8, c: c_int, n: usize) -> *mut u8 {
+    unsafe {
+        if n >= simd::NT_SET_FROM.load(core::sync::atomic::Ordering::Relaxed) {
+            set_streaming(d, c as u8, n)
+        } else {
+            set_zmm(d, c as u8, n)
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn set_streaming(d: *mut u8, c: u8, n: usize) -> *mut u8 {
+    use core::arch::x86_64::*;
+    unsafe {
+        let v = _mm256_set1_epi8(c as i8);
+        _mm256_storeu_si256(d.cast(), v);
+        _mm256_storeu_si256(d.add(32).cast(), v);
+        let mut dp = ((d as usize + 64) & !63) as *mut u8;
+        let end = d.add(n - 128);
+        while dp < end {
+            _mm256_stream_si256(dp.cast(), v);
+            _mm256_stream_si256(dp.add(32).cast(), v);
+            _mm256_stream_si256(dp.add(64).cast(), v);
+            _mm256_stream_si256(dp.add(96).cast(), v);
+            dp = dp.add(128);
+        }
+        _mm_sfence();
+        for k in 0..4 {
+            _mm256_storeu_si256(d.add(n - 128 + 32 * k).cast(), v);
+        }
+        d
+    }
+}
+
+#[target_feature(enable = "avx512f,avx512bw")]
+pub(crate) unsafe fn set_zmm(d: *mut u8, c: u8, n: usize) -> *mut u8 {
+    use core::arch::x86_64::*;
+    unsafe {
+        let v = _mm512_set1_epi8(c as i8);
+        _mm512_storeu_si512(d.cast(), v);
+        let mut dp = ((d as usize + 64) & !63) as *mut u8;
+        let end = d.add(n - 256);
+        while dp < end {
+            _mm512_store_si512(dp.cast(), v);
+            _mm512_store_si512(dp.add(64).cast(), v);
+            _mm512_store_si512(dp.add(128).cast(), v);
+            _mm512_store_si512(dp.add(192).cast(), v);
+            dp = dp.add(256);
+        }
+        for k in 0..4 {
+            _mm512_storeu_si512(d.add(n - 256 + 64 * k).cast(), v);
+        }
+        d
+    }
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn memset(dest: *mut c_void, c: c_int, n: usize) -> *mut c_void {
-    simd::avx2_front!(
+    simd::avx2_front_x!(
         MEMSET,
+        [setl = sym SET_LARGE_FROM, large = sym memset_large],
         "vmovd xmm0, esi",
         "mov rax, rdi",
         "cmp rdx, 32",
@@ -574,6 +681,8 @@ pub unsafe extern "C" fn memset(dest: *mut c_void, c: c_int, n: usize) -> *mut c
         "ret",
         ".p2align 4",
         "50:",
+        "cmp rdx, qword ptr [rip + {setl}]",
+        "jae 70f",
         "vmovdqu [rdi], ymm0",
         "lea rcx, [rdi + rdx - 128]",
         "lea rsi, [rdi + 32]",
@@ -593,6 +702,10 @@ pub unsafe extern "C" fn memset(dest: *mut c_void, c: c_int, n: usize) -> *mut c
         "vmovdqu [rcx + 96], ymm0",
         "vzeroupper",
         "ret",
+        ".p2align 4",
+        "70:",
+        "vzeroupper",
+        "jmp {large}",
         ".p2align 4",
         "20:",
         "vpbroadcastb xmm0, xmm0",

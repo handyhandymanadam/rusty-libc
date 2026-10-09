@@ -134,6 +134,47 @@ fn round_checked(fast: D, precise: impl FnOnce() -> D) -> f64 {
     if fabs(l) + eps >= half_ulp { precise().0 } else { h }
 }
 
+const E_PRECISE: f64 = 7.888609052210118e-31;
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn rounds_away(neg: bool) -> bool {
+    dd::rounding_control() == if neg { 1 } else { 2 }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn rounds_away(neg: bool) -> bool {
+    let h = black_box(f64::from_bits(0x3ca0_0000_0200_0000));
+    if neg { -1.0 - h < -1.0 } else { 1.0 + h > 1.0 }
+}
+
+#[inline(always)]
+fn round_dir(h: f64, l: f64, eps: f64, away: bool) -> Option<f64> {
+    let r = h + l;
+    let t = (h - r) + l;
+    if fabs(t) <= eps {
+        return None;
+    }
+    let b = r.to_bits();
+    Some(if away {
+        if t > 0.0 { f64::from_bits(b + 1) } else { r }
+    } else if t < 0.0 {
+        f64::from_bits(b - 1)
+    } else {
+        r
+    })
+}
+
+#[inline(always)]
+fn tiny_result(r: f64, uflow: bool) -> f64 {
+    if uflow {
+        black_box(black_box(f64::MIN_POSITIVE) * black_box(f64::MIN_POSITIVE));
+        set_errno(ERANGE);
+    }
+    inexact(r)
+}
+
 macro_rules! fma_thunks {
     ($($t:ident = $i:ident($($a:ident: $ty:ty),*) -> $r:ty;)*) => {$(
         #[target_feature(enable = "fma")]
@@ -188,22 +229,48 @@ fma_thunks! {
     atan2pif_fma = atan2pif_impl(y: f32, x: f32) -> f32;
 }
 
+macro_rules! nofma_entries {
+    ($($t:ident = $i:ident($($a:ident: $ty:ty),*) -> $r:ty;)*) => {$(
+        #[inline(never)]
+        fn $t($($a: $ty),*) -> $r {
+            $i::<false>($($a),*)
+        }
+    )*};
+}
+
+nofma_entries! {
+    sin_nofma = sin_impl(x: f64) -> f64;
+    cos_nofma = cos_impl(x: f64) -> f64;
+    tan_nofma = tan_impl(x: f64) -> f64;
+    sincos_nofma = sincos_impl(x: f64) -> (f64, f64);
+    atan_nofma = atan_impl(x: f64) -> f64;
+    atan2_nofma = atan2_impl(y: f64, x: f64) -> f64;
+    atan2pi_nofma = atan2pi_impl(y: f64, x: f64) -> f64;
+    atanpi_nofma = atanpi_impl(x: f64) -> f64;
+    asinh_nofma = asinh_impl(x: f64) -> f64;
+    acosh_nofma = acosh_impl(x: f64) -> f64;
+    atanh_nofma = atanh_impl(x: f64) -> f64;
+}
+
 const SMALL_END_BITS: u64 = direct::SMALL_END.to_bits();
 const DIRECT_END_BITS: u64 = direct::DIRECT_MAX.to_bits();
+
+directed_paths!(sin_impl_dir_fma, sin_impl_dir_plain, sin_fma, sin_nofma, (x: f64) -> f64);
 
 #[inline(always)]
 fn sin_impl<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !SIGN;
     if F {
         if ab.wrapping_sub(TINY) < SMALL_END_BITS - TINY {
+            directed!(F, sin_impl_dir_fma, sin_impl_dir_plain, (x));
             if let Some(r) = direct::sin_small::<F>(x) {
                 return r;
             }
-        } else if ab >= SMALL_END_BITS
-            && ab < DIRECT_END_BITS
-            && let Some(r) = direct::sin_zv::<F>(x)
-        {
-            return r;
+        } else if ab >= SMALL_END_BITS && ab < DIRECT_END_BITS {
+            directed!(F, sin_impl_dir_fma, sin_impl_dir_plain, (x));
+            if let Some(r) = direct::sin_zv::<F>(x) {
+                return r;
+            }
         }
     }
     if ab < TINY {
@@ -212,23 +279,27 @@ fn sin_impl<const F: bool>(x: f64) -> f64 {
     if ab >= INF_BITS {
         return nonfinite_arg(x);
     }
+    directed!(F, sin_impl_dir_fma, sin_impl_dir_plain, (x));
     let (h, l) = direct::sin_pair::<F>(x);
     h + l
 }
+
+directed_paths!(cos_impl_dir_fma, cos_impl_dir_plain, cos_fma, cos_nofma, (x: f64) -> f64);
 
 #[inline(always)]
 fn cos_impl<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !SIGN;
     if F {
         if ab.wrapping_sub(TINY) < SMALL_END_BITS - TINY {
+            directed!(F, cos_impl_dir_fma, cos_impl_dir_plain, (x));
             if let Some(r) = direct::cos_small::<F>(x) {
                 return r;
             }
-        } else if ab >= SMALL_END_BITS
-            && ab < DIRECT_END_BITS
-            && let Some(r) = direct::cos_zv::<F>(x)
-        {
-            return r;
+        } else if ab >= SMALL_END_BITS && ab < DIRECT_END_BITS {
+            directed!(F, cos_impl_dir_fma, cos_impl_dir_plain, (x));
+            if let Some(r) = direct::cos_zv::<F>(x) {
+                return r;
+            }
         }
     }
     if ab < TINY {
@@ -237,14 +308,18 @@ fn cos_impl<const F: bool>(x: f64) -> f64 {
     if ab >= INF_BITS {
         return nonfinite_arg(x);
     }
+    directed!(F, cos_impl_dir_fma, cos_impl_dir_plain, (x));
     let (h, l) = direct::cos_pair::<F>(x);
     h + l
 }
+
+directed_paths!(tan_impl_dir_fma, tan_impl_dir_plain, tan_fma, tan_nofma, (x: f64) -> f64);
 
 #[inline(always)]
 fn tan_impl<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !SIGN;
     if F && ab.wrapping_sub(TINY) < SMALL_END_BITS - TINY {
+        directed!(F, tan_impl_dir_fma, tan_impl_dir_plain, (x));
         return direct::tan_small::<F>(x);
     }
     if ab < TINY {
@@ -253,9 +328,12 @@ fn tan_impl<const F: bool>(x: f64) -> f64 {
     if ab >= INF_BITS {
         return nonfinite_arg(x);
     }
+    directed!(F, tan_impl_dir_fma, tan_impl_dir_plain, (x));
     let (h, l) = direct::tan_pair::<F>(x);
     h + l
 }
+
+directed_paths!(sincos_impl_dir_fma, sincos_impl_dir_plain, sincos_fma, sincos_nofma, (x: f64) -> (f64, f64));
 
 #[inline(always)]
 fn sincos_impl<const F: bool>(x: f64) -> (f64, f64) {
@@ -267,6 +345,7 @@ fn sincos_impl<const F: bool>(x: f64) -> (f64, f64) {
         let r = nonfinite_arg(x);
         return (r, r);
     }
+    directed!(F, sincos_impl_dir_fma, sincos_impl_dir_plain, (x));
     let ((sh, sl), (ch, cl)) = direct::sincos_pair::<F>(x);
     (sh + sl, ch + cl)
 }
@@ -278,7 +357,7 @@ pub extern "C" fn sin(x: f64) -> f64 {
         if has_fma() {
             unsafe { sin_fma(x) }
         } else {
-            sin_impl::<false>(x)
+            sin_nofma(x)
         }
     }
     if fma_ready() {
@@ -295,7 +374,7 @@ pub extern "C" fn cos(x: f64) -> f64 {
         if has_fma() {
             unsafe { cos_fma(x) }
         } else {
-            cos_impl::<false>(x)
+            cos_nofma(x)
         }
     }
     if fma_ready() {
@@ -312,7 +391,7 @@ pub extern "C" fn tan(x: f64) -> f64 {
         if has_fma() {
             unsafe { tan_fma(x) }
         } else {
-            tan_impl::<false>(x)
+            tan_nofma(x)
         }
     }
     if fma_ready() {
@@ -328,7 +407,7 @@ pub fn sin_cos(x: f64) -> (f64, f64) {
         if has_fma() {
             unsafe { sincos_fma(x) }
         } else {
-            sincos_impl::<false>(x)
+            sincos_nofma(x)
         }
     }
     if fma_ready() {
@@ -391,14 +470,18 @@ fn acos_impl<const F: bool>(x: f64) -> f64 {
     h + l
 }
 
+directed_paths!(atan_impl_dir_fma, atan_impl_dir_plain, atan_fma, atan_nofma, (x: f64) -> f64);
+
 #[inline(always)]
 fn atan_impl<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !SIGN;
-    if F
-        && ab.wrapping_sub(TINY) < inv::ATAN_ZV_END.to_bits() - TINY
-        && let Some(r) = inv::atan_zv::<F>(x)
-    {
-        return r;
+    if F && ab.wrapping_sub(TINY) < inv::ATAN_ZV_END.to_bits() - TINY {
+        if ab <= 0x3ff0_0000_0000_0000 {
+            directed!(F, atan_impl_dir_fma, atan_impl_dir_plain, (x));
+        }
+        if let Some(r) = inv::atan_zv::<F>(x) {
+            return r;
+        }
     }
     if ab < TINY {
         return tiny_x(x);
@@ -406,6 +489,7 @@ fn atan_impl<const F: bool>(x: f64) -> f64 {
     if ab >= INF_BITS {
         return if ab > INF_BITS { black_box(x) + black_box(x) } else { inexact(copysign(PIO2.0, x)) };
     }
+    directed!(F, atan_impl_dir_fma, atan_impl_dir_plain, (x));
     let (h, l) = inv::atan_pair::<F>(x);
     h + l
 }
@@ -465,6 +549,9 @@ fn atan2_core<const F: bool>(ay: f64, ax: f64, xneg: bool, pi_mode: bool) -> f64
     if pi_mode { mul::<F>(a, INV_PI).0 } else { a.0 + a.1 }
 }
 
+directed_paths!(atan2_impl_dir_fma, atan2_impl_dir_plain, atan2_fma, atan2_nofma, (y: f64, x: f64) -> f64);
+directed_paths!(atan2pi_impl_dir_fma, atan2pi_impl_dir_plain, atan2pi_fma, atan2pi_nofma, (y: f64, x: f64) -> f64);
+
 #[inline(always)]
 fn atan2_gen<const F: bool>(y: f64, x: f64, pi_mode: bool) -> f64 {
     if y.is_nan() || x.is_nan() {
@@ -494,6 +581,11 @@ fn atan2_gen<const F: bool>(y: f64, x: f64, pi_mode: bool) -> f64 {
     }
     if pi_mode && ay == ax {
         return copysign(if xneg { 0.75 } else { 0.25 }, y);
+    }
+    if pi_mode {
+        directed!(F, atan2pi_impl_dir_fma, atan2pi_impl_dir_plain, (y, x));
+    } else {
+        directed!(F, atan2_impl_dir_fma, atan2_impl_dir_plain, (y, x));
     }
     copysign(atan2_core::<F>(ay, ax, xneg, pi_mode), y)
 }
@@ -544,7 +636,7 @@ pub extern "C" fn atan(x: f64) -> f64 {
         if has_fma() {
             unsafe { atan_fma(x) }
         } else {
-            atan_impl::<false>(x)
+            atan_nofma(x)
         }
     }
     if fma_ready() {
@@ -561,7 +653,7 @@ pub extern "C" fn atan2(y: f64, x: f64) -> f64 {
         if has_fma() {
             unsafe { atan2_fma(y, x) }
         } else {
-            atan2_impl::<false>(y, x)
+            atan2_nofma(y, x)
         }
     }
     if fma_ready() {
@@ -635,8 +727,38 @@ fn tanh_impl<const F: bool>(x: f64) -> f64 {
     copysign(hyp::tanh_pos::<F>(fabs(x)), x)
 }
 
+#[cold]
+#[inline(never)]
+fn asinh_directed(x: f64) -> f64 {
+    let ab = x.to_bits() & !SIGN;
+    let away = rounds_away(x < 0.0);
+    if ab < TINY {
+        let r = if away { x } else { f64::from_bits(x.to_bits() - 1) };
+        return tiny_result(r, fabs(r) < f64::MIN_POSITIVE);
+    }
+    let m = {
+        let _g = NearestGuard::new();
+        let ax = dd::launder(fabs(x));
+        let (h, l) = lg::asinh_pos::<false>(ax);
+        round_dir(h, l, fast::eps(h, if ax < 0.5 { E_ASINH_ROWS } else { E_LOG }), away).unwrap_or_else(|| {
+            let (h, l) = kern::asinh_pos::<false, true>(ax);
+            round_dir(h, l, fabs(h) * E_PRECISE, away).unwrap_or(h)
+        })
+    };
+    copysign(m, x)
+}
+
 #[inline(always)]
 fn asinh_impl<const F: bool>(x: f64) -> f64 {
+    let ab = x.to_bits() & !SIGN;
+    if ab.wrapping_sub(1) < INF_BITS - 1 && !dd::is_nearest() {
+        return asinh_directed(x);
+    }
+    asinh_body::<F>(x)
+}
+
+#[inline(always)]
+fn asinh_body<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !SIGN;
     if unlikely(ab < TINY) {
         if ab != 0 && ab < 0x0010_0000_0000_0000 {
@@ -656,6 +778,19 @@ fn asinh_impl<const F: bool>(x: f64) -> f64 {
     copysign(round_checked(kern::asinh_pos::<F, false>(ax), || kern::asinh_pos::<F, true>(ax)), x)
 }
 
+#[cold]
+#[inline(never)]
+fn acosh_directed(x: f64) -> f64 {
+    let away = rounds_away(false);
+    let _g = NearestGuard::new();
+    let x = dd::launder(x);
+    let (h, l) = lg::acosh_pos::<false>(x);
+    round_dir(h, l, fast::eps(h, if x < 2.0 { E_ACOSH_ROWS } else { E_LOG }), away).unwrap_or_else(|| {
+        let (h, l) = kern::acosh_pos::<false, true>(x);
+        round_dir(h, l, fabs(h) * E_PRECISE, away).unwrap_or(h)
+    })
+}
+
 #[inline(always)]
 fn acosh_impl<const F: bool>(x: f64) -> f64 {
     if unlikely(x.is_nan()) {
@@ -670,6 +805,9 @@ fn acosh_impl<const F: bool>(x: f64) -> f64 {
     if x == 1.0 {
         return 0.0;
     }
+    if !dd::is_nearest() {
+        return acosh_directed(x);
+    }
     let (h, l) = lg::acosh_pos::<F>(x);
     if let Some(r) = fast::finish(h, l, fast::eps(h, if x < 2.0 { E_ACOSH_ROWS } else { E_LOG })) {
         return r;
@@ -678,8 +816,39 @@ fn acosh_impl<const F: bool>(x: f64) -> f64 {
     round_checked(kern::acosh_pos::<F, false>(x), || kern::acosh_pos::<F, true>(x))
 }
 
+#[cold]
+#[inline(never)]
+fn atanh_directed(x: f64) -> f64 {
+    let ab = x.to_bits() & !SIGN;
+    let away = rounds_away(x < 0.0);
+    if ab < TINY {
+        let r = if away { f64::from_bits(x.to_bits() + 1) } else { x };
+        return tiny_result(r, ab < 0x0010_0000_0000_0000);
+    }
+    let m = {
+        let _g = NearestGuard::new();
+        let ax = dd::launder(fabs(x));
+        let (h, l) = lg::atanh_pos::<false>(ax);
+        let e = if ax < 0.5 { E_ATANH_ROWS } else if ax < ATANH_ROWS_TO { E_ATANH_WIDE } else { E_LOG };
+        round_dir(h, l, fast::eps(h, e), away).unwrap_or_else(|| {
+            let (h, l) = kern::atanh_pos::<false, true>(ax);
+            round_dir(h, l, fabs(h) * E_PRECISE, away).unwrap_or(h)
+        })
+    };
+    copysign(m, x)
+}
+
 #[inline(always)]
 fn atanh_impl<const F: bool>(x: f64) -> f64 {
+    let ab = x.to_bits() & !SIGN;
+    if ab.wrapping_sub(1) < 0x3ff0_0000_0000_0000 - 1 && !dd::is_nearest() {
+        return atanh_directed(x);
+    }
+    atanh_body::<F>(x)
+}
+
+#[inline(always)]
+fn atanh_body<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !SIGN;
     if unlikely(ab < TINY) {
         if ab != 0 && ab < 0x0010_0000_0000_0000 {
@@ -764,7 +933,7 @@ pub extern "C" fn asinh(x: f64) -> f64 {
         if has_fma() {
             unsafe { asinh_fma(x) }
         } else {
-            asinh_impl::<false>(x)
+            asinh_nofma(x)
         }
     }
     if fma_ready() {
@@ -781,7 +950,7 @@ pub extern "C" fn acosh(x: f64) -> f64 {
         if has_fma() {
             unsafe { acosh_fma(x) }
         } else {
-            acosh_impl::<false>(x)
+            acosh_nofma(x)
         }
     }
     if fma_ready() {
@@ -798,7 +967,7 @@ pub extern "C" fn atanh(x: f64) -> f64 {
         if has_fma() {
             unsafe { atanh_fma(x) }
         } else {
-            atanh_impl::<false>(x)
+            atanh_nofma(x)
         }
     }
     if fma_ready() {
@@ -1067,8 +1236,23 @@ fn acospi_impl<const F: bool>(x: f64) -> f64 {
     mul::<F>(inv::acos_pair::<F>(x), INV_PI).0
 }
 
+directed_paths!(atanpi_impl_dir_fma, atanpi_impl_dir_plain, atanpi_fma, atanpi_nofma, (x: f64) -> f64);
+
 #[inline(always)]
 fn atanpi_impl<const F: bool>(x: f64) -> f64 {
+    let ab = x.to_bits() & !SIGN;
+    if ab.wrapping_sub(1) < INF_BITS - 1 && ab != 0x3ff0_0000_0000_0000 && !dd::is_nearest() {
+        return if F {
+            unsafe { atanpi_impl_dir_fma(x) }
+        } else {
+            atanpi_impl_dir_plain(x)
+        };
+    }
+    atanpi_body::<F>(x)
+}
+
+#[inline(always)]
+fn atanpi_body<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !SIGN;
     if ab.wrapping_sub(0x3c30_0000_0000_0000) < 0x7ff0_0000_0000_0000 - 0x3c30_0000_0000_0000 && ab != 0x3ff0_0000_0000_0000 {
         return copysign(mul::<F>(inv::atan_pos::<F>(fabs(x)), INV_PI).0, x);
@@ -1187,7 +1371,7 @@ pub extern "C" fn atanpi(x: f64) -> f64 {
         if has_fma() {
             unsafe { atanpi_fma(x) }
         } else {
-            atanpi_impl::<false>(x)
+            atanpi_nofma(x)
         }
     }
     if fma_ready() {
@@ -1204,7 +1388,7 @@ pub extern "C" fn atan2pi(y: f64, x: f64) -> f64 {
         if has_fma() {
             unsafe { atan2pi_fma(y, x) }
         } else {
-            atan2pi_impl::<false>(y, x)
+            atan2pi_nofma(y, x)
         }
     }
     if fma_ready() {

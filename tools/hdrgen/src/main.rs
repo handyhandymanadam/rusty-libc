@@ -48,6 +48,11 @@ fn main() {
             let libdir = arg(&args, "--libdir").unwrap_or_else(|| "/usr/lib64".into());
             versions::versions(&root, &libdir, arg(&args, "--out").map(PathBuf::from).as_deref());
         }
+        Some("stubsrc") => {
+            let lib = args.get(1).expect("stubsrc LIB BASE");
+            let base = PathBuf::from(args.get(2).expect("stubsrc LIB BASE"));
+            versions::stubsrc(&root, lib, &base);
+        }
         Some("linkstubs") => {
             let out = PathBuf::from(args.get(1).expect("linkstubs OUTDIR"));
             versions::linkstubs(&root, &out);

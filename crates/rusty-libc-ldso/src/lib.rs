@@ -18,6 +18,197 @@ pub mod util;
 #[path = "../../rusty-libc-core/src/tunables.rs"]
 mod tunables;
 
+pub mod ldebug {
+    use super::sys;
+
+    pub const LIBS: u32 = 1 << 0;
+    pub const IMPCALLS: u32 = 1 << 1;
+    pub const BINDINGS: u32 = 1 << 2;
+    pub const SYMBOLS: u32 = 1 << 3;
+    pub const VERSIONS: u32 = 1 << 4;
+    pub const RELOC: u32 = 1 << 5;
+    pub const FILES: u32 = 1 << 6;
+    pub const STATISTICS: u32 = 1 << 7;
+    pub const UNUSED: u32 = 1 << 8;
+    pub const SCOPES: u32 = 1 << 9;
+    pub const HELP: u32 = 1 << 10;
+    pub const TLS: u32 = 1 << 11;
+    pub const SECURITY: u32 = 1 << 12;
+
+    static mut MASK: u32 = 0;
+    static mut FD: i32 = 2;
+
+    const OPTS: [(&[u8], &[u8], u32); 13] = [
+        (b"libs", b"display library search paths", LIBS | IMPCALLS),
+        (b"reloc", b"display relocation processing", RELOC | IMPCALLS),
+        (b"files", b"display progress for input file", FILES | IMPCALLS),
+        (b"symbols", b"display symbol table processing", SYMBOLS | IMPCALLS),
+        (b"bindings", b"display information about symbol binding", BINDINGS | IMPCALLS),
+        (b"versions", b"display version dependencies", VERSIONS | IMPCALLS),
+        (b"scopes", b"display scope information", SCOPES),
+        (b"tls", b"display TLS structures processing", TLS),
+        (b"security", b"show security warnings for input files", SECURITY),
+        (b"all", b"all previous options combined", LIBS | RELOC | FILES | SYMBOLS | BINDINGS | VERSIONS | IMPCALLS | SCOPES | TLS | SECURITY),
+        (b"statistics", b"display relocation statistics", STATISTICS),
+        (b"unused", b"determined unused DSOs", UNUSED),
+        (b"help", b"display this help message and exit", HELP),
+    ];
+
+    pub fn mask() -> u32 {
+        unsafe { MASK }
+    }
+
+    pub fn parse(v: &[u8]) {
+        let mut m = 0;
+        for w in v.split(|&c| c == b' ' || c == b',' || c == b':').filter(|w| !w.is_empty()) {
+            match OPTS.iter().find(|o| o.0 == w) {
+                Some(o) => m |= o.2,
+                None => {
+                    let mut o = super::Out::new(2);
+                    o.bytes(b"warning: debug option `");
+                    o.bytes(w);
+                    o.bytes(b"' unknown; try LD_DEBUG=help\n");
+                }
+            }
+        }
+        unsafe { MASK |= m };
+        if m & HELP != 0 {
+            let mut o = super::Out::new(1);
+            o.bytes(b"Valid options for the LD_DEBUG environment variable are:\n\n");
+            for (name, text, _) in OPTS {
+                o.bytes(b"  ");
+                o.bytes(name);
+                o.bytes(&b"         "[name.len() - 3..]);
+                o.bytes(text);
+                o.bytes(b"\n");
+            }
+            o.bytes(b"\nTo direct the debugging output into a file instead of standard output\na filename can be specified using the LD_DEBUG_OUTPUT environment variable.\n");
+            drop(o);
+            sys::exit(0);
+        }
+    }
+
+    pub fn open_output(name: &[u8]) {
+        if unsafe { MASK } == 0 {
+            return;
+        }
+        let mut path = [0u8; 4096 + 24];
+        if name.len() > 4096 {
+            return;
+        }
+        path[..name.len()].copy_from_slice(name);
+        let mut n = name.len();
+        path[n] = b'.';
+        n += 1;
+        n += dec(unsafe { sys::syscall3(sys::SYS_GETPID, 0, 0, 0) } as u64, &mut path[n..]);
+        path[n] = 0;
+        const FLAGS: usize = 0o1 | 0o2000 | 0o100 | 0o400000;
+        let fd = unsafe { sys::syscall6(sys::SYS_OPENAT, sys::AT_FDCWD as usize, path.as_ptr() as usize, FLAGS, 0o666, 0, 0) };
+        unsafe { FD = if fd < 0 { 1 } else { fd as i32 } };
+    }
+
+    fn dec(mut v: u64, out: &mut [u8]) -> usize {
+        let mut t = [0u8; 20];
+        let mut i = t.len();
+        loop {
+            i -= 1;
+            t[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        let n = t.len() - i;
+        out[..n].copy_from_slice(&t[i..]);
+        n
+    }
+
+    pub fn write(msg: &[u8]) {
+        let mut tag = [b' '; 12];
+        let mut d = [0u8; 20];
+        let n = dec(unsafe { sys::syscall3(sys::SYS_GETPID, 0, 0, 0) } as u64, &mut d);
+        let n = n.min(10);
+        tag[10 - n..10].copy_from_slice(&d[..n]);
+        tag[10] = b':';
+        tag[11] = b'\t';
+        let mut o = super::Out::new(unsafe { FD });
+        for line in msg.split_inclusive(|&c| c == b'\n') {
+            o.bytes(&tag);
+            o.bytes(line);
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn __libc_ldso_debug_mask() -> u32 {
+        mask()
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __libc_ldso_debug_write(buf: *const u8, len: usize) {
+        write(unsafe { core::slice::from_raw_parts(buf, len) });
+    }
+}
+
+mod tunable_api {
+    use super::tunables::{Ty, Values, COUNT, LIST};
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct TunableVal {
+        a: u64,
+        b: u64,
+    }
+
+    static mut VALS: [TunableVal; COUNT] = {
+        let mut v = [TunableVal { a: 0, b: 0 }; COUNT];
+        let mut i = 0;
+        while i < COUNT {
+            v[i].a = LIST[i].def as u64;
+            i += 1;
+        }
+        v
+    };
+    static mut INIT: [bool; COUNT] = [false; COUNT];
+
+    pub unsafe fn store(t: &Values<'_>) {
+        unsafe {
+            for (i, x) in t.0.iter().enumerate() {
+                VALS[i] = match x.str {
+                    Some(s) if LIST[i].ty == Ty::Str => TunableVal { a: s.as_ptr() as u64, b: s.len() as u64 },
+                    _ => TunableVal { a: x.num as u64, b: 0 },
+                };
+                INIT[i] = x.initialized;
+            }
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __tunable_get_val(id: u32, valp: *mut u8, callback: Option<unsafe extern "C" fn(*mut TunableVal)>) {
+        let i = id as usize;
+        if i >= COUNT {
+            return;
+        }
+        unsafe {
+            let cur = &raw mut VALS[i];
+            match LIST[i].ty {
+                Ty::I32 => *(valp as *mut i32) = (*cur).a as i32,
+                Ty::U64 | Ty::Size => *(valp as *mut u64) = (*cur).a,
+                Ty::Str => *(valp as *mut *const TunableVal) = cur,
+            }
+            if INIT[i] {
+                if let Some(cb) = callback {
+                    cb(cur);
+                }
+            }
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn __tunable_is_initialized(id: u32) -> bool {
+        unsafe { (id as usize) < COUNT && INIT[id as usize] }
+    }
+}
+
 use elf::*;
 use map::*;
 use util::*;
@@ -66,7 +257,7 @@ unsafe fn order_chain() {
     let s = st();
     let mut all: [*mut LinkMap; MAX_MAPS] = [core::ptr::null_mut(); MAX_MAPS];
     let mut n = 0;
-    let mut c = s.head;
+    let mut c = ns(0).head;
     while !c.is_null() && n < MAX_MAPS {
         all[n] = c;
         n += 1;
@@ -86,8 +277,8 @@ unsafe fn order_chain() {
             push(m, &mut new);
         }
     }
-    for i in 0..s.nglobal {
-        push(s.global[i], &mut new);
+    for i in 0..ns(0).nglobal {
+        push(ns(0).scope()[i], &mut new);
     }
     for &m in &all[..n] {
         push(m, &mut new);
@@ -99,8 +290,8 @@ unsafe fn order_chain() {
         (*new[i]).l_prev = if i == 0 { core::ptr::null_mut() } else { new[i - 1] };
         (*new[i]).l_next = if i + 1 == k { core::ptr::null_mut() } else { new[i + 1] };
     }
-    s.head = new[0];
-    s.tail = new[k - 1];
+    ns(0).head = new[0];
+    ns(0).tail = new[k - 1];
 }
 
 pub fn die(args: core::fmt::Arguments) -> ! {
@@ -270,19 +461,18 @@ unsafe fn join_names(a: *const u8, b: &[u8]) -> *const u8 {
 }
 
 unsafe fn add_global(m: *mut LinkMap) {
-    let s = st();
-    if (*m).in_global || s.nglobal >= MAX_MAPS {
+    if (*m).in_global {
         return;
     }
-    s.global[s.nglobal] = m;
-    s.nglobal += 1;
-    (*m).in_global = true;
+    if ns((*m).l_ns as usize).push_global(m) {
+        (*m).in_global = true;
+    }
 }
 
 unsafe fn load_closure(from: usize) -> bool {
     let mut i = from;
-    while i < st().nglobal {
-        let m = st().global[i];
+    while i < ns(0).nglobal {
+        let m = ns(0).scope()[i];
         i += 1;
         if (*m).is_ldso {
             continue;
@@ -298,7 +488,7 @@ unsafe fn load_closure(from: usize) -> bool {
             if !ok {
                 return;
             }
-            let d = load_library(name, m);
+            let d = load_library((*m).l_ns as usize, name, m);
             if d.is_null() {
                 ok = kind != 0;
                 return;
@@ -347,6 +537,8 @@ pub unsafe fn build_scope(m: *mut LinkMap) {
 
 static mut INIT_COUNTER: usize = 0;
 
+pub static mut INIT_ENV: *mut *mut u8 = core::ptr::null_mut();
+
 type InitFn = unsafe extern "C" fn(i32, *mut *mut u8, *mut *mut u8);
 
 pub unsafe fn call_init(m: *mut LinkMap) {
@@ -357,13 +549,14 @@ pub unsafe fn call_init(m: *mut LinkMap) {
     INIT_COUNTER += 1;
     (*m).init_seq = INIT_COUNTER;
     let s = st();
+    let envp = if INIT_ENV.is_null() { s.envp } else { INIT_ENV };
     if (*m).init != 0 {
         let f: InitFn = core::mem::transmute((*m).init);
-        f(s.argc as i32, s.argv, s.envp);
+        f(s.argc as i32, s.argv, envp);
     }
     for i in 0..(*m).init_arraysz / 8 {
         let f: InitFn = core::mem::transmute(*(*m).init_array.add(i));
-        f(s.argc as i32, s.argv, s.envp);
+        f(s.argc as i32, s.argv, envp);
     }
 }
 
@@ -421,12 +614,11 @@ unsafe fn init_sorted(list: &[*mut LinkMap; 256], n: usize, first: *mut LinkMap,
 }
 
 pub unsafe fn init_global() {
-    let s = st();
     let mut list = [core::ptr::null_mut::<LinkMap>(); 256];
     let mut n = 0;
-    for i in 0..s.nglobal {
+    for i in 0..ns(0).nglobal {
         if n < 256 {
-            list[n] = s.global[i];
+            list[n] = ns(0).scope()[i];
             n += 1;
         }
     }
@@ -434,8 +626,8 @@ pub unsafe fn init_global() {
         return;
     }
     if n >= 256 {
-        for i in 0..s.nglobal {
-            let m = s.global[i];
+        for i in 0..ns(0).nglobal {
+            let m = ns(0).scope()[i];
             if !(*m).is_main {
                 init_tree(m, false);
             }
@@ -485,6 +677,11 @@ pub unsafe extern "C" fn __libc_ldso_init_main(_argc: i32, _argv: *mut *mut u8, 
     if !m.is_null() && !(*m).init_called {
         call_init(m);
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __libc_ldso_auxv() -> *const usize {
+    st().auxv
 }
 
 #[unsafe(no_mangle)]
@@ -582,8 +779,34 @@ unsafe fn fini_order(n: usize) -> *mut [*mut LinkMap; MAX_MAPS] {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _dl_fini() {
+    for auditing in [false, true] {
+        if auditing {
+            audit::finish();
+        }
+        for nsid in (0..st().nns).rev() {
+            if audit::is_audit_ns(nsid) != auditing {
+                continue;
+            }
+            fini_namespace(nsid);
+        }
+    }
+}
+
+unsafe fn fini_namespace(nsid: usize) {
+    let head = ns(nsid).head;
+    let mut audit = false;
+    if audit::active() && !audit::is_audit_ns(nsid) {
+        let mut cur = head;
+        while !cur.is_null() {
+            audit |= (*cur).audit_opened && !(*cur).is_vdso;
+            cur = (*cur).l_next;
+        }
+    }
+    if audit {
+        audit::activity_ns(nsid, audit::LA_ACT_DELETE);
+    }
     let mut n = 0;
-    let mut cur = st().head;
+    let mut cur = ns(nsid).head;
     while !cur.is_null() && n < MAX_MAPS {
         (*(&raw mut SORT_MAPS))[n] = cur;
         n += 1;
@@ -596,9 +819,21 @@ pub unsafe extern "C" fn _dl_fini() {
             if (*m).init_called && !(*m).fini_called && !(*m).is_ldso {
                 run_fini(m);
             }
+            if audit && !(*m).is_ldso && !(*m).is_vdso {
+                audit::objclose_once(m);
+            }
         }
     }
-    audit::close_all();
+    if audit {
+        let mut cur = head;
+        while !cur.is_null() {
+            if (*cur).is_ldso {
+                audit::objclose_once(cur);
+            }
+            cur = (*cur).l_next;
+        }
+        audit::activity_ns(nsid, audit::LA_ACT_CONSISTENT);
+    }
 }
 
 pub unsafe fn run_fini(m: *mut LinkMap) {
@@ -627,8 +862,63 @@ pub struct RDebug {
     pub r_next: *mut RDebug,
 }
 
+pub const RT_CONSISTENT: i32 = 0;
+pub const RT_ADD: i32 = 1;
+pub const RT_DELETE: i32 = 2;
+
 #[unsafe(no_mangle)]
 pub static mut _r_debug: RDebug = RDebug { version: 1, map: core::ptr::null_mut(), brk: 0, state: 0, ldbase: 0, r_next: core::ptr::null_mut() };
+
+static mut R_DEBUG_ARRAY: [RDebug; DL_NNS - 1] =
+    [const { RDebug { version: 0, map: core::ptr::null_mut(), brk: 0, state: 0, ldbase: 0, r_next: core::ptr::null_mut() } }; DL_NNS - 1];
+
+static mut R_DEBUG_MAIN: *mut RDebug = core::ptr::null_mut();
+
+pub unsafe fn rdebug(ns: usize) -> *mut RDebug {
+    if ns == 0 { &raw mut _r_debug } else { &raw mut R_DEBUG_ARRAY[ns - 1] }
+}
+
+pub unsafe fn debug_update(ns: usize) -> *mut RDebug {
+    let r = rdebug(ns);
+    if (*r).map.is_null() {
+        (*r).map = map::ns(ns).head;
+    }
+    r
+}
+
+pub unsafe fn debug_change_state(r: *mut RDebug, state: i32) {
+    (*r).state = state;
+    if r == &raw mut _r_debug && !R_DEBUG_MAIN.is_null() {
+        (*R_DEBUG_MAIN).state = state;
+    }
+    _dl_debug_state();
+}
+
+pub unsafe fn debug_initialize(ns: usize) -> *mut RDebug {
+    let r = rdebug(ns);
+    if (*r).brk == 0 {
+        (*r).ldbase = (*st().ldso_map).l_addr;
+        (*r).brk = _dl_debug_state as usize;
+        if ns != 0 {
+            (*r).version = 2;
+            if ns == 1 {
+                _r_debug.r_next = r;
+                _r_debug.version = 2;
+            } else {
+                R_DEBUG_ARRAY[ns - 2].r_next = r;
+            }
+        } else {
+            (*r).version = 1;
+        }
+    }
+    if (*r).map.is_null() {
+        (*r).map = map::ns(ns).head;
+        if ns == 0 && !R_DEBUG_MAIN.is_null() {
+            (*R_DEBUG_MAIN).map = (*r).map;
+        }
+    }
+    r
+}
 
 #[unsafe(no_mangle)]
 pub static mut __libc_stack_end: usize = 0;
@@ -657,14 +947,16 @@ pub unsafe extern "C" fn _dl_x86_get_cpu_features() -> *mut u8 {
 
 #[unsafe(no_mangle)]
 #[inline(never)]
-pub extern "C" fn _dl_debug_state() {}
+pub extern "C" fn _dl_debug_state() {
+    unsafe { core::arch::asm!("", options(nostack, preserves_flags)) }
+}
 
 unsafe fn preload_names(list: &[u8], from: &[u8]) {
     for name in list.split(|&c| c == b':' || c == b' ' || c == b'\t' || c == b'\n') {
         if name.is_empty() {
             continue;
         }
-        let d = load_library(name, core::ptr::null_mut());
+        let d = load_library(0, name, core::ptr::null_mut());
         if d.is_null() {
             let e = error_str();
             let e = e.strip_prefix(name).and_then(|r| r.strip_prefix(b": ")).unwrap_or(e);
@@ -770,6 +1062,7 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
     s.stack_exec = (0..at_phnum).map(|i| &*(at_phdr as *const Phdr).add(i)).find(|p| p.typ == PT_GNU_STACK).is_none_or(|p| p.flags & PF_X != 0);
 
     let mut tunables_env = false;
+    let mut tvals = tunables::Values::default();
     if !s.secure {
         if let Some(v) = tunables::find_env(envp) {
             tunables_env = true;
@@ -780,11 +1073,35 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
             }
             s.map32 = t.prefer_map_32bit_exec;
             s.execstack_mode = t.execstack;
+            s.tls_nns = t.nns;
+            s.tls_optional = t.optional_static_tls;
+            tvals = t.values;
         }
     }
+    if !s.secure {
+        let mut alias: [Option<&[u8]>; tunables::COUNT] = [None; tunables::COUNT];
+        let mut e = envp;
+        while !(*e).is_null() {
+            let v = cstr(*e);
+            if let Some(i) = tunables::LIST.iter().position(|d| !d.alias.is_empty() && env_value(v, d.alias).is_some()) {
+                alias[i] = env_value(v, tunables::LIST[i].alias);
+            }
+            e = e.add(1);
+        }
+        for (i, a) in alias.iter().enumerate() {
+            if let Some(v) = *a
+                && !tvals.0[i].initialized
+                && !tvals.initialize(i, v)
+            {
+                tunables::warning_text(&tunables::Warning::BadValue(v, tunables::LIST[i].name), v, &mut |b| Out::new(2).bytes(b));
+            }
+        }
+    }
+    tunable_api::store(&tvals);
 
     let mut e = envp;
     let mut debug_libs = false;
+    let mut debug_output: Option<&[u8]> = None;
     let mut stats = false;
     let mut prof_name: *const u8 = core::ptr::null();
     let mut prof_out: *const u8 = core::ptr::null();
@@ -833,11 +1150,18 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
             if let Some(x) = env_value(v, b"LD_DEBUG") {
                 stats = x.windows(10).any(|w| w == b"statistics");
                 s.trace_unused = x.windows(6).any(|w| w == b"unused");
+                ldebug::parse(x);
             }
+        }
+        if !s.secure && let Some(x) = env_value(v, b"LD_DEBUG_OUTPUT") {
+            debug_output = Some(x);
         }
         e = e.add(1);
     }
     s.debug = debug_libs;
+    if let Some(x) = debug_output {
+        ldebug::open_output(x);
+    }
     profile::configure(prof_name, prof_out);
     if s.secure {
         tunables::scrub_unsecure_env(envp);
@@ -940,7 +1264,7 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
             }
             sys::close(fd);
         }
-        let m = map_file(main_path, main_path, core::ptr::null_mut());
+        let m = map_file(0, main_path, main_path, core::ptr::null_mut());
         if verify {
             if m.is_null() {
                 sys::exit(1);
@@ -1044,6 +1368,7 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
         let phdr = at_phdr as *const Phdr;
         let mut bias = 0usize;
         let mut have_dyn = false;
+        let mut interp = None;
         for i in 0..at_phnum {
             let ph = &*phdr.add(i);
             if ph.typ == PT_PHDR {
@@ -1052,6 +1377,12 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
             if ph.typ == PT_DYNAMIC {
                 have_dyn = true;
             }
+            if ph.typ == PT_INTERP {
+                interp = Some(ph.vaddr as usize);
+            }
+        }
+        if let Some(v) = interp {
+            (*ldso).l_name = bias.wrapping_add(v) as *const u8;
         }
         if !have_dyn {
             die(format_args!("error while loading shared libraries: {}: cannot dynamically load executable", Bytes(cstr(s.prog_name))));
@@ -1113,9 +1444,9 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
     if !s.audit.is_null() {
         audit::load(cstr(s.audit), false);
     }
-    for i in 0..s.nglobal {
-        (*s.global[i]).nodelete = true;
-        (*s.global[i]).refcount += 1;
+    for i in 0..ns(0).nglobal {
+        (*ns(0).scope()[i]).nodelete = true;
+        (*ns(0).scope()[i]).refcount += 1;
     }
     if !check_versions() {
         eprint!("{}: {}\n", Bytes(cstr(s.prog_name)), Bytes(error_str()));
@@ -1136,8 +1467,8 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
         sys::exit(0);
     }
 
-    for i in 0..s.nglobal {
-        tls::add_module(s.global[i], true);
+    for i in 0..ns(0).nglobal {
+        tls::add_module(ns(0).scope()[i], true);
     }
     for i in 0..audit::au().nmaps {
         tls::add_module(audit::au().maps[i], true);
@@ -1171,18 +1502,6 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
         _dl_argv = argv;
     }
     if audit::au().n != 0 {
-        let mut i = s.nglobal;
-        while i > 0 {
-            i -= 1;
-            let m = s.global[i];
-            if (*m).is_ldso || !audit::in_audit_closure(m) {
-                continue;
-            }
-            if !reloc::relocate(m) {
-                let msg = error_str();
-                die(format_args!("{}", Bytes(msg)));
-            }
-        }
         let mut i = audit::au().nmaps;
         while i > 0 {
             i -= 1;
@@ -1192,11 +1511,11 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
                 die(format_args!("{}", Bytes(msg)));
             }
         }
-        if !reloc::apply_copy_relocs(s.main_map) {
-            let msg = error_str();
-            die(format_args!("{}", Bytes(msg)));
-        }
         for i in 0..audit::au().n {
+            let lm = ns((*audit::au().libs[i].map).l_ns as usize).libc_map;
+            if !lm.is_null() && !(*lm).init_called {
+                dl::call_libc_early_init(lm, false);
+            }
             init_tree(audit::au().libs[i].map, false);
         }
         audit::announce_open();
@@ -1204,8 +1523,8 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
 
     if tunables_env && !s.secure {
         let fl = lookup::Flags { plt: false, skip: core::ptr::null_mut(), newest: false };
-        for i in 0..s.nglobal {
-            let one = [s.global[i]];
+        for i in 0..ns(0).nglobal {
+            let one = [ns(0).scope()[i]];
             if let Some(f) = lookup::lookup(b"environ", None, &[&one], &fl) {
                 if (*f.sym).info & 0xf == STT_OBJECT {
                     *(lookup::sym_addr(&f) as *mut *mut *mut u8) = envp;
@@ -1213,10 +1532,10 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
             }
         }
     }
-    let mut i = s.nglobal;
+    let mut i = ns(0).nglobal;
     while i > 0 {
         i -= 1;
-        let m = s.global[i];
+        let m = ns(0).scope()[i];
         if (*m).is_ldso {
             continue;
         }
@@ -1243,10 +1562,24 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
     rtld_malloc_arm();
     profile::start();
     marks[6] = core::arch::x86_64::_rdtsc();
-    _r_debug.map = s.head;
+    _r_debug.map = ns(0).head;
     _r_debug.ldbase = base;
     _r_debug.brk = _dl_debug_state as usize;
-    _r_debug.state = 0;
+    _r_debug.state = RT_CONSISTENT;
+    {
+        let fl = lookup::Flags { plt: false, skip: core::ptr::null_mut(), newest: false };
+        if let Some(f) = lookup::lookup(b"_r_debug", None, &[ns(0).scope()], &fl) {
+            let a = lookup::sym_addr(&f) as *mut RDebug;
+            if (*f.sym).size as usize >= core::mem::offset_of!(RDebug, r_next) && a != &raw mut _r_debug {
+                (*a).version = 1;
+                (*a).map = _r_debug.map;
+                (*a).brk = _r_debug.brk;
+                (*a).state = _r_debug.state;
+                (*a).ldbase = _r_debug.ldbase;
+                R_DEBUG_MAIN = a;
+            }
+        }
+    }
     let mut d = (*main).l_ld;
     while (*d).tag != DT_NULL {
         if (*d).tag == DT_DEBUG {
@@ -1256,8 +1589,8 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
     }
     _dl_debug_state();
 
-    for i in 0..s.nglobal {
-        protect_relro(s.global[i]);
+    for i in 0..ns(0).nglobal {
+        protect_relro(ns(0).scope()[i]);
     }
     for i in 0..audit::au().nmaps {
         protect_relro(audit::au().maps[i]);
@@ -1288,12 +1621,12 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
 
 unsafe fn check_versions() -> bool {
     let s = st();
-    for i in 0..s.nglobal {
-        let m = s.global[i];
+    for i in 0..ns(0).nglobal {
+        let m = ns(0).scope()[i];
         let mut vn = (*m).verneed;
         for _ in 0..(*m).verneednum {
             let file = cstr((*m).strtab.add((*vn).file as usize));
-            let lib = find_loaded(file);
+            let lib = find_loaded(0, file);
             if !lib.is_null() && !(*lib).is_ldso {
                 let mut aux = (vn as *const u8).add((*vn).aux as usize) as *const Vernaux;
                 for _ in 0..(*vn).cnt {
@@ -1324,8 +1657,7 @@ unsafe fn check_versions() -> bool {
 
 pub(crate) unsafe fn bind_rtld_malloc() {
     unsafe {
-        let s = st();
-        let g = core::slice::from_raw_parts((&raw const s.global) as *const *mut LinkMap, s.nglobal);
+        let g = ns(0).scope();
         let fl = lookup::Flags { plt: false, skip: core::ptr::null_mut(), newest: true };
         let mut addr = [0usize; 3];
         for (i, name) in [&b"malloc"[..], &b"calloc"[..], &b"free"[..]].iter().enumerate() {
@@ -1342,18 +1674,17 @@ pub(crate) unsafe fn bind_rtld_malloc() {
 }
 
 unsafe fn trace_loaded(main: *mut LinkMap, ldso: *mut LinkMap, base: usize) {
-    let s = st();
     let mut o = Out::new(1);
     use core::fmt::Write;
-    let mut c = s.head;
+    let mut c = ns(0).head;
     while !c.is_null() {
         if (*c).is_vdso {
             let _ = write!(o, "\tlinux-vdso.so.1 (0x{:016x})\n", (*c).map_start);
         }
         c = (*c).l_next;
     }
-    for i in 0..s.nglobal {
-        let m = s.global[i];
+    for i in 0..ns(0).nglobal {
+        let m = ns(0).scope()[i];
         if m == main {
             continue;
         }
@@ -1374,10 +1705,10 @@ unsafe fn trace_loaded(main: *mut LinkMap, ldso: *mut LinkMap, base: usize) {
 
 unsafe fn find_needed_map(name: &[u8]) -> *mut LinkMap {
     let s = st();
-    let mut i = s.nglobal;
+    let mut i = ns(0).nglobal;
     while i > 0 {
         i -= 1;
-        let m = s.global[i];
+        let m = ns(0).scope()[i];
         if (!(*m).soname.is_null() && cstr((*m).soname) == name) || cstr((*m).l_name) == name {
             return m;
         }
@@ -1416,7 +1747,7 @@ unsafe fn trace_versions() {
     let s = st();
     let mut o = Out::new(1);
     let mut first = true;
-    let mut m = s.head;
+    let mut m = ns(0).head;
     while !m.is_null() {
         if (*m).verneed.is_null() || (*m).verneednum == 0 {
             m = (*m).l_next;
@@ -1494,10 +1825,10 @@ unsafe fn trace_warn(main: *mut LinkMap) {
     reloc::NOIFUNC = true;
     let plt = s.bind_now_env;
     scan_symbols(main, plt, true);
-    let mut i = s.nglobal;
+    let mut i = ns(0).nglobal;
     while i > 0 {
         i -= 1;
-        let m = s.global[i];
+        let m = ns(0).scope()[i];
         if m != main && !(*m).is_ldso {
             scan_symbols(m, plt, true);
         }

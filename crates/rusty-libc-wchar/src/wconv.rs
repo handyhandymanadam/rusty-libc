@@ -655,6 +655,82 @@ pub unsafe extern "C" fn wcstof128(_s: *const wchar_t, _endptr: *mut *mut wchar_
     )
 }
 
+unsafe fn with_group(s: *const wchar_t, endptr: *mut *mut wchar_t, group: c_int, conv: impl FnOnce(*const wchar_t, *mut *mut wchar_t)) {
+    use rusty_libc_stdlib::grouped::{self, Rewrite};
+    unsafe {
+        if group == 0 {
+            return conv(s, endptr);
+        }
+        let nu = rusty_libc_core::locale::numeric_of(rusty_libc_core::locale::current(rusty_libc_core::locale::LC_NUMERIC));
+        let sep = [nu.thousands_wc];
+        let r = grouped::rewrite(s, &sep, nu.grouping, is_space);
+        let empty: [wchar_t; 1] = [0];
+        let src: *const wchar_t = match &r {
+            Rewrite::Plain => return conv(s, endptr),
+            Rewrite::Zero => empty.as_ptr(),
+            Rewrite::Copy { buf, .. } => *buf as *const wchar_t,
+        };
+        let mut e: *mut wchar_t = core::ptr::null_mut();
+        conv(src, &mut e);
+        let consumed = e.offset_from(src) as usize;
+        let end = grouped::end_of(s, &r, consumed, 1);
+        grouped::release(r);
+        set_end(endptr, s, end);
+    }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __wcstod_internal(s: *const wchar_t, endptr: *mut *mut wchar_t, group: c_int) -> f64 {
+    let mut v = 0.0;
+    unsafe { with_group(s, endptr, group, |p, e| v = wcstod(p, e)) };
+    v
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __wcstof_internal(s: *const wchar_t, endptr: *mut *mut wchar_t, group: c_int) -> f32 {
+    let mut v = 0.0;
+    unsafe { with_group(s, endptr, group, |p, e| v = wcstof(p, e)) };
+    v
+}
+
+unsafe extern "C" fn wcstold_group_inner(s: *const wchar_t, endptr: *mut *mut wchar_t, out: *mut [u8; 16], group: c_int) {
+    unsafe { with_group(s, endptr, group, |p, e| wcstold_inner(p, e, out, 0)) }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[unsafe(naked)]
+pub unsafe extern "C" fn __wcstold_internal(_s: *const wchar_t, _endptr: *mut *mut wchar_t, _group: c_int) -> f64 {
+    naked_asm!(
+        "sub rsp, 24",
+        "mov ecx, edx",
+        "mov rdx, rsp",
+        "call {inner}",
+        "fld tbyte ptr [rsp]",
+        "add rsp, 24",
+        "ret",
+        inner = sym wcstold_group_inner,
+    )
+}
+
+unsafe extern "C" fn wcstof128_group_inner(s: *const wchar_t, endptr: *mut *mut wchar_t, out: *mut [u8; 16], group: c_int) {
+    unsafe { with_group(s, endptr, group, |p, e| wcstof128_inner(p, e, out, 0)) }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[unsafe(naked)]
+pub unsafe extern "C" fn __wcstof128_internal(_s: *const wchar_t, _endptr: *mut *mut wchar_t, _group: c_int) -> f64 {
+    naked_asm!(
+        "sub rsp, 24",
+        "mov ecx, edx",
+        "mov rdx, rsp",
+        "call {inner}",
+        "movups xmm0, xmmword ptr [rsp]",
+        "add rsp, 24",
+        "ret",
+        inner = sym wcstof128_group_inner,
+    )
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wcstof128_l(_s: *const wchar_t, _endptr: *mut *mut wchar_t, _locale: locale_t) -> f64 {

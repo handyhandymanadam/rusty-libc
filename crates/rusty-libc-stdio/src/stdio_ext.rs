@@ -9,12 +9,12 @@ pub unsafe extern "C" fn __fbufsize(f: *mut FILE) -> usize {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __fpending(f: *mut FILE) -> usize {
-    unsafe { if (*f).flags & file::F_WRMODE != 0 { (*f).wpos } else { 0 } }
+    unsafe { if (*f).flags & file::F_WRMODE != 0 { (*f).wpos() } else { 0 } }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __flbf(f: *mut FILE) -> c_int {
-    unsafe { c_int::from((*f).flags & file::F_LBF != 0) }
+    unsafe { ((*f).flags & file::F_LBF) as c_int }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -77,26 +77,26 @@ pub unsafe extern "C" fn __freadahead(f: *mut FILE) -> usize {
         if (*f).flags & file::F_WRMODE != 0 {
             return 0;
         }
-        let buffered = if (*f).flags & file::F_RDMODE != 0 { (*f).rend - (*f).rpos } else { 0 };
-        buffered + (*f).nunget
+        let buffered = if (*f).flags & file::F_RDMODE != 0 { (*f).rend() - (*f).rpos() } else { 0 };
+        buffered + (*f).nunget()
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __freadptr(f: *mut FILE, sizep: *mut usize) -> *const core::ffi::c_char {
     unsafe {
-        if (*f).flags & (file::F_WRMODE | file::F_RDMODE) != file::F_RDMODE || (*f).nunget > 0 || (*f).rpos >= (*f).rend {
+        if (*f).flags & (file::F_WRMODE | file::F_RDMODE) != file::F_RDMODE || (*f).nunget() > 0 || (*f).rpos() >= (*f).rend() {
             return core::ptr::null();
         }
-        *sizep = (*f).rend - (*f).rpos;
-        (*f).buf.add((*f).rpos).cast()
+        *sizep = (*f).rend() - (*f).rpos();
+        (*f).buf.add((*f).rpos()).cast()
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __freadptrinc(f: *mut FILE, inc: usize) {
     unsafe {
-        let room = (*f).rend - (*f).rpos;
-        (*f).rpos += inc.min(room);
+        let room = (*f).rend() - (*f).rpos();
+        (*f).set_rpos((*f).rpos() + inc.min(room));
     }
 }

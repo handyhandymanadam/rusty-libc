@@ -100,7 +100,9 @@ pub unsafe extern "C" fn __xmknodat(vers: c_int, dirfd: c_int, path: *const c_ch
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn __libc_freeres() {}
+pub extern "C" fn __libc_freeres() {
+    unsafe { rusty_libc_stdio::file::freeres() }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __libc_init_first(_argc: c_int, _argv: *mut *mut c_char, _envp: *mut *mut c_char) {}

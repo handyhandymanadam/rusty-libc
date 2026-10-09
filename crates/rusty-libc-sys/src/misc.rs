@@ -103,7 +103,7 @@ pub fn getrandom_r(buf: &mut [u8], flags: u32) -> Result<usize, Errno> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getrandom(buf: *mut c_void, len: usize, flags: c_uint) -> isize {
-    unsafe { sc(syscall3(rusty_libc_core::syscall::SYS_GETRANDOM, buf as usize, len, flags as usize)) }
+    unsafe { sc(rusty_libc_core::tls::syscall_cp(rusty_libc_core::syscall::SYS_GETRANDOM, buf as usize, len, flags as usize, 0, 0, 0)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

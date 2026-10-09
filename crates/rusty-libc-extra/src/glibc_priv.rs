@@ -83,6 +83,8 @@ pub unsafe extern "C" fn __libc_scratch_buffer_set_array_size(b: *mut ScratchBuf
     unsafe {
         let new_length = nelem.wrapping_mul(size);
         if size != 0 && new_length / size != nelem {
+            scratch_free(b);
+            scratch_init(b);
             errno::set(ENOMEM);
             return false;
         }

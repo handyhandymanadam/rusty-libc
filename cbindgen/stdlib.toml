@@ -5,7 +5,7 @@ no_includes = true
 sys_includes = ["stddef.h", "stdint.h"]
 
 [export]
-exclude = ["strtold", "strtold_l", "strtof64x", "strtof64x_l", "qecvt", "qfcvt", "qgcvt", "qecvt_r", "qfcvt_r", "strfroml", "strfromf32", "strfromf64", "strfromf32x", "strfromf64x", "strtof128", "strtof128_l", "strfromf128"]
+exclude = ["strtold", "strtold_l", "strtof64x", "strtof64x_l", "qecvt", "qfcvt", "qgcvt", "qecvt_r", "qfcvt_r", "strfroml", "strfromf32", "strfromf64", "strfromf32x", "strfromf64x", "strtof128", "strtof128_l", "strfromf128", "__strtod_internal", "__strtof_internal", "__strtold_internal", "__strtof128_internal"]
 [export.rename]
 "Compare" = "__compar_fn_t"
 "CompareArg" = "__compar_d_fn_t"

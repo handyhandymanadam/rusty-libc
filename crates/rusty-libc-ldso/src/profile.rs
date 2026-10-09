@@ -96,7 +96,7 @@ unsafe fn name_matches(name: &[u8], m: *mut LinkMap) -> bool {
     if cstr((*m).l_name) == name || (!(*m).soname.is_null() && cstr((*m).soname) == name) {
         return true;
     }
-    let mut x = st().head;
+    let mut x = ns(0).head;
     while !x.is_null() {
         let mut k = 0usize;
         let mut hit = false;

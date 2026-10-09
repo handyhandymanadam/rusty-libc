@@ -575,6 +575,26 @@ unsafe fn internal_get(hostp: *mut *mut c_char, userp: *mut *mut c_char, domainp
     }
 }
 
+pub(crate) struct PrivNetgr {
+    d: NetGrent,
+    ord: nssmod::Order,
+}
+
+impl PrivNetgr {
+    pub(crate) const fn new() -> PrivNetgr {
+        PrivNetgr { d: NetGrent::new(), ord: nssmod::Order::EMPTY }
+    }
+    pub(crate) unsafe fn set(&mut self, group: *const u8) -> bool {
+        unsafe { internal_set(group, &mut self.d, &mut self.ord) }
+    }
+    pub(crate) unsafe fn get(&mut self, host: *mut *mut c_char, user: *mut *mut c_char, domain: *mut *mut c_char, buffer: *mut u8, buflen: usize) -> c_int {
+        unsafe { internal_get(host, user, domain, &mut self.d, &mut self.ord, buffer, buflen) }
+    }
+    pub(crate) unsafe fn end(&mut self) {
+        unsafe { internal_end(&mut self.d, &self.ord) }
+    }
+}
+
 struct Lock(AtomicBool);
 static LOCK: Lock = Lock(AtomicBool::new(false));
 static mut DATASET: NetGrent = NetGrent::new();

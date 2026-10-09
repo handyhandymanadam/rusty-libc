@@ -1,5 +1,7 @@
 use crate::dns::{self, Addr, HostData};
 use crate::inet;
+use crate::nssdns::{self, Outcome};
+use crate::wire;
 use crate::nss::{self, Action, Db, Entry, LineReader, Source, Status};
 use crate::strerr::set_h_errno;
 use crate::types::*;
@@ -385,46 +387,122 @@ fn files_hosts(name: &[u8], af: c_int, v4mapped: bool, out: &mut HostData) -> Sr
     if found { (Status::Success, NETDB_SUCCESS) } else { (Status::NotFound, HOST_NOT_FOUND) }
 }
 
-fn dns_hosts(cfg: &dns::Config, name: &[u8], af: c_int, out: &mut HostData) -> SrcResult {
+pub(crate) fn dns_hosts(cfg: &dns::Config, name: &[u8], af: c_int, out: &mut HostData) -> SrcResult {
     if !crate::resolv::hostname_ok(name) {
         out.h = HOST_NOT_FOUND;
         return (Status::NotFound, HOST_NOT_FOUND);
     }
-    let mut best: Option<c_int> = None;
-    let mut any = false;
-    let fams: &[c_int] = match af {
-        AF_UNSPEC => &[AF_INET, AF_INET6],
-        AF_INET => &[AF_INET],
-        _ => &[AF_INET6],
+    let olderr = errno::get();
+    let o = match af {
+        AF_INET | AF_INET6 => dns_host_one(cfg, name, af, out),
+        AF_UNSPEC => dns_host_pair(cfg, name, out),
+        _ => Outcome { status: Status::Unavail, h_errno: Some(NO_DATA), errno: Some(EAFNOSUPPORT) },
     };
-    for &fam in fams {
-        if fam == AF_INET6 && cfg.options & dns::RES_NOAAAA != 0 {
-            continue;
+    if o.status != Status::Success {
+        out.n = 0;
+        out.addrs.clear();
+        out.aliases.clear();
+        out.naliases = 0;
+        out.have_canon = false;
+    }
+    errno::set(o.errno.unwrap_or(olderr));
+    if let Some(h) = o.h_errno {
+        out.h = h;
+    }
+    (o.status, out.h)
+}
+
+struct HostCollect<'a> {
+    out: &'a mut HostData,
+    last: Option<Buf<{ nssdns::MAXHOST + 1 }>>,
+}
+
+impl HostCollect<'_> {
+    fn finish(&mut self) {
+        if let Some(l) = self.last.take() {
+            self.out.canon = Buf::from(l.as_bytes()).unwrap_or_default();
+            self.out.have_canon = true;
         }
-        match dns::lookup_host(cfg, name, fam, out) {
-            Ok(()) => any = true,
-            Err(e) => {
-                let rank = |h: c_int| match h {
-                    TRY_AGAIN => 3,
-                    NO_RECOVERY => 2,
-                    NO_DATA => 1,
-                    _ => 0,
-                };
-                if best.map(|b| rank(e.h) > rank(b)).unwrap_or(true) {
-                    best = Some(e.h);
-                }
-            }
+    }
+}
+
+fn push_addr(out: &mut HostData, a: &[u8]) {
+    let mut b = [0u8; 16];
+    b[..a.len()].copy_from_slice(a);
+    out.push(Addr { family: if a.len() == 4 { AF_INET } else { AF_INET6 }, bytes: b, scope: 0 });
+}
+
+impl nssdns::HostSink for HostCollect<'_> {
+    fn alias(&mut self, name: &[u8]) {
+        if let Some(prev) = self.last.take() {
+            self.out.add_alias(prev.as_bytes());
+        }
+        self.last = Buf::from(name);
+    }
+    fn addr(&mut self, a: &[u8]) {
+        push_addr(self.out, a);
+    }
+}
+
+struct TupleCollect<'a>(&'a mut HostData);
+
+impl nssdns::TupleSink for TupleCollect<'_> {
+    fn tuple(&mut self, _family: c_int, addr: &[u8], canon: Option<&[u8]>) {
+        push_addr(self.0, addr);
+        if let Some(c) = canon {
+            self.0.canon = Buf::from(c).unwrap_or_default();
+            self.0.have_canon = true;
         }
     }
-    if any {
-        return (Status::Success, NETDB_SUCCESS);
+}
+
+fn keep_ttl(out: &mut HostData, ttl: i32) {
+    if ttl != i32::MAX {
+        out.ttl = out.ttl.min(ttl.max(0) as u32);
     }
-    let h = best.unwrap_or(HOST_NOT_FOUND);
-    out.h = h;
-    match h {
-        TRY_AGAIN => (Status::TryAgain, TRY_AGAIN),
-        h => (Status::NotFound, h),
+}
+
+fn dns_host_one(cfg: &dns::Config, name: &[u8], af: c_int, out: &mut HostData) -> Outcome {
+    let qtype = if af == AF_INET { wire::T_A } else { wire::T_AAAA };
+    let mut first = [0u8; 4096];
+    let mut ans = dns::Answer::growable(&mut first);
+    let n = match dns::search_in(cfg, name, wire::C_IN, qtype, &mut ans) {
+        Ok(n) => n,
+        Err(e) => return nssdns::query_failure(&e),
+    };
+    let mut ttl = i32::MAX;
+    let mut sink = HostCollect { out, last: None };
+    let o = nssdns::parse_host(ans.kept(n), qtype, &mut sink, &mut ttl);
+    sink.finish();
+    keep_ttl(out, ttl);
+    o
+}
+
+pub(crate) fn query_a_aaaa<'a>(cfg: &dns::Config, name: &[u8], a1: &mut dns::Answer<'a>, a2: &mut dns::Answer<'a>) -> Result<(usize, Option<usize>), Outcome> {
+    if cfg.options & dns::RES_NOAAAA != 0 {
+        return match dns::search_in(cfg, name, wire::C_IN, wire::T_A, a1) {
+            Ok(n) => Ok((n, None)),
+            Err(e) => Err(nssdns::query_failure(&e)),
+        };
     }
+    let flags = unsafe { &mut (*crate::resolv::__res_state()).flags };
+    match dns::search_pair(cfg, name, a1, a2, flags) {
+        Ok((n1, n2)) => Ok((n1, Some(n2))),
+        Err(e) => Err(nssdns::query_failure(&e)),
+    }
+}
+
+fn dns_host_pair(cfg: &dns::Config, name: &[u8], out: &mut HostData) -> Outcome {
+    let (mut f4, mut f6) = ([0u8; 4096], [0u8; 4096]);
+    let (mut a4, mut a6) = (dns::Answer::growable(&mut f4), dns::Answer::growable(&mut f6));
+    let (n1, n2) = match query_a_aaaa(cfg, name, &mut a4, &mut a6) {
+        Ok(l) => l,
+        Err(o) => return o,
+    };
+    let mut ttl = i32::MAX;
+    let o = nssdns::parse_a_aaaa(a4.kept(n1), n2.map(|n| a6.kept(n)), &mut TupleCollect(out), &mut ttl);
+    keep_ttl(out, ttl);
+    o
 }
 
 pub(crate) fn src_lookup(e: &Entry, name: &[u8], af: c_int, v4mapped: bool, out: &mut HostData) -> (Status, c_int) {
@@ -677,11 +755,12 @@ pub fn lookup_name(name: &[u8], af: c_int, v4mapped: bool, out: &mut HostData) -
     let mut status = Status::Unavail;
     let mut any = false;
     for e in &order.e[..order.n] {
-        let saved = if status == Status::Success { Some(*out) } else { None };
+        let mut saved = None;
         if status == Status::Success {
             let keep = (out.fit, out.func, out.h);
-            *out = HostData::new();
-            (out.fit, out.func, out.h) = keep;
+            let mut fresh = HostData::new();
+            (fresh.fit, fresh.func, fresh.h) = keep;
+            saved = Some(core::mem::replace(out, fresh));
         }
         out.called = e.src != Source::Module;
         let r = src_lookup(e, name, af, v4mapped, out);
@@ -784,6 +863,126 @@ fn digits_dots(name: &[u8], af: c_int, use_inet6: bool) -> Result<Option<(Addr, 
         }
     }
     Ok(None)
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __nss_hostname_digits_dots(
+    name: *const c_char,
+    resbuf: *mut hostent,
+    buffer: *mut *mut c_char,
+    buffer_size: *mut usize,
+    buflen: usize,
+    result: *mut *mut hostent,
+    status: *mut c_int,
+    af: c_int,
+    h_errnop: *mut c_int,
+) -> c_int {
+    const NSS_TRYAGAIN: c_int = -2;
+    const NSS_NOTFOUND: c_int = 0;
+    const NSS_SUCCESS: c_int = 1;
+    unsafe {
+        nss::hconf_init();
+        let nm = cbytes(name);
+        let fixed = buffer_size.is_null();
+        let fail = |h: c_int| {
+            if !h_errnop.is_null() {
+                *h_errnop = h;
+            }
+            if fixed {
+                *status = NSS_NOTFOUND;
+            } else {
+                *result = core::ptr::null_mut();
+            }
+        };
+        let c0 = nm.first().copied().unwrap_or(0);
+        if !(c0.is_ascii_hexdigit() || c0 == b':') {
+            return 0;
+        }
+        let need = 16 + 16 + 8 + nm.len() + 1;
+        if fixed {
+            if buflen < need {
+                *status = NSS_TRYAGAIN;
+                if !h_errnop.is_null() {
+                    *h_errnop = NETDB_INTERNAL;
+                }
+                errno::set(ERANGE);
+                return 1;
+            }
+        } else if *buffer_size < need {
+            *buffer_size = need;
+            let nb = rusty_libc_malloc::realloc((*buffer).cast(), need) as *mut c_char;
+            if nb.is_null() {
+                let save = errno::get();
+                rusty_libc_malloc::free((*buffer).cast());
+                *buffer = core::ptr::null_mut();
+                *buffer_size = 0;
+                errno::set(save);
+                if !h_errnop.is_null() {
+                    *h_errnop = NETDB_INTERNAL;
+                }
+                *result = core::ptr::null_mut();
+                return 1;
+            }
+            *buffer = nb;
+        }
+        let base = *buffer as *mut u8;
+        core::ptr::write_bytes(base, 0, need);
+        let found = match digits_dots(nm, af, use_inet6()) {
+            Ok(None) => return 0,
+            Err(h) => {
+                fail(h);
+                return 1;
+            }
+            Ok(Some(a)) => a,
+        };
+        let (a, fam) = found;
+        let len = if fam == AF_INET6 { 16 } else { 4 };
+        core::ptr::copy_nonoverlapping(a.bytes.as_ptr(), base, len);
+        let addrs = base.add(16) as *mut *mut c_char;
+        let aliases = base.add(32) as *mut *mut c_char;
+        let hname = base.add(40);
+        core::ptr::copy_nonoverlapping(nm.as_ptr(), hname, nm.len());
+        *addrs = base.cast();
+        *addrs.add(1) = core::ptr::null_mut();
+        *aliases = core::ptr::null_mut();
+        let r = &mut *resbuf;
+        r.h_name = hname.cast();
+        r.h_aliases = aliases;
+        r.h_addr_list = addrs;
+        r.h_addrtype = fam;
+        r.h_length = len as c_int;
+        if !h_errnop.is_null() {
+            *h_errnop = NETDB_SUCCESS;
+        }
+        if fixed {
+            *status = NSS_SUCCESS;
+        } else {
+            *result = resbuf;
+        }
+        1
+    }
+}
+
+fn dns_addr(cfg: &dns::Config, af: c_int, a: &[u8]) -> (Status, Option<c_int>, Option<Buf<256>>) {
+    let olderr = errno::get();
+    let rn = dns::reverse_name(af, a);
+    let mut first = [0u8; 4096];
+    let mut ans = dns::Answer::growable(&mut first);
+    let n = match dns::query_in(cfg, rn.as_bytes(), wire::C_IN, wire::T_PTR, &mut ans) {
+        Ok(n) => n,
+        Err(e) => {
+            errno::set(olderr);
+            return (Status::NotFound, Some(e.h), None);
+        }
+    };
+    let mut ttl = i32::MAX;
+    let mut nm = Buf::<{ nssdns::MAXHOST + 1 }>::new();
+    let o = nssdns::parse_ptr(ans.kept(n), &mut ttl, &mut nm);
+    if let Some(e) = o.errno {
+        errno::set(e);
+    }
+    let name = if o.status == Status::Success { Buf::from(nm.as_bytes()) } else { None };
+    (o.status, o.h_errno, name)
 }
 
 fn use_inet6() -> bool {
@@ -1001,16 +1200,12 @@ unsafe fn hostbyaddr_r_body(addr: *const c_void, len: u32, af: c_int, res: *mut 
                 }
                 Source::Dns => {
                     any = true;
-                    match dns::lookup_addr(&crate::resolv::current_config(), af, a) {
-                        Ok(n) => {
-                            name = Some(n);
-                            Status::Success
-                        }
-                        Err(he) => {
-                            h_out = he.h;
-                            Status::NotFound
-                        }
+                    let (st, h, nm) = dns_addr(&crate::resolv::current_config(), af, a);
+                    if let Some(h) = h {
+                        h_out = h;
                     }
+                    name = nm;
+                    st
                 }
                 Source::Module => {
                     let (st, h, asked) = module_addr(e.module_name(), af, a, h_out, &mut name, &mut aliases);
@@ -1313,14 +1508,7 @@ pub unsafe extern "C" fn getnetbyname_r(name: *const c_char, res: *mut netent, b
                 let f: unsafe extern "C" fn(*const c_char, *mut netent, *mut c_char, usize, *mut c_int, *mut c_int) -> c_int = core::mem::transmute(f);
                 f(name, res, buf, buflen, en, h_errnop)
             },
-            Some(&|en| {
-                if dns::net_name_query_refused(&crate::resolv::current_config(), nm) {
-                    *en = ECONNREFUSED;
-                    NSS_UNAVAIL
-                } else {
-                    NSS_NOTFOUND
-                }
-            }),
+            Some(&|en| crate::nssdns_abi::_nss_dns_getnetbyname_r(name, res, buf, buflen, en, h_errnop)),
         )
     }
 }
@@ -1345,15 +1533,7 @@ pub unsafe extern "C" fn getnetbyaddr_r(net: u32, ty: c_int, res: *mut netent, b
                 let f: unsafe extern "C" fn(u32, c_int, *mut netent, *mut c_char, usize, *mut c_int, *mut c_int) -> c_int = core::mem::transmute(f);
                 f(net, ty, res, buf, buflen, en, h_errnop)
             },
-            Some(&|_en| {
-                if ty != AF_INET {
-                    return NSS_UNAVAIL;
-                }
-                let olderr = errno::get();
-                let refused = dns::net_addr_query_refused(&crate::resolv::current_config(), net);
-                errno::set(olderr);
-                if refused { NSS_UNAVAIL } else { NSS_NOTFOUND }
-            }),
+            Some(&|en| crate::nssdns_abi::_nss_dns_getnetbyaddr_r(net, ty, res, buf, buflen, en, h_errnop)),
         )
     }
 }
@@ -1444,7 +1624,7 @@ pub unsafe extern "C" fn getrpcbynumber(number: c_int) -> *mut rpcent {
 pub unsafe extern "C" fn getnetbyname(name: *const c_char) -> *mut netent {
     let mut h = 0;
     let r = with_static(&NETENT_S, |res, buf, cap, out| unsafe { getnetbyname_r(name, res, buf, cap, out, &mut h) });
-    if r.is_null() {
+    if h != 0 {
         set_h_errno(h);
     }
     r
@@ -1454,7 +1634,7 @@ pub unsafe extern "C" fn getnetbyname(name: *const c_char) -> *mut netent {
 pub unsafe extern "C" fn getnetbyaddr(net: u32, ty: c_int) -> *mut netent {
     let mut h = 0;
     let r = with_static(&NETENT_S, |res, buf, cap, out| unsafe { getnetbyaddr_r(net, ty, res, buf, cap, out, &mut h) });
-    if r.is_null() {
+    if h != 0 {
         set_h_errno(h);
     }
     r

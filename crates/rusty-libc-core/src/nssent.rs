@@ -230,19 +230,34 @@ pub trait MergeOps {
 }
 
 pub fn dispatch(db: &[u8], func: &[u8], files: &dyn Fn() -> i32, call: &dyn Fn(usize, *mut i32) -> i32, merge: Option<&mut dyn MergeOps>) -> i32 {
-    dispatch_dns(db, func, files, call, merge, None)
+    dispatch_all(db, func, files, call, merge, None, 0)
 }
 
-pub fn dispatch_dns(db: &[u8], func: &[u8], files: &dyn Fn() -> i32, call: &dyn Fn(usize, *mut i32) -> i32, mut merge: Option<&mut dyn MergeOps>, dns: Option<&dyn Fn(*mut i32) -> i32>) -> i32 {
+pub fn dispatch_compat(db: &[u8], func: &[u8], files: &dyn Fn() -> i32, call: &dyn Fn(usize, *mut i32) -> i32, merge: Option<&mut dyn MergeOps>, compat_fn: usize) -> i32 {
+    dispatch_all(db, func, files, call, merge, None, compat_fn)
+}
+
+pub fn dispatch_dns(db: &[u8], func: &[u8], files: &dyn Fn() -> i32, call: &dyn Fn(usize, *mut i32) -> i32, merge: Option<&mut dyn MergeOps>, dns: Option<&dyn Fn(*mut i32) -> i32>) -> i32 {
+    dispatch_all(db, func, files, call, merge, dns, 0)
+}
+
+fn dispatch_all(db: &[u8], func: &[u8], files: &dyn Fn() -> i32, call: &dyn Fn(usize, *mut i32) -> i32, mut merge: Option<&mut dyn MergeOps>, dns: Option<&dyn Fn(*mut i32) -> i32>, compat_fn: usize) -> i32 {
     let order = nssmod::order(db);
     let mut status = NSS_UNAVAIL;
     let mut do_merge = false;
     for src in &order.e[..order.n] {
-        if is_files(src) {
+        let compat = compat_fn != 0 && src.is(b"compat");
+        if is_files(src) && !compat {
             status = files();
         } else {
             let is_dns = src.is(b"dns");
-            let f = if is_dns { 0 } else { nssmod::function(src.name(), func) };
+            let f = if compat {
+                compat_fn
+            } else if is_dns {
+                0
+            } else {
+                nssmod::function(src.name(), func)
+            };
             if f == 0 && !(is_dns && dns.is_some()) {
                 if src.action(NSS_UNAVAIL) != ACT_CONTINUE {
                     break;

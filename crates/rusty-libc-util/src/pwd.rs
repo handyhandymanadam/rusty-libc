@@ -547,6 +547,43 @@ impl Entry for Spwd {
     }
 }
 
+pub const PASSWD_FILE: &[u8] = Passwd::PATH;
+pub const GROUP_FILE: &[u8] = Group::PATH;
+pub const SHADOW_FILE: &[u8] = Spwd::PATH;
+
+pub struct CompatFile(FdStream);
+
+impl CompatFile {
+    pub unsafe fn open(path: &[u8]) -> Result<CompatFile, i32> {
+        unsafe { FdStream::open(path.as_ptr()).map(CompatFile) }
+    }
+    pub fn rewind(&mut self) {
+        self.0.rewind();
+    }
+    pub fn close(mut self) {
+        self.0.close();
+    }
+    pub fn tell(&mut self) -> i64 {
+        self.0.tell()
+    }
+    pub fn seek(&mut self, off: i64) {
+        self.0.seek(off);
+    }
+    pub unsafe fn next_passwd(&mut self, res: *mut Passwd, buf: *mut u8, len: usize) -> i32 {
+        unsafe { internal_getent::<Passwd, _>(&mut self.0, res, buf, len) }
+    }
+    pub unsafe fn next_group(&mut self, res: *mut Group, buf: *mut u8, len: usize) -> i32 {
+        unsafe { internal_getent::<Group, _>(&mut self.0, res, buf, len) }
+    }
+    pub unsafe fn next_spwd(&mut self, res: *mut Spwd, buf: *mut u8, len: usize) -> i32 {
+        unsafe { internal_getent::<Spwd, _>(&mut self.0, res, buf, len) }
+    }
+}
+
+pub unsafe fn files_initgroups_dyn(user: *const c_char, group: Gid, start: &mut i64, size: &mut i64, groups: &mut *mut Gid, limit: i64) {
+    unsafe { files_groups(user, group, size, groups, limit, start) }
+}
+
 const ST_TRYAGAIN: i32 = -2;
 const ST_UNAVAIL: i32 = -1;
 const ST_NOTFOUND: i32 = 0;
@@ -605,7 +642,21 @@ unsafe fn db_lookup<E: Entry>(result: *mut E, buffer: *mut u8, buflen: usize, ma
 }
 
 fn nss_dispatch(db: &[u8], func: &[u8], files: &dyn Fn() -> i32, call: &dyn Fn(usize, *mut c_int) -> i32) -> i32 {
-    nssent::dispatch(db, func, files, call, None)
+    nssent::dispatch_compat(db, func, files, call, None, compat_fn(func))
+}
+
+pub(crate) fn compat_fn(func: &[u8]) -> usize {
+    #[cfg(feature = "export")]
+    unsafe extern "C" {
+        fn __rl_nss_compat_function(name: *const u8, len: usize) -> usize;
+    }
+    #[cfg(feature = "export")]
+    return unsafe { __rl_nss_compat_function(func.as_ptr(), func.len()) };
+    #[cfg(not(feature = "export"))]
+    {
+        let _ = func;
+        0
+    }
 }
 
 unsafe fn copy_grp(src: &Group, buflen: usize, dest: *mut Group, destbuf: *mut u8, end: Option<&mut *mut u8>) -> c_int {
@@ -1122,7 +1173,7 @@ pub unsafe extern "C" fn getpw(uid: Uid, buf: *mut c_char) -> c_int {
 pub unsafe extern "C" fn getgrnam_r(name: *const c_char, resbuf: *mut Group, buffer: *mut c_char, buflen: usize, result: *mut *mut Group) -> c_int {
     unsafe {
         let mut gm = GrMerge::new(resbuf, buffer.cast(), buflen);
-        let status = nssent::dispatch(
+        let status = nssent::dispatch_compat(
             b"group",
             b"getgrnam_r",
             &|| db_lookup::<Group>(resbuf, buffer.cast(), buflen, &|r| !is_nis(name) && cstr_eq(name, r.gr_name)),
@@ -1131,6 +1182,7 @@ pub unsafe extern "C" fn getgrnam_r(name: *const c_char, resbuf: *mut Group, buf
                 f(name, resbuf, buffer, buflen, en)
             },
             Some(&mut gm),
+            compat_fn(b"getgrnam_r"),
         );
         finish_r(status, resbuf, result)
     }
@@ -1140,7 +1192,7 @@ pub unsafe extern "C" fn getgrnam_r(name: *const c_char, resbuf: *mut Group, buf
 pub unsafe extern "C" fn getgrgid_r(gid: Gid, resbuf: *mut Group, buffer: *mut c_char, buflen: usize, result: *mut *mut Group) -> c_int {
     unsafe {
         let mut gm = GrMerge::new(resbuf, buffer.cast(), buflen);
-        let status = nssent::dispatch(
+        let status = nssent::dispatch_compat(
             b"group",
             b"getgrgid_r",
             &|| db_lookup::<Group>(resbuf, buffer.cast(), buflen, &|r| r.gr_gid == gid && !is_nis(r.gr_name)),
@@ -1149,6 +1201,7 @@ pub unsafe extern "C" fn getgrgid_r(gid: Gid, resbuf: *mut Group, buffer: *mut c
                 f(gid, resbuf, buffer, buflen, en)
             },
             Some(&mut gm),
+            compat_fn(b"getgrgid_r"),
         );
         finish_r(status, resbuf, result)
     }
@@ -1365,11 +1418,12 @@ unsafe fn internal_getgrouplist(user: *const c_char, group: Gid, size: &mut i64,
         let mut prev_start: i64 = 1;
         for src in &order.e[..order.n] {
             let mut status = ST_UNAVAIL;
-            if src.is(b"files") || src.is(b"compat") {
+            let compat = if src.is(b"compat") { compat_fn(b"initgroups_dyn") } else { 0 };
+            if (src.is(b"files") || src.is(b"compat")) && compat == 0 {
                 files_groups(user, group, size, groups, limit, &mut start);
                 status = ST_SUCCESS;
             } else if !src.is(b"dns") {
-                let f = nssmod::function(src.name(), b"initgroups_dyn");
+                let f = if compat != 0 { compat } else { nssmod::function(src.name(), b"initgroups_dyn") };
                 if f == 0 {
                     if src.action(ST_UNAVAIL) != nssmod::ACT_CONTINUE {
                         break;

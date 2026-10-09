@@ -31,9 +31,11 @@ follow glibc sources, rewritten in Rust; the upstream licence applies):
   crates/rusty-libc-signal   psiginfo message strings, ucontext/setjmp structure
   crates/rusty-libc-pthread  cond, rwlock, barrier, once, sem, forced-unwind cancellation
   crates/rusty-libc-regex    parse, nfa, exec, collation contractions, step/advance
-  crates/rusty-libc-net      inet, ns_* and dn_* functions, res_debug, netgroups, rcmd, getaddrinfo_a
+  crates/rusty-libc-net      inet, ns_* and dn_* functions, res_debug, netgroups, rcmd, getaddrinfo_a,
+                             idna.rs (AI_IDN/AI_CANONIDN/NI_IDN, from inet/idna.c and idna_name_classify.c)
   crates/rusty-libc-fortify  the _chk functions and abort messages
-  crates/rusty-libc-stdio    translit.rs (C-locale transliteration table), printf extension registry, ftw
+  crates/rusty-libc-stdio    translit.rs (C-locale transliteration table), printf extension registry, ftw,
+                             file.rs FILE layout, flag bits and pushback area (libio struct _IO_FILE ABI)
   crates/rusty-libc-iconv    charset, composition, CJK and transliteration tables, gconv layouts
   crates/rusty-libc-ipc      aio, mq, notify
   crates/rusty-libc-extra    ftw/nftw, argp, spawn-related code, ttyent, fstab and related files
@@ -41,7 +43,8 @@ follow glibc sources, rewritten in Rust; the upstream licence applies):
   crates/rusty-libc-wchar    Charset::Other, wide-character tables
   crates/rusty-libc-rpc      Sun RPC and XDR (see entry 2)
   crates/rusty-libc-sys      legacy-versioned cfget/cfset speed functions
-  crates/rusty-libc-core     NSS plug-in loading and enumeration (nssmod), netgroup and alias parsing layout
+  crates/rusty-libc-core     NSS plug-in loading and enumeration (nssmod), netgroup and alias parsing layout,
+                             thread_db.rs (libthread_db descriptors, from nptl_db)
   crates/rusty-libc-time     strftime.rs (and wcsftime in rusty-libc-wchar wtime.rs)
   crates/rusty-libc-ctype    __ctype32_* tables (data measured from glibc)
   crates/rusty-libc-ldso     glibc elf/ and sprof behaviour read as reference (no code carried over)
@@ -273,7 +276,8 @@ Files: crates/rusty-libc-net/src/gai.rs (getaddrinfo, freeaddrinfo,
 getnameinfo: the service/protocol table, service tuples, address list
 handling, RFC 3484 label and precedence tables and the destination sorting
 rule order follow glibc nss/getaddrinfo.c and nss/getnameinfo.c, rewritten
-in Rust).
+in Rust); crates/rusty-libc-net/src/idna.rs (canonical-name processing
+follows process_canonname in nss/getaddrinfo.c).
 This software is Copyright 1996 by Craig Metz, All Rights Reserved.
 The two glibc files also carry the Free Software Foundation LGPL-2.1-or-later
 notice (entry 1).

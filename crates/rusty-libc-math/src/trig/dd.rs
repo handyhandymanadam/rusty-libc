@@ -245,6 +245,38 @@ fn write_mxcsr(v: u32) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn is_nearest() -> bool {
+    use core::arch::x86_64::{_mm_add_pd, _mm_cmpeq_pd, _mm_movemask_pd, _mm_set_pd};
+    unsafe {
+        let mut one = _mm_set_pd(-1.0, 1.0);
+        core::arch::asm!("/* {o} */", o = inout(xmm_reg) one, options(nomem, nostack, preserves_flags));
+        let h = _mm_set_pd(-f64::from_bits(0x3ca0_0000_0200_0000), f64::from_bits(0x3ca0_0000_0200_0000));
+        _mm_movemask_pd(_mm_cmpeq_pd(_mm_add_pd(one, h), one)) == 0
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn rounding_control() -> u32 {
+    (read_mxcsr() >> 13) & 3
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn launder(mut x: f64) -> f64 {
+    unsafe { core::arch::asm!("/* {x} */", x = inout(xmm_reg) x, options(nomem, nostack, preserves_flags)) };
+    x
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+pub fn launder(x: f64) -> f64 {
+    core::hint::black_box(x)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
 pub fn is_nearest() -> bool {
     let h = core::hint::black_box(f64::from_bits(0x3ca0_0000_0200_0000));
@@ -254,6 +286,11 @@ pub fn is_nearest() -> bool {
 }
 
 impl NearestGuard {
+    #[inline(always)]
+    pub fn new_if(cond: bool) -> NearestGuard {
+        if cond { NearestGuard::new() } else { NearestGuard(NO_RESTORE) }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     pub fn new() -> NearestGuard {

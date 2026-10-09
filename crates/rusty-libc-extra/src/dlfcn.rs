@@ -97,7 +97,38 @@ struct DlError {
 }
 
 #[thread_local]
-static mut ERR: DlError = DlError { state: State::None, errcode: 0, objname: [0; 300], errstring: [0; 100], message: [0; 560] };
+static mut ERR: *mut DlError = core::ptr::null_mut();
+
+unsafe extern "C" fn release_err(obj: *mut c_void) {
+    unsafe {
+        let slot = obj as *mut *mut DlError;
+        if !(*slot).is_null() {
+            rusty_libc_malloc::free(*slot as *mut c_void);
+        }
+        *slot = core::ptr::null_mut();
+    }
+}
+
+unsafe fn err_block(create: bool) -> Option<&'static mut DlError> {
+    unsafe {
+        if ERR.is_null() {
+            if !create {
+                return None;
+            }
+            let p = rusty_libc_malloc::malloc(core::mem::size_of::<DlError>()) as *mut DlError;
+            if p.is_null() {
+                return None;
+            }
+            core::ptr::write_bytes(p, 0, 1);
+            if !rusty_libc_core::tls::register_thread_dtor(release_err, (&raw mut ERR) as *mut c_void) {
+                rusty_libc_malloc::free(p as *mut c_void);
+                return None;
+            }
+            ERR = p;
+        }
+        Some(&mut *ERR)
+    }
+}
 
 fn copy_into(dst: &mut [u8], src: &[u8]) {
     let n = src.len().min(dst.len() - 1);
@@ -107,8 +138,7 @@ fn copy_into(dst: &mut [u8], src: &[u8]) {
 
 fn fail(objname: &[u8], errstring: &str, errcode: c_int) {
     unsafe {
-        #[allow(clippy::deref_addrof)]
-        let e = &mut *(&raw mut ERR);
+        let Some(e) = err_block(true) else { return };
         copy_into(&mut e.objname, objname);
         copy_into(&mut e.errstring, errstring.as_bytes());
         e.errcode = errcode;
@@ -118,17 +148,15 @@ fn fail(objname: &[u8], errstring: &str, errcode: c_int) {
 
 fn succeed() {
     unsafe {
-        #[allow(clippy::deref_addrof)]
-        let e = &mut *(&raw mut ERR);
-        e.state = State::None;
+        if let Some(e) = err_block(false) {
+            e.state = State::None;
+        }
     }
 }
 
 fn begin() {
     unsafe {
-        #[allow(clippy::deref_addrof)]
-        let e = &mut *(&raw mut ERR);
-        if e.state == State::Pending {
+        if let Some(e) = err_block(false).filter(|e| e.state == State::Pending) {
             e.state = State::None;
         }
     }
@@ -170,8 +198,7 @@ pub(crate) fn program_name_ptr() -> *const c_char {
 #[cfg_attr(all(feature = "export", not(feature = "shared")), unsafe(no_mangle))]
 pub extern "C" fn dlerror() -> *mut c_char {
     unsafe {
-        #[allow(clippy::deref_addrof)]
-        let e = &mut *(&raw mut ERR);
+        let Some(e) = err_block(false) else { return core::ptr::null_mut() };
         match e.state {
             State::None => core::ptr::null_mut(),
             State::Delivered => {

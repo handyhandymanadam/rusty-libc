@@ -26,20 +26,32 @@ unsafe fn learn_tls_from_loader() {
         crate::tls::DL_TLS_INIT.store(init, Ordering::Relaxed);
         let free = weak_got!("__libc_ldso_tls_free_block");
         crate::tls::DL_TLS_FREE.store(free, Ordering::Relaxed);
+        let mask = weak_got!("__libc_ldso_debug_mask");
+        let write = weak_got!("__libc_ldso_debug_write");
+        if mask != 0 && write != 0 && core::mem::transmute::<usize, unsafe extern "C" fn() -> u32>(mask)() & crate::tls::DL_DEBUG_TLS_BIT != 0 {
+            crate::tls::DL_DEBUG_WRITE.store(write, Ordering::Relaxed);
+        }
         let sync = weak_got!("__libc_ldso_tls_sync");
         crate::tls::DL_TLS_SYNC.store(sync, Ordering::Relaxed);
+        crate::tls::DL_FORK_CHILD.store(weak_got!("__libc_ldso_fork_child"), Ordering::Relaxed);
         crate::tls::MAIN_TP.store(crate::tls::current() as usize, Ordering::Relaxed);
+        if crate::lock::libc_initial() {
+            let f = weak_got!("__libc_ldso_tls_dbslots");
+            let slots = if f == 0 { 0 } else { core::mem::transmute::<usize, unsafe extern "C" fn() -> usize>(f)() };
+            crate::thread_db::init(crate::tls::current(), slots);
+        }
     }
 }
 
 unsafe extern "C" fn libc_init(argc: c_int, argv: *mut *mut c_char, envp: *mut *mut c_char) {
     unsafe {
         environ = envp;
-        let mut p = envp;
-        while !(*p).is_null() {
-            p = p.add(1);
-        }
-        let mut aux = p.add(1) as *const usize;
+        let ask = if crate::lock::libc_initial() { 0 } else { weak_got!("__libc_ldso_auxv") };
+        let auxv = match ask {
+            0 => crate::start::auxv_after(envp),
+            f => core::mem::transmute::<usize, unsafe extern "C" fn() -> *const u64>(f)(),
+        };
+        let mut aux = auxv as *const usize;
         while *aux != 0 {
             if *aux == 33 {
                 crate::start::set_sysinfo_ehdr(*aux.add(1));
@@ -50,7 +62,7 @@ unsafe extern "C" fn libc_init(argc: c_int, argv: *mut *mut c_char, envp: *mut *
         if (*crate::tls::current()).tid == 0 {
             (*crate::tls::current()).tid = crate::syscall::syscall0(crate::syscall::SYS_GETTID) as i32;
         }
-        crate::start::run_hooks(argc, argv, envp);
+        crate::start::run_hooks_auxv(argc, argv, envp, auxv);
     }
 }
 

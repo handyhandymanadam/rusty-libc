@@ -66,11 +66,21 @@ ld -shared ${LDMAP:+-Map=$LDMAP} $ORDER -soname libc.so.6 --version-script=$SH/l
     --whole-archive "$OUT/work/libours.a" --no-whole-archive "$OUT/work/librt.a" $(needs_files libc.so.6) -o "$OUT/libc.so.6"
 rm -rf "$OUT/work"
 
+cargo_hdrgen() { cargo +nightly build --release --manifest-path tools/hdrgen/Cargo.toml --target-dir target/hdrgen; }
+cargo_hdrgen
 for lib in libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 libutil.so.1 libresolv.so.2 libanl.so.1; do
-    defs=$(grep -o '__stub_GLIBC_[0-9_]*' $SH/$lib.stub.map | sort -u | sed 's/.*/--defsym &=0/' | tr '\n' ' ')
-    ld -shared -soname $lib --version-script=$SH/$lib.stub.map $defs --hash-style=both -z noexecstack \
-        $(needs_args $lib) "$OUT/libc.so.6" $(needs_files $lib) -o "$OUT/$lib"
+    target/hdrgen/release/hdrgen stubsrc $lib "$OUT/stub"
+    as "$OUT/stub.s" -o "$OUT/stub.o"
+    python3 -c 'import json, sys; print("\n".join(s["name"] for s in json.load(open(sys.argv[1]))["symbols"]))' "$SH/$lib.json" > "$OUT/stub.own"
+    ld -shared -soname $lib --version-script="$OUT/stub.map" --hash-style=both -z noexecstack -F libc.so.6 \
+        $(needs_args $lib "$OUT/stub.own") "$OUT/stub.o" "$OUT/libc.so.6" $(needs_files $lib) -o "$OUT/$lib"
 done
+rm -f "$OUT/stub.s" "$OUT/stub.o" "$OUT/stub.map" "$OUT/stub.own"
+
+ld -shared -soname libnss_dns.so.2 --hash-style=both -z noexecstack --no-as-needed "$OUT/libresolv.so.2" "$OUT/libc.so.6" -o "$OUT/libnss_dns.so.2"
+printf 'GLIBC_PRIVATE { local: *; };\n' > "$OUT/compat.map"
+ld -shared -soname libnss_compat.so.2 --version-script="$OUT/compat.map" --hash-style=both -z noexecstack --no-as-needed "$OUT/libc.so.6" -o "$OUT/libnss_compat.so.2"
+rm -f "$OUT/compat.map"
 
 MVEC_A=target/mvec/x86_64-unknown-linux-gnu/release/librusty_libc_mvec.a
 split_archive "$MVEC_A" "$OUT/work"
@@ -78,7 +88,8 @@ ld -shared -soname libmvec.so.1 --version-script=crates/rusty-libc-mvec/libmvec.
     --eh-frame-hdr --whole-archive "$OUT/work/libours.a" --no-whole-archive "$OUT/work/librt.a" "$OUT/libc.so.6" -o "$OUT/libmvec.so.1"
 rm -rf "$OUT/work"
 
-cargo +nightly build --release --manifest-path tools/hdrgen/Cargo.toml --target-dir target/hdrgen
+python3 tools/add_versioned_symtab.py "$OUT/libc.so.6" "$OUT/libmvec.so.1" "$OUT/ld-linux-x86-64.so.2"
+
 target/hdrgen/release/hdrgen linkstubs "$OUT/link"
 rm -rf "$OUT/include"
 { target/hdrgen/release/hdrgen headers --root "$PWD" --out "$OUT/include"; } > "$OUT/gen_headers.log" 2>&1 || { tail -5 "$OUT/gen_headers.log"; exit 1; }

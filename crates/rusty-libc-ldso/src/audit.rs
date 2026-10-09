@@ -44,9 +44,15 @@ pub struct Audit {
     pub ready: bool,
     pub maps: [*mut LinkMap; 64],
     pub nmaps: usize,
+    pub ns_mask: u32,
 }
 
-pub static mut AUDIT: Audit = Audit { libs: [NO_LIB; MAX_AUDIT], n: 0, ready: false, maps: [null_mut(); 64], nmaps: 0 };
+pub static mut AUDIT: Audit = Audit { libs: [NO_LIB; MAX_AUDIT], n: 0, ready: false, maps: [null_mut(); 64], nmaps: 0, ns_mask: 0 };
+
+#[inline(always)]
+pub fn is_audit_ns(ns: usize) -> bool {
+    au().ns_mask >> ns & 1 != 0
+}
 
 #[inline(always)]
 pub fn au() -> &'static mut Audit {
@@ -65,7 +71,7 @@ pub fn wants_objsearch() -> bool {
 
 pub unsafe fn objsearch(mut name: *const u8, l: *mut LinkMap, code: u32) -> *const u8 {
     unsafe {
-        if l.is_null() || code == 0 || !wants_objsearch() || in_audit_closure(l) || is_audit_map(l) {
+        if l.is_null() || code == 0 || !wants_objsearch() || is_audit_map(l) {
             return name;
         }
         for i in 0..au().n {
@@ -99,20 +105,24 @@ pub unsafe fn load(list: &[u8], from_option: bool) {
             if name.is_empty() || au().n >= MAX_AUDIT {
                 continue;
             }
-            let before = st().tail;
-            let m = load_library(name, null_mut());
-            if m.is_null() {
+            let Some(nsid) = crate::dl::new_namespace() else {
+                set_error(format_args!("{}: no more namespaces available for dlmopen(): Invalid argument", Bytes(name)));
                 report_fail(name, from_option);
                 continue;
-            }
-            let first_new = if before.is_null() { st().head } else { (*before).l_next };
-            if !load_deps(m) {
+            };
+            au().ns_mask |= 1 << nsid;
+            crate::debug_initialize(nsid);
+            let m = load_library(nsid, name, null_mut());
+            if m.is_null() || !load_deps(m) {
                 report_fail(name, from_option);
+                crate::dl::discard_from(ns(nsid).head);
+                au().ns_mask &= !(1 << nsid);
+                trim_nns();
                 continue;
             }
-            let mut cur = first_new;
+            let mut cur = ns(nsid).head;
             while !cur.is_null() {
-                if au().nmaps < 64 && !(*cur).in_global {
+                if au().nmaps < 64 && !(*cur).is_ldso {
                     au().maps[au().nmaps] = cur;
                     au().nmaps += 1;
                     (*cur).nodelete = true;
@@ -121,7 +131,7 @@ pub unsafe fn load(list: &[u8], from_option: bool) {
                 cur = (*cur).l_next;
             }
             crate::build_scope(m);
-            let mut cur = first_new;
+            let mut cur = ns(nsid).head;
             while !cur.is_null() {
                 if (*cur).scope.is_null() {
                     (*cur).scope = (*m).scope;
@@ -159,7 +169,7 @@ unsafe fn load_deps(m: *mut LinkMap) -> bool {
                     if !ok {
                         return;
                     }
-                    let d = load_library(name, c);
+                    let d = load_library((*c).l_ns as usize, name, c);
                     if d.is_null() {
                         ok = false;
                         return;
@@ -213,7 +223,7 @@ pub unsafe fn announce_open() {
         objopen(st().main_map);
         objopen(st().ldso_map);
         activity(LA_ACT_ADD);
-        let mut cur = st().head;
+        let mut cur = ns(0).head;
         while !cur.is_null() {
             if !is_audit_map(cur) && !(*cur).is_main && !(*cur).is_ldso {
                 objopen(cur);
@@ -240,57 +250,72 @@ pub unsafe fn announce_preinit() {
 }
 
 pub unsafe fn plt_hooks_for(m: *mut LinkMap) -> bool {
-    unsafe { active() && au().libs[..au().n].iter().any(|l| l.f_pltenter != 0 || l.f_pltexit != 0) && !in_audit_closure(m) }
+    unsafe { active() && au().libs[..au().n].iter().any(|l| l.f_pltenter != 0 || l.f_pltexit != 0) && !is_audit_map(m) }
 }
 
-pub unsafe fn in_audit_closure(m: *mut LinkMap) -> bool {
-    unsafe {
-        let mut list: [*mut LinkMap; 256] = [null_mut(); 256];
-        let mut n = 0;
-        for i in 0..au().n {
-            list[n] = au().libs[i].map;
-            n += 1;
-        }
-        let mut i = 0;
-        while i < n {
-            let c = list[i];
-            i += 1;
-            if c == m {
-                return true;
-            }
-            for k in 0..(*c).nneeded {
-                let d = *(*c).needed.add(k);
-                if !list[..n].contains(&d) && n < 256 {
-                    list[n] = d;
-                    n += 1;
-                }
-            }
-        }
-        false
-    }
-}
-
-unsafe fn is_audit_map(m: *mut LinkMap) -> bool {
-    unsafe {
-        for i in 0..au().nmaps {
-            if au().maps[i] == m {
-                return true;
-            }
-        }
-        false
-    }
+pub unsafe fn is_audit_map(m: *mut LinkMap) -> bool {
+    unsafe { is_audit_ns((*m).l_ns as usize) }
 }
 
 pub unsafe fn activity(flag: u32) {
+    unsafe { activity_map(st().main_map, flag) }
+}
+
+pub unsafe fn ns_head(n: usize) -> *mut LinkMap {
+    unsafe { if n == 0 { st().main_map } else { ns(n).head } }
+}
+
+pub unsafe fn activity_ns(nsid: usize, flag: u32) {
+    unsafe {
+        let head = ns_head(nsid);
+        if !head.is_null() {
+            activity_map(head, flag);
+        }
+    }
+}
+
+pub unsafe fn activity_map(head: *mut LinkMap, flag: u32) {
     unsafe {
         if !active() {
             return;
         }
         for i in 0..au().n {
             let l = au().libs[i];
+            if !(*head).audit_opened {
+                (*head).audit_cookie[i] = head as usize;
+            }
             if l.f_activity != 0 {
                 let f: unsafe extern "C" fn(*mut usize, u32) = core::mem::transmute(l.f_activity);
-                f(&raw mut (*st().main_map).audit_cookie[i], flag);
+                f(&raw mut (*head).audit_cookie[i], flag);
+            }
+        }
+    }
+}
+
+static mut CLOSING: *mut LinkMap = core::ptr::null_mut();
+
+pub unsafe fn close_one(m: *mut LinkMap) {
+    unsafe {
+        if !active() || !(*m).audit_opened {
+            return;
+        }
+        if CLOSING.is_null() {
+            CLOSING = ns_head((*m).l_ns as usize);
+            activity_map(CLOSING, LA_ACT_DELETE);
+        }
+        objclose(m);
+        (*m).audit_opened = false;
+    }
+}
+
+pub unsafe fn close_done() {
+    unsafe {
+        if !CLOSING.is_null() {
+            let h = CLOSING;
+            CLOSING = core::ptr::null_mut();
+            let n = (*h).l_ns as usize;
+            if n == 0 || !ns(n).head.is_null() {
+                activity_map(h, LA_ACT_CONSISTENT);
             }
         }
     }
@@ -308,7 +333,7 @@ pub unsafe fn objopen(m: *mut LinkMap) {
             (*m).audit_cookie[i] = m as usize;
             if l.f_objopen != 0 {
                 let f: unsafe extern "C" fn(*mut LinkMap, isize, *mut usize) -> u32 = core::mem::transmute(l.f_objopen);
-                (*m).audit_flags[i] = f(m, 0, &raw mut (*m).audit_cookie[i]);
+                (*m).audit_flags[i] = f(m, (*m).l_ns as isize, &raw mut (*m).audit_cookie[i]);
                 (*m).audit_any_plt |= (*m).audit_flags[i] != 0;
             }
         }
@@ -415,24 +440,20 @@ pub unsafe fn symbind_dlsym(caller: *mut LinkMap, sym: *const Sym, defmap: *mut 
     }
 }
 
-pub unsafe fn close_all() {
+pub unsafe fn objclose_once(m: *mut LinkMap) {
     unsafe {
-        if !active() {
-            return;
+        if (*m).audit_opened {
+            objclose(m);
+            (*m).audit_opened = false;
         }
-        activity(LA_ACT_DELETE);
-        objclose(st().main_map);
-        let mut cur = st().head;
-        while !cur.is_null() {
-            if !is_audit_map(cur) && !(*cur).is_main && !(*cur).is_ldso && !(*cur).is_vdso {
-                objclose(cur);
-                (*cur).audit_opened = false;
-            }
-            cur = (*cur).l_next;
+    }
+}
+
+pub unsafe fn finish() {
+    unsafe {
+        if active() {
+            au().ready = false;
         }
-        objclose(st().ldso_map);
-        activity(LA_ACT_CONSISTENT);
-        au().ready = false;
     }
 }
 

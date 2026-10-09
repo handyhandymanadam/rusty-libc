@@ -4,7 +4,7 @@ use crate::netdb;
 use crate::nss::{self, Action, Source, Status};
 use crate::strerr::set_h_errno;
 use crate::types::*;
-use crate::util::{Buf, cbytes};
+use crate::util::{Buf, HeapVec, cbytes};
 use core::ffi::{c_char, c_int, c_void};
 use rusty_libc_core::errno;
 
@@ -165,24 +165,19 @@ struct At {
 }
 
 struct Found {
-    at: [At; dns_max::N],
-    n: usize,
+    at: HeapVec<At>,
+    oom: bool,
     canon: Option<Buf<256>>,
     got_ipv6: bool,
 }
 
-mod dns_max {
-    pub const N: usize = 72;
-}
-
 impl Found {
     fn new() -> Found {
-        Found { at: [At { family: 0, addr: [0; 16], scope: 0 }; dns_max::N], n: 0, canon: None, got_ipv6: false }
+        Found { at: HeapVec::new(), oom: false, canon: None, got_ipv6: false }
     }
     fn push(&mut self, a: At) {
-        if self.n < self.at.len() {
-            self.at[self.n] = a;
-            self.n += 1;
+        if !self.at.push(a) {
+            self.oom = true;
         }
     }
 }
@@ -280,7 +275,9 @@ fn get_nss_addresses(name: &[u8], req_family: c_int, flags: c_int, found: &mut F
     let mut do_merge = false;
     let mut h_internal = false;
     for e in &order.e[..order.n] {
-        *found = Found { at: found.at, n: 0, canon: None, got_ipv6: false };
+        found.at.clear();
+        found.canon = None;
+        found.got_ipv6 = false;
         if do_merge {
             errno::set(EBUSY);
             break;
@@ -366,7 +363,7 @@ fn get_nss_addresses(name: &[u8], req_family: c_int, flags: c_int, found: &mut F
     if matches!(status, Status::TryAgain | Status::Unavail) && h_internal {
         return Err(EAI_SYSTEM);
     }
-    if found.n > 0 {
+    if !found.at.is_empty() {
         return Ok(());
     }
     if no_data != 0 && no_inet6_data != 0 {
@@ -642,38 +639,46 @@ fn cmp_addr(a1: &At, s1: &SortInfo, a2: &At, s2: &SortInfo) -> core::cmp::Orderi
     Equal
 }
 
-fn sort_addresses(at: &mut [At]) {
+fn sort_addresses(at: &mut [At]) -> bool {
     let mut locals = [crate::ifaddrs::LocalAddr { family: 0, addr: [0; 16], prefixlen: 0, index: 0, flags: 0, scope: 0 }; 64];
     let nl = crate::ifaddrs::local_addrs(&mut locals).unwrap_or(0);
     let n = at.len();
-    let mut info = [SortInfo { got_source: false, src_family: 0, src: [0; 16], flags: 0, prefixlen: 0, index: 0 }; dns_max::N];
-    for i in 0..n {
-        info[i] = source_for(&at[i], &locals[..nl]);
-    }
-    let mut idx = [0usize; dns_max::N];
-    for (i, v) in idx.iter_mut().enumerate().take(n) {
-        *v = i;
-    }
-    for i in 1..n {
-        let mut j = i;
-        while j > 0 {
-            let (a, b) = (idx[j - 1], idx[j]);
-            if cmp_addr(&at[a], &info[a], &at[b], &info[b]) == core::cmp::Ordering::Greater {
-                idx.swap(j - 1, j);
-                j -= 1;
-            } else {
-                break;
-            }
+    let (mut info, mut idx, mut tmp, mut copy) = (HeapVec::<SortInfo>::new(), HeapVec::<usize>::new(), HeapVec::<usize>::new(), HeapVec::<At>::new());
+    for (i, a) in at.iter().enumerate() {
+        if !info.push(source_for(a, &locals[..nl])) || !idx.push(i) || !tmp.push(i) {
+            return false;
         }
     }
-    let copy = {
-        let mut c = [At { family: 0, addr: [0; 16], scope: 0 }; dns_max::N];
-        c[..n].copy_from_slice(&at[..n]);
-        c
-    };
-    for i in 0..n {
-        at[i] = copy[idx[i]];
+    if !copy.extend_from(at) {
+        return false;
     }
+    let greater = |a: usize, b: usize| cmp_addr(&copy[a], &info[a], &copy[b], &info[b]) == core::cmp::Ordering::Greater;
+    let (mut src, mut dst) = (idx.as_mut_slice(), tmp.as_mut_slice());
+    let mut width = 1;
+    while width < n {
+        let mut lo = 0;
+        while lo < n {
+            let mid = (lo + width).min(n);
+            let hi = (lo + 2 * width).min(n);
+            let (mut i, mut j) = (lo, mid);
+            for d in dst[lo..hi].iter_mut() {
+                if i < mid && (j >= hi || !greater(src[i], src[j])) {
+                    *d = src[i];
+                    i += 1;
+                } else {
+                    *d = src[j];
+                    j += 1;
+                }
+            }
+            lo = hi;
+        }
+        core::mem::swap(&mut src, &mut dst);
+        width *= 2;
+    }
+    for (i, a) in at.iter_mut().enumerate() {
+        *a = copy[src[i]];
+    }
+    true
 }
 
 unsafe fn alloc_ai(flags: c_int, at: &At, st: &ServTuple) -> *mut addrinfo {
@@ -771,6 +776,19 @@ pub unsafe extern "C" fn getaddrinfo(name: *const c_char, service: *const c_char
         if let Err(e) = get_servtuples(&svc, h.ai_socktype, h.ai_protocol, &mut st) {
             return e;
         }
+        let orig = name;
+        let idn_name;
+        if h.ai_flags & AI_IDN != 0 {
+            if let Some(n) = name {
+                idn_name = match crate::idna::to_dns(n) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                if let Some(e) = &idn_name {
+                    name = Some(e.as_bytes());
+                }
+            }
+        }
         let mut found = Found::new();
         match name {
             None => {
@@ -801,23 +819,35 @@ pub unsafe extern "C" fn getaddrinfo(name: *const c_char, service: *const c_char
         }
         let mut canon: Option<Buf<256>> = None;
         if h.ai_flags & AI_CANONNAME != 0 {
-            canon = found.canon.or_else(|| name.and_then(|n| Buf::from(&n[..n.len().min(256)])));
+            canon = found.canon.or_else(|| orig.and_then(|n| Buf::from(&n[..n.len().min(256)])));
+            if h.ai_flags & AI_CANONIDN != 0 {
+                if let Some(c) = &canon {
+                    match crate::idna::from_dns(c.as_bytes()) {
+                        Ok(Some(u)) => canon = Buf::from(&u.as_bytes()[..u.as_bytes().len().min(256)]),
+                        Ok(None) | Err(EAI_IDN_ENCODE) => {}
+                        Err(e) => return e,
+                    }
+                }
+            }
         }
-        let mut list = [At { family: 0, addr: [0; 16], scope: 0 }; dns_max::N];
-        let mut n = 0;
-        for a in &found.at[..found.n] {
+        if found.oom {
+            return EAI_MEMORY;
+        }
+        let mut list = HeapVec::<At>::new();
+        for a in found.at.iter() {
             if a.family == AF_INET6 && found.got_ipv6 && h.ai_flags & (AI_V4MAPPED | AI_ALL) == AI_V4MAPPED && a.addr[..10] == [0; 10] && a.addr[10] == 0xff && a.addr[11] == 0xff {
                 continue;
             }
-            list[n] = *a;
-            n += 1;
+            if !list.push(*a) {
+                return EAI_MEMORY;
+            }
         }
-        if n > 1 {
-            sort_addresses(&mut list[..n]);
+        if list.len() > 1 && !sort_addresses(&mut list) {
+            return EAI_MEMORY;
         }
         let mut head: *mut addrinfo = core::ptr::null_mut();
         let mut tail: *mut *mut addrinfo = &mut head;
-        for a in &list[..n] {
+        for a in list.iter() {
             for s in st.iter().take_while(|s| s.set) {
                 let ai = alloc_ai(h.ai_flags, a, s);
                 if ai.is_null() {
@@ -1009,7 +1039,12 @@ unsafe fn gni_host(sa: *const sockaddr, host: *mut c_char, hostlen: socklen_t, f
                         }
                     }
                 }
-                let r = copy_out(host, hostlen, nm);
+                let idn = if flags & NI_IDN != 0 { crate::idna::from_dns(nm) } else { Ok(None) };
+                let r = match &idn {
+                    Ok(Some(u)) => copy_out(host, hostlen, u.as_bytes()),
+                    Ok(None) | Err(EAI_IDN_ENCODE) => copy_out(host, hostlen, nm),
+                    Err(e) => *e,
+                };
                 result = Some(r);
             }
             if !big.is_null() {

@@ -404,7 +404,7 @@ fn find_guard(text: &str) -> Option<usize> {
 }
 
 pub fn add_features_include(files: &mut BTreeMap<String, String>) {
-    let skip = ["features.h", "limits.h", "stdint.h", "gnu-versions.h"];
+    let skip = ["features.h", "limits.h", "gnu-versions.h"];
     for (path, text) in files.iter_mut() {
         let (rel, name) = match path.rsplit_once('/') {
             Some((d, n)) => (d, n),

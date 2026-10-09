@@ -5,4 +5,4 @@ no_includes = true
 sys_includes = ["stddef.h", "stdint.h", "stdarg.h"]
 
 [export]
-exclude = ["FILE", "locale_t", "wcswcs", "wcstold", "wcstold_l", "wcstof64x", "wcstof64x_l", "wcstof128", "wcstof128_l", "wcsftime", "wcsftime_l"]
+exclude = ["FILE", "locale_t", "wcswcs", "wcstold", "wcstold_l", "wcstof64x", "wcstof64x_l", "wcstof128", "wcstof128_l", "wcsftime", "wcsftime_l", "__wuflow", "__wunderflow", "__woverflow", "__wcstod_internal", "__wcstof_internal", "__wcstold_internal", "__wcstof128_internal"]

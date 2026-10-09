@@ -114,8 +114,6 @@ pub struct LinkMap {
     pub creldeps: usize,
     pub unloading: bool,
     pub removed: bool,
-    pub copy_done: bool,
-    pub copy_mask: u64,
     pub refcount: usize,
     pub scope: *mut *mut LinkMap,
     pub nscope: usize,
@@ -137,14 +135,76 @@ pub struct LinkMap {
     pub audit_any_plt: bool,
 }
 
+const _: () = assert!(core::mem::offset_of!(LinkMap, tls_modid) == 504);
+const _: () = assert!(core::mem::offset_of!(LinkMap, tls_offset) == 544);
+
 pub const MAX_MAPS: usize = 1024;
 
-pub struct State {
+pub const DL_NNS: usize = 16;
+
+pub struct Ns {
     pub head: *mut LinkMap,
     pub tail: *mut LinkMap,
     pub nmaps: usize,
-    pub global: [*mut LinkMap; MAX_MAPS],
+    pub global: *mut *mut LinkMap,
     pub nglobal: usize,
+    pub libc_map: *mut LinkMap,
+}
+
+static mut BASE_GLOBAL: [*mut LinkMap; MAX_MAPS] = [null_mut(); MAX_MAPS];
+
+impl Ns {
+    const EMPTY: Ns = Ns { head: null_mut(), tail: null_mut(), nmaps: 0, global: null_mut(), nglobal: 0, libc_map: null_mut() };
+
+    pub fn scope(&self) -> &'static [*mut LinkMap] {
+        if self.global.is_null() {
+            return &[];
+        }
+        unsafe { core::slice::from_raw_parts(self.global, self.nglobal) }
+    }
+
+    pub unsafe fn push_global(&mut self, m: *mut LinkMap) -> bool {
+        unsafe {
+            if self.nglobal >= MAX_MAPS {
+                return false;
+            }
+            if self.global.is_null() {
+                self.global = alloc_perm(MAX_MAPS * core::mem::size_of::<*mut LinkMap>(), 8) as *mut *mut LinkMap;
+            }
+            *self.global.add(self.nglobal) = m;
+            self.nglobal += 1;
+            true
+        }
+    }
+
+    pub unsafe fn remove_global(&mut self, m: *mut LinkMap) {
+        unsafe {
+            let mut j = 0;
+            for i in 0..self.nglobal {
+                let g = *self.global.add(i);
+                if g != m {
+                    *self.global.add(j) = g;
+                    j += 1;
+                }
+            }
+            self.nglobal = j;
+        }
+    }
+}
+
+#[inline(always)]
+pub fn ns(n: usize) -> &'static mut Ns {
+    unsafe { &mut (*(&raw mut STATE)).ns[n] }
+}
+
+#[inline(always)]
+pub unsafe fn ns_of(m: *mut LinkMap) -> usize {
+    if m.is_null() { 0 } else { unsafe { (*m).l_ns as usize } }
+}
+
+pub struct State {
+    pub ns: [Ns; DL_NNS],
+    pub nns: usize,
     pub main_map: *mut LinkMap,
     pub ldso_map: *mut LinkMap,
     pub argc: usize,
@@ -158,6 +218,8 @@ pub struct State {
     pub started: bool,
     pub stack_exec: bool,
     pub execstack_mode: u8,
+    pub tls_nns: usize,
+    pub tls_optional: usize,
     pub hard_error: bool,
     pub lenient: bool,
     pub debug: bool,
@@ -176,11 +238,12 @@ pub struct State {
 }
 
 pub static mut STATE: State = State {
-    head: null_mut(),
-    tail: null_mut(),
-    nmaps: 0,
-    global: [null_mut(); MAX_MAPS],
-    nglobal: 0,
+    ns: {
+        let mut t = [Ns::EMPTY; DL_NNS];
+        t[0].global = (&raw mut BASE_GLOBAL) as *mut *mut LinkMap;
+        t
+    },
+    nns: 1,
     main_map: null_mut(),
     ldso_map: null_mut(),
     argc: 0,
@@ -194,6 +257,8 @@ pub static mut STATE: State = State {
     started: false,
     stack_exec: true,
     execstack_mode: 1,
+    tls_nns: 4,
+    tls_optional: 512,
     hard_error: false,
     lenient: false,
     debug: false,
@@ -272,7 +337,7 @@ pub unsafe fn new_map() -> *mut LinkMap {
 
 pub unsafe fn link_map(m: *mut LinkMap) {
     unsafe {
-        let s = st();
+        let s = ns((*m).l_ns as usize);
         (*m).l_prev = s.tail;
         (*m).l_next = null_mut();
         if s.tail.is_null() {
@@ -282,14 +347,18 @@ pub unsafe fn link_map(m: *mut LinkMap) {
         }
         s.tail = m;
         s.nmaps += 1;
+        if s.libc_map.is_null() && !(*m).soname.is_null() && cstr((*m).soname) == b"libc.so.6" {
+            s.libc_map = m;
+        }
     }
 }
 
 pub unsafe fn unlink_map(m: *mut LinkMap) {
     unsafe {
-        let s = st();
+        let s = ns((*m).l_ns as usize);
         if (*m).l_prev.is_null() {
             s.head = (*m).l_next;
+            (*crate::rdebug((*m).l_ns as usize)).map = s.head;
         } else {
             (*(*m).l_prev).l_next = (*m).l_next;
         }
@@ -299,6 +368,17 @@ pub unsafe fn unlink_map(m: *mut LinkMap) {
             (*(*m).l_next).l_prev = (*m).l_prev;
         }
         s.nmaps -= 1;
+        if s.libc_map == m {
+            s.libc_map = null_mut();
+        }
+        trim_nns();
+    }
+}
+
+pub fn trim_nns() {
+    let s = st();
+    while s.nns > 1 && ns(s.nns - 1).head.is_null() {
+        s.nns -= 1;
     }
 }
 
@@ -436,7 +516,9 @@ unsafe fn build_versions(m: *mut LinkMap) {
         for _ in 0..(*m).verdefnum {
             let idx = (*vd).ndx as usize & 0x7fff;
             let aux = (vd as *const u8).add((*vd).aux as usize) as *const Verdaux;
-            *tbl.add(idx) = VerInfo { name: (*m).strtab.add((*aux).name as usize), hash: (*vd).hash, file: null(), hidden: false };
+            if (*vd).flags & 1 == 0 {
+                *tbl.add(idx) = VerInfo { name: (*m).strtab.add((*aux).name as usize), hash: (*vd).hash, file: null(), hidden: false };
+            }
             vd = (vd as *const u8).add((*vd).next as usize) as *const Verdef;
         }
         let mut vn = (*m).verneed;
@@ -556,23 +638,23 @@ fn errno_text(e: isize) -> &'static str {
     }
 }
 
-pub unsafe fn map_file(path: *const u8, name: *const u8, loader: *mut LinkMap) -> *mut LinkMap {
+pub unsafe fn map_file(nsid: usize, path: *const u8, name: *const u8, loader: *mut LinkMap) -> *mut LinkMap {
     unsafe {
         let fd = sys::open(path);
         if fd < 0 {
             set_error(format_args!("cannot open shared object file: {}", errno_text(fd)));
             return null_mut();
         }
-        let r = map_fd(fd, name, loader);
+        let r = map_fd(nsid, fd, name, loader);
         sys::close(fd);
         r
     }
 }
 
-unsafe fn map_fd(fd: isize, name: *const u8, loader: *mut LinkMap) -> *mut LinkMap {
+unsafe fn map_fd(nsid: usize, fd: isize, name: *const u8, loader: *mut LinkMap) -> *mut LinkMap {
     unsafe {
         let (dev, ino) = sys::fstat_id(fd);
-        let mut cur = st().head;
+        let mut cur = ns(nsid).head;
         while !cur.is_null() {
             if (*cur).dev == dev && (*cur).ino == ino && dev != 0 && !(*cur).unloading {
                 return cur;
@@ -618,6 +700,10 @@ unsafe fn map_fd(fd: isize, name: *const u8, loader: *mut LinkMap) -> *mut LinkM
             }
         }
         let ph = core::slice::from_raw_parts(phbuf as *const Phdr, phn);
+        if ph.iter().any(|p| p.typ == PT_LOAD && (p.vaddr.wrapping_sub(p.offset) as usize) & (sys::PAGE - 1) != 0) {
+            set_error(format_args!("ELF load command address/offset not page-aligned"));
+            return null_mut();
+        }
         if !st().stack_exec && ph.iter().find(|p| p.typ == PT_GNU_STACK).is_none_or(|p| p.flags & PF_X != 0) {
             let err = if !st().started && st().execstack_mode == 1 { make_stack_executable() } else { -22 };
             if err != 0 {
@@ -719,6 +805,7 @@ unsafe fn map_fd(fd: isize, name: *const u8, loader: *mut LinkMap) -> *mut LinkM
             }
         }
         let m = new_map();
+        (*m).l_ns = nsid as isize;
         (*m).l_addr = base;
         (*m).l_name = name;
         (*m).typ = eh.typ;
@@ -833,12 +920,12 @@ pub(crate) unsafe fn expand(elem: &[u8], requester: *mut LinkMap, out: &mut Path
     }
 }
 
-unsafe fn probe_found(fd: isize) -> *mut LinkMap {
+unsafe fn probe_found(nsid: usize, fd: isize) -> *mut LinkMap {
     unsafe {
         if PROBE_IDENT {
             let (dev, ino) = sys::fstat_id(fd);
             sys::close(fd);
-            let mut cur = st().head;
+            let mut cur = ns(nsid).head;
             while !cur.is_null() {
                 if (*cur).dev == dev && (*cur).ino == ino && dev != 0 && !(*cur).unloading {
                     return cur;
@@ -852,7 +939,7 @@ unsafe fn probe_found(fd: isize) -> *mut LinkMap {
     }
 }
 
-unsafe fn try_dirs(list: &[u8], name: &[u8], requester: *mut LinkMap, loader: *mut LinkMap, code: u32, found_err: &mut bool) -> *mut LinkMap {
+unsafe fn try_dirs(nsid: usize, list: &[u8], name: &[u8], requester: *mut LinkMap, loader: *mut LinkMap, code: u32, found_err: &mut bool) -> *mut LinkMap {
     unsafe {
         let probe = PROBE_ONLY;
         for elem in list.split(|&c| c == b':') {
@@ -886,9 +973,9 @@ unsafe fn try_dirs(list: &[u8], name: &[u8], requester: *mut LinkMap, loader: *m
                 continue;
             }
             if probe {
-                return probe_found(fd);
+                return probe_found(nsid, fd);
             }
-            let m = map_fd(fd, dup(core::slice::from_raw_parts(path.ptr(), plen)), requester);
+            let m = map_fd(nsid, fd, dup(core::slice::from_raw_parts(path.ptr(), plen)), requester);
             sys::close(fd);
             if !m.is_null() {
                 return m;
@@ -1026,29 +1113,29 @@ static mut PROBE_ONLY: bool = false;
 
 static mut PROBE_IDENT: bool = false;
 
-pub unsafe fn find_loaded_by_file(name: &[u8], requester: *mut LinkMap) -> *mut LinkMap {
+pub unsafe fn find_loaded_by_file(nsid: usize, name: &[u8], requester: *mut LinkMap) -> *mut LinkMap {
     unsafe {
         PROBE_ONLY = true;
         PROBE_IDENT = true;
-        let r = load_library_search(name, requester);
+        let r = load_library_search(nsid, name, requester);
         PROBE_IDENT = false;
         PROBE_ONLY = false;
         if r as usize == 1 { null_mut() } else { r }
     }
 }
 
-pub unsafe fn library_exists(name: &[u8], requester: *mut LinkMap) -> bool {
+pub unsafe fn library_exists(nsid: usize, name: &[u8], requester: *mut LinkMap) -> bool {
     unsafe {
         PROBE_ONLY = true;
-        let r = load_library_search(name, requester);
+        let r = load_library_search(nsid, name, requester);
         PROBE_ONLY = false;
         !r.is_null()
     }
 }
 
-pub unsafe fn find_loaded(name: &[u8]) -> *mut LinkMap {
+pub unsafe fn find_loaded(nsid: usize, name: &[u8]) -> *mut LinkMap {
     unsafe {
-        let mut cur = st().head;
+        let mut cur = ns(nsid).head;
         while !cur.is_null() {
             if !(*cur).unloading {
                 if !(*cur).soname.is_null() && cstr((*cur).soname) == name {
@@ -1065,17 +1152,66 @@ pub unsafe fn find_loaded(name: &[u8]) -> *mut LinkMap {
     }
 }
 
-pub unsafe fn load_library(name: &[u8], requester: *mut LinkMap) -> *mut LinkMap {
+unsafe fn names_ldso(name: &[u8]) -> bool {
     unsafe {
-        let m = find_loaded(name);
-        if !m.is_null() {
-            return m;
+        let l = st().ldso_map;
+        if l.is_null() {
+            return false;
         }
-        load_library_search(name, requester)
+        (!(*l).soname.is_null() && cstr((*l).soname) == name) || cstr((*l).l_name) == name
     }
 }
 
-unsafe fn load_library_search(name: &[u8], requester: *mut LinkMap) -> *mut LinkMap {
+unsafe fn ldso_mirror(nsid: usize) -> *mut LinkMap {
+    unsafe {
+        let real = st().ldso_map;
+        let m = new_map();
+        core::ptr::copy_nonoverlapping(real as *const u8, m as *mut u8, core::mem::size_of::<LinkMap>());
+        (*m).l_real = real;
+        (*m).l_ns = nsid as isize;
+        (*m).l_prev = null_mut();
+        (*m).l_next = null_mut();
+        (*m).refcount = 0;
+        (*m).nodelete = false;
+        (*m).in_global = false;
+        (*m).scope = null_mut();
+        (*m).nscope = 0;
+        (*m).xscope = null_mut();
+        (*m).nxscope = 0;
+        (*m).reldeps = null_mut();
+        (*m).nreldeps = 0;
+        (*m).creldeps = 0;
+        (*m).opening = false;
+        (*m).dlopened = true;
+        link_map(m);
+        m
+    }
+}
+
+pub unsafe fn load_library(nsid: usize, name: &[u8], requester: *mut LinkMap) -> *mut LinkMap {
+    unsafe {
+        let m = find_loaded(nsid, name);
+        if !m.is_null() {
+            return m;
+        }
+        if nsid != 0 && names_ldso(name) {
+            return ldso_mirror(nsid);
+        }
+        if nsid != 0 && name == b"libc.so.6" && !PROBE_ONLY {
+            let base = ns(0).libc_map;
+            if !base.is_null() && !cstr((*base).l_name).is_empty() && cstr((*base).l_name).contains(&b'/') {
+                let path = cstr((*base).l_name);
+                let m = load_library_search(nsid, path, requester);
+                if !m.is_null() {
+                    return m;
+                }
+            }
+        }
+        load_library_search(nsid, name, requester)
+    }
+}
+
+unsafe fn load_library_search(nsid: usize, name: &[u8], requester: *mut LinkMap) -> *mut LinkMap {
     unsafe {
         let asked = name;
         let mut name = name;
@@ -1110,10 +1246,10 @@ unsafe fn load_library_search(name: &[u8], requester: *mut LinkMap) -> *mut Link
                     set_error(format_args!("cannot open shared object file: {}", errno_text(fd)));
                     null_mut()
                 } else {
-                    probe_found(fd)
+                    probe_found(nsid, fd)
                 }
             } else {
-                map_file(path.ptr(), dup(core::slice::from_raw_parts(path.ptr(), n)), requester)
+                map_file(nsid, path.ptr(), dup(core::slice::from_raw_parts(path.ptr(), n)), requester)
             };
             if m.is_null() {
                 let e = error_str();
@@ -1126,15 +1262,24 @@ unsafe fn load_library_search(name: &[u8], requester: *mut LinkMap) -> *mut Link
             let mut r = requester;
             while m.is_null() && !r.is_null() && !st().hard_error {
                 if !(*r).rpath.is_null() && (*r).runpath.is_null() {
-                    m = try_dirs(cstr((*r).rpath), name, r, requester, audit::LA_SER_RUNPATH, &mut bad);
+                    m = try_dirs(nsid, cstr((*r).rpath), name, r, requester, audit::LA_SER_RUNPATH, &mut bad);
                 }
                 r = (*r).loader;
             }
             if m.is_null() && !st().hard_error && !st().library_path.is_null() {
-                m = try_dirs(cstr(st().library_path), name, requester, if requester.is_null() { st().main_map } else { requester }, audit::LA_SER_LIBPATH, &mut bad);
+                m = try_dirs(nsid, cstr(st().library_path), name, requester, if requester.is_null() { st().main_map } else { requester }, audit::LA_SER_LIBPATH, &mut bad);
             }
             if m.is_null() && !st().hard_error && !requester.is_null() && !(*requester).runpath.is_null() {
-                m = try_dirs(cstr((*requester).runpath), name, requester, requester, audit::LA_SER_RUNPATH, &mut bad);
+                m = try_dirs(nsid, cstr((*requester).runpath), name, requester, requester, audit::LA_SER_RUNPATH, &mut bad);
+            }
+            if m.is_null() && !st().hard_error && nsid != 0 {
+                let base = ns(0).libc_map;
+                if !base.is_null() {
+                    let p = cstr((*base).l_name);
+                    if let Some(slash) = p.iter().rposition(|&c| c == b'/') {
+                        m = try_dirs(nsid, &p[..slash.max(1)], name, requester, if requester.is_null() { st().main_map } else { requester }, audit::LA_SER_DEFAULT, &mut bad);
+                    }
+                }
             }
             if m.is_null() && !st().hard_error && !PROBE_ONLY_SKIP_CACHE {
                 if let Some(path) = cache_lookup(name) {
@@ -1159,14 +1304,14 @@ unsafe fn load_library_search(name: &[u8], requester: *mut LinkMap) -> *mut Link
                                 sys::close(fd);
                                 return 1 as *mut LinkMap;
                             }
-                            m = map_fd(fd, dup(path), requester);
+                            m = map_fd(nsid, fd, dup(path), requester);
                             sys::close(fd);
                         }
                     }
                 }
             }
             if m.is_null() && !st().hard_error {
-                m = try_dirs(DEFAULT_DIRS, name, requester, if requester.is_null() { st().main_map } else { requester }, audit::LA_SER_DEFAULT, &mut bad);
+                m = try_dirs(nsid, DEFAULT_DIRS, name, requester, if requester.is_null() { st().main_map } else { requester }, audit::LA_SER_DEFAULT, &mut bad);
             }
             if m.is_null() && st().hard_error {
                 let e = error_str();
@@ -1181,7 +1326,7 @@ unsafe fn load_library_search(name: &[u8], requester: *mut LinkMap) -> *mut Link
         if m.is_null() {
             return null_mut();
         }
-        if !PROBE_ONLY && (*m).l_prev.is_null() && st().head != m && (*m).l_next.is_null() && st().tail != m {
+        if !PROBE_ONLY && (*m).l_prev.is_null() && ns((*m).l_ns as usize).head != m && (*m).l_next.is_null() && ns((*m).l_ns as usize).tail != m {
             link_map(m);
         }
         if !PROBE_ONLY && (*m).req_name.is_null() {

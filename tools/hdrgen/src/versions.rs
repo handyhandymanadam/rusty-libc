@@ -294,7 +294,7 @@ fn stub_script(verdefs: &[(String, Option<String>)], markers: &BTreeMap<String, 
     out.join("\n") + "\n"
 }
 
-fn stub(root: &Path, lib: &str, outdir: &Path) -> usize {
+pub fn stubsrc(root: &Path, lib: &str, base: &Path) -> String {
     let shared = root.join("crates/rusty-libc-cabi/shared");
     let info = from_json(&fs::read_to_string(shared.join(format!("{lib}.json"))).unwrap());
     let mut verdefs = info.verdefs.clone();
@@ -325,7 +325,7 @@ fn stub(root: &Path, lib: &str, outdir: &Path) -> usize {
             _ => "tls_object",
         };
         asm.push(format!("    .type {sym}, @{kind}"));
-        let size = if s.ty != "FUNC" && s.ty != "IFUNC" { s.size } else { s.size.max(1) };
+        let size = if s.ty != "FUNC" && s.ty != "IFUNC" { s.size } else { 1 };
         asm.push(format!("    .size {sym}, {size}"));
         asm.push(format!("    .symver {sym}, {}{}{}", s.name, if s.default { "@@" } else { "@" }, ver));
         asm.push(format!("{sym}:"));
@@ -347,13 +347,18 @@ fn stub(root: &Path, lib: &str, outdir: &Path) -> usize {
         }
     }
     asm.push("    .section .note.GNU-stack,\"\",@progbits".into());
-    let base = outdir.join(lib);
     let b = base.to_string_lossy().to_string();
     fs::write(format!("{b}.s"), asm.join("\n") + "\n").unwrap();
     fs::write(format!("{b}.map"), stub_script(&verdefs, &markers)).unwrap();
+    info.soname.clone().unwrap_or_else(|| lib.to_string())
+}
+
+fn stub(root: &Path, lib: &str, outdir: &Path) -> usize {
+    let base = outdir.join(lib);
+    let soname = stubsrc(root, lib, &base);
+    let b = base.to_string_lossy().to_string();
     let st = Command::new("as").args(["-o", &format!("{b}.o"), &format!("{b}.s")]).status().unwrap();
     assert!(st.success(), "as failed for {lib}");
-    let soname = info.soname.clone().unwrap_or_else(|| lib.to_string());
     let st = Command::new("ld")
         .args(["-shared", "-soname", &soname, &format!("--version-script={b}.map"), "--hash-style=both", "-z", "noexecstack", "-z", "norelro", &format!("{b}.o"), "-o", &b])
         .status()
@@ -362,6 +367,8 @@ fn stub(root: &Path, lib: &str, outdir: &Path) -> usize {
     for ext in [".s", ".map", ".o"] {
         let _ = fs::remove_file(format!("{b}{ext}"));
     }
+    let shared = root.join("crates/rusty-libc-cabi/shared");
+    let info = from_json(&fs::read_to_string(shared.join(format!("{lib}.json"))).unwrap());
     info.symbols.iter().filter(|s| s.version.is_some()).count()
 }
 

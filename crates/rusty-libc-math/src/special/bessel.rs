@@ -454,8 +454,23 @@ const TINY_J0: u64 = 0x3e40_0000_0000_0000;
 const JS_LO: u64 = 1.0e-8f64.to_bits();
 const JS_HI: u64 = 1.25f64.to_bits();
 
+directed_paths!(j0_impl_dir_fma, j0_impl_dir_plain, super::j0_fma, super::j0_nofma, (x: f64) -> f64);
+
 #[inline(always)]
 pub(super) fn j0_impl<const F: bool>(x: f64) -> f64 {
+    let ab = x.to_bits() & !(1u64 << 63);
+    if ab.wrapping_sub(1) < 0x7ff0_0000_0000_0000 - 1 && !crate::trig::dd::is_nearest() {
+        return if F {
+            unsafe { j0_impl_dir_fma(x) }
+        } else {
+            j0_impl_dir_plain(x)
+        };
+    }
+    j0_body::<F>(x)
+}
+
+#[inline(always)]
+fn j0_body<const F: bool>(x: f64) -> f64 {
     let ax = x.abs();
     if ax.to_bits().wrapping_sub(JS_LO) <= JS_HI - JS_LO {
         if let Some(r) = jsmall_fast::<0, F>(ax) {
@@ -474,8 +489,23 @@ pub(super) fn j0_impl<const F: bool>(x: f64) -> f64 {
     eval::<0, F>(ax)
 }
 
+directed_paths!(j1_impl_dir_fma, j1_impl_dir_plain, super::j1_fma, super::j1_nofma, (x: f64) -> f64);
+
 #[inline(always)]
 pub(super) fn j1_impl<const F: bool>(x: f64) -> f64 {
+    let ab = x.to_bits() & !(1u64 << 63);
+    if ab.wrapping_sub(1) < 0x7ff0_0000_0000_0000 - 1 && !crate::trig::dd::is_nearest() {
+        return if F {
+            unsafe { j1_impl_dir_fma(x) }
+        } else {
+            j1_impl_dir_plain(x)
+        };
+    }
+    j1_body::<F>(x)
+}
+
+#[inline(always)]
+fn j1_body<const F: bool>(x: f64) -> f64 {
     let ax = x.abs();
     if ax.to_bits().wrapping_sub(JS_LO) <= JS_HI - JS_LO {
         if let Some(r) = jsmall_fast::<1, F>(ax) {
@@ -507,8 +537,22 @@ pub(super) fn j1_impl<const F: bool>(x: f64) -> f64 {
     if x < 0.0 { -y } else { y }
 }
 
+directed_paths!(y0_impl_dir_fma, y0_impl_dir_plain, super::y0_fma, super::y0_nofma, (x: f64) -> f64);
+
 #[inline(always)]
 pub(super) fn y0_impl<const F: bool>(x: f64) -> f64 {
+    if x > 0.0 && x < f64::INFINITY && !crate::trig::dd::is_nearest() {
+        return if F {
+            unsafe { y0_impl_dir_fma(x) }
+        } else {
+            y0_impl_dir_plain(x)
+        };
+    }
+    y0_body::<F>(x)
+}
+
+#[inline(always)]
+fn y0_body<const F: bool>(x: f64) -> f64 {
     if x.is_nan() {
         return nan_in(x);
     }
@@ -524,8 +568,22 @@ pub(super) fn y0_impl<const F: bool>(x: f64) -> f64 {
     eval::<2, F>(x)
 }
 
+directed_paths!(y1_impl_dir_fma, y1_impl_dir_plain, super::y1_fma, super::y1_nofma, (x: f64) -> f64);
+
 #[inline(always)]
 pub(super) fn y1_impl<const F: bool>(x: f64) -> f64 {
+    if x > 0.0 && x < f64::INFINITY && !crate::trig::dd::is_nearest() {
+        return if F {
+            unsafe { y1_impl_dir_fma(x) }
+        } else {
+            y1_impl_dir_plain(x)
+        };
+    }
+    y1_body::<F>(x)
+}
+
+#[inline(always)]
+fn y1_body<const F: bool>(x: f64) -> f64 {
     if x.is_nan() {
         return nan_in(x);
     }
@@ -749,6 +807,7 @@ pub(super) fn jn_impl<const F: bool>(n: i32, x: f64) -> f64 {
         let y = j1_impl::<F>(x);
         return if y.is_nan() { y } else { -y };
     }
+    let _g = crate::trig::dd::NearestGuard::new_if(x != 0.0 && x.is_finite());
     match jn_core::<F>(n, x) {
         NRes::Special(v) => v,
         NRes::Val(d, e, neg) => {
@@ -772,6 +831,7 @@ pub(super) fn yn_impl<const F: bool>(n: i32, x: f64) -> f64 {
         let y = y1_impl::<F>(x);
         return if y.is_nan() { y } else { -y };
     }
+    let _g = crate::trig::dd::NearestGuard::new_if(x != 0.0 && x.is_finite());
     match yn_core::<F>(n, x) {
         NRes::Special(v) if crate::SVID && v.is_nan() && !x.is_nan() => f64::from_bits(v.to_bits() & !(1u64 << 63)),
         NRes::Special(v) => v,

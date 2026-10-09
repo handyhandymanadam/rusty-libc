@@ -134,14 +134,18 @@ struct UniqueTab {
 static mut UNIQUE: UniqueTab = UniqueTab { name: [(core::ptr::null(), 0); UNIQUE_MAX], found: [(core::ptr::null(), core::ptr::null_mut()); UNIQUE_MAX], n: 0 };
 static UNIQUE_LOCK: Lock = Lock::new();
 
+pub(crate) unsafe fn fork_child_reset() {
+    unsafe { UNIQUE_LOCK.reset() };
+}
+
 unsafe fn unique_sym(name: &[u8], sym: *const Sym, m: *mut LinkMap) -> Found {
     unsafe {
         UNIQUE_LOCK.lock();
         let t = &mut *(&raw mut UNIQUE);
         for i in 0..t.n {
             let (p, len) = t.name[i];
-            if len == name.len() && core::slice::from_raw_parts(p, len) == name {
-                let (s, mm) = t.found[i];
+            let (s, mm) = t.found[i];
+            if len == name.len() && (*mm).l_ns == (*m).l_ns && core::slice::from_raw_parts(p, len) == name {
                 UNIQUE_LOCK.unlock();
                 return Found { sym: s, map: mm };
             }
@@ -173,12 +177,18 @@ pub unsafe fn lookup_hashed(name: &[u8], gh: u32, ver: Option<&VerRef>, scopes: 
                 let mut nver = 0u32;
                 let mut versioned: *const Sym = null();
                 let mut s = lookup_in(m, name, gh, &mut eh, ver, fl, &mut nver, &mut versioned);
+                if s.is_null() && nver == 1 && !versioned.is_null() {
+                    s = versioned;
+                }
                 if !s.is_null() && (*m).nfiltees > 0 {
                     let mut hit: Option<Found> = None;
                     for k in 0..(*m).nfiltees {
                         let fm = *(*m).filtees.add(k);
                         let (mut feh, mut fnv, mut fvs): (Option<u32>, u32, *const Sym) = (None, 0, null());
-                        let fsym = lookup_in(fm, name, gh, &mut feh, ver, fl, &mut fnv, &mut fvs);
+                        let mut fsym = lookup_in(fm, name, gh, &mut feh, ver, fl, &mut fnv, &mut fvs);
+                        if fsym.is_null() && fnv == 1 && !fvs.is_null() {
+                            fsym = fvs;
+                        }
                         if !fsym.is_null() {
                             hit = Some(Found { sym: fsym, map: fm });
                             break;
@@ -197,9 +207,6 @@ pub unsafe fn lookup_hashed(name: &[u8], gh: u32, ver: Option<&VerRef>, scopes: 
                         return Some(unique_sym(nm, s, m));
                     }
                     return Some(Found { sym: s, map: m });
-                }
-                if nver == 1 && !versioned.is_null() {
-                    return Some(Found { sym: versioned, map: m });
                 }
             }
         }

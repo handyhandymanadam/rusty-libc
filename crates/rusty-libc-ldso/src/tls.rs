@@ -5,7 +5,27 @@ use core::ptr::null_mut;
 
 pub const MAX_TLS_MODS: usize = 2048;
 const UNALLOCATED: usize = usize::MAX;
-const STATIC_SURPLUS: usize = 1664;
+const LIBC_IE_TLS: usize = 192;
+const OTHER_IE_TLS: usize = 144;
+const DEFAULT_NNS: usize = 4;
+const DEFAULT_OPTIONAL_TLS: usize = 512;
+
+const fn surplus_for(nns: usize, optional: usize) -> usize {
+    (nns - 1) * LIBC_IE_TLS + nns * OTHER_IE_TLS + optional
+}
+
+const LEGACY_TLS: usize = 1664 - surplus_for(DEFAULT_NNS, DEFAULT_OPTIONAL_TLS);
+
+pub fn static_surplus(nns: usize, optional: usize, naudit: usize) -> usize {
+    let nns = nns.min(DL_NNS);
+    if DL_NNS - nns < naudit {
+        let mut o = Out::new(2);
+        let _ = core::fmt::Write::write_fmt(&mut o, format_args!("Failed loading {} audit modules, {} are supported.\n", naudit, DL_NNS - nns));
+        drop(o);
+        crate::sys::exit(127);
+    }
+    surplus_for(nns + naudit, optional) + LEGACY_TLS
+}
 pub const TCB_SIZE: usize = 4096;
 
 #[repr(C)]
@@ -52,6 +72,24 @@ static mut TLS: Tls = Tls {
 };
 
 static TLS_LOCK: Lock = Lock::new();
+
+#[repr(C)]
+pub struct DbSlotList {
+    pub len: usize,
+    pub next: usize,
+    pub slots: [[usize; 2]; MAX_TLS_MODS],
+}
+
+static mut DB_SLOTS: DbSlotList = DbSlotList { len: MAX_TLS_MODS, next: 0, slots: [[0; 2]; MAX_TLS_MODS] };
+
+fn db_slot(id: usize, map: *mut LinkMap) {
+    unsafe { (*(&raw mut DB_SLOTS)).slots[id] = [tls().generation, map as usize] };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __libc_ldso_tls_dbslots() -> usize {
+    &raw const DB_SLOTS as usize
+}
 
 #[inline(always)]
 pub fn tls() -> &'static mut Tls {
@@ -110,6 +148,7 @@ pub unsafe fn add_module(m: *mut LinkMap, static_now: bool) -> bool {
         }
         (*m).tls_modid = id;
         t.generation += 1;
+        db_slot(id, m);
         true
     }
 }
@@ -117,7 +156,7 @@ pub unsafe fn add_module(m: *mut LinkMap, static_now: bool) -> bool {
 pub unsafe fn setup_main_thread(random: *const usize) {
     unsafe {
         let t = tls();
-        t.static_total = align_up(t.static_used + STATIC_SURPLUS, t.max_align);
+        t.static_total = align_up(t.static_used + static_surplus(st().tls_nns, st().tls_optional, crate::audit::au().n), t.max_align);
         let size = t.static_total + TCB_SIZE;
         let base = sys::mmap(0, size, sys::PROT_READ | sys::PROT_WRITE, sys::MAP_PRIVATE | sys::MAP_ANONYMOUS, -1, 0);
         if base < 0 && base > -4096 {
@@ -133,6 +172,21 @@ pub unsafe fn setup_main_thread(random: *const usize) {
         }
         *(tp as *mut u8).add(0x38).cast::<i32>() = sys::gettid();
         init_block(tp);
+        if crate::ldebug::mask() & crate::ldebug::TLS != 0 {
+            let mut m = [0u8; 40];
+            let mut n = 0;
+            for &b in b"TCB allocated: 0x" {
+                m[n] = b;
+                n += 1;
+            }
+            let digits = (64 - (tp | 1).leading_zeros()).div_ceil(4) as usize;
+            for i in (0..digits).rev() {
+                m[n] = b"0123456789abcdef"[(tp >> (4 * i)) & 15];
+                n += 1;
+            }
+            m[n] = b'\n';
+            crate::ldebug::write(&m[..n + 1]);
+        }
         if sys::set_fs(tp) < 0 {
             crate::die(format_args!("cannot set up the thread pointer"));
         }
@@ -311,6 +365,16 @@ unsafe extern "C" fn walk_cb(tp: usize, arg: usize) {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn __libc_ldso_fork_child() {
+    unsafe {
+        TLS_LOCK.reset();
+        crate::dl::fork_child_reset();
+        crate::util::fork_child_reset();
+        crate::lookup::fork_child_reset();
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __libc_ldso_tls_sync(tp: usize) {
     unsafe {
         let n = tls().nmods;
@@ -357,7 +421,7 @@ pub unsafe fn add_static_late(m: *mut LinkMap) -> bool {
 unsafe fn copy_image_to_threads(id: usize) {
     unsafe {
         init_static_for(sys::thread_pointer(), id);
-        let g = core::slice::from_raw_parts((&raw const st().global) as *const *mut LinkMap, st().nglobal);
+        let g = ns(0).scope();
         let fl = crate::lookup::Flags { plt: false, skip: null_mut(), newest: false };
         if let Some(f) = crate::lookup::lookup(b"__libc_walk_threads", None, &[g], &fl) {
             let walker: unsafe extern "C" fn(unsafe extern "C" fn(usize, usize), usize) = core::mem::transmute(crate::lookup::sym_addr(&f));
@@ -391,6 +455,7 @@ pub unsafe fn remove_module(m: *mut LinkMap) {
             TLS_LOCK.lock();
             tls().mods[id].live = false;
             tls().generation += 1;
+            db_slot(id, null_mut());
             let t = tls();
             if t.mods[id].is_static && !t.mods[id].forced_dynamic {
                 loop {
@@ -436,7 +501,7 @@ unsafe extern "C" fn clear_cb(tp: usize, id: usize) {
 
 unsafe fn clear_in_threads(id: usize) {
     unsafe {
-        let g = core::slice::from_raw_parts((&raw const st().global) as *const *mut LinkMap, st().nglobal);
+        let g = ns(0).scope();
         let fl = crate::lookup::Flags { plt: false, skip: null_mut(), newest: false };
         if let Some(f) = crate::lookup::lookup(b"__libc_walk_threads", None, &[g], &fl) {
             let walker: unsafe extern "C" fn(unsafe extern "C" fn(usize, usize), usize) = core::mem::transmute(crate::lookup::sym_addr(&f));

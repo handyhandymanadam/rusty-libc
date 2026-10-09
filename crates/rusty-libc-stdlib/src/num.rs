@@ -679,6 +679,66 @@ pub unsafe extern "C" fn strtold_l(_s: *const c_char, _endptr: *mut *mut c_char,
     )
 }
 
+unsafe fn with_group(s: *const c_char, endptr: *mut *mut c_char, group: c_int, conv: impl FnOnce(*const c_char, *mut *mut c_char)) {
+    unsafe {
+        if group == 0 {
+            return conv(s, endptr);
+        }
+        let nu = rusty_libc_core::locale::numeric_of(rusty_libc_core::locale::current(rusty_libc_core::locale::LC_NUMERIC));
+        let mut sep = [0u32; 16];
+        let n = nu.thousands_sep.len().min(sep.len());
+        for (d, &b) in sep.iter_mut().zip(nu.thousands_sep) {
+            *d = u32::from(b);
+        }
+        let r = crate::grouped::rewrite(s as *const u8, &sep[..n], nu.grouping, |c| is_space(c as i32));
+        let empty = [0 as c_char; 1];
+        let src: *const c_char = match &r {
+            crate::grouped::Rewrite::Plain => return conv(s, endptr),
+            crate::grouped::Rewrite::Zero => empty.as_ptr(),
+            crate::grouped::Rewrite::Copy { buf, .. } => *buf as *const c_char,
+        };
+        let mut e: *mut c_char = core::ptr::null_mut();
+        conv(src, &mut e);
+        let consumed = e.offset_from(src) as usize;
+        let end = crate::grouped::end_of(s as *const u8, &r, consumed, n);
+        crate::grouped::release(r);
+        set_end(endptr, s, end);
+    }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __strtod_internal(s: *const c_char, endptr: *mut *mut c_char, group: c_int) -> f64 {
+    let mut v = 0.0;
+    unsafe { with_group(s, endptr, group, |p, e| v = strtod(p, e)) };
+    v
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __strtof_internal(s: *const c_char, endptr: *mut *mut c_char, group: c_int) -> f32 {
+    let mut v = 0.0;
+    unsafe { with_group(s, endptr, group, |p, e| v = strtof(p, e)) };
+    v
+}
+
+unsafe extern "C" fn strtold_group_inner(s: *const c_char, endptr: *mut *mut c_char, out: *mut [u8; 16], group: c_int) {
+    unsafe { with_group(s, endptr, group, |p, e| strtold_inner(p, e, out, 0)) }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[unsafe(naked)]
+pub unsafe extern "C" fn __strtold_internal(_s: *const c_char, _endptr: *mut *mut c_char, _group: c_int) -> f64 {
+    naked_asm!(
+        "sub rsp, 24",
+        "mov ecx, edx",
+        "mov rdx, rsp",
+        "call {inner}",
+        "fld tbyte ptr [rsp]",
+        "add rsp, 24",
+        "ret",
+        inner = sym strtold_group_inner,
+    )
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn strtof64x(_s: *const c_char, _endptr: *mut *mut c_char) -> f64 {
@@ -738,6 +798,25 @@ pub unsafe extern "C" fn strtof128(_s: *const c_char, _endptr: *mut *mut c_char)
         "add rsp, 24",
         "ret",
         inner = sym strtof128_inner,
+    )
+}
+
+unsafe extern "C" fn strtof128_group_inner(s: *const c_char, endptr: *mut *mut c_char, out: *mut [u8; 16], group: c_int) {
+    unsafe { with_group(s, endptr, group, |p, e| strtof128_inner(p, e, out, 0)) }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[unsafe(naked)]
+pub unsafe extern "C" fn __strtof128_internal(_s: *const c_char, _endptr: *mut *mut c_char, _group: c_int) -> f64 {
+    naked_asm!(
+        "sub rsp, 24",
+        "mov ecx, edx",
+        "mov rdx, rsp",
+        "call {inner}",
+        "movups xmm0, xmmword ptr [rsp]",
+        "add rsp, 24",
+        "ret",
+        inner = sym strtof128_group_inner,
     )
 }
 

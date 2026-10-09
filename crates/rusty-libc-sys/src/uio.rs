@@ -153,22 +153,22 @@ pub unsafe extern "C" fn sendfile64(out_fd: c_int, in_fd: c_int, offset: *mut i6
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn splice(fd_in: c_int, off_in: *mut i64, fd_out: c_int, off_out: *mut i64, len: usize, flags: c_uint) -> isize {
-    unsafe { sc(syscall6(SYS_SPLICE, fd_in as usize, off_in as usize, fd_out as usize, off_out as usize, len, flags as usize)) }
+    unsafe { sc(rusty_libc_core::tls::syscall_cp(SYS_SPLICE, fd_in as usize, off_in as usize, fd_out as usize, off_out as usize, len, flags as usize)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn tee(fd_in: c_int, fd_out: c_int, len: usize, flags: c_uint) -> isize {
-    unsafe { sc(syscall4(SYS_TEE, fd_in as usize, fd_out as usize, len, flags as usize)) }
+    unsafe { sc(rusty_libc_core::tls::syscall_cp(SYS_TEE, fd_in as usize, fd_out as usize, len, flags as usize, 0, 0)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn vmsplice(fd: c_int, iov: *const iovec, n: usize, flags: c_uint) -> isize {
-    unsafe { sc(syscall4(SYS_VMSPLICE, fd as usize, iov as usize, n, flags as usize)) }
+    unsafe { sc(rusty_libc_core::tls::syscall_cp(SYS_VMSPLICE, fd as usize, iov as usize, n, flags as usize, 0, 0)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn copy_file_range(fd_in: c_int, off_in: *mut i64, fd_out: c_int, off_out: *mut i64, len: usize, flags: c_uint) -> isize {
-    unsafe { sc(syscall6(SYS_COPY_FILE_RANGE, fd_in as usize, off_in as usize, fd_out as usize, off_out as usize, len, flags as usize)) }
+    unsafe { sc(rusty_libc_core::tls::syscall_cp(SYS_COPY_FILE_RANGE, fd_in as usize, off_in as usize, fd_out as usize, off_out as usize, len, flags as usize)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

@@ -119,8 +119,11 @@ pub const NO_ADDRESS: c_int = 4;
 
 pub const EINTR: i32 = 4;
 pub const ENOENT: i32 = 2;
+pub const ESRCH: i32 = 3;
 pub const EAGAIN: i32 = 11;
 pub const ENOMEM: i32 = 12;
+pub const ENFILE: i32 = 23;
+pub const EMFILE: i32 = 24;
 pub const EINVAL: i32 = 22;
 pub const EBUSY: i32 = 16;
 pub const ENOSPC: i32 = 28;

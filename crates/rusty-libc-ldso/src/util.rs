@@ -50,7 +50,8 @@ pub unsafe extern "C" fn bcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
     unsafe { memcmp(a, b, n) }
 }
 
-pub unsafe fn strlen(s: *const u8) -> usize {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
     let mut n = 0;
     unsafe {
         while *s.add(n) != 0 {
@@ -58,6 +59,42 @@ pub unsafe fn strlen(s: *const u8) -> usize {
         }
     }
     n
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strcmp(a: *const u8, b: *const u8) -> i32 {
+    let mut i = 0;
+    unsafe {
+        loop {
+            let (x, y) = (*a.add(i), *b.add(i));
+            if x != y || x == 0 {
+                return x as i32 - y as i32;
+            }
+            i += 1;
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strchr(s: *const u8, c: i32) -> *const u8 {
+    let c = c as u8;
+    let mut p = s;
+    unsafe {
+        loop {
+            if *p == c {
+                return p;
+            }
+            if *p == 0 {
+                return core::ptr::null();
+            }
+            p = p.add(1);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn index(s: *const u8, c: i32) -> *const u8 {
+    unsafe { strchr(s, c) }
 }
 
 pub unsafe fn cstr<'a>(s: *const u8) -> &'a [u8] {
@@ -210,6 +247,10 @@ impl core::fmt::Display for Bytes<'_> {
 }
 
 static ALLOC_LOCK: Lock = Lock::new();
+
+pub(crate) unsafe fn fork_child_reset() {
+    unsafe { ALLOC_LOCK.reset() };
+}
 const CHUNK: usize = 256 * 1024;
 const ARENA: usize = 64 * 1024;
 static mut BUMP: usize = 0;
@@ -423,6 +464,11 @@ impl Lock {
             self.waiters.fetch_sub(1, SeqCst);
         }
         unsafe { *self.depth.get() = 1 };
+    }
+    pub unsafe fn reset(&self) {
+        unsafe { *self.depth.get() = 0 };
+        self.owner.store(0, core::sync::atomic::Ordering::Relaxed);
+        self.waiters.store(0, core::sync::atomic::Ordering::Relaxed);
     }
     pub fn unlock(&self) {
         use core::sync::atomic::Ordering::*;

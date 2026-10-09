@@ -77,6 +77,11 @@ pub unsafe extern "C" fn __uflow(f: *mut FILE) -> c_int {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __underflow(f: *mut FILE) -> c_int {
+    unsafe { file::peekc(f) }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __overflow(f: *mut FILE, c: c_int) -> c_int {
     unsafe { file::putc(c, f) }
 }

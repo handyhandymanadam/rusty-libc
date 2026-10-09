@@ -24,6 +24,10 @@ use common::{fma_ready, have_fma};
 
 macro_rules! paths {
     ($t:ty; $nofma:ident, $fma:ident, $m:ident :: $f:ident, ($($a:ident),*)) => {
+        paths!(#[allow(dead_code)] $t; $nofma, $fma, $m::$f, ($($a),*));
+    };
+    (#[$at:meta] $t:ty; $nofma:ident, $fma:ident, $m:ident :: $f:ident, ($($a:ident),*)) => {
+        #[$at]
         #[allow(dead_code)]
         pub(crate) fn $nofma($($a: $t),*) -> $t {
             $m::$f::<false>($($a),*)
@@ -75,10 +79,10 @@ pub extern "C" fn erfc(x: f64) -> f64 {
 }
 
 paths!(f64; tgamma_nofma, tgamma_fma, gamma::tgamma_impl, (x));
-paths!(f64; j0_nofma, j0_fma, bessel::j0_impl, (x));
-paths!(f64; j1_nofma, j1_fma, bessel::j1_impl, (x));
-paths!(f64; y0_nofma, y0_fma, bessel::y0_impl, (x));
-paths!(f64; y1_nofma, y1_fma, bessel::y1_impl, (x));
+paths!(#[inline(never)] f64; j0_nofma, j0_fma, bessel::j0_impl, (x));
+paths!(#[inline(never)] f64; j1_nofma, j1_fma, bessel::j1_impl, (x));
+paths!(#[inline(never)] f64; y0_nofma, y0_fma, bessel::y0_impl, (x));
+paths!(#[inline(never)] f64; y1_nofma, y1_fma, bessel::y1_impl, (x));
 
 pub(crate) fn lgamma_r_nofma(x: f64) -> (f64, i32) {
     gamma::lgamma_r_impl::<false>(x)

@@ -10,6 +10,20 @@ const FUTEX_WAKE_PRIVATE: usize = 129;
 #[allow(non_upper_case_globals)]
 pub static mut __libc_single_threaded: u8 = 1;
 
+#[cfg_attr(feature = "export-mem", unsafe(no_mangle))]
+pub extern "C" fn __libc_early_init(initial: bool) {
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(__libc_single_threaded), initial as u8);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(LIBC_INITIAL), initial as u8);
+    }
+}
+
+static mut LIBC_INITIAL: u8 = 1;
+
+pub fn libc_initial() -> bool {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(LIBC_INITIAL)) != 0 }
+}
+
 pub fn note_multithreaded() {
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(__libc_single_threaded), 0) };
 }

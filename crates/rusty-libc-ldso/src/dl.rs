@@ -14,6 +14,10 @@ pub const RTLD_GLOBAL: c_int = 0x100;
 pub const RTLD_NODELETE: c_int = 0x1000;
 
 static DL_LOCK: Lock = Lock::new();
+
+pub(crate) unsafe fn fork_child_reset() {
+    unsafe { DL_LOCK.reset() };
+}
 static mut ADDS: u64 = 1;
 static mut SUBS: u64 = 0;
 
@@ -128,12 +132,14 @@ pub unsafe extern "C" fn __libc_ldso_dlerror() -> *const c_char {
 }
 
 pub unsafe fn map_of_addr(addr: usize) -> *mut LinkMap {
-    let mut cur = st().head;
-    while !cur.is_null() {
-        if !(*cur).unloading && addr >= (*cur).map_start && addr < (*cur).map_end {
-            return cur;
+    for n in 0..st().nns {
+        let mut cur = ns(n).head;
+        while !cur.is_null() {
+            if !(*cur).unloading && addr >= (*cur).map_start && addr < (*cur).map_end {
+                return cur;
+            }
+            cur = (*cur).l_next;
         }
-        cur = (*cur).l_next;
     }
     null_mut()
 }
@@ -159,7 +165,7 @@ unsafe fn load_deps_new(first: *mut LinkMap) -> bool {
                 if !ok {
                     return;
                 }
-                let d = load_library(name, m);
+                let d = load_library((*m).l_ns as usize, name, m);
                 if d.is_null() {
                     ok = kind != 0;
                     return;
@@ -183,7 +189,7 @@ unsafe fn load_deps_new(first: *mut LinkMap) -> bool {
     true
 }
 
-unsafe fn discard_from(first: *mut LinkMap) {
+pub unsafe fn discard_from(first: *mut LinkMap) {
     let mut list: [*mut LinkMap; 256] = [null_mut(); 256];
     let mut n = 0;
     let mut cur = first;
@@ -198,20 +204,15 @@ unsafe fn discard_from(first: *mut LinkMap) {
 }
 
 unsafe fn drop_map(m: *mut LinkMap) {
-    let s = st();
     (*m).unloading = true;
     (*m).removed = true;
-    let mut j = 0;
-    for i in 0..s.nglobal {
-        if s.global[i] != m {
-            s.global[j] = s.global[i];
-            j += 1;
-        }
-    }
-    s.nglobal = j;
+    ns((*m).l_ns as usize).remove_global(m);
     (*m).in_global = false;
     tls::remove_module(m);
     unlink_map(m);
+    if (*m).l_real != m {
+        return;
+    }
     if !(*m).plt_cache.is_null() {
         let n = ((*m).pltrelsz / core::mem::size_of::<Rela>()).max(1) * crate::plt::SLOT_SIZE;
         sys::munmap((*m).plt_cache as usize, n);
@@ -220,20 +221,69 @@ unsafe fn drop_map(m: *mut LinkMap) {
     sys::munmap((*m).map_start, (*m).map_end - (*m).map_start);
 }
 
-pub unsafe fn open_object(name: Option<&[u8]>, mode: c_int, caller: usize) -> *mut LinkMap {
+pub unsafe fn new_namespace() -> Option<usize> {
+    let s = st();
+    let mut n = 1;
+    while n < s.nns && !ns(n).head.is_null() {
+        n += 1;
+    }
+    if n == DL_NNS {
+        return None;
+    }
+    if n == s.nns {
+        s.nns += 1;
+    }
+    Some(n)
+}
+
+pub const LM_ID_BASE: isize = 0;
+pub const LM_ID_NEWLM: isize = -1;
+pub const LM_ID_CALLER: isize = -2;
+
+pub unsafe fn open_object(lmid: isize, name: Option<&[u8]>, mode: c_int, caller: usize) -> *mut LinkMap {
     let s = st();
     let Some(name) = name else { return s.main_map };
     if name.is_empty() {
         return s.main_map;
     }
     let requester = map_of_addr(caller);
+    let nsid;
+    if lmid == LM_ID_NEWLM {
+        let Some(n) = new_namespace() else {
+            set_error(format_args!("{}: no more namespaces available for dlmopen(): Invalid argument", Bytes(name)));
+            return null_mut();
+        };
+        nsid = n;
+    } else if lmid == LM_ID_CALLER {
+        nsid = ns_of(requester);
+    } else if lmid == LM_ID_BASE {
+        nsid = 0;
+    } else if lmid < 0 || lmid as usize >= s.nns || ns(lmid as usize).head.is_null() || crate::audit::is_audit_ns(lmid as usize) {
+        set_error(format_args!("{}: invalid target namespace in dlmopen(): Invalid argument", Bytes(name)));
+        return null_mut();
+    } else {
+        nsid = lmid as usize;
+    }
+    if lmid == LM_ID_NEWLM {
+        crate::debug_change_state(crate::debug_update(nsid), crate::RT_CONSISTENT);
+    }
+    crate::debug_initialize(nsid);
+    let r = open_in(nsid, requester, name, mode);
+    if r.is_null() {
+        trim_nns();
+    }
+    r
+}
+
+unsafe fn open_in(nsid: usize, requester: *mut LinkMap, name: &[u8], mode: c_int) -> *mut LinkMap {
+    let s = st();
     if mode & SPROF != 0 {
         return sprof_open(name, requester);
     }
     if mode & RTLD_NOLOAD != 0 {
-        let mut m = find_loaded(name);
+        let mut m = find_loaded(nsid, name);
         if m.is_null() {
-            m = find_loaded_by_file(name, requester);
+            m = find_loaded_by_file(nsid, name, requester);
         }
         if !m.is_null() && mode & RTLD_GLOBAL != 0 {
             promote_global(m);
@@ -241,18 +291,18 @@ pub unsafe fn open_object(name: Option<&[u8]>, mode: c_int, caller: usize) -> *m
         if !m.is_null() {
             (*m).refcount += 1;
         }
-        if m.is_null() && !library_exists(name, requester) {
+        if m.is_null() && !library_exists(nsid, name, requester) {
             set_error(format_args!("{}: cannot open shared object file: No such file or directory", Bytes(name)));
         }
         return m;
     }
-    let tail_before = s.tail;
-    let root = load_library(name, requester);
+    let tail_before = ns(nsid).tail;
+    let root = load_library(nsid, name, requester);
     if root.is_null() {
-        discard_from(if tail_before.is_null() { s.head } else { (*tail_before).l_next });
+        discard_from(if tail_before.is_null() { ns(nsid).head } else { (*tail_before).l_next });
         return null_mut();
     }
-    let first_new = if tail_before.is_null() { s.head } else { (*tail_before).l_next };
+    let first_new = if tail_before.is_null() { ns(nsid).head } else { (*tail_before).l_next };
     if (*root).opening && first_new.is_null() {
         if mode & RTLD_GLOBAL != 0 {
             promote_global(root);
@@ -341,22 +391,27 @@ pub unsafe fn open_object(name: Option<&[u8]>, mode: c_int, caller: usize) -> *m
         n += 1;
         cur = (*cur).l_next;
     }
-    crate::_r_debug.state = 1;
-    crate::_dl_debug_state();
-    crate::audit::activity(crate::audit::LA_ACT_ADD);
+    let rd = crate::debug_update(nsid);
+    crate::debug_change_state(rd, crate::RT_ADD);
+    crate::audit::activity_ns(nsid, crate::audit::LA_ACT_ADD);
     for &m in &list[..n] {
         crate::audit::objopen(m);
     }
     for i in (0..n).rev() {
         if !reloc::relocate(list[i]) {
             discard_from(first_new);
-            crate::_r_debug.state = 0;
-            crate::_dl_debug_state();
-            crate::audit::activity(crate::audit::LA_ACT_CONSISTENT);
+            crate::debug_change_state(rd, crate::RT_CONSISTENT);
+            crate::audit::activity_ns(nsid, crate::audit::LA_ACT_CONSISTENT);
             return null_mut();
         }
     }
     crate::profile::start();
+    if nsid != 0 {
+        let lm = ns(nsid).libc_map;
+        if !lm.is_null() && list[..n].contains(&lm) {
+            call_libc_early_init(lm, false);
+        }
+    }
     for &m in &list[..n] {
         protect_relro(m);
         ADDS += 1;
@@ -368,9 +423,8 @@ pub unsafe fn open_object(name: Option<&[u8]>, mode: c_int, caller: usize) -> *m
         (*root).nodelete = true;
     }
     (*root).refcount += 1;
-    crate::_r_debug.state = 0;
-    crate::_dl_debug_state();
-    crate::audit::activity(crate::audit::LA_ACT_CONSISTENT);
+    crate::debug_change_state(rd, crate::RT_CONSISTENT);
+    crate::audit::activity_ns(nsid, crate::audit::LA_ACT_CONSISTENT);
     let mut cur = first_new;
     while !cur.is_null() {
         (*cur).opening = false;
@@ -380,6 +434,14 @@ pub unsafe fn open_object(name: Option<&[u8]>, mode: c_int, caller: usize) -> *m
     root
 }
 
+pub unsafe fn call_libc_early_init(libc: *mut LinkMap, initial: bool) {
+    let fl = Flags { plt: false, skip: null_mut(), newest: false };
+    if let Some(f) = lookup(b"__libc_early_init", None, &[&[libc]], &fl) {
+        let f: extern "C" fn(bool) = core::mem::transmute(sym_addr(&f));
+        f(initial);
+    }
+}
+
 unsafe fn promote_global(m: *mut LinkMap) {
     if (*m).scope.is_null() {
         crate::build_scope(m);
@@ -387,10 +449,7 @@ unsafe fn promote_global(m: *mut LinkMap) {
     for i in 0..(*m).nscope {
         let d = *(*m).scope.add(i);
         if !(*d).is_ldso {
-            let s = st();
-            if !(*d).in_global && s.nglobal < MAX_MAPS {
-                s.global[s.nglobal] = d;
-                s.nglobal += 1;
+            if !(*d).in_global && ns((*m).l_ns as usize).push_global(d) {
                 (*d).in_global = true;
             }
         }
@@ -398,7 +457,16 @@ unsafe fn promote_global(m: *mut LinkMap) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __libc_ldso_dlopen(file: *const u8, mode: c_int, caller: usize) -> *mut c_void {
+pub unsafe extern "C" fn __libc_ldso_dlopen(file: *const u8, mode: c_int, caller: usize, env: *mut *mut u8) -> *mut c_void {
+    unsafe { dlmopen_impl(LM_ID_CALLER, file, mode, caller, env) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __libc_ldso_dlmopen(lmid: isize, file: *const u8, mode: c_int, caller: usize, env: *mut *mut u8) -> *mut c_void {
+    unsafe { dlmopen_impl(lmid, file, mode, caller, env) }
+}
+
+unsafe fn dlmopen_impl(lmid: isize, file: *const u8, mode: c_int, caller: usize, env: *mut *mut u8) -> *mut c_void {
     if mode & !(0x3 | RTLD_NOLOAD | RTLD_DEEPBIND | RTLD_GLOBAL | RTLD_NODELETE | 0x4000_0000) != 0 {
         fail(format_args!("invalid mode parameter"));
         return null_mut();
@@ -413,7 +481,10 @@ pub unsafe extern "C" fn __libc_ldso_dlopen(file: *const u8, mode: c_int, caller
     }
     DL_LOCK.lock();
     set_error(format_args!(""));
-    let r = open_object(if file.is_null() { None } else { Some(cstr(file)) }, mode, caller);
+    let outer_env = crate::INIT_ENV;
+    crate::INIT_ENV = env;
+    let r = open_object(lmid, if file.is_null() { None } else { Some(cstr(file)) }, mode, caller);
+    crate::INIT_ENV = outer_env;
     if r.is_null() {
         if st().error_len != 0 {
             publish_error();
@@ -488,15 +559,23 @@ unsafe fn release(m: *mut LinkMap) {
     if (*m).refcount > 0 {
         (*m).refcount -= 1;
     }
+    if (*m).is_ldso && (*m).l_real != m {
+        if (*m).refcount == 0 && !(*m).unloading {
+            crate::audit::close_one(m);
+            drop_map(m);
+        }
+        return;
+    }
     if (*m).refcount > 0 || (*m).nodelete || (*m).is_main || (*m).is_ldso || (*m).unloading {
         return;
     }
     (*m).unloading = true;
-    crate::_r_debug.state = 2;
-    crate::_dl_debug_state();
+    let rd = crate::debug_update((*m).l_ns as usize);
+    crate::debug_change_state(rd, crate::RT_DELETE);
     if (*m).init_called {
         crate::run_fini(m);
     }
+    crate::audit::close_one(m);
     for k in 0..(*m).nneeded {
         release(*(*m).needed.add(k));
     }
@@ -505,13 +584,9 @@ unsafe fn release(m: *mut LinkMap) {
     }
     (*m).unloading = false;
     (*m).removed = true;
-    crate::audit::activity(crate::audit::LA_ACT_DELETE);
-    crate::audit::objclose(m);
     drop_map(m);
     SUBS += 1;
-    crate::_r_debug.state = 0;
-    crate::_dl_debug_state();
-    crate::audit::activity(crate::audit::LA_ACT_CONSISTENT);
+    crate::debug_change_state(rd, crate::RT_CONSISTENT);
 }
 
 #[unsafe(no_mangle)]
@@ -528,19 +603,22 @@ pub unsafe extern "C" fn __libc_ldso_dlclose(handle: *mut c_void) -> c_int {
         succeed();
         0
     } else {
-        let mut cur = st().head;
         let mut ok = false;
-        while !cur.is_null() {
-            if cur == m && !(*cur).unloading {
-                ok = true;
+        for n in 0..st().nns {
+            let mut cur = ns(n).head;
+            while !cur.is_null() {
+                if cur == m && !(*cur).unloading {
+                    ok = true;
+                }
+                cur = (*cur).l_next;
             }
-            cur = (*cur).l_next;
         }
         if !ok {
             fail(format_args!("invalid handle"));
             -1
         } else {
             release(m);
+            crate::audit::close_done();
             succeed();
             0
         }
@@ -556,21 +634,26 @@ unsafe fn tls_symbol_address(f: &Found) -> usize {
 
 pub unsafe fn symbol_lookup(handle: *mut c_void, name: &[u8], ver: Option<&VerRef>, caller: usize) -> usize {
     let s = st();
-    let g = core::slice::from_raw_parts((&raw const s.global) as *const *mut LinkMap, s.nglobal);
+    let caller_map = if handle as usize == 0 || handle as usize == usize::MAX { map_of_addr(caller) } else { null_mut() };
+    let g = ns(ns_of(caller_map)).scope();
     let fl = Flags { plt: false, skip: null_mut(), newest: ver.is_none() };
     let found: Option<Found>;
     let where_: Option<*mut LinkMap>;
     match handle as usize {
         0 => {
-            found = lookup(name, ver, &[g], &fl);
+            let own: &[*mut LinkMap] = if !caller_map.is_null() && !(*caller_map).in_global && !(*caller_map).scope.is_null() {
+                core::slice::from_raw_parts((*caller_map).scope, (*caller_map).nscope)
+            } else {
+                &[]
+            };
+            found = lookup(name, ver, &[g, own], &fl);
             where_ = None;
             if let Some(f) = &found {
-                let c = map_of_addr(caller);
-                note_binding(if c.is_null() { s.main_map } else { c }, f.map);
+                note_binding(if caller_map.is_null() { s.main_map } else { caller_map }, f.map);
             }
         }
         usize::MAX => {
-            let c = map_of_addr(caller);
+            let c = caller_map;
             if c.is_null() {
                 fail(format_args!("RTLD_NEXT used in code not dynamically loaded"));
                 return 0;
@@ -614,7 +697,7 @@ pub unsafe fn symbol_lookup(handle: *mut c_void, name: &[u8], ver: Option<&VerRe
         _ => {
             let m = handle as *mut LinkMap;
             if m == s.main_map {
-                found = lookup(name, ver, &[g], &fl);
+                found = lookup(name, ver, &[ns(0).scope()], &fl);
             } else {
                 if (*m).scope.is_null() {
                     crate::build_scope(m);
@@ -786,7 +869,7 @@ pub unsafe extern "C" fn __libc_ldso_dlinfo(handle: *mut c_void, request: c_int,
     let m = if handle.is_null() { st().main_map } else { handle as *mut LinkMap };
     let r = match request {
         1 => {
-            *(arg as *mut c_int as *mut isize) = 0;
+            *(arg as *mut isize) = (*m).l_ns;
             0
         }
         2 => {
@@ -940,24 +1023,36 @@ pub struct DlPhdrInfo {
 type PhdrCb = unsafe extern "C" fn(*mut DlPhdrInfo, usize, *mut c_void) -> c_int;
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __libc_ldso_iterate_phdr(cb: Option<PhdrCb>, data: *mut c_void) -> c_int {
+pub unsafe extern "C" fn __libc_ldso_iterate_phdr(cb: Option<PhdrCb>, data: *mut c_void, caller: usize) -> c_int {
     let Some(cb) = cb else { return 0 };
     DL_LOCK.lock();
     let mut list: [*mut LinkMap; 1024] = [null_mut(); 1024];
     let mut n = 0;
-    list[0] = st().main_map;
-    n += 1;
-    let mut cur = st().head;
-    while !cur.is_null() && n < 1024 {
-        if cur != st().main_map && !(*cur).unloading && !(*cur).is_ldso {
-            list[n] = cur;
+    let nsid = ns_of(map_of_addr(caller));
+    if nsid == 0 {
+        list[0] = st().main_map;
+        n += 1;
+        let mut cur = ns(0).head;
+        while !cur.is_null() && n < 1024 {
+            if cur != st().main_map && !(*cur).unloading && !(*cur).is_ldso {
+                list[n] = cur;
+                n += 1;
+            }
+            cur = (*cur).l_next;
+        }
+        if !st().ldso_map.is_null() && n < 1024 {
+            list[n] = st().ldso_map;
             n += 1;
         }
-        cur = (*cur).l_next;
-    }
-    if !st().ldso_map.is_null() && n < 1024 {
-        list[n] = st().ldso_map;
-        n += 1;
+    } else {
+        let mut cur = ns(nsid).head;
+        while !cur.is_null() && n < 1024 {
+            if !(*cur).unloading {
+                list[n] = (*cur).l_real;
+                n += 1;
+            }
+            cur = (*cur).l_next;
+        }
     }
     let adds = ADDS;
     let subs = SUBS;
@@ -1052,13 +1147,13 @@ fn l_info_index(t: u64) -> Option<usize> {
 }
 
 unsafe fn sprof_open(name: &[u8], requester: *mut LinkMap) -> *mut LinkMap {
-    let s = st();
-    let tail_before = s.tail;
-    let m = load_library(name, requester);
+    let nsid = ns_of(requester);
+    let tail_before = ns(nsid).tail;
+    let m = load_library(nsid, name, requester);
     if m.is_null() {
         return null_mut();
     }
-    let fresh = s.tail != tail_before;
+    let fresh = ns(nsid).tail != tail_before;
     let mut slot = usize::MAX;
     for i in 0..16 {
         if SPROF_HANDLES[i].is_null() {

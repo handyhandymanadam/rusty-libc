@@ -380,7 +380,9 @@ pub fn module(name: &[u8]) -> usize {
         file[..pre.len()].copy_from_slice(pre);
         file[pre.len()..pre.len() + name.len()].copy_from_slice(name);
         file[pre.len() + name.len()..pre.len() + name.len() + suf.len()].copy_from_slice(suf);
+        let saved = crate::errno::get();
         let h = dlopen(file.as_ptr() as *const c_char, 1) as usize;
+        crate::errno::set(saved);
         if *n < tab.len() {
             tab[*n] = Mod { name: [0; NAME_MAX], len: name.len() as u8, handle: h };
             tab[*n].name[..name.len()].copy_from_slice(name);
@@ -414,7 +416,10 @@ pub fn function(modname: &[u8], func: &[u8]) -> usize {
             sym[o..o + part.len()].copy_from_slice(part);
             o += part.len();
         }
-        dlsym(h as *mut c_void, sym.as_ptr() as *const c_char) as usize
+        let saved = crate::errno::get();
+        let f = dlsym(h as *mut c_void, sym.as_ptr() as *const c_char) as usize;
+        crate::errno::set(saved);
+        f
     }
     #[cfg(not(feature = "shared"))]
     {

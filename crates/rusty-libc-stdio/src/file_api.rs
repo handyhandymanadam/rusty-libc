@@ -149,15 +149,6 @@ pub(crate) unsafe fn fgets_u(s: *mut c_char, n: c_int, f: *mut FILE) -> *mut c_c
         let mut i = 0usize;
         let max = (n - 1) as usize;
         'line: while i < max {
-            if (*f).nunget > 0 {
-                let c = file::getc(f);
-                *s.add(i) = c as c_char;
-                i += 1;
-                if c == c_int::from(b'\n') {
-                    break;
-                }
-                continue;
-            }
             let Some((p, avail)) = file::fill_buf(f) else { break };
             let take = avail.min(max - i);
             let nl = rusty_libc_mem::memchr(p.cast(), c_int::from(b'\n'), take) as *const u8;
@@ -445,7 +436,7 @@ unsafe fn getdelim_u(lineptr: *mut *mut c_char, n: *mut usize, delim: c_int, f: 
         }
         let mut len = 0usize;
         'outer: loop {
-            if (*f).nunget > 0 {
+            if (*f).nunget() > 0 {
                 let c = file::getc(f);
                 if len + 2 > *n && !grow(lineptr, n, len + 2) {
                     (*f).flags |= F_ERR;

@@ -11,7 +11,11 @@ const LC_ALL: c_int = 6;
 const NLS_MAGIC: u32 = 0x9504_12de;
 const NLS_MAGIC_SWAPPED: u32 = 0xde12_0495;
 const SEGMENTS_END: u32 = !0;
-const DEFAULT_DIRNAME: &[u8] = b"/usr/share/locale\0";
+#[allow(non_upper_case_globals)]
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub static _nl_default_dirname: [u8; 18] = *b"/usr/share/locale\0";
+static DEFAULT_DIRNAME_OWN: [u8; 18] = *b"/usr/share/locale\0";
+const DEFAULT_DIRNAME: &[u8] = &DEFAULT_DIRNAME_OWN;
 const DEFAULT_DOMAIN: &[u8] = b"messages\0";
 
 static STATE: RawMutex = RawMutex::new();
@@ -75,7 +79,9 @@ fn category_name(category: c_int) -> &'static [u8] {
     }
 }
 static mut CURRENT_DOMAIN: *const u8 = DEFAULT_DOMAIN.as_ptr();
-static mut BINDINGS: *mut Binding = null_mut();
+#[allow(non_upper_case_globals)]
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub static mut _nl_domain_bindings: *mut Binding = null_mut();
 
 #[allow(non_upper_case_globals)]
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -89,11 +95,18 @@ pub(crate) fn bump_cat_cntr() {
 }
 static mut LOADED: *mut Loaded = null_mut();
 
-struct Binding {
+#[repr(C)]
+pub struct Binding {
     next: *mut Binding,
-    domainname: *mut u8,
     dirname: *mut u8,
     codeset: *mut u8,
+    domainname: [u8; 0],
+}
+
+impl Binding {
+    unsafe fn domain(b: *const Binding) -> &'static [u8] {
+        unsafe { cstr_bytes((&raw const (*b).domainname).cast()) }
+    }
 }
 
 struct Conversion {
@@ -787,9 +800,9 @@ fn plural_lookup(d: &Domain, n: u64, translation: *const u8, len: usize) -> *con
 
 fn find_binding(domain: &[u8]) -> *mut Binding {
     unsafe {
-        let mut b = BINDINGS;
+        let mut b = _nl_domain_bindings;
         while !b.is_null() {
-            match domain.cmp(cstr_bytes((*b).domainname)) {
+            match domain.cmp(Binding::domain(b)) {
                 core::cmp::Ordering::Equal => return b,
                 core::cmp::Ordering::Less => return null_mut(),
                 core::cmp::Ordering::Greater => b = (*b).next,
@@ -1064,7 +1077,7 @@ unsafe fn set_binding_values(domainname: *const c_char, dirname: Option<*const c
                 rdir = DEFAULT_DIRNAME.as_ptr() as *mut u8;
             }
         } else {
-            let nb = rusty_libc_malloc::malloc(core::mem::size_of::<Binding>()) as *mut Binding;
+            let nb = rusty_libc_malloc::malloc(core::mem::size_of::<Binding>() + dname.len() + 1) as *mut Binding;
             if nb.is_null() {
                 return (null_mut(), null_mut());
             }
@@ -1083,13 +1096,16 @@ unsafe fn set_binding_values(domainname: *const c_char, dirname: Option<*const c
                 rusty_libc_malloc::free(nb.cast());
                 return (null_mut(), null_mut());
             }
-            *nb = Binding { next: null_mut(), domainname: dup(dname), dirname: dir, codeset: cs };
-            if BINDINGS.is_null() || dname < cstr_bytes((*BINDINGS).domainname) {
-                (*nb).next = BINDINGS;
-                BINDINGS = nb;
+            nb.write(Binding { next: null_mut(), dirname: dir, codeset: cs, domainname: [] });
+            let name = (&raw mut (*nb).domainname).cast::<u8>();
+            core::ptr::copy_nonoverlapping(dname.as_ptr(), name, dname.len());
+            *name.add(dname.len()) = 0;
+            if _nl_domain_bindings.is_null() || dname < Binding::domain(_nl_domain_bindings) {
+                (*nb).next = _nl_domain_bindings;
+                _nl_domain_bindings = nb;
             } else {
-                let mut p = BINDINGS;
-                while !(*p).next.is_null() && dname > cstr_bytes((*(*p).next).domainname) {
+                let mut p = _nl_domain_bindings;
+                while !(*p).next.is_null() && dname > Binding::domain((*p).next) {
                     p = (*p).next;
                 }
                 (*nb).next = (*p).next;

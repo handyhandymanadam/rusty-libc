@@ -7,7 +7,7 @@ use core::ffi::{c_int, c_void};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use rusty_libc_core::lock::RawMutex;
 use rusty_libc_core::syscall::{syscall2, syscall3, syscall4};
-use rusty_libc_core::tls::{self, TCB_SIZE, Tcb};
+use rusty_libc_core::tls::{self, DebugArg, TCB_SIZE, Tcb};
 
 pub type StartFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 
@@ -56,6 +56,7 @@ pub struct Thread {
     pub attr_flags: i32,
     pub specific_1st: [KeyData; 32],
     pub specific_2nd: *mut KeyData,
+    pub dtv_block: usize,
 }
 
 const _: () = assert!(core::mem::size_of::<Thread>() <= TCB_SIZE);
@@ -69,6 +70,7 @@ pub fn current_thread() -> *mut Thread {
 static LIST_LOCK: RawMutex = RawMutex::new();
 static mut ALL_HEAD: *mut Thread = core::ptr::null_mut();
 static mut FREE_HEAD: *mut Thread = core::ptr::null_mut();
+#[cfg_attr(feature = "export", unsafe(export_name = "__nptl_nthreads"))]
 static THREAD_COUNT: AtomicUsize = AtomicUsize::new(1);
 const CACHE_MAX: usize = 32;
 
@@ -176,6 +178,13 @@ unsafe extern "C" {
 
 unsafe fn list_insert_all(t: *mut Thread) {
     unsafe {
+        list_insert_all_only(t);
+        rusty_libc_core::thread_db::add(t as *mut Tcb);
+    }
+}
+
+unsafe fn list_insert_all_only(t: *mut Thread) {
+    unsafe {
         (*t).list_prev = core::ptr::null_mut();
         (*t).list_next = ALL_HEAD;
         if !ALL_HEAD.is_null() {
@@ -200,6 +209,7 @@ unsafe fn list_remove_all(t: *mut Thread) {
         }
         (*t).list_next = core::ptr::null_mut();
         (*t).list_prev = core::ptr::null_mut();
+        rusty_libc_core::thread_db::remove(t as *mut Tcb);
     }
 }
 
@@ -227,6 +237,9 @@ unsafe fn release(t: *mut Thread) {
         LIST_LOCK.lock_always();
         list_remove_all(t);
         if (*t).flags & FLAG_USER_STACK == 0 && !(*t).mapping.is_null() {
+            if tls::debug_tls_on() {
+                tls::debug_tls(&[DebugArg::S(b"TCB deallocated into cache: TID="), DebugArg::D(tid_of(t).max(0) as i64), DebugArg::S(b", TCB="), DebugArg::X(t as usize)]);
+            }
             (*t).list_next = FREE_HEAD;
             FREE_HEAD = t;
         }
@@ -256,6 +269,10 @@ unsafe fn reap_and_find(total: usize, guard: usize) -> *mut Thread {
                     remove = true;
                 } else if cached >= CACHE_MAX || (*cur).mapping_size > (64 << 20) {
                     let (m, s) = ((*cur).mapping, (*cur).mapping_size);
+                    if tls::debug_tls_on() {
+                        tls::debug_tls(&[DebugArg::S(b"TCB cache full, deallocating: TID="), DebugArg::D(tid_of(cur).max(0) as i64), DebugArg::S(b", TCB="), DebugArg::X(cur as usize)]);
+                        tls::debug_tls(&[DebugArg::S(b"TCB deallocating: "), DebugArg::X(cur as usize), DebugArg::S(b" (dealloc_tcb=0)")]);
+                    }
                     tls::release_block(cur as *mut Tcb);
                     if prev.is_null() {
                         FREE_HEAD = next;
@@ -333,6 +350,9 @@ unsafe fn resolve(attr: *const PthreadAttr) -> Params {
 unsafe extern "C" fn thread_entry(t: *mut Thread) -> ! {
     unsafe {
         sigprocmask_set(2, (*t).start_mask);
+        if tls::debug_tls_on() {
+            tls::debug_tls(&[DebugArg::S(b"Thread starting: TID="), DebugArg::D(raw_gettid() as i64), DebugArg::S(b", TCB="), DebugArg::X(t as usize)]);
+        }
         tls::sync_new_thread(t as *mut Tcb);
         loop {
             let g = (*t).gate.load(Ordering::Acquire);
@@ -372,12 +392,23 @@ pub unsafe extern "C" fn pthread_create(newthread: *mut PthreadT, attr: *const P
             let base = ((p.user_top as usize - block_size) & !(align - 1)) as *mut u8;
             core::ptr::write_bytes(base, 0, block_size);
             let tp = tls::setup_block(base, &tpl, (*me).tcb.stack_guard, (*me).tcb.pointer_guard) as *mut Thread;
+            (*tp).dtv_block = tls::dtv_allocation(tp as *mut Tcb);
             t = tp;
             mapping = core::ptr::null_mut();
             (*t).flags = FLAG_USER_STACK;
             (*t).stack_lo = p.user_top.sub(p.stacksize);
             (*t).stack_size = p.stacksize;
             (*t).block_base = base;
+            if tls::debug_tls_on() {
+                tls::debug_tls(&[
+                    DebugArg::S(b"TCB for user-supplied stack created: "),
+                    DebugArg::X(t as usize),
+                    DebugArg::S(b", stack="),
+                    DebugArg::X((*t).stack_lo as usize),
+                    DebugArg::S(b", size="),
+                    DebugArg::D(p.stacksize as i64),
+                ]);
+            }
         } else {
             let guard = align_up(p.guardsize, PAGE);
             let size = align_up(p.stacksize, PAGE);
@@ -409,6 +440,14 @@ pub unsafe extern "C" fn pthread_create(newthread: *mut PthreadT, attr: *const P
                 core::ptr::write_bytes(base, 0, block_size);
             }
             t = tls::setup_block(base, &tpl, (*me).tcb.stack_guard, (*me).tcb.pointer_guard) as *mut Thread;
+            (*t).dtv_block = tls::dtv_allocation(t as *mut Tcb);
+            if tls::debug_tls_on() {
+                if reuse.is_null() {
+                    tls::debug_tls(&[DebugArg::S(b"TCB for new stack allocated: "), DebugArg::X(t as usize)]);
+                } else {
+                    tls::debug_tls(&[DebugArg::S(b"TLS TCB reused from cache: "), DebugArg::X(t as usize)]);
+                }
+            }
             (*t).flags = 0;
             (*t).mapping = mapping;
             (*t).mapping_size = mapping_size;
@@ -422,6 +461,7 @@ pub unsafe extern "C" fn pthread_create(newthread: *mut PthreadT, attr: *const P
         (*t).tcb.multiple_threads = 1;
         (*t).tcb.tid = 0;
         (*t).start = Some(start);
+        (*t).tcb.db_start = start as usize;
         (*t).arg = arg;
         (*t).joinstate.store(if p.detached { DETACHED } else { JOINABLE }, Ordering::Relaxed);
         (*t).robust.list = &raw mut (*t).robust as *mut u8;
@@ -513,6 +553,7 @@ pub fn thread_exit(retval: *mut c_void) -> ! {
         rusty_libc_core::tls::run_thread_dtors();
         crate::key::run_destructors(t);
         crate::key::free_second_level(t);
+        rusty_libc_malloc::thread_shutdown();
         let is_main = (*t).mapping.is_null() && (*t).flags & FLAG_USER_STACK == 0;
         let left = THREAD_COUNT.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
@@ -711,8 +752,9 @@ pub unsafe fn after_fork_child() {
         if !is_main_thread(me) {
             (*me).list_next = core::ptr::null_mut();
             (*me).list_prev = core::ptr::null_mut();
-            list_insert_all(me);
+            list_insert_all_only(me);
         }
+        rusty_libc_core::thread_db::after_fork(me as *mut Tcb);
         THREAD_COUNT.store(1, Ordering::Release);
         if (*me).robust_registered != 0 {
             (*me).robust.list = &raw mut (*me).robust as *mut u8;

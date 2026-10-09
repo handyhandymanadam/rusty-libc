@@ -1215,9 +1215,18 @@ pub unsafe extern "C" fn syscall(number: c_long, mut args: ...) -> c_long {
     }
 }
 
+#[allow(non_upper_case_globals)]
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub static mut __curbrk: *mut c_void = core::ptr::null_mut();
+
+fn set_curbrk(v: usize) {
+    unsafe { (&raw mut __curbrk).write_volatile(v as *mut c_void) };
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn brk(addr: *mut c_void) -> c_int {
     let cur = unsafe { syscall::syscall1(syscall::SYS_BRK, addr as usize) };
+    set_curbrk(cur);
     if cur < addr as usize {
         return fail(ENOMEM);
     }
@@ -1227,6 +1236,7 @@ pub extern "C" fn brk(addr: *mut c_void) -> c_int {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sbrk(increment: isize) -> *mut c_void {
     let old = unsafe { syscall::syscall1(syscall::SYS_BRK, 0) };
+    set_curbrk(old);
     if increment == 0 {
         return old as *mut c_void;
     }
@@ -1237,6 +1247,7 @@ pub extern "C" fn sbrk(increment: isize) -> *mut c_void {
     }
     let want = old.wrapping_add(increment as usize);
     let got = unsafe { syscall::syscall1(syscall::SYS_BRK, want) };
+    set_curbrk(got);
     if got < want {
         errno::set(ENOMEM);
         return usize::MAX as *mut c_void;

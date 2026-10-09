@@ -266,7 +266,97 @@ pub(crate) unsafe extern "C" fn resolve_common() {
 }
 
 extern "C" fn init_dispatch() {
+    if has_avx2() {
+        init_large_sizes();
+    }
     crate::slots::init(has_avx2());
+}
+
+pub(crate) static NT_COPY_FROM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+pub(crate) static NT_SET_FROM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+pub(crate) static SET_LARGE_FROM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+const ZMM_SET_FROM: usize = 1 << 20;
+pub(crate) static ZMM_SET: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+fn cache_leaf(leaf: u32, level: u32) -> Option<(usize, usize, bool)> {
+    for sub in 0..16 {
+        let r = __cpuid_count(leaf, sub);
+        let kind = r.eax & 0x1f;
+        if kind == 0 {
+            break;
+        }
+        if (r.eax >> 5) & 7 == level && kind != 2 {
+            let size = (((r.ebx >> 22) & 0x3ff) as usize + 1)
+                * (((r.ebx >> 12) & 0x3ff) as usize + 1)
+                * ((r.ebx & 0xfff) as usize + 1)
+                * (r.ecx as usize + 1);
+            return Some((size, ((r.eax >> 14) & 0xfff) as usize + 1, r.edx & 2 != 0));
+        }
+    }
+    None
+}
+
+fn non_temporal_threshold(vendor: [u32; 3], family: u32, model: u32) -> Option<usize> {
+    let amd = vendor == [0x6874_7541, 0x6974_6e65, 0x444d_4163];
+    let intel = vendor == [0x756e_6547, 0x4965_6e69, 0x6c65_746e];
+    if amd {
+        let max_ext = __cpuid(0x8000_0000).eax;
+        let (l2, l3) = if max_ext >= 0x8000_001d {
+            (cache_leaf(0x8000_001d, 2).map_or(0, |c| c.0), cache_leaf(0x8000_001d, 3).map_or(0, |c| c.0))
+        } else if max_ext >= 0x8000_0006 {
+            let r = __cpuid(0x8000_0006);
+            (((r.ecx >> 16) as usize) << 10, ((r.edx >> 18) as usize) << 19)
+        } else {
+            return None;
+        };
+        let mut shared = if l3 == 0 { l2 } else { l3 };
+        if l3 != 0 && family < 0x17 {
+            shared += l2;
+        }
+        return if shared == 0 { None } else { Some((shared / 4).max(shared * 3 / 4)) };
+    }
+    if intel && __cpuid(0).eax >= 4 {
+        let (l3, threads, inclusive) = cache_leaf(4, 3)?;
+        let l2 = cache_leaf(4, 2).map_or(0, |c| c.0);
+        let shared = if inclusive { l3 } else { l3 + l2 };
+        let per_thread = l3 / threads.max(1) + if inclusive { 0 } else { l2 };
+        let divisor = if family == 6 && model >= 0x8f { 2 } else if family == 6 && (0x1a..=0x4f).contains(&model) { 8 } else { 4 };
+        let t = (shared / divisor).max(per_thread * 3 / 4);
+        return Some(if t < 0x4040 { 64 << 20 } else { t });
+    }
+    None
+}
+
+#[cold]
+pub(crate) fn init_large_sizes() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let v0 = __cpuid(0);
+    let vendor = [v0.ebx, v0.edx, v0.ecx];
+    let l1 = __cpuid(1);
+    let mut family = (l1.eax >> 8) & 0xf;
+    let mut model = (l1.eax >> 4) & 0xf;
+    if family == 0xf {
+        family += (l1.eax >> 20) & 0xff;
+    }
+    if family >= 6 {
+        model += ((l1.eax >> 16) & 0xf) << 4;
+    }
+    let amd = vendor[0] == 0x6874_7541;
+    let Some(nt) = non_temporal_threshold(vendor, family, model) else { return };
+    NT_COPY_FROM.store(nt, Relaxed);
+    let nt_set = if amd { usize::MAX } else { nt };
+    NT_SET_FROM.store(nt_set, Relaxed);
+    let leaf7 = __cpuid_count(7, 0);
+    let leaf71 = __cpuid_count(7, 1);
+    let xcr0 = {
+        let (lo, _hi): (u32, u32);
+        unsafe { core::arch::asm!("xgetbv", in("ecx") 0, out("eax") lo, out("edx") _hi, options(nomem, nostack, preserves_flags)) };
+        lo
+    };
+    let avx512 = leaf7.ebx & (1 << 16) != 0 && leaf7.ebx & (1 << 30) != 0 && xcr0 & 0xe6 == 0xe6;
+    let zmm = avx512 && (amd || leaf71.eax & (1 << 4) != 0);
+    ZMM_SET.store(u8::from(zmm), Relaxed);
+    SET_LARGE_FROM.store(if zmm { ZMM_SET_FROM.min(nt_set) } else { nt_set }, Relaxed);
 }
 
 macro_rules! slot_table {

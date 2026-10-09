@@ -8,7 +8,7 @@ unsafe fn read_line(s: *mut c_char, max: usize, f: *mut File) -> usize {
     unsafe {
         let mut i = 0usize;
         while i < max {
-            if (*f).nunget > 0 {
+            if (*f).nunget() > 0 {
                 let c = file::getc(f);
                 *s.add(i) = c as c_char;
                 i += 1;

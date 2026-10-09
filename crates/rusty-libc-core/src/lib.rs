@@ -19,6 +19,7 @@ pub mod start;
 pub mod shared;
 pub mod string;
 pub mod syscall;
+pub mod thread_db;
 pub mod tls;
 pub mod tunables;
 pub mod unistd;

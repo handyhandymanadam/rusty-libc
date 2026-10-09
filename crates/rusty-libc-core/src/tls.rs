@@ -4,6 +4,7 @@ use core::ptr::null_mut;
 const SYS_ARCH_PRCTL: usize = 158;
 const ARCH_SET_FS: usize = 0x1002;
 const SYS_MMAP: usize = 9;
+const SYS_MUNMAP: usize = 11;
 
 pub const AT_PHDR: usize = 3;
 pub const AT_PHENT: usize = 4;
@@ -29,6 +30,10 @@ pub struct Tcb {
     pub cancelhandling: u32,
     pub _pad2: u32,
     pub dl_error: usize,
+    pub db_list: crate::thread_db::ListT,
+    pub db_start: usize,
+    pub db: crate::thread_db::DbZero,
+    pub db_dtv: [usize; 6],
 }
 
 #[inline(always)]
@@ -68,7 +73,99 @@ pub static DL_TLS_FREE: core::sync::atomic::AtomicUsize = core::sync::atomic::At
 #[cfg(feature = "shared")]
 pub static DL_TLS_SYNC: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 #[cfg(feature = "shared")]
+pub static DL_FORK_CHILD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub unsafe fn loader_fork_child() {
+    #[cfg(feature = "shared")]
+    {
+        let h = DL_FORK_CHILD.load(core::sync::atomic::Ordering::Relaxed);
+        if h != 0 {
+            unsafe { core::mem::transmute::<usize, unsafe extern "C" fn()>(h)() };
+        }
+    }
+}
+
+#[cfg(feature = "shared")]
 pub static MAIN_TP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "shared")]
+pub const DL_DEBUG_TLS_BIT: u32 = 1 << 11;
+#[cfg(feature = "shared")]
+pub static DL_DEBUG_WRITE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub enum DebugArg<'a> {
+    S(&'a [u8]),
+    X(usize),
+    D(i64),
+}
+
+#[inline]
+pub fn debug_tls_on() -> bool {
+    #[cfg(feature = "shared")]
+    {
+        DL_DEBUG_WRITE.load(core::sync::atomic::Ordering::Relaxed) != 0
+    }
+    #[cfg(not(feature = "shared"))]
+    {
+        false
+    }
+}
+
+pub fn debug_tls(parts: &[DebugArg<'_>]) {
+    #[cfg(feature = "shared")]
+    {
+        let h = DL_DEBUG_WRITE.load(core::sync::atomic::Ordering::Relaxed);
+        if h == 0 {
+            return;
+        }
+        let mut buf = [0u8; 256];
+        let mut n = 0;
+        let mut put = |b: &[u8]| {
+            let k = b.len().min(buf.len() - n);
+            buf[n..n + k].copy_from_slice(&b[..k]);
+            n += k;
+        };
+        for p in parts {
+            let mut t = [0u8; 24];
+            let mut i = t.len();
+            match *p {
+                DebugArg::S(s) => put(s),
+                DebugArg::X(mut v) => {
+                    loop {
+                        i -= 1;
+                        t[i] = b"0123456789abcdef"[v & 15];
+                        v >>= 4;
+                        if v == 0 {
+                            break;
+                        }
+                    }
+                    put(b"0x");
+                    put(&t[i..]);
+                }
+                DebugArg::D(v) => {
+                    let mut u = v.unsigned_abs();
+                    loop {
+                        i -= 1;
+                        t[i] = b'0' + (u % 10) as u8;
+                        u /= 10;
+                        if u == 0 {
+                            break;
+                        }
+                    }
+                    if v < 0 {
+                        i -= 1;
+                        t[i] = b'-';
+                    }
+                    put(&t[i..]);
+                }
+            }
+        }
+        put(b"\n");
+        unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(*const u8, usize)>(h)(buf.as_ptr(), n) };
+    }
+    #[cfg(not(feature = "shared"))]
+    let _ = parts;
+}
 
 pub unsafe fn sync_new_thread(tp: *mut Tcb) {
     #[cfg(feature = "shared")]
@@ -96,6 +193,24 @@ pub fn main_thread_pointer() -> usize {
 #[cfg(feature = "shared")]
 pub unsafe fn set_dynamic_template(memsz: usize, align: usize) {
     unsafe { *core::ptr::addr_of_mut!(TEMPLATE) = Template { image: 0, filesz: 0, memsz, align: align.max(1) } };
+}
+
+pub unsafe fn dtv_allocation(tp: *mut Tcb) -> usize {
+    #[cfg(feature = "shared")]
+    {
+        if DL_TLS_INIT.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+            return 0;
+        }
+        unsafe {
+            let d = *((tp as usize + 8) as *const usize);
+            if d == 0 { 0 } else { *((d + 8) as *const usize) }
+        }
+    }
+    #[cfg(not(feature = "shared"))]
+    {
+        let _ = tp;
+        0
+    }
 }
 
 pub unsafe fn release_block(tp: *mut Tcb) {
@@ -169,6 +284,8 @@ pub unsafe fn setup_block(base: *mut u8, t: &Template, canary: usize, pointer_gu
         (*tp).self_ptr = tp;
         (*tp).stack_guard = canary;
         (*tp).pointer_guard = pointer_guard;
+        #[cfg(not(feature = "shared"))]
+        crate::thread_db::set_static_dtv(tp, (tp as usize).wrapping_sub(align_up(t.memsz, t.align.max(1))));
         #[cfg(feature = "shared")]
         {
             let h = DL_TLS_INIT.load(core::sync::atomic::Ordering::Relaxed);
@@ -212,6 +329,7 @@ pub unsafe fn init_main(aux: *const usize) {
         set_thread_pointer(tp);
         (*tp).tid = syscall::syscall0(syscall::SYS_GETTID) as i32;
         syscall::syscall1(218 , core::ptr::addr_of_mut!((*tp).tid) as usize);
+        crate::thread_db::init(tp, 0);
     }
 }
 
@@ -249,7 +367,8 @@ const _: () = assert!(core::mem::offset_of!(Tcb, tid) == 0x38);
 const _: () = assert!(core::mem::offset_of!(Tcb, cancelhandling) == 0x40);
 const _: () = assert!(core::mem::offset_of!(Tcb, dl_error) == 0x48);
 
-const MAX_THREAD_DTORS: usize = 64;
+const INLINE_DTORS: usize = 2;
+const MORE_PAGE: usize = 4096;
 
 #[derive(Clone, Copy)]
 struct ThreadDtor {
@@ -257,18 +376,34 @@ struct ThreadDtor {
     obj: *mut core::ffi::c_void,
 }
 
+const MORE_DTORS: usize = MORE_PAGE / core::mem::size_of::<ThreadDtor>();
+
 #[thread_local]
-static mut THREAD_DTORS: [ThreadDtor; MAX_THREAD_DTORS] = [ThreadDtor { f: None, obj: core::ptr::null_mut() }; MAX_THREAD_DTORS];
+static mut THREAD_DTORS: [ThreadDtor; INLINE_DTORS] = [ThreadDtor { f: None, obj: core::ptr::null_mut() }; INLINE_DTORS];
+#[thread_local]
+static mut THREAD_DTORS_MORE: *mut ThreadDtor = null_mut();
 #[thread_local]
 static mut THREAD_DTOR_N: usize = 0;
 
 pub fn register_thread_dtor(f: unsafe extern "C" fn(*mut core::ffi::c_void), obj: *mut core::ffi::c_void) -> bool {
     unsafe {
         let n = THREAD_DTOR_N;
-        if n >= MAX_THREAD_DTORS {
-            return false;
+        let d = ThreadDtor { f: Some(f), obj };
+        if n < INLINE_DTORS {
+            (*core::ptr::addr_of_mut!(THREAD_DTORS))[n] = d;
+        } else {
+            if n - INLINE_DTORS >= MORE_DTORS {
+                return false;
+            }
+            if THREAD_DTORS_MORE.is_null() {
+                let p = syscall6(SYS_MMAP, 0, MORE_PAGE, 3, 0x22, usize::MAX, 0);
+                if p > usize::MAX - 4095 {
+                    return false;
+                }
+                THREAD_DTORS_MORE = p as *mut ThreadDtor;
+            }
+            *THREAD_DTORS_MORE.add(n - INLINE_DTORS) = d;
         }
-        (*core::ptr::addr_of_mut!(THREAD_DTORS))[n] = ThreadDtor { f: Some(f), obj };
         THREAD_DTOR_N = n + 1;
         true
     }
@@ -278,10 +413,15 @@ pub fn run_thread_dtors() {
     unsafe {
         while THREAD_DTOR_N > 0 {
             THREAD_DTOR_N -= 1;
-            let d = (*core::ptr::addr_of_mut!(THREAD_DTORS))[THREAD_DTOR_N];
+            let n = THREAD_DTOR_N;
+            let d = if n < INLINE_DTORS { (*core::ptr::addr_of_mut!(THREAD_DTORS))[n] } else { *THREAD_DTORS_MORE.add(n - INLINE_DTORS) };
             if let Some(f) = d.f {
                 f(d.obj);
             }
+        }
+        if !THREAD_DTORS_MORE.is_null() {
+            syscall2(SYS_MUNMAP, THREAD_DTORS_MORE as usize, MORE_PAGE);
+            THREAD_DTORS_MORE = null_mut();
         }
     }
 }
