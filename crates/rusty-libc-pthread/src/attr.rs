@@ -96,12 +96,15 @@ unsafe fn ext_get(a: *mut PthreadAttr, size_needed: usize) -> Result<*mut AttrEx
         if !cur.is_null() && (*cur).map_size >= EXT_HDR + size_needed {
             return Ok(cur);
         }
-        let len = align_up(EXT_HDR + size_needed, PAGE);
-        let p = mmap(len, 3).map_err(|_| ENOMEM)? as *mut AttrExt;
+        let len = EXT_HDR + size_needed;
+        let p = rusty_libc_malloc::calloc(1, len) as *mut AttrExt;
+        if p.is_null() {
+            return Err(ENOMEM);
+        }
         if !cur.is_null() {
             (*p).sigmask = (*cur).sigmask;
             (*p).sigmask_set = (*cur).sigmask_set;
-            munmap(cur as *mut u8, (*cur).map_size);
+            rusty_libc_malloc::free(cur as *mut core::ffi::c_void);
         }
         (*p).map_size = len;
         (*a).extension = p;
@@ -140,7 +143,7 @@ pub unsafe extern "C" fn pthread_attr_destroy(attr: *mut PthreadAttr) -> c_int {
     unsafe {
         let e = (*attr).extension;
         if !e.is_null() {
-            munmap(e as *mut u8, (*e).map_size);
+            rusty_libc_malloc::free(e as *mut core::ffi::c_void);
             (*attr).extension = core::ptr::null_mut();
         }
         0

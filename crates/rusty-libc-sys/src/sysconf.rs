@@ -1,5 +1,5 @@
 use crate::unistd::{self, EBADF, EINVAL, ENOENT, ENOSYS, fail, nr};
-use core::arch::x86_64::{__cpuid, __cpuid_count};
+use core::arch::x86_64::CpuidResult;
 use core::ffi::{c_char, c_int, c_long};
 use rusty_libc_core::{Errno, errno, syscall};
 
@@ -435,8 +435,8 @@ static TABLE: [i64; 251] = [
     2147483647,
     2147483647,
     2147483647,
-    1,
-    1,
+    D,
+    D,
     1,
     -1,
     1,
@@ -486,8 +486,8 @@ static TABLE: [i64; 251] = [
     -1,
     -1,
     -1,
-    1,
-    1,
+    D,
+    D,
     1,
     -1,
     64,
@@ -547,8 +547,8 @@ static TABLE: [i64; 251] = [
     E,
     200809,
     200809,
-    1,
-    1,
+    D,
+    D,
     1,
     -1,
     E,
@@ -728,6 +728,83 @@ pub extern "C" fn get_avphys_pages() -> c_long {
     mempages(si.freeram, si.mem_unit)
 }
 
+const SNAP_MAX: usize = 24;
+static SNAP_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static mut SNAP: [(u32, u32, [u32; 4]); SNAP_MAX] = [(0, 0, [0; 4]); SNAP_MAX];
+static mut SNAP_LEN: usize = 0;
+
+fn cpuid_now(leaf: u32, sub: u32) -> CpuidResult {
+    core::arch::x86_64::__cpuid_count(leaf, sub)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __rusty_libc_init_cacheinfo() {
+    use core::sync::atomic::Ordering::{Acquire, Release};
+    if SNAP_STATE.compare_exchange(0, 1, Acquire, Acquire).is_err() {
+        return;
+    }
+    let mut t = [(0u32, 0u32, [0u32; 4]); SNAP_MAX];
+    let mut n = 0;
+    let mut keep = |leaf: u32, sub: u32| -> CpuidResult {
+        let r = cpuid_now(leaf, sub);
+        if n < SNAP_MAX {
+            t[n] = (leaf, sub, [r.eax, r.ebx, r.ecx, r.edx]);
+            n += 1;
+        }
+        r
+    };
+    let r0 = keep(0, 0);
+    let v = [r0.ebx, r0.edx, r0.ecx];
+    if v == [0x756e_6547, 0x4965_6e69, 0x6c65_746e] {
+        if r0.eax >= 2 {
+            keep(2, 0);
+        }
+        if r0.eax >= 4 {
+            for i in 0..16 {
+                if keep(4, i).eax & 0x1f == 0 {
+                    break;
+                }
+            }
+        }
+    } else if v == [0x6874_7541, 0x6974_6e65, 0x444d_4163] || v == [0x6f67_7948, 0x656e_6975, 0x6e65_4965] {
+        keep(1, 0);
+        let max_ext = keep(0x8000_0000, 0).eax;
+        for leaf in [0x8000_0005, 0x8000_0006, 0x8000_0008] {
+            if max_ext >= leaf {
+                keep(leaf, 0);
+            }
+        }
+        if max_ext >= 0x8000_001d {
+            for i in 0..4 {
+                keep(0x8000_001d, i);
+            }
+        }
+    }
+    unsafe {
+        *core::ptr::addr_of_mut!(SNAP) = t;
+        *core::ptr::addr_of_mut!(SNAP_LEN) = n;
+    }
+    SNAP_STATE.store(2, Release);
+}
+
+fn __cpuid_count(leaf: u32, sub: u32) -> CpuidResult {
+    use core::sync::atomic::Ordering::Acquire;
+    if SNAP_STATE.load(Acquire) == 0 {
+        __rusty_libc_init_cacheinfo();
+    }
+    if SNAP_STATE.load(Acquire) == 2 {
+        let (t, n) = unsafe { (&*core::ptr::addr_of!(SNAP), *core::ptr::addr_of!(SNAP_LEN)) };
+        if let Some(&(_, _, r)) = t[..n].iter().find(|e| e.0 == leaf && e.1 == sub) {
+            return CpuidResult { eax: r[0], ebx: r[1], ecx: r[2], edx: r[3] };
+        }
+    }
+    cpuid_now(leaf, sub)
+}
+
+fn __cpuid(leaf: u32) -> CpuidResult {
+    __cpuid_count(leaf, 0)
+}
+
 fn vendor() -> [u8; 12] {
     let r = __cpuid(0);
     let mut v = [0u8; 12];
@@ -862,6 +939,32 @@ fn handle_amd(name: c_int) -> i64 {
 }
 
 fn handle_intel(name: c_int) -> i64 {
+    if __cpuid(0).eax < 2 {
+        return -1;
+    }
+    let r2 = __cpuid(2);
+    if r2.eax & 0xff != 1 {
+        return intel_leaf4(name).unwrap_or(-1);
+    }
+    for reg in [r2.eax & 0xffff_ff00, r2.ebx, r2.ecx, r2.edx] {
+        if reg & 0x8000_0000 != 0 {
+            continue;
+        }
+        let mut v = reg;
+        while v != 0 {
+            if v & 0xff == 0xff {
+                return intel_leaf4(name).unwrap_or(-1);
+            }
+            v >>= 8;
+        }
+    }
+    if __cpuid(0).eax < 4 {
+        return -1;
+    }
+    intel_leaf4(name).unwrap_or(0)
+}
+
+fn intel_leaf4(name: c_int) -> Option<i64> {
     let (level, want_type) = match name {
         SC_LEVEL1_ICACHE_SIZE | SC_LEVEL1_ICACHE_ASSOC | SC_LEVEL1_ICACHE_LINESIZE => (1, 2),
         SC_LEVEL1_DCACHE_SIZE | SC_LEVEL1_DCACHE_ASSOC | SC_LEVEL1_DCACHE_LINESIZE => (1, 1),
@@ -869,32 +972,29 @@ fn handle_intel(name: c_int) -> i64 {
         SC_LEVEL3_CACHE_SIZE | SC_LEVEL3_CACHE_ASSOC | SC_LEVEL3_CACHE_LINESIZE => (3, 0),
         _ => (4, 0),
     };
-    if __cpuid(0).eax < 4 {
-        return -1;
-    }
-    for i in 0..16 {
+    for i in 0..64 {
         let r = __cpuid_count(4, i);
         let kind = r.eax & 0x1f;
         if kind == 0 {
             break;
         }
         let lvl = (r.eax >> 5) & 7;
-        if lvl != level || (want_type != 0 && kind != want_type) || (want_type == 0 && kind == 2) {
+        if lvl != level || (want_type != 0 && kind != want_type) {
             continue;
         }
         let ways = (r.ebx >> 22) as i64 + 1;
         let line = (r.ebx & 0xfff) as i64 + 1;
         let parts = ((r.ebx >> 12) & 0x3ff) as i64 + 1;
         let sets = r.ecx as i64 + 1;
-        return if is_assoc(name) {
+        return Some(if is_assoc(name) {
             ways
         } else if is_line(name) {
             line
         } else {
             ways * parts * line * sets
-        };
+        });
     }
-    0
+    None
 }
 
 fn cache_sysconf(name: c_int) -> i64 {
@@ -939,6 +1039,57 @@ fn read_ngroups_max() -> Option<i64> {
     if k < n && buf[k] != b'\n' { None } else { Some(v as i64) }
 }
 
+fn ilp32_env(offbig: bool) -> bool {
+    let secure = rusty_libc_core::lock::at_secure().unwrap_or_else(|| unsafe {
+        syscall::syscall0(syscall::SYS_GETUID) != syscall::syscall0(syscall::SYS_GETEUID)
+            || syscall::syscall0(104) != syscall::syscall0(108)
+    });
+    let env = if secure { core::ptr::null_mut() } else { unsafe { rusty_libc_core::env::getenv(b"GETCONF_DIR") } };
+    let dir: &[u8] = if env.is_null() {
+        b"/usr/libexec/getconf"
+    } else {
+        unsafe { core::ffi::CStr::from_ptr(env).to_bytes() }
+    };
+    let spec: &[u8] = if offbig { b"/POSIX_V6_ILP32_OFFBIG\0" } else { b"/POSIX_V6_ILP32_OFF32\0" };
+    let mut path = [0u8; 4096];
+    if dir.len() + spec.len() > path.len() {
+        return false;
+    }
+    path[..dir.len()].copy_from_slice(dir);
+    path[dir.len()..dir.len() + spec.len()].copy_from_slice(spec);
+    let mut st = [0u64; 32];
+    let r = unsafe { syscall::syscall2(syscall::SYS_STAT, path.as_ptr() as usize, st.as_mut_ptr() as usize) };
+    r <= usize::MAX - 4095
+}
+
+fn width_restricted_envs(name: c_int) -> Option<&'static [u8]> {
+    macro_rules! envs {
+        ($p:literal) => {
+            match (ilp32_env(false), ilp32_env(true)) {
+                (true, true) => concat!($p, "_ILP32_OFF32\n", $p, "_ILP32_OFFBIG\n", $p, "_LP64_OFF64").as_bytes(),
+                (true, false) => concat!($p, "_ILP32_OFF32\n", $p, "_LP64_OFF64").as_bytes(),
+                (false, true) => concat!($p, "_ILP32_OFFBIG\n", $p, "_LP64_OFF64").as_bytes(),
+                (false, false) => concat!($p, "_LP64_OFF64").as_bytes(),
+            }
+        };
+    }
+    Some(match name {
+        CS_V6_WIDTH_RESTRICTED_ENVS => envs!("POSIX_V6"),
+        CS_V5_WIDTH_RESTRICTED_ENVS => envs!("XBS5"),
+        CS_V7_WIDTH_RESTRICTED_ENVS => envs!("POSIX_V7"),
+        _ => return None,
+    })
+}
+
+fn confstr_str(name: c_int) -> Option<&'static [u8]> {
+    match name {
+        1100 | 1101 | 1116 | 1117 | 1132 | 1133 if !ilp32_env(false) => return Some(b""),
+        1104 | 1105 | 1120 | 1121 | 1136 | 1137 if !ilp32_env(true) => return Some(b""),
+        _ => {}
+    }
+    width_restricted_envs(name).or_else(|| CONFSTR.iter().find(|(n, _)| *n == name).map(|&(_, s)| s))
+}
+
 pub fn sysconf_value(name: c_int) -> Result<i64, i32> {
     if (SC_LEVEL1_ICACHE_SIZE..=SC_LEVEL4_CACHE_LINESIZE).contains(&name) {
         return Ok(cache_sysconf(name));
@@ -964,6 +1115,8 @@ pub fn sysconf_value(name: c_int) -> Result<i64, i32> {
             }
             return Ok(-1);
         }
+        SC_XBS5_ILP32_OFF32 | SC_V6_ILP32_OFF32 | SC_V7_ILP32_OFF32 => return Ok(if ilp32_env(false) { 1 } else { -1 }),
+        SC_XBS5_ILP32_OFFBIG | SC_V6_ILP32_OFFBIG | SC_V7_ILP32_OFFBIG => return Ok(if ilp32_env(true) { 1 } else { -1 }),
         SC_NPROCESSORS_CONF => return Ok(get_nprocs_conf() as i64),
         SC_NPROCESSORS_ONLN => return Ok(get_nprocs() as i64),
         SC_PHYS_PAGES => return Ok(get_phys_pages()),
@@ -1000,11 +1153,8 @@ pub extern "C" fn sysconf(name: c_int) -> c_long {
 
 static CONFSTR: &[(c_int, &[u8])] = &[
     (0, b"/usr/bin"),
-    (1, b"POSIX_V6_ILP32_OFF32\nPOSIX_V6_ILP32_OFFBIG\nPOSIX_V6_LP64_OFF64"),
     (2, b"glibc 2.43"),
     (3, b"NPTL 2.43"),
-    (4, b"XBS5_ILP32_OFF32\nXBS5_ILP32_OFFBIG\nXBS5_LP64_OFF64"),
-    (5, b"POSIX_V7_ILP32_OFF32\nPOSIX_V7_ILP32_OFFBIG\nPOSIX_V7_LP64_OFF64"),
     (1000, b""),
     (1001, b""),
     (1002, b""),
@@ -1067,7 +1217,7 @@ static CONFSTR: &[(c_int, &[u8])] = &[
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn confstr(name: c_int, buf: *mut c_char, len: usize) -> usize {
-    let Some(&(_, s)) = CONFSTR.iter().find(|(n, _)| *n == name) else {
+    let Some(s) = confstr_str(name) else {
         errno::set(EINVAL);
         return 0;
     };
@@ -1348,7 +1498,7 @@ pub mod rs {
         r
     }
     pub fn confstr(name: i32) -> Option<&'static [u8]> {
-        CONFSTR.iter().find(|(n, _)| *n == name).map(|&(_, s)| s)
+        confstr_str(name)
     }
     pub fn nprocs_online() -> usize {
         get_nprocs() as usize

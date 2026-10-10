@@ -91,6 +91,11 @@ pub(crate) unsafe fn run_hooks_auxv(argc: c_int, argv: *mut *mut c_char, envp: *
             let f: unsafe extern "C" fn(*const u64) = core::mem::transmute(aux);
             f(auxv);
         }
+        let cache = weak_addr!("__rusty_libc_init_cacheinfo");
+        if cache != 0 {
+            let f: extern "C" fn() = core::mem::transmute(cache);
+            f();
+        }
     }
 }
 

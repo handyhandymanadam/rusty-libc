@@ -123,6 +123,11 @@ pub unsafe extern "C" fn pthread_setname_np(th: PthreadT, name: *const c_char) -
         if len > TASK_COMM_LEN - 1 {
             return ERANGE;
         }
+        if th as *mut Thread == current_thread() {
+            let r = syscall3(SYS_PRCTL, 15 , name as usize, 0);
+            let e = errno_of(r);
+            return if e != 0 { e } else { 0 };
+        }
         let tid = tid_of(th);
         let mut path = [0u8; 48];
         comm_path(tid, &mut path);

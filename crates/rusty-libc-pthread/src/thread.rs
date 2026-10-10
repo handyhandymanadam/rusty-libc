@@ -888,8 +888,11 @@ pub unsafe extern "C" fn pthread_getattr_np(th: PthreadT, attr: *mut PthreadAttr
 
 unsafe fn ext_alloc(a: *mut PthreadAttr, size: usize) -> Result<*mut AttrExt, c_int> {
     unsafe {
-        let len = align_up(core::mem::size_of::<AttrExt>() + size, PAGE);
-        let p = mmap(len, 3).map_err(|_| ENOMEM)? as *mut AttrExt;
+        let len = core::mem::size_of::<AttrExt>() + size;
+        let p = rusty_libc_malloc::calloc(1, len) as *mut AttrExt;
+        if p.is_null() {
+            return Err(ENOMEM);
+        }
         (*p).map_size = len;
         (*a).extension = p;
         Ok(p)
