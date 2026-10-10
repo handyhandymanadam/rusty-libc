@@ -426,6 +426,14 @@ pub static HDR: Header = Header {
             Item::Include("<bits/rlibc-cdefs.h>"),
             Item::Include("<bits/types.h>"),
             Item::Blank,
+            Item::Gate(&[
+                Branch { head: "if defined __GNUC__ && defined __OPTIMIZE__ && !defined __OPTIMIZE_SIZE__ && !defined __NO_INLINE__ && defined __extern_inline", items: &[
+                    Item::Consts(&[
+                        ("__USE_EXTERN_INLINES", V::Dec(1)),
+                    ]),
+                ] },
+            ], ""),
+            Item::Blank,
         ]},
     ],
 };

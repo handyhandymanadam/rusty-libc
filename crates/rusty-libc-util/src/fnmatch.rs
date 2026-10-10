@@ -81,6 +81,12 @@ static SPECIAL: [bool; 128] = {
     t
 };
 
+static STOP: [bool; 128] = {
+    let mut t = SPECIAL;
+    t[0] = true;
+    t
+};
+
 #[inline]
 unsafe fn at<T: Ch>(p: P<T>, i: usize) -> T {
     unsafe { *p.add(i) }
@@ -906,6 +912,23 @@ unsafe fn fct<T: Ch>(pattern: P<T>, string: P<T>, string_end: P<T>, mut no_leadi
                             break;
                         }
                         m += 1;
+                    }
+                } else if flags & FNM_CASEFOLD == 0 {
+                    let qm_ok = !extmatch;
+                    let nlp0 = no_leading_period_;
+                    let fname = flags & FNM_FILE_NAME != 0;
+                    while n.add(m) < string_end {
+                        let pc = (*p.add(m)).v();
+                        let nc = (*n.add(m)).v();
+                        if pc == nc && !(pc < 128 && STOP[pc as usize]) && !(pc == SLASH && slash_special) {
+                            m += 1;
+                            continue;
+                        }
+                        if pc == QM && qm_ok && (m != 0 || !nlp0) && !(fname && nc == SLASH) {
+                            m += 1;
+                            continue;
+                        }
+                        break;
                     }
                 } else {
                 while n.add(m) < string_end {

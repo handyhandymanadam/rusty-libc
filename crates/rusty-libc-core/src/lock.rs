@@ -1,6 +1,6 @@
 use crate::syscall::syscall4;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 const SYS_FUTEX: usize = 202;
 const FUTEX_WAIT_PRIVATE: usize = 128;
@@ -24,6 +24,19 @@ pub fn libc_initial() -> bool {
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(LIBC_INITIAL)) != 0 }
 }
 
+static AT_SECURE: AtomicU8 = AtomicU8::new(2);
+
+pub fn set_at_secure(v: bool) {
+    AT_SECURE.store(v as u8, Ordering::Relaxed);
+}
+
+pub fn at_secure() -> Option<bool> {
+    match AT_SECURE.load(Ordering::Relaxed) {
+        2 => None,
+        v => Some(v != 0),
+    }
+}
+
 pub fn note_multithreaded() {
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(__libc_single_threaded), 0) };
 }
@@ -43,6 +56,22 @@ pub fn futex_wait(word: &AtomicU32, expected: u32) {
 #[inline]
 pub fn futex_wake(word: &AtomicU32, n: u32) {
     unsafe { syscall4(SYS_FUTEX, word as *const AtomicU32 as usize, FUTEX_WAKE_PRIVATE, n as usize, 0) };
+}
+
+#[inline(always)]
+pub unsafe fn take01_single_thread(w: &AtomicU32) -> bool {
+    if w.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    w.store(1, Ordering::Relaxed);
+    true
+}
+
+#[inline(always)]
+pub unsafe fn release_single_thread(w: &AtomicU32) -> u32 {
+    let s = w.load(Ordering::Relaxed);
+    w.store(0, Ordering::Release);
+    s
 }
 
 pub struct RawMutex {
@@ -92,6 +121,38 @@ impl RawMutex {
         if self.state.swap(0, Ordering::Release) == 2 {
             futex_wake(&self.state, 1);
         }
+    }
+
+    #[inline(always)]
+    pub fn lock_fast(&self) {
+        if !multithreaded() && unsafe { take01_single_thread(&self.state) } {
+            return;
+        }
+        self.lock_always();
+    }
+
+    #[inline(always)]
+    pub unsafe fn take_single_thread(&self) -> bool {
+        unsafe { take01_single_thread(&self.state) }
+    }
+
+    #[inline(always)]
+    pub fn try_lock_fast(&self) -> bool {
+        if !multithreaded() {
+            return unsafe { take01_single_thread(&self.state) };
+        }
+        self.try_lock_always()
+    }
+
+    #[inline(always)]
+    pub fn unlock_fast(&self) {
+        if !multithreaded() {
+            if unsafe { release_single_thread(&self.state) } == 2 {
+                futex_wake(&self.state, 1);
+            }
+            return;
+        }
+        self.unlock_always();
     }
 
     #[inline(always)]

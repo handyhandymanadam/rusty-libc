@@ -1,11 +1,11 @@
 #![allow(clippy::assign_op_pattern, clippy::eq_op, clippy::needless_late_init, clippy::manual_range_contains, clippy::collapsible_if, clippy::doc_lazy_continuation, clippy::approx_constant, clippy::type_complexity, clippy::too_many_arguments)]
 mod bessel;
 mod common;
-mod dd;
+pub(crate) mod dd;
 mod erf;
 mod fastd;
 mod fastf;
-mod float;
+pub(crate) mod float;
 mod gamma;
 #[allow(dead_code)]
 mod tab_base;
@@ -17,6 +17,7 @@ mod tab_yrows;
 mod tab_erf;
 mod tab_erf8;
 mod tab_lg12;
+mod tab_gamma16;
 #[allow(dead_code)]
 mod tab_gamma;
 

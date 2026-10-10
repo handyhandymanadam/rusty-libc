@@ -71,33 +71,36 @@ fn select_le(x: f64, y: f64, a: f64, b: f64) -> f64 {
     r
 }
 
+#[inline(always)]
+fn fm<const HW: bool>(a: f64, b: f64, c: f64) -> f64 {
+    if HW { super::cbrt_impl::fmadd(a, b, c) } else { super::fma_impl::fma_emul(a, b, c) }
+}
+
+#[inline(always)]
+fn sel<const HW: bool>(x: f64, y: f64, a: f64, b: f64) -> f64 {
+    if HW { select_le(x, y, a, b) } else if x <= y { a } else { b }
+}
+
+#[inline(always)]
+fn kernel_fused<const HW: bool>(ax: f64, ay: f64) -> f64 {
+    let h = Fp::sqrt(fm::<HW>(ax, ax, ay * ay));
+    let u = ax - ay;
+    let da = h - ay;
+    let sa = fm::<HW>(ax, fm::<HW>(da, 2.0, -ax), fm::<HW>(-u, 2.0, da) * da);
+    let db = h - ax;
+    let sb = fm::<HW>(db + db, fm::<HW>(-ay, 2.0, ax), fm::<HW>(fm::<HW>(db, 4.0, -ay), ay, db * db));
+    let t = sel::<HW>(h, ay + ay, sa, sb);
+    h - t / (h + h)
+}
+
 #[inline(never)]
 fn kernel_plain(ax: f64, ay: f64) -> f64 {
-    let h = Fp::sqrt(ax * ax + ay * ay);
-    let (t1, t2);
-    if h <= 2.0 * ay {
-        let delta = h - ay;
-        t1 = ax * (2.0 * delta - ax);
-        t2 = (delta - 2.0 * (ax - ay)) * delta;
-    } else {
-        let delta = h - ax;
-        t1 = 2.0 * delta * (ax - 2.0 * ay);
-        t2 = (4.0 * delta - ay) * ay + delta * delta;
-    }
-    h - (t1 + t2) / (2.0 * h)
+    kernel_fused::<false>(ax, ay)
 }
 
 #[inline(always)]
 fn kernel_fma(ax: f64, ay: f64) -> f64 {
-    let h = Fp::sqrt(super::cbrt_impl::fmadd(ax, ax, ay * ay));
-    use super::cbrt_impl::fmadd as f;
-    let u = ax - ay;
-    let da = h - ay;
-    let sa = f(ax, f(da, 2.0, -ax), f(u, -2.0, da) * da);
-    let db = h - ax;
-    let sb = f(db + db, f(ay, -2.0, ax), f(f(db, 4.0, -ay), ay, db * db));
-    let t = select_le(h, ay + ay, sa, sb);
-    h - t / (h + h)
+    kernel_fused::<true>(ax, ay)
 }
 
 #[inline(never)]
@@ -119,14 +122,22 @@ fn force_underflow_nonneg(x: f64) {
     }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub extern "C" fn hypot(x: f64, y: f64) -> f64 {
+#[inline(always)]
+pub fn hypot_fast(x: f64, y: f64) -> Option<f64> {
     let (a, b) = (x.abs_(), y.abs_());
     if a <= LARGE_VAL && b <= LARGE_VAL {
         let (hi, lo) = max_min(a, b);
         if lo >= TINY_VAL && lo > mul(hi, EPS) && fma_ready() {
-            return kernel_fma(hi, lo);
+            return Some(kernel_fma(hi, lo));
         }
+    }
+    None
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub extern "C" fn hypot(x: f64, y: f64) -> f64 {
+    if let Some(r) = hypot_fast(x, y) {
+        return r;
     }
     hypot_slow(x, y)
 }
@@ -196,3 +207,4 @@ fn narrow(x: f64) -> f32 {
 
 export_alias!(fn(x: f64, y: f64) -> f64; hypot => hypotf64, hypotf32x);
 export_alias!(fn(x: f32, y: f32) -> f32; hypotf => hypotf32);
+

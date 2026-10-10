@@ -213,14 +213,56 @@ pub(crate) fn fma_soft<F: Fp>(x: F, y: F, z: F) -> F {
     F::from_bits(sign | ((((be - 1) as u64) << F::MANT) + kept))
 }
 
+pub(crate) fn glibc_soft_fma_special(x: f64, y: f64, z: f64) -> Option<f64> {
+    if x.is_finite_() && y.is_finite_() && z.is_finite_() {
+        return None;
+    }
+    if x == 0.0 || y == 0.0 || !x.is_finite_() || !y.is_finite_() {
+        return Some(Fp::add(Fp::mul(black_box(x), black_box(y)), black_box(z)));
+    }
+    if z.is_nan_() {
+        if z.is_signaling_() {
+            raise_invalid_for(z);
+        }
+        return Some(f64::from_bits(0x7ff8_0000_0000_0000));
+    }
+    Some(z)
+}
+
+fn glibc_soft_fmaf_special(x: f32, y: f32, z: f32) -> Option<f32> {
+    if x.is_finite_() && y.is_finite_() && z.is_finite_() {
+        return None;
+    }
+    let r = Fp::add(black_box(f64::from(z)), Fp::mul(black_box(f64::from(y)), black_box(f64::from(x))));
+    let out: f32;
+    unsafe { asm!("cvtsd2ss {0}, {1}", out(xmm_reg) out, in(xmm_reg) r, options(nomem, nostack, preserves_flags)) };
+    Some(out)
+}
+
+pub(crate) fn soft_special_for_narrow(x: f64, y: f64, z: f64) -> Option<f64> {
+    if has_fma() { None } else { glibc_soft_fma_special(x, y, z) }
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn fma(x: f64, y: f64, z: f64) -> f64 {
-    if has_fma() { fma_hw_d(x, y, z) } else { fma_soft(x, y, z) }
+    if has_fma() {
+        fma_hw_d(x, y, z)
+    } else if let Some(r) = glibc_soft_fma_special(x, y, z) {
+        r
+    } else {
+        fma_soft(x, y, z)
+    }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn fmaf(x: f32, y: f32, z: f32) -> f32 {
-    if has_fma() { fma_hw_f(x, y, z) } else { fma_soft(x, y, z) }
+    if has_fma() {
+        fma_hw_f(x, y, z)
+    } else if let Some(r) = glibc_soft_fmaf_special(x, y, z) {
+        r
+    } else {
+        fma_soft(x, y, z)
+    }
 }
 
 pub fn fma_software(x: f64, y: f64, z: f64) -> f64 {
@@ -232,3 +274,65 @@ pub fn fmaf_software(x: f32, y: f32, z: f32) -> f32 {
 
 export_alias!(fn(x: f64, y: f64, z: f64) -> f64; fma => fmaf64, fmaf32x);
 export_alias!(fn(x: f32, y: f32, z: f32) -> f32; fmaf => fmaf32);
+
+#[inline(always)]
+fn after(mut x: f64, saved: u32) -> f64 {
+    unsafe { asm!("/* {x} {s:e} */", x = inout(xmm_reg) x, s = in(reg) saved, options(nomem, nostack, preserves_flags)) };
+    x
+}
+
+#[inline(always)]
+fn restore_flags(saved: u32, mut r: f64, mut w: f64, mut chk: f64) -> (f64, f64, f64) {
+    unsafe {
+        asm!("ldmxcsr [{m}] /* {r} {w} {c} */", m = in(reg) &saved, r = inout(xmm_reg) r, w = inout(xmm_reg) w, c = inout(xmm_reg) chk, options(nostack, preserves_flags));
+    }
+    (r, w, chk)
+}
+
+#[inline]
+pub(crate) fn fma_emul(a: f64, b: f64, c: f64) -> f64 {
+    #[inline(always)]
+    fn expo(x: f64) -> i32 {
+        ((x.to_bits() >> 52) & 0x7ff) as i32 - 1023
+    }
+    let (ea, eb, ec) = (expo(a), expo(b), expo(c));
+    let ok = a != 0.0 && b != 0.0 && ea > -400 && ea < 400 && eb > -400 && eb < 400 && ea + eb > -800 && ea + eb < 800
+        && (c == 0.0 || (ec > -900 && ec < 900 && ec - (ea + eb) < 120 && (ea + eb) - ec < 120));
+    if !ok {
+        return fma_soft(a, b, c);
+    }
+    let saved = crate::fenv::mxcsr_get();
+    if !crate::trig::dd::is_nearest() {
+        crate::fenv::mxcsr_set(saved);
+        return fma_soft(a, b, c);
+    }
+    let (a, b, c) = (after(a, saved), after(b, saved), after(c, saved));
+    const SPLIT: f64 = 134217729.0;
+    let p = a * b;
+    let ta = SPLIT * a;
+    let ah = ta - (ta - a);
+    let al = a - ah;
+    let tb = SPLIT * b;
+    let bh = tb - (tb - b);
+    let bl = b - bh;
+    let e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+    let uh = c + p;
+    let bb = uh - c;
+    let ul = (c - (uh - bb)) + (p - bb);
+    let v0 = ul + e;
+    let bb2 = v0 - ul;
+    let w = (ul - (v0 - bb2)) + (e - bb2);
+    let mut v = v0;
+    if w != 0.0 && v.to_bits() & 1 == 0 {
+        let up = (w > 0.0) == (v > 0.0);
+        let b = v.to_bits();
+        v = f64::from_bits(if v == 0.0 { 1 | (if w < 0.0 { 1u64 << 63 } else { 0 }) } else if up { b + 1 } else { b - 1 });
+    }
+    let r = uh + v;
+    let chk = (r - uh) - v;
+    let (r, w, chk) = restore_flags(saved, r, w, chk);
+    if w != 0.0 || chk != 0.0 {
+        raise_inexact();
+    }
+    r
+}

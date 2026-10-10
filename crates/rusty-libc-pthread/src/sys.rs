@@ -114,8 +114,8 @@ pub unsafe fn sys_cp(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: 
 
 #[inline(always)]
 pub fn gettid() -> i32 {
-    unsafe {
-        (*rusty_libc_core::tls::current()).tid
+    {
+        rusty_libc_core::tls::current_tid()
     }
 }
 

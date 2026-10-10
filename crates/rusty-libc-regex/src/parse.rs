@@ -1588,10 +1588,16 @@ impl<'a> Parser<'a> {
         if coll.nrules() > 0 || self.mb != Mb::None {
             acc.ranges.push((sv, ev));
         }
-        for ch in 0..=255u32 {
-            let c = coll.seq_of_byte(ch as u8);
-            if sv <= c && c <= ev {
+        if coll.is_byte_identity() {
+            for ch in sv..=ev.min(255) {
                 set_bit(&mut acc.sb, ch as u8);
+            }
+        } else {
+            for ch in 0..=255u32 {
+                let c = coll.seq_of_byte(ch as u8);
+                if sv <= c && c <= ev {
+                    set_bit(&mut acc.sb, ch as u8);
+                }
             }
         }
         Ok(())

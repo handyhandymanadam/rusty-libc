@@ -53,7 +53,8 @@ fn cbrt_impl(x: f64, fma: bool) -> f64 {
     if x.exp_field() == 0x7ff || x.abs_() == 0.0 {
         return Fp::add(x, x);
     }
-    let (hi, _) = cbrt_dd(x.abs_(), fma);
+    let _g = crate::trig::dd::NearestGuard::new_if(crate::trig::dd::rounding_control() != 0);
+    let (hi, _) = cbrt_dd(crate::trig::dd::launder(x.abs_()), fma);
     hi.copysign_(x)
 }
 
@@ -114,19 +115,36 @@ fn cbrtf_raw(ab: u32) -> f64 {
 
 #[inline(always)]
 fn cbrtf_impl(x: f32, fma: bool) -> f32 {
-    if let Some(r) = cbrtf_fast(x, fma) {
+    if crate::trig::dd::rounding_control() == 0
+        && let Some(r) = cbrtf_fast(x, fma)
+    {
         return r;
     }
     if x.exp_field() == 0xff || x.abs_() == 0.0 {
         return Fp::add(x, x);
     }
     let a = f64::from(x.abs_());
-    let (hi, lo) = cbrt_dd(a, fma);
+    let rc = crate::trig::dd::rounding_control();
+    let _g = crate::trig::dd::NearestGuard::new_if(rc != 0);
+    let (hi, lo) = cbrt_dd(crate::trig::dd::launder(a), fma);
     let mut f = narrow(hi);
     if hi.to_bits() & 0x1fff_ffff == 0x1000_0000 {
         let down = hi.to_bits() & !0x1fff_ffff;
         let pick = if lo > 0.0 { down + 0x2000_0000 } else { down };
         f = f64::from_bits(pick) as f32;
+    }
+    if rc != 0 {
+        let mut t = (hi - f64::from(f)) + lo;
+        if t.abs() <= hi * 8.271806125530277e-25 {
+            t = 0.0;
+        }
+        let away = rc == if x.is_sign_negative() { 1 } else { 2 };
+        let b = f.to_bits();
+        if away && t > 0.0 {
+            f = f32::from_bits(b + 1);
+        } else if !away && t < 0.0 {
+            f = f32::from_bits(b - 1);
+        }
     }
     f.copysign_(x)
 }

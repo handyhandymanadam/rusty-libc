@@ -184,6 +184,34 @@ fn is_neg_int(e: &Ext) -> bool {
     e.neg && e.is_integer()
 }
 
+#[target_feature(enable = "fma")]
+fn lgammal_any_fma(x: F80) -> Option<(F80, bool)> {
+    super::fast_special::lgammal_any(x)
+}
+
+#[target_feature(enable = "fma")]
+fn tgammal_any_fma(x: F80) -> Option<F80> {
+    super::fast_special::tgammal_any(x)
+}
+
+#[inline(always)]
+fn lgammal_fast(x: F80) -> Option<(F80, bool)> {
+    if crate::trig::dd::fma_ready() {
+        unsafe { lgammal_any_fma(x) }
+    } else {
+        super::fast_special::lgammal_any(x)
+    }
+}
+
+#[inline(always)]
+fn tgammal_fast(x: F80) -> Option<F80> {
+    if crate::trig::dd::fma_ready() {
+        unsafe { tgammal_any_fma(x) }
+    } else {
+        super::fast_special::tgammal_any(x)
+    }
+}
+
 pub unsafe fn lgamma_r_impl(x: F80, sign: *mut i32) -> F80 {
     let set = |s: i32| {
         if !sign.is_null() {
@@ -191,7 +219,7 @@ pub unsafe fn lgamma_r_impl(x: F80, sign: *mut i32) -> F80 {
         }
     };
     set(1);
-    if let Some((r, neg)) = super::fast_special::lgammal_any(x) {
+    if let Some((r, neg)) = lgammal_fast(x) {
         set(if neg { -1 } else { 1 });
         return r;
     }
@@ -225,7 +253,7 @@ pub fn lgammal_impl(x: F80) -> F80 {
 }
 
 pub fn tgammal_impl(x: F80) -> F80 {
-    if let Some(r) = super::fast_special::tgammal_any(x) {
+    if let Some(r) = tgammal_fast(x) {
         return r;
     }
     if x.is_nan_() {

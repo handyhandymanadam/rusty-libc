@@ -171,7 +171,51 @@ pub(super) fn lgamma_dd<const F: bool>(x: f64) -> (D, i32) {
 }
 
 #[inline(always)]
+pub(super) fn is_whole(x: f64) -> bool {
+    let b = x.to_bits() & 0x7fff_ffff_ffff_ffff;
+    let e = (b >> 52) as i32;
+    if e >= 1075 {
+        return b < 0x7ff0_0000_0000_0000;
+    }
+    if e < 1023 {
+        return b == 0;
+    }
+    b & ((1u64 << (1075 - e)) - 1) == 0
+}
+
+#[cold]
+#[inline(never)]
+fn lgamma_r_directed(x: f64) -> (f64, i32) {
+    let rc = crate::trig::dd::rounding_control();
+    let _g = crate::trig::dd::NearestGuard::new();
+    let (l, s) = lgamma_dd::<false>(crate::trig::dd::launder(x));
+    let (mut h, mut lo) = l;
+    let y = if h.is_finite() && h != 0.0 {
+        let neg = h < 0.0;
+        if neg {
+            (h, lo) = (-h, -lo);
+        }
+        let away = rc == if neg { 1 } else { 2 };
+        let r = crate::trig::round_dir(h, lo, h * 7.888609052210118e-31 * 1024.0, away).unwrap_or(h + lo);
+        if neg { -r } else { r }
+    } else {
+        h + lo
+    };
+    if y == f64::INFINITY && x.is_finite() {
+        let y = dir_overflow(y, rc);
+        if y.is_infinite() {
+            set_errno(ERANGE);
+        }
+        return (y, s);
+    }
+    (y, s)
+}
+
+#[inline(always)]
 pub(super) fn lgamma_r_impl<const F: bool>(x: f64) -> (f64, i32) {
+    if x.is_finite() && x != 0.0 && x != 1.0 && x != 2.0 && !(x < 0.0 && is_whole(x)) && !crate::trig::dd::is_nearest() {
+        return lgamma_r_directed(x);
+    }
     if x >= 0.5 && x < 16.0 && x != 1.0 && x != 2.0 {
         if let Some(y) = lgamma_fast::<F>(x) {
             return (y, 1);
@@ -238,8 +282,42 @@ pub(super) fn tgamma_dd<const F: bool>(x: f64) -> Result<((D, i32), bool), f64> 
     Ok((exp_dd::<F>(l), floor_odd))
 }
 
+#[cold]
+#[inline(never)]
+fn tgamma_directed(x: f64) -> f64 {
+    let rc = crate::trig::dd::rounding_control();
+    let _g = crate::trig::dd::NearestGuard::new();
+    match tgamma_dd::<false>(crate::trig::dd::launder(x)) {
+        Err(v) if v.is_infinite() && x.is_finite() => dir_overflow(v, rc),
+        Err(v) if v == 0.0 => dir_underflow(v, rc),
+        Err(v) => v,
+        Ok(((m, k), neg)) => {
+            let m = if x.abs().to_bits() == 0x0004_0000_0000_0000 { (1.0, if neg { 1e-300 } else { -1e-300 }) } else { m };
+            let (h, l) = if neg { (-m.0, -m.1) } else { m };
+            let (y, ovf) = scale_round_dir(h, l, k, rc, m.0.abs() * 7.888609052210118e-31 * 1024.0);
+            if ovf || y.is_infinite() || y.abs() < f64::MIN_POSITIVE {
+                set_errno(ERANGE);
+            }
+            y
+        }
+    }
+}
+
+#[inline(always)]
+pub(super) fn dir_overflow(v: f64, rc: u32) -> f64 {
+    if rc == if v < 0.0 { 1 } else { 2 } { v } else { f64::MAX.copysign(v) }
+}
+
+#[inline(always)]
+pub(super) fn dir_underflow(v: f64, rc: u32) -> f64 {
+    if rc == if v.is_sign_negative() { 1 } else { 2 } { f64::from_bits(1).copysign(v) } else { v }
+}
+
 #[inline(always)]
 pub(super) fn tgamma_impl<const F: bool>(x: f64) -> f64 {
+    if x.is_finite() && x != 0.0 && !(x < 0.0 && is_whole(x)) && !(x >= 1.0 && x <= 23.0 && is_whole(x)) && !crate::trig::dd::is_nearest() {
+        return tgamma_directed(x);
+    }
     if x >= 0.5 && x < 16.0 && !super::fastf::is_int(x) {
         if let Some(y) = super::fastd::tgamma_small::<F>(x) {
             return y;

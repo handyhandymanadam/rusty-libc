@@ -74,17 +74,29 @@ pub fn cexp<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
     }
 }
 
-fn clog_gen<F: CF>(xr: W<F>, xi: W<F>, base10: bool) -> P<F> {
+fn clog_gen<F: CF, const BASE10: bool>(xr: W<F>, xi: W<F>) -> P<F> {
     let rcls = xr.cls();
     let icls = xi.cls();
-    let half_l10e = W(F::HALF_LOG10E);
-    let l1p = |d: W<F>| -> W<F> { if base10 { d.log1p() * half_l10e } else { d.log1p() * 0.5 } };
+    let base10 = BASE10;
     if rcls == FP_ZERO && icls == FP_ZERO {
         let pi = if base10 { W(F::PI_LOG10E) } else { W(F::PI) };
         let im = (if xr.signbit() { pi } else { W::k(0.0) }).copysign(xi);
         let re = W::<F>::k(-1.0) / xr.abs();
         (re, im)
     } else if rcls != FP_NAN && icls != FP_NAN {
+        clog_finite_gen::<F, BASE10>(xr, xi)
+    } else {
+        let re = if rcls == FP_INFINITE || icls == FP_INFINITE { inf() } else { nan() };
+        (re, nan())
+    }
+}
+
+#[inline(always)]
+fn clog_finite_gen<F: CF, const BASE10: bool>(xr: W<F>, xi: W<F>) -> P<F> {
+    let base10 = BASE10;
+    let half_l10e = W(F::HALF_LOG10E);
+    let l1p = |d: W<F>| -> W<F> { if base10 { d.log1p() * half_l10e } else { d.log1p() * 0.5 } };
+    {
         let mut absx = xr.abs();
         let mut absy = xi.abs();
         let mut scale: i32 = 0;
@@ -125,18 +137,20 @@ fn clog_gen<F: CF>(xr: W<F>, xi: W<F>, base10: bool) -> P<F> {
         let at = xi.atan2(xr);
         let im = if base10 { W(F::LOG10E) * at } else { at };
         (re, im)
-    } else {
-        let re = if rcls == FP_INFINITE || icls == FP_INFINITE { inf() } else { nan() };
-        (re, nan())
     }
 }
 
 pub fn clog<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
-    clog_gen(xr, xi, false)
+    clog_gen::<F, false>(xr, xi)
 }
 
 pub fn clog10<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
-    clog_gen(xr, xi, true)
+    clog_gen::<F, true>(xr, xi)
+}
+
+pub fn clog_finite<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
+    debug_assert!(!xr.is_nan() && !xi.is_nan() && !(xr == 0.0 && xi == 0.0));
+    clog_finite_gen::<F, false>(xr, xi)
 }
 
 pub fn cpow<F: CF>(xr: W<F>, xi: W<F>, cr: W<F>, ci: W<F>) -> P<F> {

@@ -157,27 +157,34 @@ impl File {
 
     #[inline(always)]
     pub fn rpos(&self) -> usize {
-        (if self.flags & F_UNGOT != 0 { self.save_base } else { self.rptr }) as usize - self.buf as usize
+        (if self.flags & (F_UNGOT | F_WIDE) != 0 { self.save_base } else { self.rptr }) as usize - self.buf as usize
     }
     #[inline(always)]
     pub fn rend(&self) -> usize {
-        (if self.flags & F_UNGOT != 0 { self.save_end } else { self.rend_p }) as usize - self.buf as usize
+        (if self.flags & (F_UNGOT | F_WIDE) != 0 { self.save_end } else { self.rend_p }) as usize - self.buf as usize
     }
     #[inline(always)]
     pub fn set_rpos(&mut self, n: usize) {
         let p = self.buf.wrapping_add(n);
-        if self.flags & F_UNGOT != 0 { self.save_base = p } else { self.rptr = p }
+        if self.flags & (F_UNGOT | F_WIDE) != 0 { self.save_base = p } else { self.rptr = p }
     }
     #[inline(always)]
     pub fn set_read(&mut self, pos: usize, end: usize) {
         let (p, e) = (self.buf.wrapping_add(pos), self.buf.wrapping_add(end));
-        if self.flags & F_UNGOT != 0 {
+        if self.flags & (F_UNGOT | F_WIDE) != 0 {
             self.save_base = p;
             self.save_end = e;
         } else {
             self.rptr = p;
             self.rend_p = e;
             self.rbase = self.buf;
+        }
+    }
+    pub fn hide_read_window(&mut self) {
+        if self.flags & (F_UNGOT | F_WIDE) == 0 {
+            self.save_base = self.rptr;
+            self.save_end = self.rend_p;
+            self.rptr = self.rend_p;
         }
     }
     #[inline(always)]
@@ -301,10 +308,20 @@ unsafe fn walk_pinned(mut visit: impl FnMut(*mut File)) {
     }
 }
 
+static FORK_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+#[inline(always)]
 fn note_used() {
-    static FORK_REGISTERED: AtomicBool = AtomicBool::new(false);
+    if !FORK_REGISTERED.load(Ordering::Relaxed) {
+        note_used_first();
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn note_used_first() {
     rusty_libc_core::process::set_stdio_flush(flush_at_exit);
-    if !FORK_REGISTERED.load(Ordering::Relaxed) && !FORK_REGISTERED.swap(true, Ordering::AcqRel) {
+    if !FORK_REGISTERED.swap(true, Ordering::AcqRel) {
         rusty_libc_core::process::register_fork_handlers(atfork_prepare, atfork_parent, atfork_child);
     }
 }
@@ -431,6 +448,14 @@ unsafe fn decide(f: *mut File) {
         if (*f).flags & F_UNBUF != 0 {
             return;
         }
+        if (*f).buf.is_null() {
+            alloc_default(f);
+        }
+    }
+}
+
+unsafe fn alloc_default(f: *mut File) {
+    unsafe {
         let mut size = BUFSIZ;
         if (*f).flags & F_MEM == 0
             && (*f).fd >= 0
@@ -443,14 +468,12 @@ unsafe fn decide(f: *mut File) {
                 size = blksize as usize;
             }
         }
-        if (*f).buf.is_null() {
-            let b = rusty_libc_malloc::malloc(size) as *mut u8;
-            if b.is_null() {
-                (*f).flags |= F_UNBUF;
-                return;
-            }
-            (*f).set_buffer(b, size);
+        let b = rusty_libc_malloc::malloc(size) as *mut u8;
+        if b.is_null() {
+            (*f).flags |= F_UNBUF;
+            return;
         }
+        (*f).set_buffer(b, size);
     }
 }
 
@@ -459,13 +482,7 @@ unsafe fn prepare(f: *mut File) {
         if (*f).flags & F_DECIDED == 0 {
             decide(f);
         } else if (*f).buf.is_null() && (*f).flags & F_UNBUF == 0 {
-            let size = if (*f).bufsize != 0 { (*f).bufsize } else { BUFSIZ };
-            let b = rusty_libc_malloc::malloc(size) as *mut u8;
-            if b.is_null() {
-                (*f).flags |= F_UNBUF;
-            } else {
-                (*f).set_buffer(b, size);
-            }
+            alloc_default(f);
         }
     }
 }
@@ -567,30 +584,51 @@ pub(crate) unsafe fn close_all() {
     }
 }
 
-pub(crate) unsafe fn fork_list_lock() -> bool {
-    if multithreaded() {
-        LIST.lock_always();
-        true
-    } else {
-        false
-    }
-}
-
-pub(crate) unsafe fn fork_list_unlock(taken: bool) {
-    if taken {
-        LIST.unlock_always();
-    }
-}
-
-pub(crate) unsafe fn close_popen_fds(keep: c_int) {
+pub(crate) unsafe fn popen_spawn(f: *mut File, command: *const c_char, child_end: c_int, target: c_int, parent_end: c_int, cloexec: bool) -> c_int {
+    use rusty_libc_core::spawn::{A_CLOSE, A_DUP2, PosixSpawnFileActions, SpawnAction, spawnix};
     unsafe {
+        let act = |tag, fd, arg| SpawnAction { tag, fd, arg, mode: 0, path: null_mut() };
+        let t = LIST.lock();
+        let mut n = 1usize;
         let mut p = OPEN_HEAD;
         while !p.is_null() {
-            if (*p).pid > 0 && (*p).fd >= 0 && (*p).fd != keep {
-                let _ = unistd::close((*p).fd);
+            n += ((*p).pid > 0 && (*p).fd >= 0) as usize;
+            p = (*p).next;
+        }
+        let mut local = [act(0, 0, 0); 16];
+        let heap = if n > local.len() { rusty_libc_malloc::malloc(n * size_of::<SpawnAction>()) as *mut SpawnAction } else { null_mut() };
+        if n > local.len() && heap.is_null() {
+            LIST.unlock(t);
+            return 12;
+        }
+        let acts = if heap.is_null() { local.as_mut_ptr() } else { heap };
+        acts.write(act(A_DUP2, child_end, target));
+        let mut used = 1usize;
+        let mut p = OPEN_HEAD;
+        while !p.is_null() {
+            if (*p).pid > 0 && (*p).fd >= 0 && (*p).fd != target {
+                acts.add(used).write(act(A_CLOSE, (*p).fd, 0));
+                used += 1;
             }
             p = (*p).next;
         }
+        let fa = PosixSpawnFileActions { allocated: used as c_int, used: used as c_int, actions: acts, pad: [0; 16] };
+        let argv: [*const c_char; 5] = [c"sh".as_ptr(), c"-c".as_ptr(), c"--".as_ptr(), command, core::ptr::null()];
+        let env = rusty_libc_core::env::block() as *const *const c_char;
+        let mut pid: c_int = 0;
+        let err = spawnix(&mut pid, c"/bin/sh".as_ptr(), &fa, core::ptr::null(), argv.as_ptr(), env, false, false);
+        if err == 0 {
+            let _ = unistd::close(child_end);
+            if !cloexec {
+                syscall::syscall3(syscall::SYS_FCNTL, parent_end as usize, 2 , 0);
+            }
+            (*f).pid = pid;
+        }
+        LIST.unlock(t);
+        if !heap.is_null() {
+            rusty_libc_malloc::free(heap.cast());
+        }
+        err
     }
 }
 
@@ -609,6 +647,7 @@ pub(crate) unsafe fn flush_line_buffered_pub() {
     unsafe { flush_lbf(true) }
 }
 
+#[inline]
 pub fn note_locking() {
     note_used();
 }
@@ -1318,9 +1357,10 @@ unsafe fn push_byte(f: *mut File, c: u8) -> bool {
 #[inline]
 pub unsafe fn getc(f: *mut File) -> c_int {
     unsafe {
-        if (*f).flags & F_WIDE == 0 && (*f).rptr < (*f).rend_p {
-            let c = *(*f).rptr;
-            (*f).rptr = (*f).rptr.add(1);
+        let p = (*f).rptr;
+        if p < (*f).rend_p {
+            let c = *p;
+            (*f).rptr = p.add(1);
             return c_int::from(c);
         }
         getc_slow(f)
@@ -1404,6 +1444,11 @@ pub(crate) unsafe fn ungetc_force(c: c_int, f: *mut File) -> c_int {
         if (*f).flags & F_WRMODE != 0 && !flush_write(f) {
             return EOF;
         }
+        if (*f).flags & (F_UNGOT | F_RDMODE) == F_UNGOT | F_RDMODE && (*f).rptr > (*f).rbase && *(*f).rptr.sub(1) == c as u8 {
+            (*f).rptr = (*f).rptr.sub(1);
+            (*f).flags &= !(F_PUTTING | F_EOF);
+            return c_int::from(c as u8);
+        }
         unget_done(f);
         if (*f).flags & F_RDMODE == 0 {
             (*f).set_read(0, 0);
@@ -1483,9 +1528,10 @@ pub unsafe fn read_bytes(f: *mut File, dst: *mut u8, n: usize) -> usize {
 pub unsafe fn putc(c: c_int, f: *mut File) -> c_int {
     unsafe {
         let b = c as u8;
-        if (*f).wptr < (*f).wend {
-            *(*f).wptr = b;
-            (*f).wptr = (*f).wptr.add(1);
+        let p = (*f).wptr;
+        if p < (*f).wend {
+            *p = b;
+            (*f).wptr = p.add(1);
             return c_int::from(b);
         }
         putc_slow(b, f)
@@ -1496,8 +1542,9 @@ pub unsafe fn putc(c: c_int, f: *mut File) -> c_int {
 unsafe fn putc_slow(b: u8, f: *mut File) -> c_int {
     unsafe {
         if (*f).flags & (F_WRMODE | F_UNBUF | F_WIDE | F_LBF) == F_WRMODE | F_LBF && b != b'\n' && (*f).wpos() < (*f).bufsize {
-            *(*f).wptr = b;
-            (*f).wptr = (*f).wptr.add(1);
+            let p = (*f).wptr;
+            *p = b;
+            (*f).wptr = p.add(1);
             return c_int::from(b);
         }
         if (*f).flags & (F_WRMODE | F_UNBUF | F_WIDE | F_LBF) == F_WRMODE && !(*f).buf.is_null() && (*f).wpos() >= (*f).bufsize {
@@ -1730,6 +1777,7 @@ unsafe fn seek_bytes(f: *mut File, off: i64, whence: c_int) -> c_int {
             errno::set(22);
             return -1;
         }
+        let exact = (*f).wpos() == 0 && if (*f).flags & F_UNGOT != 0 { (*f).save_base == (*f).save_end } else { (*f).rend() == 0 };
         if (*f).flags & F_WRMODE != 0 && !flush_write(f) {
             return -1;
         }
@@ -1750,6 +1798,9 @@ unsafe fn seek_bytes(f: *mut File, off: i64, whence: c_int) -> c_int {
                 return 0;
             }
         }
+        if let Some(r) = block_seek(f, off, whence, exact) {
+            return r;
+        }
         match raw_seek(f, off, whence) {
             Ok(_) => {
                 if reading {
@@ -1769,6 +1820,53 @@ unsafe fn seek_bytes(f: *mut File, off: i64, whence: c_int) -> c_int {
                 -1
             }
         }
+    }
+}
+
+unsafe fn block_seek(f: *mut File, off: i64, whence: c_int, exact: bool) -> Option<c_int> {
+    unsafe {
+        if (*f).flags & (F_MEM | F_UNBUF | F_NOSEEK) != 0 || (*f).flags & F_READ == 0 || !(*f).wide.is_null() {
+            return None;
+        }
+        prepare(f);
+        if (*f).buf.is_null() {
+            return None;
+        }
+        let target = match whence {
+            0 => off,
+            1 if (*f).cookie_pos >= 0 => (*f).cookie_pos + off,
+            2 => match unistd::fstat_basic((*f).fd) {
+                Ok((mode, _, size)) if mode & 0o170000 == 0o100000 => size + off,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let size = (*f).bufsize as i64;
+        let base = target & !(size - 1);
+        let delta = target - base;
+        if target < 0 || delta == 0 || delta > size {
+            return None;
+        }
+        if raw_seek(f, base, 0).is_err() {
+            return None;
+        }
+        drop_unget(f);
+        drop_wpush(f);
+        (*f).set_read(0, 0);
+        (*f).flags &= !(F_RDMODE | F_EOF | F_PUTTING);
+        (*f).flags |= F_SEEKED;
+        let count = raw_read(f, (*f).buf, if exact { delta as usize } else { (*f).bufsize });
+        if count < delta as isize {
+            let rest = if count < 0 { delta } else { delta - count as i64 };
+            if let Err(e) = raw_seek(f, rest, 1) {
+                errno::set(e);
+                return Some(-1);
+            }
+            return Some(0);
+        }
+        (*f).set_read(delta as usize, count as usize);
+        (*f).flags |= F_RDMODE;
+        Some(0)
     }
 }
 
@@ -1818,6 +1916,21 @@ pub unsafe fn setvbuf(f: *mut File, buf: *mut c_char, mode: c_int, size: usize) 
             errno::set(22);
             return EOF;
         }
+        if mode != 2 && buf.is_null() && (*f).flags & F_UNBUF == 0 {
+            if mode == 0 && (*f).buf.is_null() {
+                note_used();
+                (*f).flags |= F_DECIDED;
+                alloc_default(f);
+                if (*f).flags & F_UNBUF != 0 {
+                    return EOF;
+                }
+            }
+            (*f).flags &= !F_LBF;
+            if mode == 1 {
+                (*f).flags |= F_LBF;
+            }
+            return 0;
+        }
         if (*f).flags & F_WRMODE != 0 {
             flush_write(f);
         }
@@ -1837,13 +1950,9 @@ pub unsafe fn setvbuf(f: *mut File, buf: *mut c_char, mode: c_int, size: usize) 
             1 => (*f).flags |= F_LBF,
             _ => {}
         }
-        if mode != 2 {
-            if !buf.is_null() && size > 0 {
-                (*f).set_buffer(buf.cast(), size);
-                (*f).flags |= F_USERBUF;
-            } else if size > 0 {
-                (*f).bufsize = size;
-            }
+        if mode != 2 && !buf.is_null() && size > 0 {
+            (*f).set_buffer(buf.cast(), size);
+            (*f).flags |= F_USERBUF;
         }
         0
     }

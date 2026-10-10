@@ -1061,8 +1061,11 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                 era_cnt: -1,
             },
         };
-        let mut tmb = *tmp;
-        let tm: &mut Tm = if nested { &mut tmb } else { tmp };
+        let mut tmb = core::mem::MaybeUninit::<Tm>::uninit();
+        if nested {
+            tmb.write(*tmp);
+        }
+        let tm: &mut Tm = if nested { &mut *tmb.as_mut_ptr() } else { tmp };
         let mut val: usize;
 
         macro_rules! fail {
@@ -1776,7 +1779,7 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
 
         if let Some(st) = state {
             *st = s;
-            *tmp = tmb;
+            *tmp = *tm;
             return rp;
         }
 

@@ -279,13 +279,21 @@ pub fn is_combining_level3(c: u32) -> bool {
 
 #[inline]
 pub fn width(c: u32) -> Option<u8> {
+    if !rusty_libc_core::locale::locale_slow() {
+        return width_in(code_charset(CHARSET.load(Ordering::Relaxed) as u32), c);
+    }
     if let Some(w) = wtab(core::ptr::null(), true) {
         return match unsafe { rusty_libc_core::locale::width_lookup(w.width, c) } {
             0xff => None,
             x => Some(x),
         };
     }
-    match charset() {
+    width_in(charset(), c)
+}
+
+#[inline(always)]
+fn width_in(cs: Charset, c: u32) -> Option<u8> {
+    match cs {
         Charset::Utf8 | Charset::Other => match props(c) >> 14 {
             3 => None,
             w => Some(w as u8),
@@ -441,6 +449,20 @@ pub unsafe extern "C" fn wcwidth(wc: wchar_t) -> c_int {
 pub unsafe extern "C" fn wcswidth(s: *const wchar_t, n: usize) -> c_int {
     unsafe {
         let mut total: c_int = 0;
+        if !rusty_libc_core::locale::locale_slow() {
+            let cs = code_charset(CHARSET.load(Ordering::Relaxed) as u32);
+            for i in 0..n {
+                let c = *s.add(i);
+                if c == 0 {
+                    break;
+                }
+                match width_in(cs, c as u32) {
+                    Some(w) => total = total.wrapping_add(c_int::from(w)),
+                    None => return -1,
+                }
+            }
+            return total;
+        }
         for i in 0..n {
             let c = *s.add(i);
             if c == 0 {

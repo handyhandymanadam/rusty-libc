@@ -105,6 +105,15 @@ def asin_fp(x):
     return y
 
 
+def atan_fp(x):
+    xf = from_frac(x)
+    y = from_frac(Fraction(math.atan(float(x))))
+    for _ in range(7):
+        s, c = fsincos(y)
+        y -= fdiv(s - fmul(xf, c), c + fmul(xf, s))
+    return y
+
+
 def erf_fp(x):
     xf = from_frac(x)
     x2 = fmul(xf, xf)
@@ -245,6 +254,13 @@ def main():
         TOL_BITS, CHECK_BITS, DD_THRESH = 88, 84, Fraction(1, 1 << 26)
         ivs = [(Fraction(j, 256), Fraction(1, 512)) for j in range(0, 193)]
         tab = Table("ASIN_TAB", asin_fp, ivs, deg_min=6)
+        tab.verify()
+        tab.emit()
+
+    if "atan" in which:
+        TOL_BITS, CHECK_BITS, DD_THRESH = 88, 84, Fraction(1, 1 << 32)
+        ivs = [(Fraction(j, 256), Fraction(1, 512)) for j in range(0, 257)]
+        tab = Table("ATAN_TAB", atan_fp, ivs, deg_min=6)
         tab.verify()
         tab.emit()
 

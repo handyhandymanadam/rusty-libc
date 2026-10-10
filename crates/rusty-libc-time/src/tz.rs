@@ -1178,10 +1178,12 @@ pub(crate) unsafe fn tz_convert(timer: i64, use_localtime: bool, tp: *mut Tm, al
             leap_correction = c;
             leap_extra = e;
         } else {
-            if !offtime(timer, 0, tm) {
-                return null_mut();
+            if use_localtime {
+                if !offtime(timer, 0, tm) {
+                    return null_mut();
+                }
+                tz_compute(timer, tm, true);
             }
-            tz_compute(timer, tm, use_localtime);
             leap_correction = 0;
             leap_extra = 0;
         }

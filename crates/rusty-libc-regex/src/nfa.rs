@@ -621,6 +621,7 @@ impl Nfa {
         let icase = icase && self.mb == Mb::None;
         let contexts: [u8; 4] = [0, CTX_WORD, CTX_NEWLINE, CTX_NEWLINE | CTX_BEGBUF];
         let mut st: V<u32> = V::new();
+        let mut sets_done: V<u32> = V::new();
         for &cx in contexts.iter() {
             self.init_state(cx, &mut st);
             for &n in st.iter() {
@@ -634,10 +635,15 @@ impl Nfa {
                 match nd.kind {
                     K_CHAR => set(nd.c, fastmap),
                     K_SET => {
-                        let s = &self.sets[nd.arg as usize];
-                        for ch in 0..=255u32 {
-                            if set_has(s, ch as u8) {
-                                set(ch as u8, fastmap);
+                        if !sets_done.contains(&nd.arg) {
+                            sets_done.push(nd.arg);
+                            let s = &self.sets[nd.arg as usize];
+                            for (w, &word) in s.iter().enumerate() {
+                                let mut b = word;
+                                while b != 0 {
+                                    set((w * 64) as u8 + b.trailing_zeros() as u8, fastmap);
+                                    b &= b - 1;
+                                }
                             }
                         }
                     }

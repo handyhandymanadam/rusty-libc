@@ -110,6 +110,10 @@ pub trait Sink {
         }
         true
     }
+    const DIRECT: bool = false;
+    fn direct(&mut self, _n: usize) -> *mut u8 {
+        core::ptr::null_mut()
+    }
     fn put(&mut self, bytes: &[u8]) -> bool;
     fn partial_output_on_error(&self) -> bool {
         true
@@ -200,6 +204,86 @@ const fn hex_pairs(upper: bool) -> [u16; 256] {
 static HEX_LOWER: [u16; 256] = hex_pairs(false);
 static HEX_UPPER: [u16; 256] = hex_pairs(true);
 
+const PAIRS: &[u8; 200] = b"0001020304050607080910111213141516171819202122232425262728293031323334353637383940414243444546474849\
+5051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
+
+#[inline]
+fn ndigits(v: u64, base: u64) -> usize {
+    let bits = 64 - (v | 1).leading_zeros() as usize;
+    match base {
+        10 => {
+            const POW10: [u64; 20] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000, 1_000_000_000, 10_000_000_000, 100_000_000_000, 1_000_000_000_000, 10_000_000_000_000, 100_000_000_000_000, 1_000_000_000_000_000, 10_000_000_000_000_000, 100_000_000_000_000_000, 1_000_000_000_000_000_000, 10_000_000_000_000_000_000];
+            let t = (bits * 1233) >> 12;
+            t + 1 - usize::from((v | 1) < POW10[t])
+        }
+        16 => bits.div_ceil(4),
+        8 => bits.div_ceil(3),
+        2 => bits,
+        _ => {
+            let mut n = 1;
+            let mut x = v / base;
+            while x != 0 {
+                n += 1;
+                x /= base;
+            }
+            n
+        }
+    }
+}
+
+#[inline]
+unsafe fn put_digits(mut v: u64, base: u64, upper: bool, dst: *mut u8, nd: usize) {
+    unsafe {
+        let mut i = nd;
+        if base == 10 {
+            while v >= 100 {
+                let r = (v % 100) as usize;
+                v /= 100;
+                i -= 2;
+                *dst.add(i) = PAIRS[2 * r];
+                *dst.add(i + 1) = PAIRS[2 * r + 1];
+            }
+            if v >= 10 {
+                *dst = PAIRS[2 * v as usize];
+                *dst.add(1) = PAIRS[2 * v as usize + 1];
+            } else {
+                *dst = b'0' + v as u8;
+            }
+            return;
+        }
+        let digs: &[u8; 16] = if upper { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
+        if base == 16 {
+            let tab = if upper { &HEX_UPPER } else { &HEX_LOWER };
+            while i >= 2 {
+                i -= 2;
+                (dst.add(i) as *mut u16).write_unaligned(tab[(v & 0xff) as usize]);
+                v >>= 8;
+            }
+            if i == 1 {
+                *dst = digs[(v & 15) as usize];
+            }
+        } else if base == 8 {
+            while i > 0 {
+                i -= 1;
+                *dst.add(i) = b'0' + (v & 7) as u8;
+                v >>= 3;
+            }
+        } else if base == 2 {
+            while i > 0 {
+                i -= 1;
+                *dst.add(i) = b'0' + (v & 1) as u8;
+                v >>= 1;
+            }
+        } else {
+            while i > 0 {
+                i -= 1;
+                *dst.add(i) = digs[(v % base) as usize];
+                v /= base;
+            }
+        }
+    }
+}
+
 fn digits_u64(mut v: u64, base: u64, upper: bool, buf: &mut [u8; 70]) -> usize {
     let digs: &[u8; 16] = if upper { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
     let mut i = 70;
@@ -217,8 +301,6 @@ fn digits_u64(mut v: u64, base: u64, upper: bool, buf: &mut [u8; 70]) -> usize {
         return 70 - nd;
     }
     if base == 10 {
-        const PAIRS: &[u8; 200] = b"0001020304050607080910111213141516171819202122232425262728293031323334353637383940414243444546474849\
-5051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
         while v >= 100 {
             let r = (v % 100) as usize;
             v /= 100;
@@ -506,6 +588,16 @@ impl<S: Sink> Out<'_, S> {
             self.failed = true;
         }
     }
+    fn direct(&mut self, n: usize) -> *mut u8 {
+        if !S::DIRECT || S::WIDE || self.failed || n == 0 {
+            return core::ptr::null_mut();
+        }
+        let p = self.sink.direct(n);
+        if !p.is_null() {
+            self.total = self.total.saturating_add(n);
+        }
+        p
+    }
     pub fn put(&mut self, b: &[u8]) {
         if self.failed || b.is_empty() {
             return;
@@ -565,10 +657,13 @@ pub unsafe fn small_copy(dst: *mut u8, src: *const u8, n: usize) {
             (dst.add(n - 4) as *mut u32).write_unaligned(b);
         } else if n > 16 {
             rusty_libc_mem::memcpy(dst.cast(), src.cast(), n);
-        } else {
-            for i in 0..n {
-                *dst.add(i) = *src.add(i);
-            }
+        } else if n >= 2 {
+            let a = (src as *const u16).read_unaligned();
+            let b = (src.add(n - 2) as *const u16).read_unaligned();
+            (dst as *mut u16).write_unaligned(a);
+            (dst.add(n - 2) as *mut u16).write_unaligned(b);
+        } else if n == 1 {
+            *dst = *src;
         }
     }
 }
@@ -588,10 +683,12 @@ unsafe fn small_fill(dst: *mut u8, byte: u8, n: usize) {
             let w = u32::from_ne_bytes([byte; 4]);
             (dst as *mut u32).write_unaligned(w);
             (dst.add(n - 4) as *mut u32).write_unaligned(w);
-        } else {
-            for i in 0..n {
-                *dst.add(i) = byte;
-            }
+        } else if n >= 2 {
+            let w = u16::from_ne_bytes([byte; 2]);
+            (dst as *mut u16).write_unaligned(w);
+            (dst.add(n - 2) as *mut u16).write_unaligned(w);
+        } else if n == 1 {
+            *dst = byte;
         }
     }
 }
@@ -608,12 +705,16 @@ fn write_num<S: Sink>(o: &mut Out<S>, n: &Num, width: usize, left: bool, zero_pa
         let mut k = 0usize;
         unsafe {
             let copy = |src: &[u8], k: &mut usize| {
-                small_copy(base.add(*k), src.as_ptr(), src.len());
-                *k += src.len();
+                if !src.is_empty() {
+                    small_copy(base.add(*k), src.as_ptr(), src.len());
+                    *k += src.len();
+                }
             };
             let fill = |byte: u8, cnt: usize, k: &mut usize| {
-                small_fill(base.add(*k), byte, cnt);
-                *k += cnt;
+                if cnt != 0 {
+                    small_fill(base.add(*k), byte, cnt);
+                    *k += cnt;
+                }
             };
             if !left && !zero_pad {
                 fill(b' ', pad, &mut k);
@@ -716,8 +817,49 @@ pub unsafe fn format_builtin<S: Sink, A: Args, F: FmtChar>(sink: &mut S, fmt: *c
                 bj += 1;
             }
             let bare = F::at(fmt, bj);
-            let is_bare = matches!(bare, b's' | b'd' | b'i' | b'u' | b'x' | b'c');
-            let mut spec = Spec { flags: Flags::default(), pad0: false, width: if is_bare { bw } else { 0 }, prec: None, len: Len::None, conv: if is_bare { bare } else { 0 }, conv_raw: if is_bare { F::raw(fmt, bj) } else { 0 }, wide_fmt: F::WIDE };
+            if bare == b'c' && bw == 0 && !S::WIDE {
+                let v = val_i(args.get(Kind::Int, None)) as u8;
+                o.put(&[v]);
+                i = bj + 1;
+                run_start = i;
+                if o.failed {
+                    return -1;
+                }
+                continue;
+            }
+            let mut is_bare = matches!(bare, b's' | b'd' | b'i' | b'u' | b'x' | b'c' | b'o' | b'X' | b'p' | b'e' | b'E' | b'f' | b'F' | b'g' | b'G' | b'a' | b'A');
+            let mut bare = bare;
+            let mut bflags = Flags::default();
+            if !is_bare && matches!(F::at(fmt, i), b'-' | b' ' | b'+' | b'#' | b'0') {
+                let mut fj = i;
+                loop {
+                    match F::at(fmt, fj) {
+                        b'-' => bflags.left = true,
+                        b' ' => bflags.space = true,
+                        b'+' => bflags.plus = true,
+                        b'#' => bflags.alt = true,
+                        b'0' => bflags.zero = true,
+                        _ => break,
+                    }
+                    fj += 1;
+                }
+                let mut wj = fj;
+                let mut ww = 0usize;
+                while wj < fj + 4 && F::at(fmt, wj).is_ascii_digit() {
+                    ww = ww * 10 + usize::from(F::at(fmt, wj) - b'0');
+                    wj += 1;
+                }
+                let b2 = F::at(fmt, wj);
+                if matches!(b2, b's' | b'd' | b'i' | b'u' | b'x' | b'c' | b'o' | b'X' | b'p' | b'e' | b'E' | b'f' | b'F' | b'g' | b'G' | b'a' | b'A') {
+                    is_bare = true;
+                    bare = b2;
+                    bj = wj;
+                    bw = ww;
+                } else {
+                    bflags = Flags::default();
+                }
+            }
+            let mut spec = Spec { flags: bflags, pad0: false, width: if is_bare { bw } else { 0 }, prec: None, len: Len::None, conv: if is_bare { bare } else { 0 }, conv_raw: if is_bare { F::raw(fmt, bj) } else { 0 }, wide_fmt: F::WIDE };
             let mut pos: Option<usize> = None;
             if is_bare {
                 i = bj;
@@ -1252,6 +1394,49 @@ fn emit_int<S: Sink>(o: &mut Out<S>, s: &Spec, sign: &[u8], prefix: &[u8], mag: 
     if s.flags.group || (s.flags.i18n && base == 10) {
         return emit_int_loc(o, s, sign, prefix, mag, base, upper);
     }
+    if S::DIRECT && sign.len() <= 1 && prefix.len() <= 2 {
+        let nd = ndigits(mag, base);
+        let digits_len = if mag == 0 && s.prec == Some(0) { 0 } else { nd };
+        let mut zeros = s.prec.map_or(0, |p| p.saturating_sub(digits_len));
+        if s.conv == b'o' && s.flags.alt && zeros == 0 && (digits_len == 0 || mag != 0) {
+            zeros = 1;
+        }
+        let zero_pad = s.flags.zero && s.prec.is_none() && !s.flags.left;
+        let total = sign.len() + prefix.len() + zeros + digits_len;
+        let pad = s.width.saturating_sub(total);
+        let p = o.direct(total + pad);
+        if !p.is_null() {
+            unsafe {
+                let mut k = 0usize;
+                if !zero_pad && !s.flags.left {
+                    small_fill(p, b' ', pad);
+                    k += pad;
+                }
+                if let Some(&sg) = sign.first() {
+                    *p.add(k) = sg;
+                    k += 1;
+                }
+                for &c in prefix {
+                    *p.add(k) = c;
+                    k += 1;
+                }
+                if zero_pad {
+                    small_fill(p.add(k), b'0', pad);
+                    k += pad;
+                }
+                small_fill(p.add(k), b'0', zeros);
+                k += zeros;
+                if digits_len != 0 {
+                    put_digits(mag, base, upper, p.add(k), digits_len);
+                    k += digits_len;
+                }
+                if s.flags.left {
+                    small_fill(p.add(k), b' ', pad);
+                }
+            }
+            return;
+        }
+    }
     let mut buf = [0u8; 70];
     let start = digits_u64(mag, base, upper, &mut buf);
     if s.width == 0 && s.prec.is_none() && prefix.is_empty() && sign.len() <= 1 && !(s.conv == b'o' && s.flags.alt) {
@@ -1261,6 +1446,17 @@ fn emit_int<S: Sink>(o: &mut Out<S>, s: &Spec, sign: &[u8], prefix: &[u8], mag: 
         } else {
             o.put(&buf[start..]);
         }
+        return;
+    }
+    if s.width == 0 && s.prec.is_none() && prefix.len() == 2 && sign.len() <= 1 {
+        buf[start - 1] = prefix[1];
+        buf[start - 2] = prefix[0];
+        let mut st = start - 2;
+        if let Some(&sg) = sign.first() {
+            st -= 1;
+            buf[st] = sg;
+        }
+        o.put(&buf[st..]);
         return;
     }
     let mut digits = &buf[start..];
@@ -1274,12 +1470,12 @@ fn emit_int<S: Sink>(o: &mut Out<S>, s: &Spec, sign: &[u8], prefix: &[u8], mag: 
     let zero_pad = s.flags.zero && s.prec.is_none() && !s.flags.left;
     let total = sign.len() + prefix.len() + zeros + digits.len();
     let pad = s.width.saturating_sub(total);
-    if !s.flags.left && sign.len() <= 1 && prefix.len() <= 2 && total + pad <= 192 && !o.failed {
+    if sign.len() <= 1 && prefix.len() <= 2 && total + pad <= 192 && !o.failed {
         let mut raw = core::mem::MaybeUninit::<[u8; 192]>::uninit();
         let base = raw.as_mut_ptr() as *mut u8;
         unsafe {
             let mut k = 0usize;
-            if !zero_pad {
+            if !zero_pad && !s.flags.left {
                 small_fill(base, b' ', pad);
                 k += pad;
             }
@@ -1299,6 +1495,10 @@ fn emit_int<S: Sink>(o: &mut Out<S>, s: &Spec, sign: &[u8], prefix: &[u8], mag: 
             k += zeros;
             small_copy(base.add(k), digits.as_ptr(), digits.len());
             k += digits.len();
+            if s.flags.left {
+                small_fill(base.add(k), b' ', pad);
+                k += pad;
+            }
             o.put(core::slice::from_raw_parts(base, k));
         }
         return;
@@ -1620,6 +1820,49 @@ fn emit_float<S: Sink>(o: &mut Out<S>, s: &Spec, v: Val) {
 fn write_pieces<S: Sink>(o: &mut Out<S>, s: &Spec, sign: &[u8], p: &float::Pieces, zero_pad: bool) {
     if float_needs_locale(s) {
         return write_pieces_loc(o, s, sign, p, zero_pad);
+    }
+    if !s.flags.left {
+        let len = sign.len() + p.prefix.len() + p.int.len() + p.int_zeros + usize::from(p.point) + p.frac_lead_zeros + p.frac.len() + p.frac_zeros + p.tail_len;
+        let pad = s.width.saturating_sub(len);
+        if len + pad <= 192 && !o.failed {
+            let mut raw = core::mem::MaybeUninit::<[u8; 192]>::uninit();
+            let base = raw.as_mut_ptr() as *mut u8;
+            unsafe {
+                let mut k = 0usize;
+                let copy = |src: &[u8], k: &mut usize| {
+                    if !src.is_empty() {
+                        small_copy(base.add(*k), src.as_ptr(), src.len());
+                        *k += src.len();
+                    }
+                };
+                let fill = |byte: u8, cnt: usize, k: &mut usize| {
+                    if cnt != 0 {
+                        small_fill(base.add(*k), byte, cnt);
+                        *k += cnt;
+                    }
+                };
+                if !zero_pad {
+                    fill(b' ', pad, &mut k);
+                }
+                copy(sign, &mut k);
+                copy(p.prefix, &mut k);
+                if zero_pad {
+                    fill(b'0', pad, &mut k);
+                }
+                copy(p.int, &mut k);
+                fill(b'0', p.int_zeros, &mut k);
+                if p.point {
+                    *base.add(k) = b'.';
+                    k += 1;
+                }
+                fill(b'0', p.frac_lead_zeros, &mut k);
+                copy(p.frac, &mut k);
+                fill(b'0', p.frac_zeros, &mut k);
+                copy(&p.tail[..p.tail_len], &mut k);
+                o.put(core::slice::from_raw_parts(base, k));
+            }
+            return;
+        }
     }
     let point: &[u8] = if p.point { b"." } else { b"" };
     let n = Num {

@@ -1,4 +1,4 @@
-use crate::simd::{self, NT_COPY_FROM, PAGE, SET_LARGE_FROM, Sse2, Vector, full, low_bits, pair, same_page};
+use crate::simd::{self, AVX512_ON, NT_COPY_FROM, PAGE, SET_LARGE_FROM, Sse2, Vector, full, low_bits, pair, same_page};
 use core::arch::asm;
 use core::ffi::{c_int, c_void};
 use core::ptr::null_mut;
@@ -167,6 +167,9 @@ pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: usize)
         MEMCPY,
         [ntc = sym NT_COPY_FROM, large = sym memcpy_large],
         "mov rax, rdi",
+        ".globl rusty_libc_memcpy_body",
+        ".hidden rusty_libc_memcpy_body",
+        "rusty_libc_memcpy_body:",
         "cmp rdx, 32",
         "ja 20f",
         "cmp edx, 16",
@@ -548,36 +551,44 @@ pub(crate) unsafe extern "C" fn memcpy_large(d: *mut u8, s: *const u8, n: usize)
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn copy_streaming(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
     use core::arch::x86_64::*;
+    const BLOCK: usize = 4 * 4096;
+    const STREAM_MIN: usize = 2 * BLOCK + 256;
     unsafe {
-        let head0 = _mm256_loadu_si256(s.cast());
-        let head1 = _mm256_loadu_si256(s.add(32).cast());
-        let mut tail = [_mm256_setzero_si256(); 4];
-        for (k, t) in tail.iter_mut().enumerate() {
-            *t = _mm256_loadu_si256(s.add(n - 128 + 32 * k).cast());
+        if n < STREAM_MIN {
+            return memmove_avx2(d, s, n);
         }
+        let dp = ((d as usize + 63) & !63) as *mut u8;
+        let head = dp as usize - d as usize;
+        let blocks = (n - head) / BLOCK;
         let off = (s as usize).wrapping_sub(d as usize);
-        let mut dp = ((d as usize + 64) & !63) as *mut u8;
-        let end = d.add(n - 128);
-        while dp < end {
-            let sp = dp.wrapping_add(off) as *const u8;
-            _mm_prefetch::<_MM_HINT_T0>(sp.wrapping_add(1024).cast());
-            _mm_prefetch::<_MM_HINT_T0>(sp.wrapping_add(1088).cast());
-            let a = _mm256_loadu_si256(sp.cast());
-            let b = _mm256_loadu_si256(sp.add(32).cast());
-            let c = _mm256_loadu_si256(sp.add(64).cast());
-            let e = _mm256_loadu_si256(sp.add(96).cast());
-            _mm256_stream_si256(dp.cast(), a);
-            _mm256_stream_si256(dp.add(32).cast(), b);
-            _mm256_stream_si256(dp.add(64).cast(), c);
-            _mm256_stream_si256(dp.add(96).cast(), e);
-            dp = dp.add(128);
+        let mut p = dp;
+        let end = dp.add(blocks * BLOCK);
+        while p < end {
+            let mut i = 0;
+            while i < 4096 {
+                let q = p.add(i);
+                for pg in 0..4 {
+                    let sp = q.add(pg * 4096).wrapping_add(off) as *const u8;
+                    let dq = q.add(pg * 4096);
+                    let a = _mm256_loadu_si256(sp.cast());
+                    let b = _mm256_loadu_si256(sp.add(32).cast());
+                    let c = _mm256_loadu_si256(sp.add(64).cast());
+                    let e = _mm256_loadu_si256(sp.add(96).cast());
+                    _mm256_stream_si256(dq.cast(), a);
+                    _mm256_stream_si256(dq.add(32).cast(), b);
+                    _mm256_stream_si256(dq.add(64).cast(), c);
+                    _mm256_stream_si256(dq.add(96).cast(), e);
+                }
+                i += 128;
+            }
+            p = p.add(BLOCK);
         }
         _mm_sfence();
-        _mm256_storeu_si256(d.cast(), head0);
-        _mm256_storeu_si256(d.add(32).cast(), head1);
-        for (k, t) in tail.iter().enumerate() {
-            _mm256_storeu_si256(d.add(n - 128 + 32 * k).cast(), *t);
+        if head != 0 {
+            memmove_avx2(d, s, head);
         }
+        let done = head + blocks * BLOCK;
+        memmove_avx2(d.add(done), s.add(done), n - done);
         d
     }
 }
@@ -1169,85 +1180,42 @@ macro_rules! memchr_block {
 #[inline(always)]
 pub(crate) unsafe fn memchr_impl<V: Vector>(s: *const u8, c: c_int, n: usize) -> *const u8 {
     unsafe {
-        let c = c as u8;
-        let w = V::W;
         if n == 0 {
             return core::ptr::null();
         }
         let n = n.min(usize::MAX - s as usize);
-        let vc = V::splat(c);
-        if (s as usize & 4095) > 4096 - w {
-            let stop = ((s as usize | 4095) + 1) as *const u8;
-            let end = s.wrapping_add(n);
-            let lim = if end < stop { end } else { stop };
-            let mut p = s;
-            while p < lim {
-                if *p == c {
-                    return p;
-                }
-                p = p.add(1);
-            }
-            return if end <= stop { core::ptr::null() } else { memchr_impl::<V>(stop, c as c_int, end as usize - stop as usize) };
-        }
-        if n <= w {
-            let m = small_eq_mask::<V>(s, vc, n);
-            return if m != 0 { s.add(m.trailing_zeros() as usize) } else { core::ptr::null() };
-        }
-        let end = s.add(n);
-        let e0 = V::eq(V::loadu(s), vc);
-        if n <= 2 * w {
-            let e1 = V::eq(V::loadu(end.sub(w)), vc);
-            if V::mask(V::or(e0, e1)) == 0 {
-                return core::ptr::null();
-            }
-            let m = V::mask(e0);
-            if m != 0 {
-                return s.add(m.trailing_zeros() as usize);
-            }
-            return end.sub(w).add(V::mask(e1).trailing_zeros() as usize);
-        }
-        if n <= 4 * w {
-            let (e1, e2, e3) = (V::eq(V::loadu(s.add(w)), vc), V::eq(V::loadu(end.sub(2 * w)), vc), V::eq(V::loadu(end.sub(w)), vc));
-            if V::mask(V::or(V::or(e0, e1), V::or(e2, e3))) == 0 {
-                return core::ptr::null();
-            }
-            for (q, e) in [(s, e0), (s.add(w), e1), (end.sub(2 * w), e2), (end.sub(w), e3)] {
-                let m = V::mask(e);
-                if m != 0 {
-                    return q.add(m.trailing_zeros() as usize);
-                }
-            }
-            return core::ptr::null();
-        }
-        let m = V::mask(e0);
+        let end = s as usize + n;
+        let w = V::W;
+        let vc = V::splat(c as u8);
+        let base = s as usize & !(w - 1);
+        let off = s as usize - base;
+        let m = V::mask(V::eq(V::load(base as *const u8), vc)) >> off;
         if m != 0 {
-            return s.add(m.trailing_zeros() as usize);
+            let p = s as usize + m.trailing_zeros() as usize;
+            return if p < end { p as *const u8 } else { core::ptr::null() };
         }
-        let mut p = ((s as usize & !(w - 1)) + w) as *const u8;
-        while p.wrapping_add(8 * w) <= end {
-            let (a0, a1, a2, a3) = (V::eq(V::load(p), vc), V::eq(V::load(p.add(w)), vc), V::eq(V::load(p.add(2 * w)), vc), V::eq(V::load(p.add(3 * w)), vc));
-            let (b0, b1, b2, b3) = (V::eq(V::load(p.add(4 * w)), vc), V::eq(V::load(p.add(5 * w)), vc), V::eq(V::load(p.add(6 * w)), vc), V::eq(V::load(p.add(7 * w)), vc));
-            let any = V::or(V::or(V::or(a0, a1), V::or(a2, a3)), V::or(V::or(b0, b1), V::or(b2, b3)));
-            if V::mask(any) != 0 {
-                if let Some(r) = find_block_fwd::<V>(p, vc, true) {
-                    return r;
-                }
-                if let Some(r) = find_block_fwd::<V>(p.add(4 * w), vc, true) {
-                    return r;
-                }
+        let mut p = base + w;
+        while p < end && p & (4 * w - 1) != 0 {
+            let m = V::mask(V::eq(V::load(p as *const u8), vc));
+            if m != 0 {
+                let q = p + m.trailing_zeros() as usize;
+                return if q < end { q as *const u8 } else { core::ptr::null() };
             }
-            p = p.add(8 * w);
+            p += w;
         }
-        while p.wrapping_add(4 * w) <= end {
-            if let Some(r) = find_block_fwd::<V>(p, vc, true) {
+        while end - p.min(end) >= 4 * w {
+            if let Some(r) = find_block_fwd::<V>(p as *const u8, vc, true) {
                 return r;
             }
-            p = p.add(4 * w);
+            p += 4 * w;
         }
-        if p < end
-            && let Some(r) = find_block_fwd::<V>(end.sub(4 * w), vc, false)
-        {
-            return r;
+        while p < end {
+            let m = V::mask(V::eq(V::load(p as *const u8), vc));
+            if m != 0 {
+                let q = p + m.trailing_zeros() as usize;
+                return if q < end { q as *const u8 } else { core::ptr::null() };
+            }
+            p += w;
         }
         core::ptr::null()
     }
@@ -1277,8 +1245,9 @@ pair!(memchr_sse2, memchr_avx2, memchr_impl, (s: *const u8, c: c_int, n: usize) 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn memchr(s: *const c_void, c: c_int, n: usize) -> *mut c_void {
-    simd::avx2_front!(
+    simd::avx2_front_x!(
         MEMCHR,
+        [on512 = sym AVX512_ON],
         "test rdx, rdx",
         "jz 70f",
         "vmovd xmm0, esi",
@@ -1355,6 +1324,8 @@ pub unsafe extern "C" fn memchr(s: *const c_void, c: c_int, n: usize) -> *mut c_
         "cmp rdx, 128",
         "jb 41b",
         "and rsi, -128",
+        "cmp byte ptr [rip + {on512}], 0",
+        "jne 56f",
         ".p2align 4",
         "50:",
         memchr_block!("rsi"),
@@ -1371,6 +1342,35 @@ pub unsafe extern "C" fn memchr(s: *const c_void, c: c_int, n: usize) -> *mut c_
         "mov rdx, r8",
         "sub rdx, rsi",
         "jmp 41b",
+        ".p2align 4",
+        "56:",
+        "vpbroadcastb zmm16, xmm0",
+        ".p2align 4",
+        "57:",
+        "vpcmpeqb k0, zmm16, [rsi]",
+        "vpcmpeqb k1, zmm16, [rsi + 64]",
+        "kortestq k0, k1",
+        "jnz 58f",
+        "sub rsi, -128",
+        "mov rax, r8",
+        "sub rax, rsi",
+        "cmp rax, 128",
+        "jae 57b",
+        "jmp 45b",
+        "58:",
+        "kmovq rax, k0",
+        "test rax, rax",
+        "jnz 59f",
+        "kmovq rax, k1",
+        "tzcnt rax, rax",
+        "lea rax, [rsi + rax + 64]",
+        "vzeroupper",
+        "ret",
+        "59:",
+        "tzcnt rax, rax",
+        "add rax, rsi",
+        "vzeroupper",
+        "ret",
         ".p2align 4",
         "91:",
         "tzcnt eax, eax",
@@ -1579,8 +1579,9 @@ pair!(memrchr_sse2, memrchr_avx2, memrchr_impl, (s: *const u8, c: c_int, n: usiz
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn memrchr(s: *const c_void, c: c_int, n: usize) -> *mut c_void {
-    simd::avx2_front!(
+    simd::avx2_front_x!(
         MEMRCHR,
+        [on512 = sym AVX512_ON],
         "test rdx, rdx",
         "jz 70f",
         "vmovd xmm0, esi",
@@ -1704,6 +1705,8 @@ pub unsafe extern "C" fn memrchr(s: *const c_void, c: c_int, n: usize) -> *mut c
         "and r8, -128",
         "cmp r8, r9",
         "jb 45f",
+        "cmp byte ptr [rip + {on512}], 0",
+        "jne 80f",
         ".p2align 6",
         "41:",
         "vpcmpeqb ymm1, ymm0, [r8]",
@@ -1769,6 +1772,34 @@ pub unsafe extern "C" fn memrchr(s: *const c_void, c: c_int, n: usize) -> *mut c
         "lea rax, [r8 + rax + 32]",
         "vzeroupper",
         "ret",
+        ".p2align 4",
+        "80:",
+        "vpbroadcastb zmm16, xmm0",
+        "81:",
+        "vpcmpeqb k1, zmm16, [r8 + 64]",
+        "vpcmpeqb k2, zmm16, [r8]",
+        "kortestq k1, k2",
+        "jnz 82f",
+        "sub r8, 128",
+        "cmp r8, r9",
+        "jae 81b",
+        "jmp 45b",
+        "82:",
+        "kmovq rax, k1",
+        "test rax, rax",
+        "jnz 83f",
+        "kmovq rax, k2",
+        "lzcnt rax, rax",
+        "xor eax, 63",
+        "add rax, r8",
+        "vzeroupper",
+        "ret",
+        "83:",
+        "lzcnt rax, rax",
+        "xor eax, 63",
+        "lea rax, [r8 + rax + 64]",
+        "vzeroupper",
+        "ret",
     )
 }
 
@@ -1832,7 +1863,24 @@ pub unsafe extern "C" fn memccpy(dest: *mut c_void, src: *const c_void, c: c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[unsafe(naked)]
 pub unsafe extern "C" fn mempcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    core::arch::naked_asm!(
+        "cmp byte ptr [rip + {ok}], 0",
+        "je 99f",
+        "cmp rdx, qword ptr [rip + {ntc}]",
+        "jae 99f",
+        "lea rax, [rdi + rdx]",
+        "jmp rusty_libc_memcpy_body",
+        "99:",
+        "jmp {slow}",
+        ok = sym crate::simd::AVX2_OK,
+        ntc = sym NT_COPY_FROM,
+        slow = sym mempcpy_slow,
+    )
+}
+
+unsafe extern "C" fn mempcpy_slow(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
     unsafe {
         memcpy(dest, src, n);
         dest.cast::<u8>().add(n).cast()
@@ -1897,8 +1945,9 @@ pub unsafe extern "C" fn memfrob(s: *mut c_void, n: usize) -> *mut c_void {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[unsafe(naked)]
 pub unsafe extern "C" fn __mempcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
-    unsafe { mempcpy(dest, src, n) }
+    core::arch::naked_asm!("jmp {f}", f = sym mempcpy)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

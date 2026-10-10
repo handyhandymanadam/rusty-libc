@@ -111,6 +111,28 @@ pub static TRAILER: &[Item] = &[
         ] },
     ], ""),
     Item::Gate(&[
+        Branch { head: "ifdef __USE_EXTERN_INLINES", items: &[
+            Item::Raw(Reason::GlibcMacro, "# define __rlibc_getc_inline(__s) \\\n  (__builtin_expect ((__s)->_IO_read_ptr < (__s)->_IO_read_end, 1) \\\n   ? (int) *(unsigned char *) (__s)->_IO_read_ptr++ : __uflow (__s))"),
+            Item::Raw(Reason::GlibcMacro, "# define __rlibc_putc_inline(__b, __s) \\\n  (__builtin_expect ((__s)->_IO_write_ptr < (__s)->_IO_write_end, 1) \\\n   ? (int) (unsigned char) (*(__s)->_IO_write_ptr++ = (char) (__b)) : __overflow ((__s), (unsigned char) (__b)))"),
+            Item::Gate(&[
+                Branch { head: "if defined __USE_POSIX199506 && !defined __RLIBC_STDIO_INLINE_POSIX", items: &[
+                    Item::Raw(Reason::GlibcMacro, "# define __RLIBC_STDIO_INLINE_POSIX 1"),
+                    Item::Raw(Reason::StaticInline, "__extern_inline int getc_unlocked (FILE *__s) { return __rlibc_getc_inline (__s); }"),
+                    Item::Raw(Reason::StaticInline, "__extern_inline int getchar_unlocked (void) { return __rlibc_getc_inline (stdin); }"),
+                    Item::Raw(Reason::StaticInline, "__extern_inline int putc_unlocked (int __b, FILE *__s) { return __rlibc_putc_inline (__b, __s); }"),
+                    Item::Raw(Reason::StaticInline, "__extern_inline int putchar_unlocked (int __b) { return __rlibc_putc_inline (__b, stdout); }"),
+                ] },
+            ], ""),
+            Item::Gate(&[
+                Branch { head: "if defined __USE_MISC && !defined __RLIBC_STDIO_INLINE_MISC", items: &[
+                    Item::Raw(Reason::GlibcMacro, "# define __RLIBC_STDIO_INLINE_MISC 1"),
+                    Item::Raw(Reason::StaticInline, "__extern_inline int fgetc_unlocked (FILE *__s) { return __rlibc_getc_inline (__s); }"),
+                    Item::Raw(Reason::StaticInline, "__extern_inline int fputc_unlocked (int __b, FILE *__s) { return __rlibc_putc_inline (__b, __s); }"),
+                ] },
+            ], ""),
+        ] },
+    ], ""),
+    Item::Gate(&[
         Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function", items: &[
             Item::Include("<bits/stdio2-decl.h>"),
             Item::Include("<bits/stdio2.h>"),

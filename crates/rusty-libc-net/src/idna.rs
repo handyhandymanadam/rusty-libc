@@ -1,13 +1,25 @@
 use crate::types::*;
 use core::ffi::{c_char, c_int, c_void};
+#[cfg(feature = "export")]
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+#[cfg(feature = "export")]
 unsafe extern "C" {
     fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void;
     fn dlvsym(handle: *mut c_void, name: *const c_char, version: *const c_char) -> *mut c_void;
     fn dlclose(handle: *mut c_void) -> c_int;
     fn mbrtowc(wc: *mut i32, s: *const c_char, n: usize, ps: *mut c_void) -> usize;
     fn free(p: *mut c_void);
+}
+
+#[cfg(not(feature = "export"))]
+unsafe fn free(p: *mut c_void) {
+    unsafe { rusty_libc_malloc::free(p) }
+}
+
+#[cfg(not(feature = "export"))]
+unsafe fn mbrtowc(wc: *mut i32, s: *const c_char, n: usize, ps: *mut c_void) -> usize {
+    unsafe { rusty_libc_wchar::mbyte::mbrtowc(wc, s, n, ps as *mut rusty_libc_wchar::mbstate_t) }
 }
 
 const IDN2_MALLOC: c_int = -100;
@@ -19,8 +31,15 @@ struct Functions {
     to_unicode_lzlz: Idn2Fn,
 }
 
+#[cfg(feature = "export")]
 static FUNCS: AtomicPtr<Functions> = AtomicPtr::new(core::ptr::null_mut());
 
+#[cfg(not(feature = "export"))]
+fn functions() -> Option<&'static Functions> {
+    None
+}
+
+#[cfg(feature = "export")]
 fn functions() -> Option<&'static Functions> {
     let p = FUNCS.load(Ordering::Acquire);
     if !p.is_null() {

@@ -23,18 +23,7 @@ fn log_inline<const F: bool>(ix: u64) -> (f64, f64) {
     let logc = POW_LOG_TAB[4 * i + 2];
     let logctail = POW_LOG_TAB[4 * i + 3];
     let a = &POW_LOG_POLY;
-    let (r, rhi, rlo);
-    if F {
-        r = fma::<F>(z, invc, -1.0);
-        rhi = 0.0;
-        rlo = 0.0;
-    } else {
-        let zhi = asf64(iz.wrapping_add(1u64 << 31) & (!0u64 << 32));
-        let zlo = z - zhi;
-        rhi = zhi * invc - 1.0;
-        rlo = zlo * invc;
-        r = rhi + rlo;
-    }
+    let r = fma::<F>(z, invc, -1.0);
     let t1 = fma::<F>(kd, LN2HI, logc);
     let t2 = t1 + r;
     let lo1 = fma::<F>(kd, LN2LO, logctail);
@@ -42,18 +31,9 @@ fn log_inline<const F: bool>(ix: u64) -> (f64, f64) {
     let ar = a[0] * r;
     let ar2 = r * ar;
     let ar3 = r * ar2;
-    let (hi, lo3, lo4);
-    if F {
-        hi = t2 + ar2;
-        lo3 = fma::<F>(ar, r, -ar2);
-        lo4 = t2 - hi + ar2;
-    } else {
-        let arhi = a[0] * rhi;
-        let arhi2 = rhi * arhi;
-        hi = t2 + arhi2;
-        lo3 = rlo * (ar + arhi);
-        lo4 = t2 - hi + arhi2;
-    }
+    let hi = t2 + ar2;
+    let lo3 = fma::<F>(ar, r, -ar2);
+    let lo4 = t2 - hi + ar2;
     let pa = fma::<F>(r, a[2], a[1]);
     let pb = fma::<F>(r, a[4], a[3]);
     let pc = fma::<F>(r, a[6], a[5]);
@@ -224,17 +204,7 @@ pub(crate) fn pow_impl<const F: bool>(x: f64, y: f64) -> f64 {
         }
     }
     let (hi, lo) = log_inline::<F>(ix);
-    let (ehi, elo);
-    if F {
-        ehi = y * hi;
-        elo = fma::<F>(y, lo, fma::<F>(y, hi, -ehi));
-    } else {
-        let yhi = asf64(iy & (!0u64 << 27));
-        let ylo = y - yhi;
-        let lhi = asf64(asu64(hi) & (!0u64 << 27));
-        let llo = hi - lhi + lo;
-        ehi = yhi * lhi;
-        elo = ylo * lhi + y * llo;
-    }
+    let ehi = y * hi;
+    let elo = fma::<F>(y, lo, fma::<F>(y, hi, -ehi));
     exp_inline::<F>(ehi, elo, sign_bias)
 }

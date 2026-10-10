@@ -60,9 +60,17 @@ fn lll_trylock(f: &AtomicU32) -> bool {
     f.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
 }
 
+#[inline(always)]
+fn lll_trylock_p(f: &AtomicU32, private: bool) -> bool {
+    if private && !rusty_libc_core::lock::multithreaded() {
+        return unsafe { rusty_libc_core::lock::take01_single_thread(f) };
+    }
+    lll_trylock(f)
+}
+
 #[inline]
 fn lll_lock(f: &AtomicU32, private: bool) {
-    if !lll_trylock(f) {
+    if !lll_trylock_p(f, private) {
         lll_lock_wait(f, private);
     }
 }
@@ -84,7 +92,12 @@ fn lll_lock_wait(f: &AtomicU32, private: bool) {
 
 #[inline]
 fn lll_unlock(f: &AtomicU32, private: bool) {
-    if f.swap(0, Ordering::Release) > 1 {
+    let old = if private && !rusty_libc_core::lock::multithreaded() {
+        unsafe { rusty_libc_core::lock::release_single_thread(f) }
+    } else {
+        f.swap(0, Ordering::Release)
+    };
+    if old > 1 {
         futex_wake(f, 1, private);
     }
 }
@@ -201,7 +214,7 @@ pub unsafe fn mutex_lock_common(m: *mut Mutex, w: Wait) -> c_int {
                 _ => {}
             }
             if ty == PTHREAD_MUTEX_ADAPTIVE_NP && !timed {
-                if !lll_trylock(lockw(m)) {
+                if !lll_trylock_p(lockw(m), private) {
                     let mut spins = 0;
                     let max = max_spin().min((*m).spins as i32 * 2 + 10);
                     loop {
@@ -218,7 +231,7 @@ pub unsafe fn mutex_lock_common(m: *mut Mutex, w: Wait) -> c_int {
                     (*m).spins += ((spins - (*m).spins as i32) / 8) as i16;
                 }
             } else if timed {
-                if !lll_trylock(lockw(m)) {
+                if !lll_trylock_p(lockw(m), private) {
                     let r = lll_clocklock_wait(lockw(m), w.clock, w.abs, private);
                     if r != 0 {
                         return r;
@@ -498,9 +511,25 @@ fn futex_unlock_pi(f: &AtomicU32, private: bool) {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_lock(m: *mut Mutex) -> c_int {
     unsafe {
-        if kind_of(m) == PTHREAD_MUTEX_TIMED_NP {
+        let kind = kind_of(m);
+        if kind == PTHREAD_MUTEX_TIMED_NP {
             lll_lock(lockw(m), true);
             (*m).owner = gettid();
+            (*m).nusers += 1;
+            return 0;
+        }
+        if kind == PTHREAD_MUTEX_RECURSIVE_NP {
+            let id = gettid();
+            if (*m).owner == id {
+                if (*m).count.wrapping_add(1) == 0 {
+                    return EAGAIN;
+                }
+                (*m).count += 1;
+                return 0;
+            }
+            lll_lock(lockw(m), true);
+            (*m).count = 1;
+            (*m).owner = id;
             (*m).nusers += 1;
             return 0;
         }
@@ -539,7 +568,7 @@ pub unsafe extern "C" fn pthread_mutex_trylock(m: *mut Mutex) -> c_int {
                         (*m).count += 1;
                         return 0;
                     }
-                    if lll_trylock(lockw(m)) {
+                    if lll_trylock_p(lockw(m), private_of(kind)) {
                         (*m).owner = id;
                         (*m).nusers += 1;
                         (*m).count = 1;
@@ -548,7 +577,7 @@ pub unsafe extern "C" fn pthread_mutex_trylock(m: *mut Mutex) -> c_int {
                     return EBUSY;
                 }
                 _ => {
-                    if lll_trylock(lockw(m)) {
+                    if lll_trylock_p(lockw(m), private_of(kind)) {
                         (*m).owner = id;
                         (*m).nusers += 1;
                         return 0;
@@ -840,7 +869,21 @@ unsafe fn unlock_full(m: *mut Mutex, decr: bool, id: i32, kind: i32) -> c_int {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_unlock(m: *mut Mutex) -> c_int {
     unsafe {
-        if kind_of(m) == PTHREAD_MUTEX_TIMED_NP {
+        let kind = kind_of(m);
+        if kind == PTHREAD_MUTEX_TIMED_NP {
+            (*m).owner = 0;
+            (*m).nusers = (*m).nusers.wrapping_sub(1);
+            lll_unlock(lockw(m), true);
+            return 0;
+        }
+        if kind == PTHREAD_MUTEX_RECURSIVE_NP {
+            if (*m).owner != gettid() {
+                return EPERM;
+            }
+            (*m).count -= 1;
+            if (*m).count != 0 {
+                return 0;
+            }
             (*m).owner = 0;
             (*m).nusers = (*m).nusers.wrapping_sub(1);
             lll_unlock(lockw(m), true);

@@ -398,11 +398,14 @@ pub fn warning_text(w: &Warning<'_>, whole: &[u8], out: &mut dyn FnMut(&[u8])) {
     }
 }
 
-pub unsafe fn init_static(envp: *mut *mut u8, mut secure: bool, warn: &mut dyn FnMut(&[u8])) {
+pub unsafe fn init_static(envp: *mut *mut u8, mut secure: bool, warn: &mut dyn FnMut(&[u8]), hwcaps: &mut dyn FnMut(&[u8])) {
     unsafe {
         if let Some(v) = find_env(envp).filter(|_| !secure) {
             let t = parse(v, &mut |w| warning_text(&w, v, warn));
             secure = t.enable_secure;
+            if let Some(h) = t.hwcaps.filter(|_| !secure) {
+                hwcaps(h);
+            }
         }
         if secure {
             scrub_unsecure_env(envp);

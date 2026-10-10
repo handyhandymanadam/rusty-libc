@@ -352,7 +352,7 @@ ld_unary_fast!(log10l, super::log10l_impl, crate::longdouble::fast::log10l);
 ld_unary_fast!(log1pl, super::log1pl_impl, crate::longdouble::fast::log1pl);
 ld_unary_fast!(log2p1l, super::log2p1l_impl, crate::longdouble::fast::log2p1l);
 ld_unary_fast!(log10p1l, super::log10p1l_impl, crate::longdouble::fast::log10p1l);
-ld_unary!(logp1l, super::log1pl_impl);
+ld_unary_fast!(logp1l, super::log1pl_impl, crate::longdouble::fast::log1pl);
 
 alias! {
     "expf64x" = "expl",

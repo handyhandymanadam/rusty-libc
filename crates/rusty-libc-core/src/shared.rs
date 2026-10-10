@@ -52,11 +52,21 @@ unsafe extern "C" fn libc_init(argc: c_int, argv: *mut *mut c_char, envp: *mut *
             f => core::mem::transmute::<usize, unsafe extern "C" fn() -> *const u64>(f)(),
         };
         let mut aux = auxv as *const usize;
+        let mut secure = false;
         while *aux != 0 {
             if *aux == 33 {
                 crate::start::set_sysinfo_ehdr(*aux.add(1));
+            } else if *aux == 23 {
+                secure = *aux.add(1) != 0;
+                crate::lock::set_at_secure(secure);
             }
             aux = aux.add(2);
+        }
+        if !secure && let Some(v) = crate::tunables::find_env(envp as *const *mut u8) {
+            let t = crate::tunables::parse(v, &mut |_| {});
+            if let Some(h) = t.hwcaps.filter(|_| !t.enable_secure) {
+                crate::start::apply_hwcaps(h);
+            }
         }
         learn_tls_from_loader();
         if (*crate::tls::current()).tid == 0 {

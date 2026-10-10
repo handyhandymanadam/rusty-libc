@@ -645,7 +645,11 @@ fn sort_addresses(at: &mut [At]) -> bool {
     let n = at.len();
     let (mut info, mut idx, mut tmp, mut copy) = (HeapVec::<SortInfo>::new(), HeapVec::<usize>::new(), HeapVec::<usize>::new(), HeapVec::<At>::new());
     for (i, a) in at.iter().enumerate() {
-        if !info.push(source_for(a, &locals[..nl])) || !idx.push(i) || !tmp.push(i) {
+        let si = match at[..i].iter().position(|b| b.family == a.family && b.addr == a.addr && b.scope == a.scope) {
+            Some(j) => info[j],
+            None => source_for(a, &locals[..nl]),
+        };
+        if !info.push(si) || !idx.push(i) || !tmp.push(i) {
             return false;
         }
     }

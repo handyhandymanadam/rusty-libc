@@ -134,23 +134,23 @@ fn round_checked(fast: D, precise: impl FnOnce() -> D) -> f64 {
     if fabs(l) + eps >= half_ulp { precise().0 } else { h }
 }
 
-const E_PRECISE: f64 = 7.888609052210118e-31;
+pub(crate) const E_PRECISE: f64 = 7.888609052210118e-31;
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn rounds_away(neg: bool) -> bool {
+pub(crate) fn rounds_away(neg: bool) -> bool {
     dd::rounding_control() == if neg { 1 } else { 2 }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
-fn rounds_away(neg: bool) -> bool {
+pub(crate) fn rounds_away(neg: bool) -> bool {
     let h = black_box(f64::from_bits(0x3ca0_0000_0200_0000));
     if neg { -1.0 - h < -1.0 } else { 1.0 + h > 1.0 }
 }
 
 #[inline(always)]
-fn round_dir(h: f64, l: f64, eps: f64, away: bool) -> Option<f64> {
+pub(crate) fn round_dir(h: f64, l: f64, eps: f64, away: bool) -> Option<f64> {
     let r = h + l;
     let t = (h - r) + l;
     if fabs(t) <= eps {
@@ -666,11 +666,20 @@ pub extern "C" fn atan2(y: f64, x: f64) -> f64 {
 const HYP_OVERFLOW: u64 = 0x4086_3800_0000_0000;
 const COSH_FAST_END: u64 = 0x4086_2000_0000_0000;
 
+#[inline(never)]
+fn sinh_tiny(x: f64) -> f64 {
+    let r = tiny_x(x);
+    if r == 0.0 || dd::is_nearest() {
+        return r;
+    }
+    black_box(x) + black_box(x) * f64::from_bits(0x3c30_0000_0000_0000)
+}
+
 #[inline(always)]
 fn sinh_impl<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !SIGN;
     if unlikely(ab < TINY) {
-        return tiny_x(x);
+        return sinh_tiny(x);
     }
     if unlikely(ab >= INF_BITS) {
         return black_box(x) + black_box(x);
@@ -678,11 +687,11 @@ fn sinh_impl<const F: bool>(x: f64) -> f64 {
     if unlikely(ab >= HYP_OVERFLOW) {
         return overflow(x);
     }
-    let r = hyp::sinh_pos::<F>(fabs(x));
+    let r = if dd::is_nearest() { copysign(hyp::sinh_pos::<F>(fabs(x)), x) } else { hyp::sinh_directed(x) };
     if r.is_infinite() {
         return overflow(x);
     }
-    copysign(r, x)
+    r
 }
 
 #[inline(always)]
@@ -697,7 +706,7 @@ fn cosh_impl<const F: bool>(x: f64) -> f64 {
 #[inline(never)]
 fn cosh_edge<const F: bool>(x: f64, ab: u64) -> f64 {
     if ab < TINY {
-        return if ab == 0 { 1.0 } else { inexact(1.0) };
+        return if ab == 0 { 1.0 } else { black_box(1.0f64) + black_box(f64::MIN_POSITIVE) };
     }
     if ab >= INF_BITS {
         return black_box(x) * black_box(x);
@@ -716,15 +725,28 @@ fn cosh_edge<const F: bool>(x: f64, ab: u64) -> f64 {
 fn tanh_impl<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !SIGN;
     if unlikely(ab < TINY) {
-        return tiny_x(x);
+        return tanh_tiny(x);
     }
     if unlikely(ab > INF_BITS) {
         return black_box(x) + black_box(x);
     }
     if unlikely(ab >= 0x4036_0000_0000_0000) {
-        return copysign(black_box(1.0f64) - black_box(1.0e-30f64), x);
+        return black_box(copysign(1.0, x)) - black_box(copysign(1.0e-30, x));
     }
-    copysign(hyp::tanh_pos::<F>(fabs(x)), x)
+    if dd::is_nearest() { copysign(hyp::tanh_pos::<F>(fabs(x)), x) } else { hyp::tanh_directed(x) }
+}
+
+#[inline(never)]
+fn tanh_tiny(x: f64) -> f64 {
+    let r = tiny_x(x);
+    if r == 0.0 || dd::is_nearest() {
+        return r;
+    }
+    let toward_zero = f64::from_bits(x.to_bits() - 1);
+    match (dd::rounding_control(), x > 0.0) {
+        (2, true) | (1, false) => x,
+        _ => toward_zero,
+    }
 }
 
 #[cold]
@@ -1027,6 +1049,14 @@ fn is_multiple_bits(ab: u64, s: i32) -> bool {
     m & ((1u64 << (52 - s - e)) - 1) == 0
 }
 
+#[inline(always)]
+fn needs_nearest_pi(ab: u64, limit: u64) -> bool {
+    ab.wrapping_sub(1) < limit - 1
+}
+const PI_SMALL: u64 = 0x3f80_0000_0000_0000;
+const PI_TINY: u64 = 0x3e60_0000_0000_0000;
+const PI_EXACT_TINY: u64 = 0x0170_0000_0000_0000;
+
 const PI_LO_BITS: u64 = 0x3c30_0000_0000_0000;
 const PI_DIRECT_END_BITS: u64 = 0x42b0_0000_0000_0000;
 
@@ -1068,6 +1098,25 @@ fn tan_pi_small<const F: bool>(g: f64) -> f64 {
 #[inline(always)]
 fn sinpi_impl<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !SIGN;
+    if dd::directed_if(needs_nearest_pi(ab, PI_SMALL)) {
+        return sinpi_directed::<F>(x);
+    }
+    sinpi_body::<F>(x)
+}
+
+#[inline(always)]
+fn sinpi_directed<const F: bool>(x: f64) -> f64 {
+    let rc = dd::rounding_control();
+    let _g = dd::NearestGuard::new();
+    if (x.to_bits() & !SIGN) < PI_EXACT_TINY {
+        return crate::special::dd::tiny_mul_dir(x, PI.0, PI.1, rc);
+    }
+    sinpi_body::<F>(x)
+}
+
+#[inline(always)]
+fn sinpi_body<const F: bool>(x: f64) -> f64 {
+    let ab = x.to_bits() & !SIGN;
     if F && ab.wrapping_sub(PI_LO_BITS) < PI_DIRECT_END_BITS - PI_LO_BITS
         && let Some(r) = direct::sin_pi_fast::<F>(f64::from_bits(ab))
     {
@@ -1100,6 +1149,21 @@ fn sinpi_impl<const F: bool>(x: f64) -> f64 {
 
 #[inline(always)]
 fn cospi_impl<const F: bool>(x: f64) -> f64 {
+    let ab = x.to_bits() & !SIGN;
+    if dd::directed_if(needs_nearest_pi(ab, PI_TINY)) {
+        return cospi_directed::<F>(x);
+    }
+    cospi_body::<F>(x)
+}
+
+#[inline(always)]
+fn cospi_directed<const F: bool>(x: f64) -> f64 {
+    let _g = dd::NearestGuard::new();
+    cospi_body::<F>(x)
+}
+
+#[inline(always)]
+fn cospi_body<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !SIGN;
     if F && ab.wrapping_sub(PI_LO_BITS) < PI_DIRECT_END_BITS - PI_LO_BITS
         && let Some(r) = direct::cos_pi_fast::<F>(f64::from_bits(ab))
@@ -1140,6 +1204,25 @@ fn cospi_impl<const F: bool>(x: f64) -> f64 {
 
 #[inline(always)]
 fn tanpi_impl<const F: bool>(x: f64) -> f64 {
+    let ab = x.to_bits() & !SIGN;
+    if dd::directed_if(needs_nearest_pi(ab, PI_SMALL)) {
+        return tanpi_directed::<F>(x);
+    }
+    tanpi_body::<F>(x)
+}
+
+#[inline(always)]
+fn tanpi_directed<const F: bool>(x: f64) -> f64 {
+    let rc = dd::rounding_control();
+    let _g = dd::NearestGuard::new();
+    if (x.to_bits() & !SIGN) < PI_EXACT_TINY {
+        return crate::special::dd::tiny_mul_dir(x, PI.0, PI.1, rc);
+    }
+    tanpi_body::<F>(x)
+}
+
+#[inline(always)]
+fn tanpi_body<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !SIGN;
     if F && ab.wrapping_sub(PI_LO_BITS) < PI_DIRECT_END_BITS - PI_LO_BITS
         && let Some((h, l)) = direct::tan_pi_fast::<F>(f64::from_bits(ab))
@@ -1590,6 +1673,25 @@ fn atanhf_impl<const F: bool>(x: f32) -> f32 {
 }
 #[inline(always)]
 fn sinpif_impl<const F: bool>(x: f32) -> f32 {
+    if dd::directed_if((x.to_bits() & 0x7fff_ffff).wrapping_sub(1) < 0x3300_0000 - 1) {
+        return sinpif_directed(x);
+    }
+    sinpif_body::<F>(x)
+}
+
+#[cold]
+#[inline(never)]
+fn sinpif_directed(x: f32) -> f32 {
+    let rc = dd::rounding_control();
+    let _g = dd::NearestGuard::new();
+    if (x.to_bits() & 0x7fff_ffff) < 0x2400_0000 {
+        return crate::special::float::tiny_mul_dir_f32(x, PI.0, PI.1, rc);
+    }
+    sinpif_body::<false>(x)
+}
+
+#[inline(always)]
+fn sinpif_body<const F: bool>(x: f32) -> f32 {
     if let Some(r) = fpi::sinpif::<F>(x) {
         return r;
     }
@@ -1597,6 +1699,21 @@ fn sinpif_impl<const F: bool>(x: f32) -> f32 {
 }
 #[inline(always)]
 fn cospif_impl<const F: bool>(x: f32) -> f32 {
+    if dd::directed_if((x.to_bits() & 0x7fff_ffff).wrapping_sub(1) < 0x3300_0000 - 1) {
+        return cospif_directed(x);
+    }
+    cospif_body::<F>(x)
+}
+
+#[cold]
+#[inline(never)]
+fn cospif_directed(x: f32) -> f32 {
+    let _g = dd::NearestGuard::new();
+    cospif_body::<false>(x)
+}
+
+#[inline(always)]
+fn cospif_body<const F: bool>(x: f32) -> f32 {
     if let Some(r) = fpi::cospif::<F>(x) {
         return r;
     }
@@ -1607,6 +1724,25 @@ fn cospif_impl<const F: bool>(x: f32) -> f32 {
 }
 #[inline(always)]
 fn tanpif_impl<const F: bool>(x: f32) -> f32 {
+    if dd::directed_if((x.to_bits() & 0x7fff_ffff).wrapping_sub(1) < 0x3300_0000 - 1) {
+        return tanpif_directed(x);
+    }
+    tanpif_body::<F>(x)
+}
+
+#[cold]
+#[inline(never)]
+fn tanpif_directed(x: f32) -> f32 {
+    let rc = dd::rounding_control();
+    let _g = dd::NearestGuard::new();
+    if (x.to_bits() & 0x7fff_ffff) < 0x2400_0000 {
+        return crate::special::float::tiny_mul_dir_f32(x, PI.0, PI.1, rc);
+    }
+    tanpif_body::<false>(x)
+}
+
+#[inline(always)]
+fn tanpif_body<const F: bool>(x: f32) -> f32 {
     if let Some(r) = fpi::tanpif::<F>(x) {
         return r;
     }

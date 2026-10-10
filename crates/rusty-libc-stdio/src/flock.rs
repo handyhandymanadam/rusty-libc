@@ -37,7 +37,17 @@ impl FLock {
             unsafe { *self.count.get() += 1 };
             return;
         }
-        self.m.lock_always();
+        if !multithreaded() && unsafe { self.m.take_single_thread() } {
+            self.owner.store(me, Ordering::Relaxed);
+            unsafe { *self.count.get() = 1 };
+            return;
+        }
+        self.lock_first(me);
+    }
+
+    #[inline(never)]
+    fn lock_first(&self, me: usize) {
+        self.m.lock_fast();
         self.owner.store(me, Ordering::Relaxed);
         unsafe { *self.count.get() = 1 };
     }
@@ -49,7 +59,7 @@ impl FLock {
             unsafe { *self.count.get() += 1 };
             return true;
         }
-        if !self.m.try_lock_always() {
+        if !self.m.try_lock_fast() {
             return false;
         }
         self.owner.store(me, Ordering::Relaxed);
@@ -85,7 +95,7 @@ impl FLock {
         };
         if c == 0 {
             self.owner.store(0, Ordering::Relaxed);
-            self.m.unlock_always();
+            self.m.unlock_fast();
         }
         true
     }

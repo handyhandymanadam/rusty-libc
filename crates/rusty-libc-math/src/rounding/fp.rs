@@ -256,6 +256,12 @@ const F_SSE41: u8 = 2;
 const F_FMA: u8 = 4;
 static FEATURES: AtomicU8 = AtomicU8::new(0);
 
+pub(crate) fn force_nofma() -> bool {
+    unsafe {
+        !rusty_libc_core::env::getenv(b"RL_FORCE_NOFMA").is_null()
+    }
+}
+
 #[cold]
 fn detect() -> u8 {
     use core::arch::x86_64::__cpuid;
@@ -271,7 +277,7 @@ fn detect() -> u8 {
         let osxsave = r.ecx & (1 << 27) != 0;
         let avx = r.ecx & (1 << 28) != 0;
         let fma = r.ecx & (1 << 12) != 0;
-        if osxsave && avx && fma {
+        if osxsave && avx && fma && !force_nofma() {
             let lo: u32;
             unsafe { asm!("xgetbv", in("ecx") 0, out("eax") lo, out("edx") _, options(nomem, nostack, preserves_flags)) };
             if lo & 6 == 6 {

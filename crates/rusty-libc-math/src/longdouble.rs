@@ -12,6 +12,7 @@ pub mod fast;
 pub mod fast_special;
 mod fast_special_tables;
 mod fast_asin_tables;
+mod fast_atan_tables;
 mod fast_tables;
 pub mod fx;
 pub mod ext;

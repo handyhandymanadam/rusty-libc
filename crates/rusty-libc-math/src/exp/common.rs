@@ -161,7 +161,7 @@ fn detect_fma(state: &AtomicU8) -> bool {
             let fma = c & (1 << 12) != 0;
             let osxsave = c & (1 << 27) != 0;
             let avx = c & (1 << 28) != 0;
-            fma && osxsave && avx && xcr0_has_ymm()
+            fma && osxsave && avx && xcr0_has_ymm() && !crate::rounding::fp::force_nofma()
         }
     };
     state.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
@@ -184,7 +184,7 @@ pub(crate) fn unlikely(b: bool) -> bool {
 
 #[inline(always)]
 pub(crate) fn fma<const F: bool>(a: f64, b: f64, c: f64) -> f64 {
-    if F { fmadd(a, b, c) } else { a * b + c }
+    if F { fmadd(a, b, c) } else { crate::rounding::fma_impl::fma_emul(a, b, c) }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -204,7 +204,7 @@ pub(crate) fn fma_i<const F: bool>(a: f64, b: f64, c: f64) -> f64 {
         use core::arch::x86_64::{_mm_cvtsd_f64, _mm_fmadd_sd, _mm_set_sd};
         return unsafe { _mm_cvtsd_f64(_mm_fmadd_sd(_mm_set_sd(a), _mm_set_sd(b), _mm_set_sd(c))) };
     }
-    a * b + c
+    crate::rounding::fma_impl::fma_emul(a, b, c)
 }
 
 #[cfg(not(target_arch = "x86_64"))]

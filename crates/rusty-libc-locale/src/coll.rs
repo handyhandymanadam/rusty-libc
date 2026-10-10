@@ -67,6 +67,11 @@ impl Collation {
         NO_SEQ
     }
 
+    #[inline]
+    pub fn is_byte_identity(&self) -> bool {
+        self.nrules == 0 && self.seqmb.is_null()
+    }
+
     pub fn seq_of_byte(&self, ch: u8) -> u32 {
         if self.nrules == 0 {
             return self.seq_mb(ch);

@@ -28,7 +28,7 @@ fn finish(y: f64) -> Option<f32> {
 
 #[inline(always)]
 fn reduce(ax: f64) -> (u64, f64) {
-    let kd = fma::<false>(ax, 2.0, SHIFT);
+    let kd = ax * 2.0 + SHIFT;
     let f = ax - (kd - SHIFT) * 0.5;
     (kd.to_bits(), f)
 }

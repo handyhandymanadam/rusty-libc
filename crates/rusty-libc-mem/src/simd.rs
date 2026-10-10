@@ -7,7 +7,28 @@ pub(crate) static AVX2_OK: core::sync::atomic::AtomicU8 = core::sync::atomic::At
 
 const F_INIT: u32 = 1 << 31;
 const F_AVX2: u32 = 1;
+const F_AVX512: u32 = 2;
+
+pub(crate) static AVX512_ON: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 static FEATURES: AtomicU32 = AtomicU32::new(0);
+static NO_AVX2: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn disable_avx2() {
+    NO_AVX2.store(true, Ordering::Relaxed);
+    let f = FEATURES.load(Ordering::Relaxed);
+    if f != 0 {
+        FEATURES.store(f & !(F_AVX2 | F_AVX512), Ordering::Relaxed);
+    }
+    let (a, b) = (crate::slots::STRCASECMP.load(Ordering::Relaxed), crate::slots::STRNCASECMP.load(Ordering::Relaxed));
+    crate::slots::init(false);
+    set_avx512_flags(false, false);
+    if crate::str::hooks::ACTIVE.load(Ordering::Relaxed) {
+        crate::slots::STRCASECMP.store(a, Ordering::Relaxed);
+        crate::slots::STRNCASECMP.store(b, Ordering::Relaxed);
+    }
+}
+
+pub const AVX2_NEEDS: &[&[u8]] = &[b"AVX2", b"AVX", b"BMI1", b"BMI2", b"LZCNT", b"XSAVE", b"OSXSAVE"];
 
 #[cold]
 #[inline(never)]
@@ -18,15 +39,22 @@ fn detect() -> u32 {
         let leaf7 = __cpuid_count(7, 0);
         let osxsave = leaf1.ecx & (1 << 27) != 0;
         let mut ymm = false;
+        let mut zmm = false;
         if osxsave {
             let (lo, hi): (u32, u32);
             core::arch::asm!("xgetbv", in("ecx") 0, out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
             let _ = hi;
             ymm = lo & 6 == 6;
+            zmm = lo & 0xe6 == 0xe6;
         }
         let abm = __cpuid(0x8000_0001).ecx & (1 << 5) != 0;
-        if ymm && leaf7.ebx & (1 << 5) != 0 && leaf7.ebx & (1 << 3) != 0 && leaf7.ebx & (1 << 8) != 0 && abm {
+        if ymm && leaf7.ebx & (1 << 5) != 0 && leaf7.ebx & (1 << 3) != 0 && leaf7.ebx & (1 << 8) != 0 && abm
+            && !NO_AVX2.load(Ordering::Relaxed)
+        {
             f |= F_AVX2;
+            if zmm && leaf7.ebx & (1 << 16) != 0 && leaf7.ebx & (1 << 30) != 0 && leaf7.ebx & (1 << 31) != 0 {
+                f |= F_AVX512;
+            }
         }
     }
     FEATURES.store(f, Ordering::Relaxed);
@@ -42,6 +70,15 @@ fn features() -> u32 {
 #[inline(always)]
 pub(crate) fn has_avx2() -> bool {
     features() & F_AVX2 != 0
+}
+
+#[inline(always)]
+pub(crate) fn has_avx512() -> bool {
+    features() & F_AVX512 != 0
+}
+
+pub(crate) fn set_avx512_flags(avx2: bool, avx512: bool) {
+    AVX512_ON.store(u8::from(avx2 && avx512), Ordering::Relaxed);
 }
 
 pub(crate) trait Vector: Copy {
@@ -254,6 +291,7 @@ macro_rules! avx2_front_x {
 }
 pub(crate) use avx2_front_x;
 
+
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn resolve_common() {
     core::arch::naked_asm!(
@@ -270,6 +308,7 @@ extern "C" fn init_dispatch() {
         init_large_sizes();
     }
     crate::slots::init(has_avx2());
+    set_avx512_flags(has_avx2(), has_avx512());
 }
 
 pub(crate) static NT_COPY_FROM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);

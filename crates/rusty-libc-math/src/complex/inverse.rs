@@ -1,12 +1,11 @@
 use super::cfp::*;
-use super::explog::clog;
+use super::explog::clog_finite;
 
 type P<F> = (W<F>, W<F>);
 
 pub fn csqrt<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
     let rcls = xr.cls();
     let icls = xi.cls();
-    let half = 0.5;
     if rcls <= FP_INFINITE || icls <= FP_INFINITE {
         if icls == FP_INFINITE {
             (inf(), xi)
@@ -27,7 +26,20 @@ pub fn csqrt<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
         } else {
             (xr.sqrt().abs(), W::k(0.0).copysign(xi))
         }
-    } else if rcls == FP_ZERO {
+    } else {
+        csqrt_finite_body(xr, xi)
+    }
+}
+
+fn csqrt_finite<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
+    debug_assert!(xr.is_finite() && xi.is_finite() && xi != 0.0);
+    csqrt_finite_body(xr, xi)
+}
+
+#[inline(always)]
+fn csqrt_finite_body<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
+    let half = 0.5;
+    if xr == 0.0 {
         let r = if xi.abs() >= W(F::MIN_2) {
             (half * xi.abs()).sqrt()
         } else {
@@ -94,7 +106,7 @@ pub fn kernel_casinh<F: CF>(xr: W<F>, xi: W<F>, adj: bool) -> P<F> {
             yr = yi.copysign(xi);
             yi = t;
         }
-        let (lr, li) = clog(yr, yi);
+        let (lr, li) = clog_finite(yr, yi);
         re = lr + ln2;
         im = li;
     } else if rx >= 0.5 && ix < W(F::EPS_8) {
@@ -162,14 +174,14 @@ pub fn kernel_casinh<F: CF>(xr: W<F>, xi: W<F>, adj: bool) -> P<F> {
     } else {
         let yr = (rx - ix) * (rx + ix) + 1.0;
         let yi = 2.0 * rx * ix;
-        let (sr, si) = csqrt(yr, yi);
+        let (sr, si) = csqrt_finite(yr, yi);
         let (mut yr, mut yi) = (sr + rx, si + ix);
         if adj {
             let t = yr;
             yr = yi.copysign(xi);
             yi = t;
         }
-        let (lr, li) = clog(yr, yi);
+        let (lr, li) = clog_finite(yr, yi);
         re = lr;
         im = li;
     }

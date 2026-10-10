@@ -1,12 +1,12 @@
 use core::ffi::{c_char, c_int, c_long, c_void};
 use core::ptr::null_mut;
-use rusty_libc_core::{Errno, errno, process, signal, syscall, unistd};
+use rusty_libc_core::{Errno, errno, process, signal, spawn, syscall, unistd};
 
 const EINTR: i32 = 4;
+const EAGAIN: i32 = 11;
 const ENOMEM: i32 = 12;
 const EACCES: i32 = 13;
 const EEXIST: i32 = 17;
-const ENOTDIR: i32 = 20;
 const EINVAL: i32 = 22;
 const ENOTTY: i32 = 25;
 const ERANGE: i32 = 34;
@@ -153,35 +153,41 @@ pub unsafe fn run_shell(cmd: *const c_char) -> Result<i32, Errno> {
         };
         let omask = signal::sigprocmask(signal::SIG_BLOCK, Some(signal::bit(signal::SIGCHLD))).unwrap_or(0);
 
+        let mut attr = spawn::ZERO_ATTR;
+        attr.flags = (spawn::POSIX_SPAWN_SETSIGDEF | spawn::POSIX_SPAWN_SETSIGMASK) as core::ffi::c_short;
+        attr.ss.val[0] = omask;
+        if intr_handler != signal::SIG_IGN {
+            attr.sd.val[0] |= signal::bit(signal::SIGINT);
+        }
+        if quit_handler != signal::SIG_IGN {
+            attr.sd.val[0] |= signal::bit(signal::SIGQUIT);
+        }
         let sh = c"/bin/sh".as_ptr();
         let argv: [*const c_char; 5] = [c"sh".as_ptr(), c"-c".as_ptr(), c"--".as_ptr(), cmd, core::ptr::null()];
         let envp = rusty_libc_core::env::block() as *const *const c_char;
 
-        let result = match unistd::fork() {
-            Ok(0) => {
-                let _ = signal::sigprocmask(signal::SIG_SETMASK, Some(omask));
-                if intr_handler != signal::SIG_IGN {
-                    let _ = signal::sigaction(signal::SIGINT, Some(&signal::KSigaction::DEFAULT));
-                }
-                if quit_handler != signal::SIG_IGN {
-                    let _ = signal::sigaction(signal::SIGQUIT, Some(&signal::KSigaction::DEFAULT));
-                }
-                let _ = unistd::execve(sh, argv.as_ptr(), envp);
-                process::exit_now(127)
-            }
-            Ok(pid) => rusty_libc_core::cleanup::with(system_cancelled, pid as isize as *mut c_void, || loop {
+        let mut pid: c_int = 0;
+        let ret = spawn::spawnix(&mut pid, sh, core::ptr::null(), &attr, argv.as_ptr(), envp, false, false);
+        let result = if ret == 0 {
+            rusty_libc_core::cleanup::with(system_cancelled, pid as isize as *mut c_void, || loop {
                 match unistd::waitpid(pid, 0) {
                     Ok((p, status)) if p == pid => break Ok(status),
                     Ok(_) => break Err(Errno(EINVAL)),
                     Err(Errno(EINTR)) => continue,
                     Err(e) => break Err(e),
                 }
-            }),
-            Err(e) => Err(e),
+            })
+        } else if ret == EAGAIN || ret == ENOMEM {
+            Err(Errno(ret))
+        } else {
+            Ok(127 << 8)
         };
 
         system_release();
         let _ = signal::sigprocmask(signal::SIG_SETMASK, Some(omask));
+        if ret != 0 {
+            errno::set(ret);
+        }
         result
     }
 }
@@ -362,6 +368,22 @@ struct Seg {
     pos: usize,
 }
 
+unsafe fn next_is_plain_name(seg: &Seg) -> bool {
+    unsafe {
+        let w = core::slice::from_raw_parts(seg.p, seg.len);
+        let mut i = seg.pos;
+        while i < w.len() && w[i] == b'/' {
+            i += 1;
+        }
+        let start = i;
+        while i < w.len() && w[i] != b'/' {
+            i += 1;
+        }
+        let name = &w[start..i];
+        !name.is_empty() && name != b"." && name != b".." && name.len() < PATH_MAX
+    }
+}
+
 unsafe fn resolve(path: &[u8], rpath: &mut Buf) -> Result<(), i32> {
     unsafe {
         if path.is_empty() {
@@ -428,16 +450,29 @@ unsafe fn resolve(path: &[u8], rpath: &mut Buf) -> Result<(), i32> {
                 return Err(ENOMEM);
             }
             let mut lb = Buf::new();
-            let mut size = 256usize;
-            let linklen = loop {
-                if !lb.reserve(size) {
-                    return Err(ENOMEM);
+            let mut sb = [0u8; 256];
+            let r = syscall::syscall3(SYS_READLINK, cp as usize, sb.as_mut_ptr() as usize, sb.len());
+            let linklen = match raw_err(r) {
+                Some(e) => Err(e),
+                None if r < sb.len() => {
+                    if !lb.push(&sb[..r]) {
+                        return Err(ENOMEM);
+                    }
+                    Ok(r)
                 }
-                let r = syscall::syscall3(SYS_READLINK, cp as usize, lb.p as usize, size);
-                match raw_err(r) {
-                    Some(e) => break Err(e),
-                    None if r < size => break Ok(r),
-                    None => size *= 2,
+                None => {
+                    let mut size = 512usize;
+                    loop {
+                        if !lb.reserve(size) {
+                            return Err(ENOMEM);
+                        }
+                        let r = syscall::syscall3(SYS_READLINK, cp as usize, lb.p as usize, size);
+                        match raw_err(r) {
+                            Some(e) => break Err(e),
+                            None if r < size => break Ok(r),
+                            None => size *= 2,
+                        }
+                    }
                 }
             };
             match linklen {
@@ -464,14 +499,15 @@ unsafe fn resolve(path: &[u8], rpath: &mut Buf) -> Result<(), i32> {
                     }
                 }
                 Err(EINVAL) => {
-                    if segs[..nseg].iter().any(|g| g.pos < g.len) {
-                        let mut st = [0u64; 18];
-                        let r = syscall::syscall2(syscall::SYS_STAT, cp as usize, st.as_mut_ptr() as usize);
+                    if segs[..nseg].iter().any(|g| g.pos < g.len) && !next_is_plain_name(&segs[nseg - 1]) {
+                        if !rpath.push(b"/") {
+                            return Err(ENOMEM);
+                        }
+                        let cp = rpath.cstr();
+                        let r = syscall::syscall2(syscall::SYS_ACCESS, cp as usize, 0);
+                        rpath.len -= 1;
                         if let Some(e) = raw_err(r) {
                             return Err(e);
-                        }
-                        if (st[3] & 0xffff_ffff) as u32 & 0o170000 != 0o040000 {
-                            return Err(ENOTDIR);
                         }
                     }
                 }

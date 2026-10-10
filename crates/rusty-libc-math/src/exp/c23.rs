@@ -26,6 +26,29 @@ fn rounding_down_or_zero() -> bool {
 
 #[inline(always)]
 pub(crate) fn exp2m1_impl<const F: bool>(x: f64) -> f64 {
+    let ab = x.to_bits() & !(1u64 << 63);
+    if crate::trig::dd::directed_if(ab.wrapping_sub(1) < 0x3ff0_0000_0000_0000 - 1) {
+        return exp2m1_directed::<F>(x);
+    }
+    exp2m1_body::<F>(x)
+}
+
+#[inline(always)]
+fn exp2m1_directed<const F: bool>(x: f64) -> f64 {
+    let rc = crate::trig::dd::rounding_control();
+    let _g = crate::trig::dd::NearestGuard::new();
+    if (x.to_bits() & !(1u64 << 63)) < 0x0170_0000_0000_0000 {
+        let y = crate::special::dd::tiny_mul_dir(x, core::f64::consts::LN_2, 2.3190468138462996e-17, rc);
+        if y == 0.0 {
+            set_errno(ERANGE);
+        }
+        return y;
+    }
+    exp2m1_body::<F>(x)
+}
+
+#[inline(always)]
+fn exp2m1_body<const F: bool>(x: f64) -> f64 {
     if (-55.0..=55.0).contains(&x) {
         if unlikely(x.to_bits() & 0x7fff_ffff_ffff == 0) {
             if x == 0.0 {
@@ -66,6 +89,25 @@ pub(crate) fn exp2m1_impl<const F: bool>(x: f64) -> f64 {
 
 #[inline(always)]
 pub(crate) fn exp10m1_impl<const F: bool>(x: f64) -> f64 {
+    let ab = x.to_bits() & !(1u64 << 63);
+    if crate::trig::dd::directed_if(ab.wrapping_sub(1) < 0x3ff0_0000_0000_0000 - 1) {
+        return exp10m1_directed::<F>(x);
+    }
+    exp10m1_body::<F>(x)
+}
+
+#[inline(always)]
+fn exp10m1_directed<const F: bool>(x: f64) -> f64 {
+    let rc = crate::trig::dd::rounding_control();
+    let _g = crate::trig::dd::NearestGuard::new();
+    if (x.to_bits() & !(1u64 << 63)) < 0x0170_0000_0000_0000 {
+        return crate::special::dd::tiny_mul_dir(x, core::f64::consts::LN_10, -2.1707562233822494e-16, rc);
+    }
+    exp10m1_body::<F>(x)
+}
+
+#[inline(always)]
+fn exp10m1_body<const F: bool>(x: f64) -> f64 {
     if (-19.0..=19.0).contains(&x) {
         if unlikely(x.to_bits() & 0xffff_ffff_ffff == 0) {
             if x == 0.0 {

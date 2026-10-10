@@ -232,18 +232,19 @@ pub extern "C" fn inet_makeaddr(net: in_addr_t, host: in_addr_t) -> in_addr {
 pub fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
     let mut tmp = [0u8; 4];
     let mut idx = 0usize;
+    let mut cur = 0u32;
     let mut saw_digit = false;
     let mut octets = 0;
     for &ch in s {
-        if ch.is_ascii_digit() {
-            let new = tmp[idx] as u32 * 10 + (ch - b'0') as u32;
-            if saw_digit && tmp[idx] == 0 {
+        let d = ch.wrapping_sub(b'0');
+        if d < 10 {
+            if saw_digit && cur == 0 {
                 return None;
             }
-            if new > 255 {
+            cur = cur * 10 + d as u32;
+            if cur > 255 {
                 return None;
             }
-            tmp[idx] = new as u8;
             if !saw_digit {
                 octets += 1;
                 if octets > 4 {
@@ -255,18 +256,38 @@ pub fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
             if octets == 4 {
                 return None;
             }
+            tmp[idx] = cur as u8;
             idx += 1;
-            tmp[idx] = 0;
+            cur = 0;
             saw_digit = false;
         } else {
             return None;
         }
     }
+    if saw_digit {
+        tmp[idx] = cur as u8;
+    }
     if octets < 4 { None } else { Some(tmp) }
 }
 
 fn hexval(c: u8) -> Option<u32> {
-    (c as char).to_digit(16)
+    const T: [u8; 256] = {
+        let mut t = [0xffu8; 256];
+        let mut i = 0;
+        while i < 10 {
+            t[b'0' as usize + i] = i as u8;
+            i += 1;
+        }
+        i = 0;
+        while i < 6 {
+            t[b'a' as usize + i] = 10 + i as u8;
+            t[b'A' as usize + i] = 10 + i as u8;
+            i += 1;
+        }
+        t
+    };
+    let v = T[c as usize];
+    if v == 0xff { None } else { Some(v as u32) }
 }
 
 pub fn parse_ipv6(s: &[u8]) -> Option<[u8; 16]> {
@@ -355,36 +376,49 @@ pub fn parse_ipv6(s: &[u8]) -> Option<[u8; 16]> {
     if tp != 16 { None } else { Some(tmp) }
 }
 
-fn put_u8(v: u8, out: &mut Buf<48>) {
-    out.push_u32(v as u32);
+#[inline]
+fn ipv4_text(a: &[u8; 4], out: &mut [u8; 16]) -> usize {
+    let mut n = 0;
+    for (i, &v) in a.iter().enumerate() {
+        if i > 0 {
+            out[n] = b'.';
+            n += 1;
+        }
+        if v >= 100 {
+            out[n] = b'0' + v / 100;
+            out[n + 1] = b'0' + (v / 10) % 10;
+            out[n + 2] = b'0' + v % 10;
+            n += 3;
+        } else if v >= 10 {
+            out[n] = b'0' + v / 10;
+            out[n + 1] = b'0' + v % 10;
+            n += 2;
+        } else {
+            out[n] = b'0' + v;
+            n += 1;
+        }
+    }
+    n
 }
 
 pub fn format_ipv4(a: &[u8; 4]) -> Buf<48> {
+    let mut t = [0u8; 16];
+    let n = ipv4_text(a, &mut t);
     let mut o = Buf::<48>::new();
-    for (i, b) in a.iter().enumerate() {
-        if i > 0 {
-            o.push(b'.');
-        }
-        put_u8(*b, &mut o);
-    }
+    o.push_all(&t[..n]);
     o
 }
 
-fn put_hex16(v: u16, o: &mut Buf<48>) {
-    const D: &[u8; 16] = b"0123456789abcdef";
-    if v >= 0x1000 {
-        o.push(D[(v >> 12) as usize & 15]);
-    }
-    if v >= 0x100 {
-        o.push(D[(v >> 8) as usize & 15]);
-    }
-    if v >= 0x10 {
-        o.push(D[(v >> 4) as usize & 15]);
-    }
-    o.push(D[v as usize & 15]);
+pub fn format_ipv6(a: &[u8; 16]) -> Buf<48> {
+    let mut t = [0u8; 48];
+    let n = ipv6_text(a, &mut t);
+    let mut o = Buf::<48>::new();
+    o.push_all(&t[..n]);
+    o
 }
 
-pub fn format_ipv6(a: &[u8; 16]) -> Buf<48> {
+fn ipv6_text(a: &[u8; 16], out: &mut [u8; 48]) -> usize {
+    const D: &[u8; 16] = b"0123456789abcdef";
     let w = |i: usize| ((a[2 * i] as u16) << 8) | a[2 * i + 1] as u16;
     let (mut best_base, mut best_len) = (-1i32, 0i32);
     let (mut cur_base, mut cur_len) = (-1i32, 0i32);
@@ -411,53 +445,82 @@ pub fn format_ipv6(a: &[u8; 16]) -> Buf<48> {
     if best_base != -1 && best_len < 2 {
         best_base = -1;
     }
-    let mut o = Buf::<48>::new();
-    let mut i = 0i32;
-    while i < 8 {
-        if best_base != -1 && i >= best_base && i < best_base + best_len {
-            if i == best_base {
-                o.push(b':');
+    let o = out.as_mut_ptr();
+    let mut n = 0usize;
+    unsafe {
+        let mut i = 0i32;
+        while i < 8 {
+            if best_base != -1 && i >= best_base && i < best_base + best_len {
+                if i == best_base {
+                    *o.add(n) = b':';
+                    n += 1;
+                }
+                i += 1;
+                continue;
             }
+            if i != 0 {
+                *o.add(n) = b':';
+                n += 1;
+            }
+            if i == 6 && best_base == 0 && (best_len == 6 || (best_len == 5 && w(5) == 0xffff)) {
+                let mut t = [0u8; 16];
+                let m = ipv4_text(&[a[12], a[13], a[14], a[15]], &mut t);
+                core::ptr::copy_nonoverlapping(t.as_ptr(), o.add(n), m);
+                n += m;
+                break;
+            }
+            let v = w(i as usize);
+            if v >= 0x1000 {
+                *o.add(n) = D[(v >> 12) as usize & 15];
+                n += 1;
+            }
+            if v >= 0x100 {
+                *o.add(n) = D[(v >> 8) as usize & 15];
+                n += 1;
+            }
+            if v >= 0x10 {
+                *o.add(n) = D[(v >> 4) as usize & 15];
+                n += 1;
+            }
+            *o.add(n) = D[v as usize & 15];
+            n += 1;
             i += 1;
-            continue;
         }
-        if i != 0 {
-            o.push(b':');
+        if best_base != -1 && best_base + best_len == 8 {
+            *o.add(n) = b':';
+            n += 1;
         }
-        if i == 6 && best_base == 0 && (best_len == 6 || (best_len == 5 && w(5) == 0xffff)) {
-            let v4 = format_ipv4(&[a[12], a[13], a[14], a[15]]);
-            o.push_all(v4.as_bytes());
-            break;
-        }
-        put_hex16(w(i as usize), &mut o);
-        i += 1;
     }
-    if best_base != -1 && best_base + best_len == 8 {
-        o.push(b':');
-    }
-    o
+    n
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_ntop(af: c_int, src: *const c_void, dst: *mut c_char, size: socklen_t) -> *const c_char {
-    let text = match af {
-        AF_INET => format_ipv4(unsafe { &*(src as *const [u8; 4]) }),
-        AF_INET6 => format_ipv6(unsafe { &*(src as *const [u8; 16]) }),
-        _ => {
-            errno::set(EAFNOSUPPORT);
+    unsafe {
+        let mut t = [0u8; 48];
+        let n = match af {
+            AF_INET => {
+                if size >= 16 {
+                    let n = ipv4_text(&*(src as *const [u8; 4]), &mut *(dst as *mut [u8; 16]));
+                    *dst.add(n) = 0;
+                    return dst;
+                }
+                ipv4_text(&*(src as *const [u8; 4]), (&mut t[..16]).try_into().unwrap())
+            }
+            AF_INET6 => ipv6_text(&*(src as *const [u8; 16]), &mut t),
+            _ => {
+                errno::set(EAFNOSUPPORT);
+                return core::ptr::null();
+            }
+        };
+        if n + 1 > size as usize {
+            errno::set(ENOSPC);
             return core::ptr::null();
         }
-    };
-    let n = text.len + 1;
-    if n > size as usize {
-        errno::set(ENOSPC);
-        return core::ptr::null();
+        core::ptr::copy_nonoverlapping(t.as_ptr(), dst as *mut u8, n);
+        *dst.add(n) = 0;
+        dst
     }
-    unsafe {
-        core::ptr::copy_nonoverlapping(text.b.as_ptr(), dst as *mut u8, text.len);
-        *dst.add(text.len) = 0;
-    }
-    dst
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

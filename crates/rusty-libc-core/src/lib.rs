@@ -13,6 +13,7 @@ pub mod nssent;
 pub mod nssmod;
 pub mod process;
 pub mod signal;
+pub mod spawn;
 #[cfg(feature = "start")]
 pub mod start;
 #[cfg(feature = "shared")]

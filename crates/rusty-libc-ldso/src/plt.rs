@@ -98,6 +98,14 @@ unsafe extern "C" fn plt_exit(m: *mut LinkMap, idx: usize, inregs: *const audit:
 
 static VEC_LEVEL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+pub static NO_XSAVE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+pub fn init_xsave(force: bool) {
+    let l1 = core::arch::x86_64::__cpuid(1);
+    let no = force || l1.ecx & (1 << 26) == 0 || l1.ecx & (1 << 27) == 0;
+    NO_XSAVE.store(no as u8, Relaxed);
+}
+
 pub fn init_vector_level() {
     use core::arch::x86_64::{__cpuid, __cpuid_count, _xgetbv};
     static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -147,9 +155,15 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         "mov [rsp + 552], r10",
         "mov [rsp + 560], r10",
         "mov [rsp + 568], r10",
+        "cmp byte ptr [rip + {nox}], 0",
+        "jne 818f",
         "mov eax, -1",
         "mov edx, -1",
         "xsave [rsp]",
+        "jmp 819f",
+        "818:",
+        "fxsave [rsp]",
+        "819:",
         "movups [r11 + 64], xmm0",
         "movups [r11 + 80], xmm1",
         "movups [r11 + 96], xmm2",
@@ -203,9 +217,15 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         "lea r8, [rbx + 8]",
         "call {fixup}",
         "mov r11, rax",
+        "cmp byte ptr [rip + {nox}], 0",
+        "jne 828f",
         "mov eax, -1",
         "mov edx, -1",
         "xrstor [rsp]",
+        "jmp 829f",
+        "828:",
+        "fxrstor [rsp]",
+        "829:",
         "mov r10, [rbx]",
         "movzx esi, byte ptr [rip + {lvl}]",
         "movups xmm8, [r10 + 64]",
@@ -409,9 +429,15 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         "mov [rsp + 808], r11",
         "mov [rsp + 816], r11",
         "mov [rsp + 824], r11",
+        "cmp byte ptr [rip + {nox}], 0",
+        "jne 838f",
         "mov eax, -1",
         "mov edx, -1",
         "xsave [rsp + 256]",
+        "jmp 839f",
+        "838:",
+        "fxsave [rsp + 256]",
+        "839:",
         "movups [rsp + 16], xmm0",
         "movups [rsp + 32], xmm1",
         "lea rdi, [rsp + 80]",
@@ -439,9 +465,15 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         "mov rdx, [rbx]",
         "mov rcx, rsp",
         "call {exit}",
+        "cmp byte ptr [rip + {nox}], 0",
+        "jne 848f",
         "mov eax, -1",
         "mov edx, -1",
         "xrstor [rsp + 256]",
+        "jmp 849f",
+        "848:",
+        "fxrstor [rsp + 256]",
+        "849:",
         "movzx esi, byte ptr [rip + {lvl}]",
         "movups xmm8, [rsp + 16]",
         "pcmpeqb xmm8, [rsp + 416]",
@@ -488,5 +520,6 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         fixup = sym plt_fixup,
         exit = sym plt_exit,
         lvl = sym VEC_LEVEL,
+        nox = sym NO_XSAVE,
     )
 }

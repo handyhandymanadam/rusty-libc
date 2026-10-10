@@ -73,11 +73,7 @@ impl<T> Drop for SpinGuard<'_, T> {
 
 #[inline]
 pub(crate) unsafe fn cstrlen(p: *const c_char) -> usize {
-    let mut n = 0;
-    while unsafe { *p.add(n) } != 0 {
-        n += 1;
-    }
-    n
+    unsafe { rusty_libc_mem::strlen(p.cast()) }
 }
 
 #[inline]

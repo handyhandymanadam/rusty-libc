@@ -148,6 +148,73 @@ pub(super) fn scale_round(hi: f64, lo: f64, e: i32) -> f64 {
     if neg { -res } else { res }
 }
 
+pub(crate) fn scale_round_dir(hi: f64, lo: f64, e: i32, rc: u32, eps: f64) -> (f64, bool) {
+    if hi == 0.0 {
+        return (hi, false);
+    }
+    let neg = hi < 0.0;
+    let (hi, lo) = if neg { (-hi, -lo) } else { (hi, lo) };
+    let away = rc == if neg { 1 } else { 2 };
+    let expo = |v: f64| (((v.to_bits() >> 52) & 0x7ff) as i32) - 1023;
+    let eh = expo(hi) + e;
+    let pow_of_two = hi.to_bits() & 0x000f_ffff_ffff_ffff == 0;
+    let res;
+    let mut ovf = false;
+    if eh >= -1021 || (eh == -1022 && !(pow_of_two && lo < 0.0)) {
+        let r = crate::trig::round_dir(hi, lo, eps, away).unwrap_or(hi + lo);
+        if expo(r) + e < 1024 {
+            res = ldexp(r, e);
+        } else if away {
+            res = ldexp(r, e);
+            ovf = true;
+        } else {
+            let r2 = crate::trig::round_dir(hi, lo, 0.0, false).unwrap_or(r);
+            if expo(r2) + e < 1024 {
+                res = ldexp(r2, e);
+            } else {
+                core::hint::black_box(core::hint::black_box(f64::MAX) * core::hint::black_box(2.0));
+                res = f64::MAX;
+                ovf = true;
+            }
+        }
+    } else {
+        let t = core::hint::black_box(f64::MIN_POSITIVE);
+        if eh < -1080 {
+            core::hint::black_box(t * t);
+            res = if away { f64::from_bits(1) } else { 0.0 };
+        } else {
+            let n = e + 1074;
+            let th = ldexp(hi, n);
+            let tl = ldexp(lo, n);
+            const MAGIC: f64 = 4503599627370496.0;
+            let nint = (th + MAGIC) - MAGIC;
+            let fl = if nint > th { nint - 1.0 } else { nint };
+            let d = th - fl;
+            let exact = d == 0.0 && tl == 0.0;
+            let below_fl = d == 0.0 && tl < 0.0;
+            let trunc = if below_fl { fl - 1.0 } else { fl };
+            let mut k = if away && !exact { trunc + 1.0 } else { trunc };
+            let eu = ldexp(eps, n);
+            if (d + tl).abs() <= eu || (1.0 - d - tl).abs() <= eu {
+                k = (th + tl + MAGIC) - MAGIC;
+            }
+            res = k * f64::from_bits(1);
+            force_underflow(res);
+            if res == 0.0 {
+                core::hint::black_box(t * t);
+            }
+        }
+    }
+    (if neg { -res } else { res }, ovf)
+}
+
+pub(crate) fn tiny_mul_dir(x: f64, ch: f64, cl: f64, rc: u32) -> f64 {
+    let xs = x * f64::from_bits(0x4c70_0000_0000_0000);
+    let (h, l0) = two_prod::<false>(xs, ch);
+    let (h, l) = fast_two_sum(h, l0 + xs * cl);
+    scale_round_dir(h, l, -200, rc, h.abs() * 7.888609052210118e-31 * 1024.0).0
+}
+
 #[inline(always)]
 pub(super) fn round_test(hi: f64, lo: f64, e: f64) -> Option<f64> {
     let a = hi + (lo + e);

@@ -1,4 +1,9 @@
-use super::dd::fma;
+use super::dd;
+
+#[inline(always)]
+fn fma<const F: bool>(a: f64, b: f64, c: f64) -> f64 {
+    if F { dd::fma::<true>(a, b, c) } else { crate::rounding::fma_impl::fma_emul(a, b, c) }
+}
 use super::fast::SHIFT;
 use super::fast_tables::*;
 

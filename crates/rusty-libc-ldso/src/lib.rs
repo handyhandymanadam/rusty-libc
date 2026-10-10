@@ -1105,8 +1105,12 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
     let mut stats = false;
     let mut prof_name: *const u8 = core::ptr::null();
     let mut prof_out: *const u8 = core::ptr::null();
+    let mut force_fxsave = false;
     while !(*e).is_null() {
         let v = cstr(*e);
+        if env_value(v, b"LD_RL_FORCE_FXSAVE").is_some_and(|x| !x.is_empty()) {
+            force_fxsave = true;
+        }
         if !s.secure {
             if let Some(x) = env_value(v, b"LD_LIBRARY_PATH") {
                 s.library_path = dup(x);
@@ -1158,6 +1162,7 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
         }
         e = e.add(1);
     }
+    plt::init_xsave(force_fxsave);
     s.debug = debug_libs;
     if let Some(x) = debug_output {
         ldebug::open_output(x);

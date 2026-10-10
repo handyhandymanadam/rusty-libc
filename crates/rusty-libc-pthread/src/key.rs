@@ -73,6 +73,23 @@ unsafe fn slot_of(t: *mut Thread, key: usize, alloc: bool) -> *mut KeyData {
 pub unsafe extern "C" fn pthread_setspecific(key: u32, value: *const c_void) -> c_int {
     unsafe {
         let key = key as usize;
+        if key < FIRST_LEVEL {
+            let seq = KEYS[key].seq.load(Ordering::Acquire);
+            if seq & 1 == 0 {
+                return EINVAL;
+            }
+            let s = &raw mut (*current_thread()).specific_1st[key];
+            (*s).seq = seq;
+            (*s).data = value as *mut c_void;
+            return 0;
+        }
+        setspecific_2nd(key, value)
+    }
+}
+
+#[inline(never)]
+unsafe fn setspecific_2nd(key: usize, value: *const c_void) -> c_int {
+    unsafe {
         if key >= PTHREAD_KEYS_MAX {
             return EINVAL;
         }

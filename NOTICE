@@ -235,7 +235,9 @@ coefficients from math/exp_data.c, log_data.c, pow_log_data.c, log2_data.c,
 exp2f_data.c, logf_data.c, log2f_data.c and powf_log2_data.c), dexp.rs,
 dlog.rs, dpow.rs, fexp.rs (algorithms of math/exp.c, exp2.c, exp10.c, log.c,
 log2.c, pow.c, expf.c, exp2f.c, logf.c, log2f.c, powf.c), ffast.rs and
-flog.rs (EXP2F/LOGF tables), common.rs (helpers of math/math_config.h).
+flog.rs (EXP2F/LOGF tables), common.rs (helpers of math/math_config.h);
+crates/rusty-libc-mvec/src/simd.rs (vector form of the expf, logf and powf
+algorithms above, using the tables of exp/data.rs).
 Upstream: https://github.com/ARM-software/optimized-routines, commit 503fafe.
 Upstream file headers: "Copyright (c) <years>, Arm Limited." with the SPDX
 identifier "MIT OR Apache-2.0 WITH LLVM-exception" (years 2017 to 2026 across

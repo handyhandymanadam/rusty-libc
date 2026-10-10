@@ -100,6 +100,12 @@ pub unsafe extern "C" fn pthread_cond_signal(cond: *mut Cond) -> c_int {
     if wrefs >> 3 == 0 {
         return 0;
     }
+    signal_waiters(c, wrefs)
+}
+
+#[cold]
+#[inline(never)]
+fn signal_waiters(c: &Cond, wrefs: u32) -> c_int {
     let private = is_private(wrefs);
     acquire_lock(c, private);
     let wseq_full = c.wseq.load(Ordering::Relaxed);
@@ -126,6 +132,12 @@ pub unsafe extern "C" fn pthread_cond_broadcast(cond: *mut Cond) -> c_int {
     if wrefs >> 3 == 0 {
         return 0;
     }
+    broadcast_waiters(c, wrefs)
+}
+
+#[cold]
+#[inline(never)]
+fn broadcast_waiters(c: &Cond, wrefs: u32) -> c_int {
     let private = is_private(wrefs);
     acquire_lock(c, private);
     let wseq_full = c.wseq.load(Ordering::Relaxed);

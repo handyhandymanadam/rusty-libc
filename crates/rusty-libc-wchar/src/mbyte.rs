@@ -321,6 +321,27 @@ unsafe fn tomb(st: &mut mbstate_t, src: &mut *const u32, mut avail: usize, out: 
         }
         let mut produced = 0usize;
         loop {
+            while avail >= 4 && cap - produced >= 4 {
+                let p = *src;
+                let (a, b, c, d) = (p.read_unaligned(), p.add(1).read_unaligned(), p.add(2).read_unaligned(), p.add(3).read_unaligned());
+                if (a | b | c | d) >= 0x80 {
+                    break;
+                }
+                (out.add(produced) as *mut u32).write_unaligned(a | (b << 8) | (c << 16) | (d << 24));
+                produced += 4;
+                *src = p.add(4);
+                avail -= 4;
+            }
+            while avail != 0 && produced < cap {
+                let wc = (*src).read_unaligned();
+                if wc >= 0x80 {
+                    break;
+                }
+                *out.add(produced) = wc as u8;
+                produced += 1;
+                *src = (*src).add(1);
+                avail -= 1;
+            }
             if avail == 0 {
                 return (Status::Empty, produced);
             }

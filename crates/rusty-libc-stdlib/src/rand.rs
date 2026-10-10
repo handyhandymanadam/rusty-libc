@@ -7,18 +7,25 @@ const EINVAL: i32 = 22;
 
 static LOCK: AtomicBool = AtomicBool::new(false);
 
-struct Guard;
+struct Guard(bool);
 impl Guard {
+    #[inline(always)]
     fn new() -> Guard {
+        if !rusty_libc_core::lock::multithreaded() {
+            return Guard(false);
+        }
         while LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
-        Guard
+        Guard(true)
     }
 }
 impl Drop for Guard {
+    #[inline(always)]
     fn drop(&mut self) {
-        LOCK.store(false, Ordering::Release);
+        if self.0 {
+            LOCK.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -315,7 +322,7 @@ unsafe fn iterate(xsubi: *mut c_ushort, buf: *mut Drand48Data) {
             (*buf).c = C48;
             (*buf).init = 1;
         }
-        let x = ((*xsubi.add(2)) as u64) << 32 | ((*xsubi.add(1)) as u64) << 16 | (*xsubi) as u64;
+        let x = (xsubi.add(2).read_volatile() as u64) << 32 | (xsubi.add(1).read_volatile() as u64) << 16 | xsubi.read_volatile() as u64;
         let r = x.wrapping_mul((*buf).a).wrapping_add((*buf).c as u64);
         *xsubi = r as u16;
         *xsubi.add(1) = (r >> 16) as u16;

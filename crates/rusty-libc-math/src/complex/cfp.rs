@@ -42,6 +42,10 @@ pub trait CF: Fp {
     fn c_cosh(x: Self) -> Self;
     fn c_atan2(y: Self, x: Self) -> Self;
     fn c_hypot(x: Self, y: Self) -> Self;
+    #[inline]
+    fn c_hypot_q(x: Self, y: Self) -> Self {
+        quiet(|| Self::c_hypot(x, y))
+    }
     fn c_scalbn(x: Self, n: i32) -> Self;
 }
 
@@ -99,6 +103,13 @@ impl CF for f64 {
     }
     fn c_hypot(x: f64, y: f64) -> f64 {
         crate::rounding::hypot(x, y)
+    }
+    #[inline(always)]
+    fn c_hypot_q(x: f64, y: f64) -> f64 {
+        match crate::rounding::hypot_fast(x, y) {
+            Some(r) => r,
+            None => quiet(|| crate::rounding::hypot(x, y)),
+        }
     }
     fn c_scalbn(x: f64, n: i32) -> f64 {
         crate::classify::scalbn(x, n)
@@ -268,7 +279,7 @@ impl<F: CF> W<F> {
         if F::ATAN2_ERRNO { W(F::c_atan2(self.0, x.0)) } else { quiet(|| W(F::c_atan2(self.0, x.0))) }
     }
     pub fn hypot(self, y: W<F>) -> W<F> {
-        quiet(|| W(F::c_hypot(self.0, y.0)))
+        W(F::c_hypot_q(self.0, y.0))
     }
     pub fn scalbn(self, n: i32) -> W<F> {
         quiet(|| W(F::c_scalbn(self.0, n)))

@@ -98,7 +98,7 @@ fn pre_fma(x: F128, y: F128, z: F128, rule: Rule) -> Pre {
         fenv::raise_exceptions(FE_INVALID as u32);
     }
     if let Some(n) = pick {
-        if (x.is_inf() && y.is_zero()) || (x.is_zero() && y.is_inf()) {
+        if rule != Rule::Ffma && ((x.is_inf() && y.is_zero()) || (x.is_zero() && y.is_inf())) {
             fenv::raise_exceptions(FE_INVALID as u32);
         }
         return Pre::Val(n);
@@ -239,14 +239,6 @@ macro_rules! wide_args2 {
         }
     )*};
 }
-macro_rules! wide_args3 {
-    ($rule:expr; $($name:ident, $imp:ident, $ret:ty;)*) => {$(
-        #[cfg_attr(feature = "export", unsafe(no_mangle))]
-        pub extern "C" fn $name(x: f64, y: f64, z: f64) -> $ret {
-            $imp(F128::from_f64(x), F128::from_f64(y), F128::from_f64(z), $rule)
-        }
-    )*};
-}
 macro_rules! wide_args1 {
     ($($name:ident, $imp:ident, $ret:ty;)*) => {$(
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -261,10 +253,33 @@ wide_args2! {
     f32addf64, to32_add, f32; f32subf64, to32_sub, f32; f32mulf64, to32_mul, f32; f32divf64, to32_div, f32;
     f32addf32x, to32_add, f32; f32subf32x, to32_sub, f32; f32mulf32x, to32_mul, f32; f32divf32x, to32_div, f32;
 }
-wide_args3! { Rule::Ffma; ffma, to32_fma, f32; f32fmaf64, to32_fma, f32; f32fmaf32x, to32_fma, f32; }
+macro_rules! ffma_names {
+    ($($name:ident;)*) => {$(
+        #[cfg_attr(feature = "export", unsafe(no_mangle))]
+        pub extern "C" fn $name(x: f64, y: f64, z: f64) -> f32 {
+            if let Some(r) = crate::rounding::fma_impl::soft_special_for_narrow(x, y, z) {
+                return narrow_to_f32(r);
+            }
+            to32_fma(F128::from_f64(x), F128::from_f64(y), F128::from_f64(z), Rule::Ffma)
+        }
+    )*};
+}
+ffma_names! { ffma; f32fmaf64; f32fmaf32x; }
+
+fn narrow_to_f32(r: f64) -> f32 {
+    let out: f32;
+    unsafe { core::arch::asm!("cvtsd2ss {0}, {1}", out(xmm_reg) out, in(xmm_reg) r, options(nomem, nostack, preserves_flags)) };
+    out
+}
 wide_args1! { fsqrt, to32_sqrt, f32; f32sqrtf64, to32_sqrt, f32; f32sqrtf32x, to32_sqrt, f32; }
 wide_args2! { f32xaddf64, to64_add, f64; f32xsubf64, to64_sub, f64; f32xmulf64, to64_mul, f64; f32xdivf64, to64_div, f64; }
-wide_args3! { Rule::Ffma; f32xfmaf64, to64_fma, f64; }
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub extern "C" fn f32xfmaf64(x: f64, y: f64, z: f64) -> f64 {
+    if let Some(r) = crate::rounding::fma_impl::soft_special_for_narrow(x, y, z) {
+        return r;
+    }
+    to64_fma(F128::from_f64(x), F128::from_f64(y), F128::from_f64(z), Rule::Ffma)
+}
 wide_args1! { f32xsqrtf64, to64_sqrt, f64; }
 
 macro_rules! soft2 {

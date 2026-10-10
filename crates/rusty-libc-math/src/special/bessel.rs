@@ -112,51 +112,60 @@ fn y1_small<const F: bool>(x: f64) -> D {
 }
 
 #[inline(always)]
-fn ysmall_pair<const K: u8, const F: bool>(x: f64) -> Option<(D, f64, f64)> {
+fn ysmall_pair<const K: u8, const F: bool, const I: bool>(x: f64) -> Option<(D, f64, f64)> {
     if K == 2 {
         let tb = tab::<2>();
         if let Some(v) = window::<2, F>(&tb, 0, x, 4) {
             return Some((v, v.0.abs(), v.0.abs() * 1.53e-19));
         }
     }
-    let (lh, ll) = crate::trig::lg::log_pair::<F>(x, 0.0, 0);
-    let (ah, ae) = two_prod::<F>(TWO_OVER_PI_DD[0], lh);
-    let (ah, al) = fast_two_sum(ah, fma::<F>(TWO_OVER_PI_DD[0], ll, fma::<F>(TWO_OVER_PI_DD[1], lh, ae)));
-    let (j, dh, ul, dd) = urow::<F>(x);
-    let (jt, et) = if K == 2 { (&J0_ROWS[j], &Y0E_ROWS[j]) } else { (&J1_ROWS[j], &Y1E_ROWS[j]) };
-    let jv = row_eval::<F>(jt, dh, ul, dd);
-    let jv = fast_two_sum(jv.0, jv.1);
-    let ev = row_eval::<F>(et, dh, ul, dd);
-    let (ph, pe) = two_prod::<F>(ah, jv.0);
-    let pl = fma::<F>(ah, jv.1, al * jv.0);
+    let l = if I { crate::trig::lg::log_pair_i::<F>(x, 0.0, 0) } else { crate::trig::lg::log_pair::<F>(x, 0.0, 0) };
+    let (jv, ev) = ysmall_rows::<K, F, I>(x);
+    let (y, mag) = ysmall_sum::<K, F, I>(x, l, jv, ev);
+    Some((y, mag, ysmall_bound::<K>(mag)))
+}
+
+#[inline(always)]
+fn ysmall_rows<const K: u8, const F: bool, const I: bool>(x: f64) -> (D, D) {
+    let (j, dh, ul, dd) = urow::<F, I>(x);
+    let (jt, et) = if K == 2 { (&J0P_ROWS[j], &Y0E_ROWS[j]) } else { (&J1P_ROWS[j], &Y1E_ROWS[j]) };
+    let jv = row_eval::<F, I>(jt, dh, ul, dd, K == 2);
+    (fast_two_sum(jv.0, jv.1), row_eval::<F, I>(et, dh, ul, dd, K == 2))
+}
+
+#[inline(always)]
+fn ysmall_sum<const K: u8, const F: bool, const I: bool>(x: f64, (lh, ll): D, jv: D, ev: D) -> (D, f64) {
+    let fma = |a: f64, b: f64, c: f64| if I { crate::trig::dd::fma_i::<F>(a, b, c) } else { fma::<F>(a, b, c) };
+    let two_prod = |a: f64, b: f64| if I { crate::trig::dd::two_prod_i::<F>(a, b) } else { two_prod::<F>(a, b) };
+    let (ph, pe) = two_prod(lh, jv.0);
+    let pl = fma(lh, jv.1, ll * jv.0);
     let (sh, se) = two_sum(ph, ev.0);
     let sl = (se + pe) + (pl + ev.1);
     let ms = ph.abs() + ev.0.abs();
     if K == 2 {
-        Some(((sh, sl), ms, ysmall_bound::<2>(ms)))
+        ((sh, sl), ms)
     } else {
         let q = 1.0 / x;
-        let (qx, qxe) = two_prod::<F>(q, x);
+        let (qx, qxe) = two_prod(q, x);
         let r = (1.0 - qx) - qxe;
-        let (th, te) = two_prod::<F>(TWO_OVER_PI_DD[0], q);
-        let tl = te + fma::<F>(TWO_OVER_PI_DD[1], q, TWO_OVER_PI_DD[0] * (r * q));
+        let (th, te) = two_prod(TWO_OVER_PI_DD[0], q);
+        let tl = te + fma(TWO_OVER_PI_DD[1], q, TWO_OVER_PI_DD[0] * (r * q));
         let h = x * 0.5;
-        let (uh, ue) = two_prod::<F>(sh, h);
-        let ul2 = fma::<F>(sl, h, ue);
+        let (uh, ue) = two_prod(sh, h);
+        let ul2 = fma(sl, h, ue);
         let (yh, ye) = two_sum(uh, -th);
-        let mag = th.abs() + ms * h;
-        Some(((yh, (ye + ul2) - tl), mag, ysmall_bound::<3>(mag)))
+        ((yh, (ye + ul2) - tl), th.abs() + ms * h)
     }
 }
 
 #[inline(always)]
 fn ysmall_bound<const K: u8>(mag: f64) -> f64 {
-    if K == 2 { mag * 7.0e-20 + 5.0e-20 } else { mag * 1.9e-20 }
+    if K == 2 { mag * 1.8e-20 + 1.2e-20 } else { mag * 1.9e-20 }
 }
 
 #[inline(always)]
 fn ysmall_fast<const K: u8, const F: bool>(x: f64) -> Option<f64> {
-    let (y, _, e) = ysmall_pair::<K, F>(x)?;
+    let (y, _, e) = ysmall_pair::<K, F, true>(x)?;
     round_test(y.0, y.1, e)
 }
 
@@ -362,7 +371,7 @@ pub(super) fn eval_fast<const K: u8, const F: bool>(x: f64) -> D {
         return cell::<K, F>(x, 4).0;
     }
     if K >= 2 && x <= 1.25 && x >= 1.0e-150 {
-        if let Some((y, mag, _)) = ysmall_pair::<K, F>(x) {
+        if let Some((y, mag, _)) = ysmall_pair::<K, F, false>(x) {
             if y.0.abs() >= mag * 5.960464477539063e-8 {
                 return fast_two_sum(y.0, y.1);
             }
@@ -378,40 +387,78 @@ pub(super) fn eval_fast<const K: u8, const F: bool>(x: f64) -> D {
 }
 
 #[inline(always)]
-fn urow<const F: bool>(x: f64) -> (usize, f64, f64, f64) {
+fn urow<const F: bool, const I: bool>(x: f64) -> (usize, f64, f64, f64) {
+    let fma = |a: f64, b: f64, c: f64| if I { crate::trig::dd::fma_i::<F>(a, b, c) } else { fma::<F>(a, b, c) };
     const SHIFT: f64 = 6755399441055744.0;
-    let (xx, xe) = two_prod::<F>(x, x);
+    let (xx, xe) = if I { crate::trig::dd::two_prod_i::<F>(x, x) } else { two_prod::<F>(x, x) };
     let (uh, ul) = (xx * 0.25, xe * 0.25);
-    let kd = fma::<F>(uh, 128.0, SHIFT);
+    let kd = fma(uh, 128.0, SHIFT);
     let j = ((kd.to_bits() & 127) as usize).min(50);
-    let d = fma::<F>(-(kd - SHIFT), 1.0 / 128.0, uh);
+    let d = fma(-(kd - SHIFT), 1.0 / 128.0, uh);
     (j, d, ul, d + ul)
 }
 
 #[inline(always)]
-fn row_eval<const F: bool>(row: &[f64; 8], d: f64, ul: f64, dd: f64) -> D {
+fn row_eval<const F: bool, const I: bool>(row: &[f64; 9], d: f64, ul: f64, dd: f64, d6: bool) -> D {
+    let fma = |a: f64, b: f64, c: f64| if I { crate::trig::dd::fma_i::<F>(a, b, c) } else { fma::<F>(a, b, c) };
     let z = dd * dd;
-    let p01 = fma::<F>(dd, row[5], row[4]);
-    let p23 = fma::<F>(dd, row[7], row[6]);
-    let tail = z * fma::<F>(z, p23, p01);
-    let (ph, pe) = two_prod::<F>(row[2], d);
+    let p01 = fma(dd, row[5], row[4]);
+    let p23 = fma(dd, row[7], row[6]);
+    let tail = z * fma(z, if d6 { fma(z, row[8], p23) } else { p23 }, p01);
+    let (ph, pe) = if I { crate::trig::dd::two_prod_i::<F>(row[2], d) } else { two_prod::<F>(row[2], d) };
     let (s, se) = two_sum(row[0], ph);
-    let lo = ((row[1] + fma::<F>(row[2], ul, row[3] * d)) + (pe + se)) + tail;
+    let lo = ((row[1] + fma(row[2], ul, row[3] * d)) + (pe + se)) + tail;
     (s, lo)
+}
+
+#[derive(Clone, Copy)]
+struct Wpow {
+    p: f64,
+    pe: f64,
+    p2: f64,
+    w2l: f64,
+    p4: f64,
+}
+
+#[inline(always)]
+fn wpow<const F: bool, const I: bool>(x: f64) -> Wpow {
+    let tp = |a: f64, b: f64| if I { crate::trig::dd::two_prod_i::<F>(a, b) } else { two_prod::<F>(a, b) };
+    let fma = |a: f64, b: f64, c: f64| if I { crate::trig::dd::fma_i::<F>(a, b, c) } else { fma::<F>(a, b, c) };
+    let (p, pe) = tp(x, x);
+    let (p2, p2e) = tp(p, p);
+    let w2l = fma(2.0 * p, pe, p2e);
+    Wpow { p, pe, p2, w2l, p4: fma(p2, p2, 2.0 * p2 * w2l) }
+}
+
+#[inline(always)]
+fn wseries<const F: bool, const I: bool>(a: &[[f64; 2]], w: Wpow) -> D {
+    let fma = |a: f64, b: f64, c: f64| if I { crate::trig::dd::fma_i::<F>(a, b, c) } else { fma::<F>(a, b, c) };
+    let tp = |a: f64, b: f64| if I { crate::trig::dd::two_prod_i::<F>(a, b) } else { two_prod::<F>(a, b) };
+    let Wpow { p, pe, p2, w2l, p4 } = w;
+    let c0 = fma(p, a[5][0], a[4][0]);
+    let c1 = fma(p, a[7][0], a[6][0]);
+    let c2 = fma(p, a[9][0], a[8][0]);
+    let c3 = if a.len() > 11 { fma(p, a[11][0], a[10][0]) } else { a[10][0] };
+    let tail = p4 * fma(p4, fma(p2, c3, c2), fma(p2, c1, c0));
+    let (qh, ql) = tp(a[3][0], p);
+    let (mh, me) = fast_two_sum(a[2][0], qh);
+    let ml = (me + ql) + (a[2][1] + fma(a[3][1], p, a[3][0] * pe));
+    let (ch, ce) = tp(p2, mh);
+    let cl = ce + fma(p2, ml, w2l * mh);
+    let (bh, be) = fast_two_sum(a[0][0], a[1][0] * p);
+    let (vh, ve) = fast_two_sum(bh, ch);
+    (vh, ve + ((be + a[1][0] * pe) + (cl + tail)))
 }
 
 #[inline(always)]
 pub(super) fn jsmall_pair<const K: u8, const F: bool>(x: f64) -> (D, f64) {
-    let (j, d, ul, dd) = urow::<F>(x);
-    let row = if K == 0 { &J0_ROWS[j] } else { &J1_ROWS[j] };
-    let v = row_eval::<F>(row, d, ul, dd);
-    let v = fast_two_sum(v.0, v.1);
+    let v = wseries::<F, true>(if K == 0 { &JS0_C } else { &JS1_C }, wpow::<F, true>(x));
     if K == 0 {
         (v, 1.0e-19)
     } else {
         let h = x * 0.5;
-        let (rh, re) = two_prod::<F>(v.0, h);
-        (fast_two_sum(rh, re + v.1 * h), 1.0e-19 * x)
+        let (rh, re) = crate::trig::dd::two_prod_i::<F>(v.0, h);
+        ((rh, crate::trig::dd::fma_i::<F>(v.1, h, re)), 1.0e-19 * x)
     }
 }
 
@@ -459,6 +506,11 @@ directed_paths!(j0_impl_dir_fma, j0_impl_dir_plain, super::j0_fma, super::j0_nof
 #[inline(always)]
 pub(super) fn j0_impl<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !(1u64 << 63);
+    if ab.wrapping_sub(JS_LO) <= JS_HI - JS_LO && crate::trig::dd::is_nearest() {
+        if let Some(r) = jsmall_fast::<0, F>(f64::from_bits(ab)) {
+            return r;
+        }
+    }
     if ab.wrapping_sub(1) < 0x7ff0_0000_0000_0000 - 1 && !crate::trig::dd::is_nearest() {
         return if F {
             unsafe { j0_impl_dir_fma(x) }
@@ -494,6 +546,11 @@ directed_paths!(j1_impl_dir_fma, j1_impl_dir_plain, super::j1_fma, super::j1_nof
 #[inline(always)]
 pub(super) fn j1_impl<const F: bool>(x: f64) -> f64 {
     let ab = x.to_bits() & !(1u64 << 63);
+    if ab.wrapping_sub(JS_LO) <= JS_HI - JS_LO && crate::trig::dd::is_nearest() {
+        if let Some(r) = jsmall_fast::<1, F>(f64::from_bits(ab)) {
+            return if x < 0.0 { -r } else { r };
+        }
+    }
     if ab.wrapping_sub(1) < 0x7ff0_0000_0000_0000 - 1 && !crate::trig::dd::is_nearest() {
         return if F {
             unsafe { j1_impl_dir_fma(x) }
@@ -796,6 +853,7 @@ pub(super) fn yn_core<const F: bool>(n: i32, x: f64) -> NRes {
     NRes::Val(if b.0 < 0.0 { neg(b) } else { b }, cnt, (b.0 < 0.0) != flip)
 }
 
+#[inline(always)]
 pub(super) fn jn_impl<const F: bool>(n: i32, x: f64) -> f64 {
     if n == 0 {
         return j0_impl::<F>(x);
@@ -820,6 +878,7 @@ pub(super) fn jn_impl<const F: bool>(n: i32, x: f64) -> f64 {
     }
 }
 
+#[inline(always)]
 pub(super) fn yn_impl<const F: bool>(n: i32, x: f64) -> f64 {
     if n == 0 {
         return y0_impl::<F>(x);

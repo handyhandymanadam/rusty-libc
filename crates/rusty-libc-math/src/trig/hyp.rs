@@ -204,28 +204,73 @@ const SIGN: u64 = 0x8000_0000_0000_0000;
 
 #[inline(always)]
 pub fn sinh_pos<const F: bool>(ax: f64) -> f64 {
+    let (h, l, k) = sinh_parts::<F>(ax);
+    cosh_finish(h, l, k)
+}
+
+#[cold]
+#[inline(never)]
+pub fn sinh_directed(x: f64) -> f64 {
+    let (h, l, k) = {
+        let _g = super::dd::NearestGuard::new();
+        sinh_parts::<false>(super::dd::launder(x.abs()))
+    };
+    let (h, l) = (super::dd::launder(h), super::dd::launder(l));
+    if x < 0.0 { cosh_finish(-h, -l, k) } else { cosh_finish(h, l, k) }
+}
+
+#[inline(always)]
+fn sinh_parts<const F: bool>(ax: f64) -> (f64, f64, i32) {
     if ax < POLY_MAX {
         let z = ax * ax;
         let lo = ax * z * estrin7::<F>(z, SINH_C);
-        return ax + lo;
+        return (ax, lo, 0);
     }
     let (k, j, rh) = red_exp::<F>(ax);
     let ((hi, lo), (ihi, ilo)) = core_both::<F>(j, rh, 0.0);
     if k > 30 {
-        return ldexp(hi + lo, k - 1);
+        return (hi, lo, k - 1);
     }
     let (pk, qk) = (pow2(k), pow2(-k));
     let (ehi, elo, jhi, jlo) = (hi * pk, lo * pk, ihi * qk, ilo * qk);
     let (s, e) = fast_two_sum(ehi, -jhi);
-    0.5 * (s + ((e + elo) - jlo))
+    (s, (e + elo) - jlo, -1)
 }
 
 #[inline(always)]
 pub fn cosh_pos<const F: bool>(ax: f64) -> f64 {
+    if !super::dd::is_nearest() {
+        return cosh_pos_directed(ax);
+    }
+    let (h, l, k) = cosh_parts::<F>(ax);
+    cosh_finish(h, l, k)
+}
+
+#[inline(always)]
+fn cosh_finish(h: f64, l: f64, k: i32) -> f64 {
+    match k {
+        0 => h + l,
+        -1 => 0.5 * (h + l),
+        _ => ldexp(h + l, k),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cosh_pos_directed(ax: f64) -> f64 {
+    let (h, l, k) = {
+        let _g = super::dd::NearestGuard::new();
+        cosh_parts::<false>(super::dd::launder(ax))
+    };
+    cosh_finish(super::dd::launder(h), super::dd::launder(l), k)
+}
+
+#[inline(always)]
+fn cosh_parts<const F: bool>(ax: f64) -> (f64, f64, i32) {
     if ax < POLY_MAX {
         let z = ax * ax;
         let lo = z * estrin7::<F>(z, COSH_C);
-        return 1.0 + lo;
+        return (1.0, lo, 0);
     }
     if ax < COSH_PLAIN_MAX {
         let (k, j, rh) = red_exp::<F>(ax);
@@ -242,7 +287,7 @@ pub fn cosh_pos<const F: bool>(ax: f64) -> f64 {
             let t = th * pk;
             let sk = fma::<F>(th, p, tl) * pk;
             let u = fma::<F>(ih, m, ih) * qk;
-            return 0.5 * (t + (sk + u));
+            return (t, sk + u, -1);
         }
         let d = rh * (1.0 / 120.0);
         let a = fma::<F>(z, 1.0 / 24.0 + d, 0.5);
@@ -252,24 +297,40 @@ pub fn cosh_pos<const F: bool>(ax: f64) -> f64 {
         let sk = fma::<F>(th, p, tl) * pk;
         let ul = fma::<F>(ih, m, il) * qk;
         let (s, e) = fast_two_sum(th * pk, ih * qk);
-        return 0.5 * (s + (e + (sk + ul)));
+        return (s, e + (sk + ul), -1);
     }
     let (k, j, rh) = red_exp::<F>(ax);
     let (hi, lo) = core_fwd::<F>(j, rh, 0.0);
-    ldexp(hi + lo, k - 1)
+    (hi, lo, k - 1)
 }
 
 #[inline(always)]
 pub fn tanh_pos<const F: bool>(ax: f64) -> f64 {
+    let (h, l) = tanh_parts::<F>(ax);
+    h + l
+}
+
+#[cold]
+#[inline(never)]
+pub fn tanh_directed(x: f64) -> f64 {
+    let (h, l) = {
+        let _g = super::dd::NearestGuard::new();
+        tanh_parts::<false>(super::dd::launder(x.abs()))
+    };
+    let (h, l) = (super::dd::launder(h), super::dd::launder(l));
+    if x < 0.0 { -h + -l } else { h + l }
+}
+
+#[inline(always)]
+fn tanh_parts<const F: bool>(ax: f64) -> (f64, f64) {
     if ax < TANH_POLY_MAX {
         let z = ax * ax;
         let c = &TANH_C;
         let p = estrin7::<F>(z, [c[0], c[1], c[2], c[3], c[4], c[5], c[6]]);
-        return ax + ax * z * p;
+        return (ax, ax * z * p);
     }
     if ax < 1.0 {
-        let (h, l) = super::lg::odd_rows::<F, 129, 128>(ax, &TANH_ROWS);
-        return h + l;
+        return super::lg::odd_rows::<F, 129, 128>(ax, &TANH_ROWS);
     }
     let (k, j, rh) = red_exp::<F>(2.0 * ax);
     let (ihi, ilo) = core_neg::<F>(j, rh, 0.0);
@@ -279,8 +340,7 @@ pub fn tanh_pos<const F: bool>(ax: f64) -> f64 {
     let (dh, de) = two_sum(1.0, ehi);
     let n = (nh, ne - elo);
     let d = (dh, de + elo);
-    let (qh, ql) = quotient::<F>(n, d);
-    qh + ql
+    quotient::<F>(n, d)
 }
 
 #[inline(always)]

@@ -991,14 +991,11 @@ unsafe fn realloc_nl(s: &mut State, p: *mut u8, n: usize) -> *mut u8 {
         if next == s.top {
             let ts = csize(next);
             if ts + old >= size + MINSIZE {
-                let nt = c.add(size);
-                wr(c, 8, size | (head & PREV_INUSE) | s.abit);
-                wr(nt, 8, (ts + old - size) | PREV_INUSE | s.abit);
-                s.top = nt;
-                let end = c as usize + size;
-                if end > s.high_water {
-                    s.high_water = end;
-                }
+                grow_into_top(s, c, old, size, head);
+                return p;
+            }
+            if size < P.mmap_threshold.load(Relaxed) && grow_top_for(s, c, old, size) {
+                grow_into_top(s, c, old, size, head);
                 return p;
             }
         } else {
@@ -1027,6 +1024,27 @@ unsafe fn realloc_nl(s: &mut State, p: *mut u8, n: usize) -> *mut u8 {
     }
 }
 
+#[inline(always)]
+unsafe fn grow_into_top(s: &mut State, c: *mut u8, old: usize, size: usize, head: usize) {
+    unsafe {
+        let ts = csize(s.top);
+        let nt = c.add(size);
+        wr(c, 8, size | (head & PREV_INUSE) | s.abit);
+        wr(nt, 8, (ts + old - size) | PREV_INUSE | s.abit);
+        s.top = nt;
+        let end = c as usize + size;
+        if end > s.high_water {
+            s.high_water = end;
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn grow_top_for(s: &mut State, c: *mut u8, old: usize, size: usize) -> bool {
+    unsafe { s.grow(size - old) && c.add(old) == s.top && csize(s.top) + old >= size + MINSIZE }
+}
+
 unsafe fn move_block(s: &mut State, p: *mut u8, old_usable: usize, n: usize) -> *mut u8 {
     unsafe {
         let q = malloc_nl(s, n);
@@ -1036,6 +1054,43 @@ unsafe fn move_block(s: &mut State, p: *mut u8, old_usable: usize, n: usize) -> 
         rusty_libc_mem::memcpy(q.cast(), p.cast(), old_usable.min(n));
         free_nl(s, p);
         q
+    }
+}
+
+#[inline(always)]
+unsafe fn small_aligned_take(s: &mut State, align: usize, n: usize) -> *mut u8 {
+    unsafe {
+        if align <= 16 || align > (usize::MAX >> 2) {
+            return null_mut();
+        }
+        let Some(size) = request2size(n) else {
+            return null_mut();
+        };
+        if size > SMALL_MAX || !small_enabled() || !s.init {
+            return null_mut();
+        }
+        let i = size >> 4;
+        let mut prev: *mut u8 = null_mut();
+        let mut c = s.small[i];
+        for _ in 0..16 {
+            if c.is_null() {
+                break;
+            }
+            if (chunk2mem(c) as usize) & (align - 1) == 0 {
+                let next = sl_get(c);
+                if prev.is_null() {
+                    s.small[i] = next;
+                } else {
+                    sl_set(prev, next);
+                }
+                wr(c, 24, 0);
+                s.small_bytes = s.small_bytes.wrapping_sub(size);
+                return perturb_alloc(perturb(), chunk2mem(c), size);
+            }
+            prev = c;
+            c = sl_get(c);
+        }
+        null_mut()
     }
 }
 
@@ -1052,30 +1107,9 @@ unsafe fn memalign_nl(s: &mut State, align: usize, n: usize) -> *mut u8 {
             set_enomem();
             return null_mut();
         };
-        {
-            if size <= SMALL_MAX && small_enabled() && s.init {
-                let i = size >> 4;
-                let mut prev: *mut u8 = null_mut();
-                let mut c = s.small[i];
-                for _ in 0..16 {
-                    if c.is_null() {
-                        break;
-                    }
-                    if (chunk2mem(c) as usize) & (align - 1) == 0 {
-                        let next = sl_get(c);
-                        if prev.is_null() {
-                            s.small[i] = next;
-                        } else {
-                            sl_set(prev, next);
-                        }
-                        wr(c, 24, 0);
-                        s.small_bytes = s.small_bytes.wrapping_sub(size);
-                        return perturb_alloc(perturb(), chunk2mem(c), size);
-                    }
-                    prev = c;
-                    c = sl_get(c);
-                }
-            }
+        let p = small_aligned_take(s, align, n);
+        if !p.is_null() {
+            return p;
         }
         let Some(req) = n.checked_add(align + MINSIZE) else {
             set_enomem();
@@ -1858,11 +1892,28 @@ unsafe fn realloc_mt(p: *mut u8, n: usize) -> *mut u8 {
     }
 }
 
+#[inline(always)]
 pub unsafe fn memalign(align: usize, n: usize) -> *mut u8 {
     unsafe {
         if !rusty_libc_core::lock::multithreaded() {
-            return memalign_nl(st(), align, n);
+            let p = small_aligned_take(st(), align, n);
+            if !p.is_null() {
+                return p;
+            }
+            return memalign_st(align, n);
         }
+        memalign_mt(align, n)
+    }
+}
+
+#[inline(never)]
+unsafe fn memalign_st(align: usize, n: usize) -> *mut u8 {
+    unsafe { memalign_nl(st(), align, n) }
+}
+
+#[inline(never)]
+unsafe fn memalign_mt(align: usize, n: usize) -> *mut u8 {
+    unsafe {
         if align > 16
             && let Some(size) = request2size(n)
             && size <= SMALL_MAX

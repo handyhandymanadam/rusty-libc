@@ -56,18 +56,20 @@ fn with_sign(v: f64, s: u64) -> f32 {
     f64::from_bits(v.to_bits() | s) as f32
 }
 
+const SMALL_DIRECTED: f64 = 1.0 / 4096.0;
+
 #[inline(always)]
 pub fn sinhf<const F: bool>(x: f32) -> f32 {
     let xd = f64::from(x);
     let s = xd.to_bits() & SIGN;
     let ax = f64::from_bits(xd.to_bits() & !SIGN);
-    let r = if ax < 0.5 {
+    if ax < 0.5 {
         let z = ax * ax;
-        ax + ax * z * est6::<F>(z, [1.0 / 6.0, 1.0 / 120.0, 1.0 / 5040.0, 1.0 / 362880.0, 1.0 / 39916800.0, 1.0 / 6227020800.0])
-    } else {
-        let e = exp_impl::<F>(ax);
-        0.5 * (e - 1.0 / e)
-    };
+        return (xd + xd * z * est6::<F>(z, [1.0 / 6.0, 1.0 / 120.0, 1.0 / 5040.0, 1.0 / 362880.0, 1.0 / 39916800.0, 1.0 / 6227020800.0]))
+            as f32;
+    }
+    let e = exp_impl::<F>(ax);
+    let r = 0.5 * (e - 1.0 / e);
     with_sign(r, s)
 }
 
@@ -89,13 +91,12 @@ pub fn tanhf<const F: bool>(x: f32) -> f32 {
     let xd = f64::from(x);
     let s = xd.to_bits() & SIGN;
     let ax = f64::from_bits(xd.to_bits() & !SIGN);
-    let r = if ax < 0.25 {
+    if ax < 0.25 {
         let z = ax * ax;
         let c = &TANH_C;
-        ax + ax * z * est7::<F>(z, [c[0], c[1], c[2], c[3], c[4], c[5], c[6]])
-    } else {
-        1.0 - 2.0 / (exp_impl::<F>(2.0 * ax) + 1.0)
-    };
+        return (xd + xd * z * est7::<F>(z, [c[0], c[1], c[2], c[3], c[4], c[5], c[6]])) as f32;
+    }
+    let r = 1.0 - 2.0 / (exp_impl::<F>(2.0 * ax) + 1.0);
     with_sign(r, s)
 }
 
@@ -104,6 +105,10 @@ pub fn asinhf<const F: bool>(x: f32) -> f32 {
     let xd = f64::from(x);
     let s = xd.to_bits() & SIGN;
     let ax = f64::from_bits(xd.to_bits() & !SIGN);
+    if ax < SMALL_DIRECTED && !super::dd::is_nearest() {
+        let u = ax * ax;
+        return (xd + xd * u * (-1.0 / 6.0 + 3.0 / 40.0 * u)) as f32;
+    }
     let r = if ax < 0.5 {
         let u = ax * ax;
         let kd = u * 128.0 + SHIFT;
@@ -142,6 +147,10 @@ pub fn atanhf<const F: bool>(x: f32) -> f32 {
     let xd = f64::from(x);
     let s = xd.to_bits() & SIGN;
     let ax = f64::from_bits(xd.to_bits() & !SIGN);
+    if ax < SMALL_DIRECTED && !super::dd::is_nearest() {
+        let u = ax * ax;
+        return (xd + xd * u * (1.0 / 3.0 + 1.0 / 5.0 * u)) as f32;
+    }
     let r = if ax < 0.5 {
         let u = ax * ax;
         let kd = u * 128.0 + SHIFT;

@@ -301,7 +301,7 @@ pub(crate) fn powf_impl(x: f32, y: f32) -> f32 {
 #[inline(always)]
 pub(crate) fn to_f32_checked(y: f64, x: f32) -> f32 {
     let r = y as f32;
-    if r.is_infinite() && x.is_finite() {
+    if (r.is_infinite() || y >= 3.4028235677973366e38) && x.is_finite() {
         set_errno(ERANGE);
     }
     r
@@ -337,6 +337,13 @@ pub(crate) fn exp10f_impl<const F: bool>(x: f32) -> f32 {
 pub(crate) fn expm1f_impl<const F: bool>(x: f32) -> f32 {
     force_underflowf(x);
     let ab = asu32(x) & 0x7fff_ffff;
+    if crate::trig::dd::directed_if(ab.wrapping_sub(1) < 0x3200_0000 - 1) {
+        let rc = crate::trig::dd::rounding_control();
+        let up = rc == 2 || (rc == 3 && x < 0.0);
+        let r = if up { f32::from_bits(if x > 0.0 { ab + 1 } else { (ab - 1) | 0x8000_0000 }) } else { x };
+        force_underflowf(r);
+        return r;
+    }
     if (0x3200_0000..0x42b0_0000).contains(&ab) {
         let xd = x as f64;
         if xd.abs() < 0.0625 {

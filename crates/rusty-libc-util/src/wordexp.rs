@@ -724,62 +724,29 @@ unsafe fn spawn_sh(comm: *const u8, fildes: [i32; 2], showerr: bool, noexec: boo
         let flag = if noexec { c"-nc".as_ptr() } else { c"-c".as_ptr() };
         let args: [*const c_char; 4] = [sh, flag, comm.cast(), core::ptr::null()];
 
-        let (er, ew) = match unistd::pipe2(O_CLOEXEC) {
-            Ok(p) => p,
-            Err(_) => {
-                xfree(newenv.cast());
-                return -1;
+        use rusty_libc_core::spawn::{A_CLOSE, A_DUP2, A_OPEN, PosixSpawnFileActions, SpawnAction, spawnix};
+        let act = |tag, fd, arg, path| SpawnAction { tag, fd, arg, mode: 0, path };
+        let mut acts = [act(0, 0, 0, null_mut()); 3];
+        let mut n = 0usize;
+        if fildes[1] != -1 {
+            if fildes[1] != 1 {
+                acts[n] = act(A_DUP2, fildes[1], 1, null_mut());
+                acts[n + 1] = act(A_CLOSE, fildes[1], 0, null_mut());
+                n += 2;
+            } else {
+                acts[n] = act(A_DUP2, fildes[1], fildes[1], null_mut());
+                n += 1;
             }
-        };
-        let pid = match unistd::fork() {
-            Ok(p) => p,
-            Err(_) => {
-                close_fd(er);
-                close_fd(ew);
-                xfree(newenv.cast());
-                return -1;
-            }
-        };
-        if pid == 0 {
-            let mut failed = 0i32;
-            if fildes[1] != -1 {
-                if fildes[1] != 1 {
-                    if let Err(e) = unistd::dup3(fildes[1], 1, 0) {
-                        failed = e.0;
-                    } else {
-                        let _ = unistd::close(fildes[1]);
-                    }
-                } else {
-                    let _ = syscall::syscall3(syscall::SYS_FCNTL, 1, 2 , 0);
-                }
-            }
-            if failed == 0 && !showerr {
-                match unistd::open(c"/dev/null".as_ptr(), O_WRONLY, 0) {
-                    Ok(fd) => {
-                        if fd != 2 {
-                            if let Err(e) = unistd::dup3(fd, 2, 0) {
-                                failed = e.0;
-                            }
-                            let _ = unistd::close(fd);
-                        }
-                    }
-                    Err(e) => failed = e.0,
-                }
-            }
-            if failed == 0 {
-                failed = unistd::execve(sh, args.as_ptr(), envp).0;
-            }
-            let _ = unistd::write(ew, &failed.to_ne_bytes());
-            rusty_libc_core::process::exit_now(127);
         }
-        close_fd(ew);
+        if !showerr {
+            acts[n] = act(A_OPEN, 2, O_WRONLY, c"/dev/null".as_ptr() as *mut c_char);
+            n += 1;
+        }
+        let fa = PosixSpawnFileActions { allocated: n as c_int, used: n as c_int, actions: acts.as_mut_ptr(), pad: [0; 16] };
+        let mut pid: c_int = -1;
+        let err = spawnix(&mut pid, sh, &fa, core::ptr::null(), args.as_ptr(), envp, false, false);
         xfree(newenv.cast());
-        let mut code = [0u8; 4];
-        let n = read_retry(er, &mut code);
-        close_fd(er);
-        if n > 0 {
-            let mut st = 0;
-            waitpid_retry(pid, 0, &mut st);
+        if err != 0 {
             return -1;
         }
         pid

@@ -3,6 +3,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod tables;
+mod wvec;
 pub mod wstring;
 pub mod mbyte;
 pub mod wctype;

@@ -73,6 +73,38 @@ pub const AFTER_INCLUDES_CHOMP: bool = false;
 
 pub static TRAILER: &[Item] = &[
     Item::Gate(&[
+        Branch { head: "if defined __OPTIMIZE__ && !defined __OPTIMIZE_SIZE__ && !defined __NO_INLINE__ && defined __extern_inline", items: &[
+            Item::Raw(Reason::StaticInline, r#"# ifndef _RLIBC_BSEARCH_INLINE
+# define _RLIBC_BSEARCH_INLINE 1
+__extern_inline void *
+bsearch (const void *__key, const void *__base, size_t __nmemb, size_t __size,
+	 __compar_fn_t __compar)
+{
+  const void *__p;
+  int __comparison;
+
+  while (__nmemb)
+    {
+      __p = (const void *) (((const char *) __base) + ((__nmemb >> 1) * __size));
+      __comparison = (*__compar) (__key, __p);
+      if (__comparison == 0)
+	{
+	  return (void *) __p;
+	}
+      if (__comparison > 0)
+	{
+	  __base = ((const char *) __p) + __size;
+	  --__nmemb;
+	}
+      __nmemb >>= 1;
+    }
+
+  return NULL;
+}
+# endif"#),
+        ] },
+    ], ""),
+    Item::Gate(&[
         Branch { head: "if __GLIBC_USE (ISOC23) && defined __glibc_const_generic && !defined _LIBC", items: &[
             Item::Raw(Reason::GlibcMacro, "# define bsearch(KEY, BASE, NMEMB, SIZE, COMPAR) __glibc_const_generic (BASE, const void *, bsearch (KEY, BASE, NMEMB, SIZE, COMPAR))"),
         ] },

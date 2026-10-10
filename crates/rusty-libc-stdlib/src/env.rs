@@ -216,8 +216,10 @@ pub unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn secure_getenv(name: *const c_char) -> *mut c_char {
     unsafe {
-        let secure = syscall::syscall0(syscall::SYS_GETUID) != syscall::syscall0(syscall::SYS_GETEUID)
-            || syscall::syscall0(SYS_GETGID) != syscall::syscall0(SYS_GETEGID);
+        let secure = rusty_libc_core::lock::at_secure().unwrap_or_else(|| {
+            syscall::syscall0(syscall::SYS_GETUID) != syscall::syscall0(syscall::SYS_GETEUID)
+                || syscall::syscall0(SYS_GETGID) != syscall::syscall0(SYS_GETEGID)
+        });
         if secure { null_mut() } else { getenv(name) }
     }
 }

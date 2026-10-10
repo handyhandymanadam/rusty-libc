@@ -43,6 +43,15 @@ pub fn current() -> *mut Tcb {
     p
 }
 
+#[inline(always)]
+pub fn current_tid() -> i32 {
+    let v: i32;
+    unsafe {
+        core::arch::asm!("mov {0:e}, fs:[{off}]", out(reg) v, off = const core::mem::offset_of!(Tcb, tid), options(nostack, readonly, preserves_flags))
+    };
+    v
+}
+
 #[repr(C)]
 struct Phdr {
     kind: u32,

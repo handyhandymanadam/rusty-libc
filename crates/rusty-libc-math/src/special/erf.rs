@@ -59,6 +59,22 @@ fn finish(r: Option<f64>, slow: impl FnOnce() -> f64) -> f64 {
 
 #[inline(always)]
 pub(super) fn erf_impl<const F: bool>(x: f64) -> f64 {
+    let ab = x.to_bits() & !(1u64 << 63);
+    if crate::trig::dd::directed_if(ab.wrapping_sub(1) < 0x3fb0_0000_0000_0000 - 1) {
+        return erf_directed::<F>(x);
+    }
+    erf_body::<F>(x, 0)
+}
+
+#[inline(always)]
+fn erf_directed<const F: bool>(x: f64) -> f64 {
+    let rc = crate::trig::dd::rounding_control();
+    let _g = crate::trig::dd::NearestGuard::new();
+    erf_body::<F>(x, rc)
+}
+
+#[inline(always)]
+fn erf_body<const F: bool>(x: f64, rc: u32) -> f64 {
     let ax = x.abs();
     let bits = ax.to_bits();
     if bits >= SIX {
@@ -71,6 +87,10 @@ pub(super) fn erf_impl<const F: bool>(x: f64) -> f64 {
     if bits < 0x1ff0_0000_0000_0000 {
         let xs = ax * f64::from_bits(0x5c70_0000_0000_0000);
         let p = mul_d::<F>(d(TWO_OVER_SQRT_PI_DD), xs);
+        if rc != 0 {
+            let (h, l) = if x < 0.0 { (-p.0, -p.1) } else { (p.0, p.1) };
+            return scale_round_dir(h, l, -456, rc, p.0 * 7.888609052210118e-31 * 1024.0).0;
+        }
         return scale_round(p.0, p.1, -456).copysign(x);
     }
     let r = {

@@ -53,8 +53,8 @@ pub fn sincosl_impl(x: F80) -> (F80, F80) {
     }
     let e = Ext::from_f80(x);
     let (s, c) = sincos_ext(e);
-    let sr = if s.is_zero_() { x } else { finish(&s, Exact::IfClose) };
-    let cr = finish(&c, Exact::IfClose);
+    let sr = if s.is_zero_() { x } else { finish(&s, Exact::Less) };
+    let cr = finish(&c, if x.is_zero_() { Exact::Yes } else { Exact::Less });
     (sr, cr)
 }
 

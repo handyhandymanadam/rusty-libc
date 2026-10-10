@@ -3,7 +3,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod mem;
-mod simd;
+pub mod simd;
 mod search;
 mod str;
 

@@ -10,6 +10,7 @@ rusty-libc-mem = { path = "../rusty-libc-mem" }
 rusty-libc-malloc = { path = "../rusty-libc-malloc" }
 rusty-libc-util = { path = "../rusty-libc-util" }
 rusty-libc-ipc = { path = "../rusty-libc-ipc" }
+rusty-libc-wchar = { path = "../rusty-libc-wchar" }
 
 [features]
 export = ["start"]

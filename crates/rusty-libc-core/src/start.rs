@@ -162,17 +162,30 @@ extern "C" fn entry(sp: *const usize) -> ! {
                 SYSINFO_EHDR.store(*aux.add(1), Ordering::Relaxed);
             } else if *aux == 23 {
                 secure = *aux.add(1) != 0;
+                crate::lock::set_at_secure(secure);
             }
             aux = aux.add(2);
         }
         crate::tunables::init_static(envp as *mut *mut u8, secure, &mut |b| {
             let _ = crate::unistd::write(2, b);
-        });
+        }, &mut apply_hwcaps);
         apply_irel();
         run_hooks(argc, argv, envp);
         crate::process::atexit(call_fini);
         call_init(argc, argv, envp);
         crate::process::exit(main(argc, argv, envp))
+    }
+}
+
+pub(crate) fn apply_hwcaps(list: &[u8]) {
+    let mut off = false;
+    crate::tunables::hwcaps_items(list, |name, disable| {
+        if disable && rusty_libc_mem::simd::AVX2_NEEDS.contains(&name) {
+            off = true;
+        }
+    });
+    if off {
+        rusty_libc_mem::simd::disable_avx2();
     }
 }
 

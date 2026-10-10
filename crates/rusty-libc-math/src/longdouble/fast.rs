@@ -1,6 +1,6 @@
 use super::common::*;
 use super::fast_tables::*;
-use crate::trig::dd::{D, fast_two_sum, fma, fma_ready, has_fma, mul as dd_mul, two_prod, two_sum};
+use crate::trig::dd::{D, fast_two_sum, fma, fma_ready, has_fma, is_nearest, mul as dd_mul, two_prod, two_sum};
 use core::arch::asm;
 
 const F: bool = true;
@@ -12,12 +12,11 @@ pub fn ready() -> bool {
     if !fma_ready() && !has_fma() {
         return false;
     }
-    let mut csr = 0u32;
     let mut cw = 0u16;
     unsafe {
-        asm!("stmxcsr [{q}]", "fnstcw [{p}]", p = in(reg) &mut cw, q = in(reg) &mut csr, options(nostack));
+        asm!("fnstcw [{p}]", p = in(reg) &mut cw, options(nostack));
     }
-    (csr & 0x6000) | (cw as u32 & 0xC00) == 0
+    is_nearest() && cw & 0xC00 == 0
 }
 
 #[inline(always)]
@@ -64,6 +63,13 @@ pub(super) fn cvr(x: f64) -> i64 {
 }
 
 #[inline(always)]
+pub(super) fn rnd_int(x: f64) -> (f64, i64) {
+    const MAGIC: f64 = 6755399441055744.0;
+    let s = x + MAGIC;
+    (s - MAGIC, s.to_bits() as i64 - MAGIC.to_bits() as i64)
+}
+
+#[inline(always)]
 pub(super) fn cvt(x: f64) -> i64 {
     let r: i64;
     unsafe {
@@ -103,8 +109,7 @@ pub fn to_f80(hi: f64, lo: f64, k: i32, tau: f64) -> Option<F80> {
     let e = (ab >> 52) as i32 - 1023;
     let n_m = ((ab & MASK52) | (1 << 52)) << 11;
     let l = f64::from_bits(lo.to_bits() ^ sign) * pow2(63 - e);
-    let ni = cvr(l);
-    let n = ni as f64;
+    let (n, ni) = rnd_int(l);
     let r = n_m as i128 + ni as i128;
     let (m, e) = if r < 1 << 63 || (n_m == 1 << 63 && l < 0.0) {
         let l2 = 2.0 * l;
@@ -513,6 +518,9 @@ pub(super) fn abs_dd(h: f64, l: f64) -> (D, bool) {
 #[inline(always)]
 fn atanl_body(x: F80) -> Option<F80> {
     let (xh, xl, e) = split(x)?;
+    if (-37..=37).contains(&e) {
+        return super::fast_special::atanl(x);
+    }
     if e.abs() > 150 || !ready() {
         return None;
     }
@@ -601,6 +609,9 @@ pub fn asinl(x: F80) -> Option<F80> {
 #[inline(always)]
 fn acosl_body(x: F80) -> Option<F80> {
     let (xh, xl, e) = split(x)?;
+    if e >= -37 {
+        return super::fast_special::acosl(x);
+    }
     if xh.abs() >= 1.0 || e < -150 || !ready() {
         return None;
     }

@@ -209,6 +209,21 @@ fn high_word(x: f64) -> u32 {
 
 #[inline(always)]
 pub(crate) fn expm1_impl<const F: bool>(x: f64) -> f64 {
+    let ab = x.to_bits() & !(1u64 << 63);
+    if crate::trig::dd::directed_if((0x3fb0_0000_0000_0000..0x3fe0_0000_0000_0000).contains(&ab)) {
+        return expm1_directed::<F>(x);
+    }
+    expm1_body::<F>(x)
+}
+
+#[inline(always)]
+fn expm1_directed<const F: bool>(x: f64) -> f64 {
+    let _g = crate::trig::dd::NearestGuard::new();
+    expm1_body::<F>(x)
+}
+
+#[inline(always)]
+fn expm1_body<const F: bool>(x: f64) -> f64 {
     let hx0 = high_word(x);
     let xsb = hx0 & 0x8000_0000;
     let hx = hx0 & 0x7fff_ffff;

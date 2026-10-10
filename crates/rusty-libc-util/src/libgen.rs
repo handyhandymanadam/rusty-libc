@@ -81,8 +81,25 @@ pub unsafe extern "C" fn dirname(path: *mut c_char) -> *mut c_char {
             return DOT.as_ptr() as *mut c_char;
         }
         let n = rusty_libc_mem::strlen(path.cast());
-        let s = core::slice::from_raw_parts(path as *const u8, n);
-        match dirname_len(s) {
+        let p = path as *const u8;
+        let mut i = n;
+        while i > 0 && *p.add(i - 1) != b'/' {
+            i -= 1;
+        }
+        if i == 0 {
+            return DOT.as_ptr() as *mut c_char;
+        }
+        let l = i - 1;
+        if l != 0 && i != n {
+            let mut r = l;
+            while r != 0 && *p.add(r - 1) == b'/' {
+                r -= 1;
+            }
+            let k = if r == 0 { if l == 1 { 2 } else { 1 } } else { r };
+            *path.add(k) = 0;
+            return path;
+        }
+        match dirname_len(core::slice::from_raw_parts(p, n)) {
             None => DOT.as_ptr() as *mut c_char,
             Some(k) => {
                 *path.add(k) = 0;

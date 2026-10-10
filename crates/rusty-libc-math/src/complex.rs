@@ -5,7 +5,7 @@ mod explog;
 mod inverse;
 mod trighyp;
 
-use cfp::W;
+use cfp::{CF, W};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -23,16 +23,55 @@ impl<T> Complex<T> {
     }
 }
 
+#[inline(always)]
+fn in_nearest<F: CF>(f: impl Fn() -> (W<F>, W<F>)) -> (W<F>, W<F>) {
+    if mxcsr() & RC == 0 {
+        return f();
+    }
+    in_nearest_directed(f)
+}
+
+const RC: u32 = 0x6000;
+const OE_UE: u32 = 0x18;
+
+#[inline(always)]
+fn mxcsr() -> u32 {
+    let mut v: u32 = 0;
+    unsafe { core::arch::asm!("stmxcsr [{p}]", p = in(reg) &mut v as *mut u32, options(nostack, preserves_flags)) };
+    v
+}
+
+#[inline(always)]
+fn set_mxcsr(v: u32) {
+    unsafe { core::arch::asm!("ldmxcsr [{p}]", p = in(reg) &v as *const u32, options(nostack, readonly)) };
+}
+
+#[cold]
+#[inline(never)]
+fn in_nearest_directed<F: CF>(f: impl Fn() -> (W<F>, W<F>)) -> (W<F>, W<F>) {
+    let c0 = mxcsr();
+    set_mxcsr(c0 & !(RC | OE_UE));
+    let (re, im) = f();
+    let c1 = mxcsr();
+    set_mxcsr((c1 & !RC) | (c0 & (RC | OE_UE)));
+    let edge = |v: W<F>| v.is_inf() || v == 0.0;
+    if c1 & OE_UE != 0 && (edge(re) || edge(im)) {
+        let (dre, dim) = f();
+        return (if edge(re) { dre } else { re }, if edge(im) { dim } else { im });
+    }
+    (re, im)
+}
+
 macro_rules! cfunc {
     ($name:ident, $namef:ident, $m:ident :: $f:ident; $($da:ident),*; $($fa:ident),*) => {
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub extern "C" fn $name(z: Cdouble) -> Cdouble {
-            let (r, i) = $m::$f::<f64>(W(z.re), W(z.im));
+            let (r, i) = in_nearest(|| $m::$f::<f64>(W(z.re), W(z.im)));
             Cdouble { re: r.0, im: i.0 }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub extern "C" fn $namef(z: Cfloat) -> Cfloat {
-            let (r, i) = $m::$f::<f32>(W(z.re), W(z.im));
+            let (r, i) = in_nearest(|| $m::$f::<f32>(W(z.re), W(z.im)));
             Cfloat { re: r.0, im: i.0 }
         }
         $(
@@ -81,13 +120,13 @@ mod conj_core {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn cpow(x: Cdouble, c: Cdouble) -> Cdouble {
-    let (r, i) = explog::cpow::<f64>(W(x.re), W(x.im), W(c.re), W(c.im));
+    let (r, i) = in_nearest(|| explog::cpow::<f64>(W(x.re), W(x.im), W(c.re), W(c.im)));
     Cdouble { re: r.0, im: i.0 }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn cpowf(x: Cfloat, c: Cfloat) -> Cfloat {
-    let (r, i) = explog::cpow::<f32>(W(x.re), W(x.im), W(c.re), W(c.im));
+    let (r, i) = in_nearest(|| explog::cpow::<f32>(W(x.re), W(x.im), W(c.re), W(c.im)));
     Cfloat { re: r.0, im: i.0 }
 }
 
@@ -106,7 +145,10 @@ cpow_alias!(Cfloat, cpowf; cpowf32);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn cabs(z: Cdouble) -> f64 {
-    crate::rounding::hypot(z.re, z.im)
+    if mxcsr() & RC == 0 {
+        return crate::rounding::hypot(z.re, z.im);
+    }
+    in_nearest_directed::<f64>(|| (W(crate::rounding::hypot(z.re, z.im)), W(0.0))).0 .0
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn cabsf(z: Cfloat) -> f32 {

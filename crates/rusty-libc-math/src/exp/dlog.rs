@@ -46,7 +46,7 @@ fn log_main<const F: bool>(ix: u64) -> (f64, f64) {
     let invc = LOG_TAB[2 * i];
     let logc = LOG_TAB[2 * i + 1];
     let z = asf64(iz);
-    let r = if F { fma::<F>(z, invc, -1.0) } else { (z - LOG_TAB2[2 * i] - LOG_TAB2[2 * i + 1]) * invc };
+    let r = fma::<F>(z, invc, -1.0);
     let kd = k as f64;
     let w = fma::<F>(kd, LN2HI, logc);
     let hi = w + r;
@@ -187,14 +187,8 @@ fn log2_gen<const F: bool, const I: bool>(x: f64) -> f64 {
             return 0.0;
         }
         let r = x - 1.0;
-        let (hi, mut lo) = if F {
-            let hi = r * INVLN2HI;
-            (hi, fma(r, INVLN2LO, fma(r, INVLN2HI, -hi)))
-        } else {
-            let rhi = asf64(asu64(r) & (!0u64 << 32));
-            let rlo = r - rhi;
-            (rhi * INVLN2HI, rlo * INVLN2HI + r * INVLN2LO)
-        };
+        let hi = r * INVLN2HI;
+        let mut lo = fma(r, INVLN2LO, fma(r, INVLN2HI, -hi));
         let b = &LOG2_POLY1;
         let r2 = r * r;
         let r4 = r2 * r2;
@@ -220,16 +214,10 @@ fn log2_gen<const F: bool, const I: bool>(x: f64) -> f64 {
     let z = asf64(iz);
     let kd = k as f64;
     let (r, t1, t2);
-    if F {
+    {
         r = fma(z, invc, -1.0);
         t1 = r * INVLN2HI;
         t2 = fma(r, INVLN2LO, fma(r, INVLN2HI, -t1));
-    } else {
-        r = (z - LOG2_TAB2[2 * i] - LOG2_TAB2[2 * i + 1]) * invc;
-        let rhi = asf64(asu64(r) & (!0u64 << 32));
-        let rlo = r - rhi;
-        t1 = rhi * INVLN2HI;
-        t2 = rlo * INVLN2HI + r * INVLN2LO;
     }
     let t3 = kd + logc;
     let hi = t3 + t1;
@@ -288,11 +276,38 @@ pub(crate) fn log1p_impl<const F: bool>(x: f64) -> f64 {
         if x != 0.0 {
             force_underflow(x);
             core::hint::black_box(pow2(54) + x);
+            if !crate::trig::dd::is_nearest() {
+                return log1p_tiny_directed(x);
+            }
         }
         return x;
     }
+    if !crate::trig::dd::is_nearest() {
+        return log1p_directed(x);
+    }
     let (hi, l) = log1p_parts::<F>(x);
     l + hi
+}
+
+#[cold]
+#[inline(never)]
+fn log1p_tiny_directed(x: f64) -> f64 {
+    let below = f64::from_bits(if x > 0.0 { x.to_bits() - 1 } else { x.to_bits() + 1 });
+    match crate::trig::dd::rounding_control() {
+        1 => below,
+        3 if x > 0.0 => below,
+        _ => x,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn log1p_directed(x: f64) -> f64 {
+    let (hi, l) = {
+        let _g = crate::trig::dd::NearestGuard::new();
+        log1p_parts::<false>(crate::trig::dd::launder(x))
+    };
+    crate::trig::dd::launder(l) + crate::trig::dd::launder(hi)
 }
 
 #[inline(always)]

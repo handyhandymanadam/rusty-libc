@@ -20,6 +20,7 @@ pub use gettext::{bind_textdomain_codeset, bindtextdomain, dcgettext, dcngettext
 
 use core::ffi::{c_char, c_int};
 use core::ptr::null_mut;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use find::{CAT_NAMES, NameBuf, cstr_bytes};
 use rusty_libc_core::errno;
 use rusty_libc_core::lock::RawMutex;
@@ -257,10 +258,14 @@ pub unsafe extern "C" fn setlocale(category: c_int, locale: *const c_char) -> *m
         errno::set(errno::EINVAL);
         return null_mut();
     }
-    let cat = category as usize;
     if locale.is_null() {
-        return unsafe { (*core::ptr::addr_of!(G_NAMES))[cat] as *mut c_char };
+        return unsafe { (*core::ptr::addr_of!(G_NAMES))[category as usize] as *mut c_char };
     }
+    unsafe { setlocale_set(category as usize, locale) }
+}
+
+#[inline(never)]
+unsafe fn setlocale_set(cat: usize, locale: *const c_char) -> *mut c_char {
     let g = LOCK.guard();
     let _ = &g;
     let arg = cstr_bytes(locale.cast());
@@ -382,12 +387,20 @@ const C_LCONV_INIT: Lconv = Lconv {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn localeconv() -> *const Lconv {
+    let n = cur_data(LC_NUMERIC as usize, 0);
+    let m = cur_data(LC_MONETARY as usize, 0);
     unsafe {
         let r = &mut *core::ptr::addr_of_mut!(LCONV);
-        fill_lconv(r, 0);
+        if LCONV_KEY[0].load(Ordering::Acquire) != n as usize || LCONV_KEY[1].load(Ordering::Acquire) != m as usize {
+            fill_lconv_from(r, n, m);
+            LCONV_KEY[0].store(n as usize, Ordering::Release);
+            LCONV_KEY[1].store(m as usize, Ordering::Release);
+        }
         r
     }
 }
+
+static LCONV_KEY: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 
 pub fn lconv_of(loc: usize) -> Lconv {
     let mut r = C_LCONV_INIT;
@@ -396,9 +409,13 @@ pub fn lconv_of(loc: usize) -> Lconv {
 }
 
 fn fill_lconv(r: &mut Lconv, loc: usize) {
+    fill_lconv_from(r, cur_data(LC_NUMERIC as usize, loc), cur_data(LC_MONETARY as usize, loc));
+}
+
+fn fill_lconv_from(r: &mut Lconv, n: *const CatData, m: *const CatData) {
     unsafe {
-        let n = &*cur_data(LC_NUMERIC as usize, loc);
-        let m = &*cur_data(LC_MONETARY as usize, loc);
+        let n = &*n;
+        let m = &*m;
         let nostop = |p: *const u8| -> *const c_char { if *p == 127 || *p == 255 { c"".as_ptr() } else { p.cast() } };
         r.decimal_point = n.cstr(0).cast();
         r.thousands_sep = n.cstr(1).cast();

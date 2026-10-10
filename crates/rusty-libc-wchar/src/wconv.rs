@@ -379,8 +379,15 @@ pub fn parse_float_dp(get: impl Fn(usize) -> u32, target: Target, dp: u32) -> (B
         }
         None => (zero, 0),
     };
+    const SMALL: usize = 64;
     const STACK: usize = 512;
-    if len <= STACK {
+    if len <= SMALL {
+        let mut buf = [0u8; SMALL];
+        for (i, b) in buf.iter_mut().enumerate().take(len) {
+            *b = get(start + i) as u8;
+        }
+        convert(&buf[..len])
+    } else if len <= STACK {
         let mut buf = [0u8; STACK];
         for (i, b) in buf.iter_mut().enumerate().take(len) {
             *b = get(start + i) as u8;

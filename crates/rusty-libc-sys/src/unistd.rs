@@ -1273,6 +1273,41 @@ pub extern "C" fn fork() -> c_int {
     raw_fork()
 }
 
+#[cfg(all(feature = "export", target_arch = "x86_64"))]
+core::arch::global_asm!(
+    ".text",
+    ".p2align 4",
+    ".globl vfork",
+    ".type vfork, @function",
+    "vfork:",
+    "pop %r9",
+    "mov $0x4111, %edi",
+    "xor %esi, %esi",
+    "xor %edx, %edx",
+    "xor %r10d, %r10d",
+    "xor %r8d, %r8d",
+    "mov $56, %eax",
+    "syscall",
+    "push %r9",
+    "cmp $-4095, %rax",
+    "jae 2f",
+    "ret",
+    "2:",
+    "mov %eax, %edi",
+    "neg %edi",
+    "jmp {fail}",
+    ".size vfork, .-vfork",
+    fail = sym vfork_failed,
+    options(att_syntax)
+);
+
+#[cfg(all(feature = "export", target_arch = "x86_64"))]
+extern "C" fn vfork_failed(err: c_int) -> c_int {
+    errno::set(err);
+    -1
+}
+
+#[cfg(not(all(feature = "export", target_arch = "x86_64")))]
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn vfork() -> c_int {
     raw_fork()

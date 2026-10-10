@@ -315,6 +315,27 @@ pub fn add_attributes(files: &mut BTreeMap<String, String>) {
     }
 }
 
+fn add_const_pure(files: &mut BTreeMap<String, String>) {
+    for line in include_str!("const_pure.txt").lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let mut f = line.split_whitespace();
+        let (Some(name), Some(kind)) = (f.next(), f.next()) else { continue };
+        let attr = if kind == "const" { "__attribute__ ((__const__))" } else { "__attribute__ ((__pure__))" };
+        let re = Regex::new(&format!(r"(?m)^([^\n#/*;{{}}()][^\n;{{}}()]*[ *]{}[ \t]*\([^;{{}}]*\))([^;{{}}]*);", regex_lite::escape(name))).unwrap();
+        for text in files.values_mut() {
+            let Some(c) = re.captures(text) else { continue };
+            let tail = c.get(2).unwrap();
+            if ["__const__", "__pure__", "__attribute_const__", "__attribute_pure__"].iter().any(|a| c.get(0).unwrap().as_str().contains(a)) {
+                continue;
+            }
+            let at = tail.end();
+            *text = format!("{} {}{}", &text[..at].trim_end(), attr, &text[at..]);
+        }
+    }
+}
+
 pub fn untypedef(files: &mut BTreeMap<String, String>) {
     for (hdr, names) in [("stdlib.h", ["random_data", "drand48_data"])] {
         if let Some(text) = files.get_mut(hdr) {
@@ -553,6 +574,7 @@ pub fn add_extern_c(files: &mut BTreeMap<String, String>) {
 
 pub fn post_passes(files: &mut BTreeMap<String, String>) {
     add_attributes(files);
+    add_const_pure(files);
     untypedef(files);
     add_features_include(files);
     add_extern_c(files);

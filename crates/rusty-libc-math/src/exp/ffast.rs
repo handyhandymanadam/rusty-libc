@@ -89,7 +89,8 @@ pub(crate) fn tanhf<const F: bool>(x: f32) -> Option<f32> {
         return None;
     }
     let m = pow2m1_x::<F>(f64::from(f32::from_bits(ab)), 2.0 * core::f64::consts::LOG2_E, ab < 0x3cb0_0000);
-    round_cr(m / (m + 2.0), MARGIN).map(|r| f32::from_bits(r.to_bits() | (x.to_bits() & 0x8000_0000)))
+    let t = m / (m + 2.0);
+    round_cr_x(if x < 0.0 { -t } else { t }, MARGIN)
 }
 
 #[inline(always)]

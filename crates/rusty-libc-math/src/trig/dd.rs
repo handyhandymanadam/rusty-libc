@@ -48,7 +48,7 @@ fn detect_fma() -> bool {
     use core::arch::x86_64::__cpuid;
     let r = __cpuid(1);
     let (fma, osxsave, avx) = ((r.ecx >> 12) & 1, (r.ecx >> 27) & 1, (r.ecx >> 28) & 1);
-    if fma == 0 || osxsave == 0 || avx == 0 {
+    if fma == 0 || osxsave == 0 || avx == 0 || crate::rounding::fp::force_nofma() {
         return false;
     }
     let lo: u32;
@@ -63,7 +63,7 @@ pub fn fma<const F: bool>(a: f64, b: f64, c: f64) -> f64 {
     if F {
         return core::f64::math::mul_add(a, b, c);
     }
-    a * b + c
+    crate::rounding::fma_impl::fma_emul(a, b, c)
 }
 
 #[inline(always)]
@@ -73,7 +73,7 @@ pub fn fma_i<const F: bool>(a: f64, b: f64, c: f64) -> f64 {
         use core::arch::x86_64::{_mm_cvtsd_f64, _mm_fmadd_sd, _mm_set_sd};
         return unsafe { _mm_cvtsd_f64(_mm_fmadd_sd(_mm_set_sd(a), _mm_set_sd(b), _mm_set_sd(c))) };
     }
-    a * b + c
+    crate::rounding::fma_impl::fma_emul(a, b, c)
 }
 
 #[inline(always)]
@@ -255,6 +255,15 @@ pub fn is_nearest() -> bool {
         let h = _mm_set_pd(-f64::from_bits(0x3ca0_0000_0200_0000), f64::from_bits(0x3ca0_0000_0200_0000));
         _mm_movemask_pd(_mm_cmpeq_pd(_mm_add_pd(one, h), one)) == 0
     }
+}
+
+#[inline(always)]
+pub fn directed_if(cond: bool) -> bool {
+    if cond {
+        core::hint::cold_path();
+        return !is_nearest();
+    }
+    false
 }
 
 #[cfg(target_arch = "x86_64")]

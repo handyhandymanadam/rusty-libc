@@ -38,7 +38,8 @@ impl Args for VaArgs<'_, '_> {
 }
 
 pub struct PosArgs {
-    vals: [Val; 128],
+    vals: [core::mem::MaybeUninit<Val>; 128],
+    n: usize,
     next: usize,
 }
 
@@ -51,7 +52,11 @@ impl Args for PosArgs {
                 self.next
             }
         };
-        if (1..=128).contains(&n) { self.vals[n - 1] } else { Val::I(0) }
+        if (1..=self.n).contains(&n) {
+            unsafe { self.vals[n - 1].assume_init() }
+        } else {
+            Val::I(0)
+        }
     }
 }
 
@@ -65,9 +70,10 @@ pub unsafe fn run_fmt<S: Sink, F: fmt::FmtChar>(sink: &mut S, f: *const F, va: &
         match positional {
             None => fmt::format(sink, f, &mut VaArgs(va)),
             Some(pk) => {
-                let mut pa = PosArgs { vals: [Val::I(0); 128], next: 0 };
-                for i in 0..pk.max.min(128) {
-                    pa.vals[i] = take(va, pk.kinds[i].unwrap_or(Kind::Int));
+                let n = pk.max.min(128);
+                let mut pa = PosArgs { vals: [const { core::mem::MaybeUninit::uninit() }; 128], n, next: 0 };
+                for i in 0..n {
+                    pa.vals[i] = core::mem::MaybeUninit::new(take(va, pk.kinds[i].unwrap_or(Kind::Int)));
                 }
                 fmt::format(sink, f, &mut pa)
             }
@@ -101,6 +107,16 @@ impl BufSink {
 }
 
 impl Sink for BufSink {
+    const DIRECT: bool = true;
+    fn direct(&mut self, n: usize) -> *mut u8 {
+        if self.cap > 0 && n < self.cap - self.pos.min(self.cap - 1) {
+            let p = unsafe { self.buf.add(self.pos) };
+            self.pos += n;
+            p
+        } else {
+            core::ptr::null_mut()
+        }
+    }
     fn put(&mut self, bytes: &[u8]) -> bool {
         if self.cap > 0 && self.pos < self.cap - 1 {
             let room = self.cap - 1 - self.pos;

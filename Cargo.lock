@@ -138,6 +138,7 @@ dependencies = [
  "rusty-libc-malloc",
  "rusty-libc-mem",
  "rusty-libc-util",
+ "rusty-libc-wchar",
 ]
 
 [[package]]

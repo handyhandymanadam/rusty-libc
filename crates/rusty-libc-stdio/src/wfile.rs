@@ -65,6 +65,7 @@ pub(crate) unsafe fn set_ccs(f: *mut FILE, name: &[u8]) -> bool {
         }
         (*w).ccs = p;
         (*w).cs = WCs::Ccs;
+        (*f).hide_read_window();
         (*f).flags |= F_WIDE;
         true
     }
@@ -137,6 +138,7 @@ unsafe fn make_wide(f: *mut FILE, cs: WCs) -> bool {
             return false;
         }
         (*w).cs = cs;
+        (*f).hide_read_window();
         (*f).flags |= F_WIDE;
         true
     }
@@ -453,8 +455,9 @@ pub unsafe fn putwc_raw(f: *mut FILE, wc: wint_t) -> wint_t {
             && (*(*f).wide).cs != WCs::Raw32
             && (*(*f).wide).cs != WCs::Ccs
         {
-            *(*f).wptr = wc as u8;
-            (*f).wptr = (*f).wptr.add(1);
+            let p = (*f).wptr;
+            *p = wc as u8;
+            (*f).wptr = p.add(1);
             (*(*f).wide).pchars += 1;
             return wc;
         }

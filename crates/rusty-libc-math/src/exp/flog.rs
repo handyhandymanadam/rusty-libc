@@ -103,7 +103,8 @@ pub(crate) fn asinhf<const F: bool>(x: f32) -> Option<f32> {
     if !(0x3f00_0000..0x7e80_0000).contains(&ab) {
         return None;
     }
-    round_cr(asinhf_raw::<F>(f32::from_bits(ab)), 1 << 12).map(|r| f32::from_bits(r.to_bits() | (x.to_bits() & 0x8000_0000)))
+    let y = asinhf_raw::<F>(f32::from_bits(ab));
+    round_cr_x(if x < 0.0 { -y } else { y }, 1 << 12)
 }
 
 #[inline(always)]
@@ -140,6 +141,6 @@ pub(crate) fn atanhf<const F: bool>(x: f32) -> Option<f32> {
         let p = fma::<F>(z, fma::<F>(z, 1.0 / 7.0, 1.0 / 5.0), 1.0 / 3.0);
         fma::<F>(a * z, p, a)
     };
-    round_cr(y, 1 << 12).map(|r| f32::from_bits(r.to_bits() | (x.to_bits() & 0x8000_0000)))
+    round_cr_x(if x < 0.0 { -y } else { y }, 1 << 12)
 }
 

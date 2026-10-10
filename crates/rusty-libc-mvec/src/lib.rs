@@ -145,3 +145,5 @@ macro_rules! sincos2 {
 }
 
 include!("vecs.rs");
+
+mod simd;

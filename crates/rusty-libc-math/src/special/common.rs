@@ -152,7 +152,7 @@ fn detect_fma(state: &AtomicU8) -> bool {
             let fma = c & (1 << 12) != 0;
             let osxsave = c & (1 << 27) != 0;
             let avx = c & (1 << 28) != 0;
-            fma && osxsave && avx && xcr0_has_ymm()
+            fma && osxsave && avx && xcr0_has_ymm() && !crate::rounding::fp::force_nofma()
         }
     };
     state.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
@@ -175,5 +175,5 @@ pub(crate) fn fma<const F: bool>(a: f64, b: f64, c: f64) -> f64 {
         }
         return r;
     }
-    a * b + c
+    crate::rounding::fma_impl::fma_emul(a, b, c)
 }

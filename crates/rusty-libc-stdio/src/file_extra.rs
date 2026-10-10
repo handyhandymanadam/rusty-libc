@@ -235,15 +235,22 @@ alias!(freopen64(path: *const c_char, mode: *const c_char, f: *mut FILE) -> *mut
 pub unsafe extern "C" fn popen(command: *const c_char, ty: *const c_char) -> *mut FILE {
     unsafe {
         let t = core::slice::from_raw_parts(ty as *const u8, rusty_libc_mem::strlen(ty));
-        let reading = match t.first() {
-            Some(b'r') => true,
-            Some(b'w') => false,
-            _ => {
-                errno::set(22);
-                return null_mut();
+        let (mut reading, mut writing, mut cloexec) = (false, false, false);
+        for &c in t {
+            match c {
+                b'r' => reading = true,
+                b'w' => writing = true,
+                b'e' => cloexec = true,
+                _ => {
+                    errno::set(22);
+                    return null_mut();
+                }
             }
-        };
-        let cloexec = t[1..].contains(&b'e');
+        }
+        if reading == writing {
+            errno::set(22);
+            return null_mut();
+        }
         let (rd, wr) = match unistd::pipe2(0o2000000) {
             Ok(p) => p,
             Err(e) => {
@@ -251,48 +258,35 @@ pub unsafe extern "C" fn popen(command: *const c_char, ty: *const c_char) -> *mu
                 return null_mut();
             }
         };
-        let (parent_end, child_end) = if reading { (rd, wr) } else { (wr, rd) };
-        let argv: [*const c_char; 4] = [c"sh".as_ptr(), c"-c".as_ptr(), command, core::ptr::null()];
-        let env = rusty_libc_core::env::block() as *const *const c_char;
-        let list_token = file::fork_list_lock();
-        let pid = match unistd::fork() {
-            Ok(p) => p,
-            Err(e) => {
-                file::fork_list_unlock(list_token);
+        let (parent_end, mut child_end) = if reading { (rd, wr) } else { (wr, rd) };
+        let target = if reading { 1 } else { 0 };
+        if child_end == target {
+            let tmp = syscall::syscall3(syscall::SYS_FCNTL, child_end as usize, 1030 , 0) as isize;
+            if tmp < 0 {
                 let _ = unistd::close(rd);
                 let _ = unistd::close(wr);
-                errno::set(e.0);
+                errno::set(-tmp as c_int);
                 return null_mut();
             }
-        };
-        if pid != 0 {
-            file::fork_list_unlock(list_token);
+            let _ = unistd::close(child_end);
+            child_end = tmp as c_int;
         }
-        if pid == 0 {
-            let target = if reading { 1 } else { 0 };
-            if child_end == target {
-                syscall::syscall3(syscall::SYS_FCNTL, target as usize, 2 , 0);
-            } else {
-                let _ = unistd::dup3(child_end, target, 0);
-            }
-            file::close_popen_fds(target);
-            unistd::execve(c"/bin/sh".as_ptr(), argv.as_ptr(), env);
-            rusty_libc_core::process::exit_now(127);
-        }
-        let _ = unistd::close(child_end);
         let flags = if reading { F_READ } else { F_WRITE };
         let f = file::alloc_file(flags, parent_end);
         if f.is_null() {
             let _ = unistd::close(parent_end);
-            let _ = unistd::waitpid(pid, 0);
+            let _ = unistd::close(child_end);
             errno::set(12);
             return null_mut();
         }
-        (*f).pid = pid;
         (*f).cookie_pos = -1;
         (*f).flags |= file::F_BYTE;
-        if !cloexec {
-            syscall::syscall3(syscall::SYS_FCNTL, parent_end as usize, 2 , 0);
+        let err = file::popen_spawn(f, command, child_end, target, parent_end, cloexec);
+        if err != 0 {
+            let _ = unistd::close(child_end);
+            crate::file_api::fclose(f);
+            errno::set(err);
+            return null_mut();
         }
         f
     }

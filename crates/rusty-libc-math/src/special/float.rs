@@ -19,6 +19,50 @@ pub(super) fn dd_to_f32(hi: f64, lo: f64) -> f32 {
 }
 
 #[inline(always)]
+pub(crate) fn dir_f32(hi: f64, lo: f64, rc: u32, eps: f64) -> f32 {
+    if hi == 0.0 {
+        return hi as f32;
+    }
+    let neg = hi < 0.0;
+    let (h, l) = if neg { (-hi, -lo) } else { (hi, lo) };
+    let away = rc == if neg { 1 } else { 2 };
+    let r = if h > f64::from_bits(0x3810_0000_4000_0000) {
+        let r = fastf::round_f32_dir(h, l, eps, away).unwrap_or_else(|| dd_to_f32(h, l));
+        if r == f32::INFINITY && !away { f32::MAX } else { r }
+    } else {
+        let th = h * f64::from_bits(((1023 + 149) as u64) << 52);
+        let tl = l * f64::from_bits(((1023 + 149) as u64) << 52);
+        const MAGIC: f64 = 4503599627370496.0;
+        let nint = (th + MAGIC) - MAGIC;
+        let fl = if nint > th { nint - 1.0 } else { nint };
+        let d = th - fl;
+        let exact = d == 0.0 && tl == 0.0;
+        let trunc = if d == 0.0 && tl < 0.0 { fl - 1.0 } else { fl };
+        let mut k = if away && !exact { trunc + 1.0 } else { trunc };
+        let eu = eps * f64::from_bits(((1023 + 149) as u64) << 52);
+        if (d + tl).abs() <= eu || (1.0 - d - tl).abs() <= eu {
+            k = (th + tl + MAGIC) - MAGIC;
+        }
+        let res = (k as f32) * f32::from_bits(1);
+        force_underflowf(res);
+        if res == 0.0 {
+            let t = black_box(f32::MIN_POSITIVE);
+            black_box(t * t);
+        }
+        res
+    };
+    if neg { -r } else { r }
+}
+
+#[inline(always)]
+pub(crate) fn tiny_mul_dir_f32(x: f32, ch: f64, cl: f64, rc: u32) -> f32 {
+    let xd = f64::from(x);
+    let (h, l0) = two_prod::<false>(xd, ch);
+    let (h, l) = fast_two_sum(h, l0 + xd * cl);
+    dir_f32(h, l, rc, h.abs() * 7.888609052210118e-31 * 1024.0)
+}
+
+#[inline(always)]
 fn one_minus_tiny(neg: bool) -> f32 {
     let r = black_box(1.0f32) - black_box(f32::from_bits(0x1e80_0000));
     if neg { -r } else { r }
@@ -26,6 +70,21 @@ fn one_minus_tiny(neg: bool) -> f32 {
 
 #[inline(always)]
 pub(super) fn erff_impl<const F: bool>(x: f32) -> f32 {
+    if crate::trig::dd::directed_if((x.to_bits() & 0x7fff_ffff).wrapping_sub(1) < 0x3880_0000 - 1) {
+        return erff_directed::<F>(x);
+    }
+    erff_body::<F>(x, 0)
+}
+
+#[inline(always)]
+fn erff_directed<const F: bool>(x: f32) -> f32 {
+    let rc = crate::trig::dd::rounding_control();
+    let _g = crate::trig::dd::NearestGuard::new();
+    erff_body::<F>(x, rc)
+}
+
+#[inline(always)]
+fn erff_body<const F: bool>(x: f32, rc: u32) -> f32 {
     const LO: u32 = 0x2b8c_bccd;
     const HI: u32 = 0x40c0_0000;
     let ab = x.to_bits() & 0x7fff_ffff;
@@ -50,6 +109,10 @@ pub(super) fn erff_impl<const F: bool>(x: f32) -> f32 {
         }
     }
     let v = if ax < 1.0e-12 { mul_d::<F>(d(TWO_OVER_SQRT_PI_DD), ax) } else { erf_dd::<F>(ax, 2) };
+    if rc != 0 {
+        let (h, l) = if x.is_sign_negative() { (-v.0, -v.1) } else { v };
+        return dir_f32(h, l, rc, v.0 * 7.888609052210118e-31 * 1024.0);
+    }
     let r = dd_to_f32(v.0, v.1);
     if x.is_sign_negative() { -r } else { r }
 }
@@ -111,6 +174,20 @@ pub(super) fn erfcf_impl<const F: bool>(x: f32) -> f32 {
 
 #[inline(always)]
 pub(super) fn lgammaf_r_impl<const F: bool>(x: f32) -> (f32, i32) {
+    if crate::trig::dd::directed_if((x.to_bits() & 0x7fff_ffff).wrapping_sub(1) < 0x3080_0000 - 1) {
+        return lgammaf_r_directed::<F>(x);
+    }
+    lgammaf_r_body::<F>(x)
+}
+
+#[inline(always)]
+fn lgammaf_r_directed<const F: bool>(x: f32) -> (f32, i32) {
+    let _g = crate::trig::dd::NearestGuard::new();
+    lgammaf_r_body::<F>(x)
+}
+
+#[inline(always)]
+fn lgammaf_r_body<const F: bool>(x: f32) -> (f32, i32) {
     if x >= 0.5 && x < 16.0 && x != 1.0 && x != 2.0 {
         let v = fastf::lgamma_pos_lo::<F>(x as f64);
         if let Some(r) = fastf::round_f32(v, v.abs() * REL) {
@@ -136,7 +213,7 @@ pub(super) fn lgammaf_r_impl<const F: bool>(x: f32) -> (f32, i32) {
     }
     let (l, s) = lgamma_dd::<F>(x as f64);
     let r = if l.1 == 0.0 { l.0 as f32 } else { dd_to_f32(l.0, l.1) };
-    if r.is_infinite() && x.is_finite() {
+    if x.is_finite() && (r.is_infinite() || l.0 >= 3.4028235677973366e38) {
         set_errno(ERANGE);
     }
     (r, s)
@@ -144,6 +221,34 @@ pub(super) fn lgammaf_r_impl<const F: bool>(x: f32) -> (f32, i32) {
 
 #[inline(always)]
 pub(super) fn tgammaf_impl<const F: bool>(x: f32) -> f32 {
+    if crate::trig::dd::directed_if((x.to_bits() & 0x7fff_ffff).wrapping_sub(1) < 0x3080_0000 - 1) {
+        return tgammaf_directed::<F>(x);
+    }
+    tgammaf_body::<F>(x, 0)
+}
+
+#[inline(always)]
+fn tgammaf_directed<const F: bool>(x: f32) -> f32 {
+    let rc = crate::trig::dd::rounding_control();
+    let _g = crate::trig::dd::NearestGuard::new();
+    tgammaf_body::<F>(x, rc)
+}
+
+#[inline(always)]
+fn tgammaf_body<const F: bool>(x: f32, rc: u32) -> f32 {
+    if rc != 0 && x.abs().to_bits() == 0x0020_0000 {
+        let neg = x < 0.0;
+        let away = rc == if neg { 1 } else { 2 };
+        return if away {
+            oflowf(neg)
+        } else if neg {
+            black_box(black_box(f32::MAX) * black_box(2.0f32));
+            -f32::MAX
+        } else {
+            black_box(black_box(f32::MAX) + black_box(1.0f32));
+            f32::MAX
+        };
+    }
     let xd = x as f64;
     if xd > 1.0e-30 && xd < 34.5 && !fastf::is_int(xd) {
         let lg = fastf::lgamma_pos_lo::<F>(xd);
@@ -154,27 +259,30 @@ pub(super) fn tgammaf_impl<const F: bool>(x: f32) -> f32 {
             }
         }
     } else if xd < -1.0e-30 && xd > -30.0 && !fastf::is_int(xd) {
-        let (s, sr) = match crate::trig::fpi::sinpi_abs::<F>(-xd) {
-            Some(a) => (if super::gamma::neg_parts(xd).1 { -a } else { a }, 2.0 * REL),
-            None => (crate::trig::sinpi(xd), REL),
-        };
-        let lg = fastf::lgamma_pos_lo::<F>(1.0 - xd);
-        let v = fastf::PI_HI / (s * crate::exp::dexp::exp_impl::<F>(lg));
+        let v = fastf::tgamma_neg::<F>(xd);
         let av = v.abs();
         if av < 1.0e38 && av > 1.0e-37 {
-            if let Some(r) = fastf::round_f32(v, av * (sr + (lg.abs() + 8.0) * 1.7763568394002505e-15)) {
+            if let Some(r) = fastf::round_f32(v, av * REL) {
                 return r;
             }
+        }
+        if let Some(r) = fastf::tgammaf_neg_reflect::<F>(xd) {
+            return r;
         }
     }
     match tgamma_dd::<F>(x as f64) {
         Err(v) => if crate::SVID && v.is_nan() && !x.is_nan() { f32::from_bits(0xffc0_0000) } else { v as f32 },
         Ok(((m, k), neg)) => {
-            let r = dd_to_f32(ldexp(m.0, k), ldexp(m.1, k));
-            if r.is_infinite() || r == 0.0 {
+            let (h, l) = if neg { (-ldexp(m.0, k), -ldexp(m.1, k)) } else { (ldexp(m.0, k), ldexp(m.1, k)) };
+            let r = if rc != 0 {
+                dir_f32(h, l, rc, h.abs() * 7.888609052210118e-31 * 1024.0)
+            } else {
+                dd_to_f32(h, l)
+            };
+            if r.is_infinite() || r == 0.0 || x >= f32::from_bits(0x420c_2910) || x < -42.0 {
                 set_errno(ERANGE);
             }
-            if neg { -r } else { r }
+            r
         }
     }
 }
@@ -207,6 +315,24 @@ fn finish_f32(d: D, e: i32, neg: bool) -> f32 {
 const BESSEL_REL: f64 = 9.094947017729282e-13;
 
 #[inline(always)]
+fn bessel_f32_directed<const K: u8>(ax: f64, flip: bool) -> f32 {
+    let rc = crate::trig::dd::rounding_control();
+    let _g = crate::trig::dd::NearestGuard::new();
+    let (mut h, mut l) = eval_fast::<K, false>(crate::trig::dd::launder(ax));
+    let mut neg = h < 0.0;
+    if neg {
+        (h, l) = (-h, -l);
+    }
+    neg ^= flip;
+    let away = rc == if neg { 1 } else { 2 };
+    let r = fastf::round_f32_dir(h, l, h * 8.881784197001252e-16, away).unwrap_or_else(|| dd_to_f32(h, l));
+    if r.is_infinite() {
+        set_errno(ERANGE);
+    }
+    if neg { -r } else { r }
+}
+
+#[inline(always)]
 pub(super) fn j0f_impl<const F: bool>(x: f32) -> f32 {
     let ax = (x as f64).abs();
     if ax.is_nan() {
@@ -220,6 +346,9 @@ pub(super) fn j0f_impl<const F: bool>(x: f32) -> f32 {
     }
     if ax < 6.0e-5 {
         return black_box(1.0f32) - black_box(f32::from_bits(0x1e80_0000));
+    }
+    if !crate::trig::dd::is_nearest() {
+        return bessel_f32_directed::<0>(ax, false);
     }
     if cell_lo_range::<0>(ax) {
         let v = cell_lo::<0, F>(ax);
@@ -253,6 +382,9 @@ pub(super) fn j1f_impl<const F: bool>(x: f32) -> f32 {
         raise_inexact();
         return r;
     }
+    if !crate::trig::dd::is_nearest() {
+        return bessel_f32_directed::<1>(ax, x < 0.0);
+    }
     if cell_lo_range::<1>(ax) {
         let v = cell_lo::<1, F>(ax);
         if let Some(r) = fastf::round_f32(v, v.abs() * BESSEL_REL) {
@@ -279,6 +411,9 @@ pub(super) fn y0f_impl<const F: bool>(x: f32) -> f32 {
     if xd == f64::INFINITY {
         return 0.0;
     }
+    if !crate::trig::dd::is_nearest() {
+        return bessel_f32_directed::<2>(xd, false);
+    }
     if cell_lo_range::<2>(xd) {
         let v = cell_lo::<2, F>(xd);
         if let Some(r) = fastf::round_f32(v, v.abs() * BESSEL_REL) {
@@ -303,6 +438,9 @@ pub(super) fn y1f_impl<const F: bool>(x: f32) -> f32 {
     }
     if xd == f64::INFINITY {
         return 0.0;
+    }
+    if !crate::trig::dd::is_nearest() {
+        return bessel_f32_directed::<3>(xd, false);
     }
     if cell_lo_range::<3>(xd) {
         let v = cell_lo::<3, F>(xd);

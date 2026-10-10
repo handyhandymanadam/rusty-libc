@@ -302,8 +302,65 @@ pub unsafe extern "C" fn setlinebuf(f: *mut FILE) {
 struct FileSink(*mut FILE);
 
 impl Sink for FileSink {
+    const DIRECT: bool = true;
+    fn direct(&mut self, n: usize) -> *mut u8 {
+        unsafe {
+            let f = &mut *self.0;
+            if f.flags & (file::F_WRMODE | file::F_UNBUF | file::F_LBF | file::F_WIDE | file::F_BYTE) == (file::F_WRMODE | file::F_BYTE) && n <= f.wend as usize - f.wptr as usize {
+                let p = f.wptr;
+                f.wptr = p.add(n);
+                p
+            } else {
+                core::ptr::null_mut()
+            }
+        }
+    }
     fn put(&mut self, bytes: &[u8]) -> bool {
-        unsafe { file::write_bytes(self.0, bytes.as_ptr(), bytes.len()) == bytes.len() }
+        unsafe {
+            let p = self.direct(bytes.len());
+            if !p.is_null() {
+                crate::fmt::small_copy(p, bytes.as_ptr(), bytes.len());
+                return true;
+            }
+            file::write_bytes(self.0, bytes.as_ptr(), bytes.len()) == bytes.len()
+        }
+    }
+    fn partial_output_on_error(&self) -> bool {
+        false
+    }
+}
+
+struct UnbufferedSink {
+    f: *mut FILE,
+    n: usize,
+    ok: bool,
+    buf: core::mem::MaybeUninit<[u8; file::BUFSIZ]>,
+}
+
+impl UnbufferedSink {
+    fn flush(&mut self) -> bool {
+        if self.n > 0 {
+            if unsafe { file::write_bytes(self.f, self.buf.as_ptr().cast::<u8>(), self.n) } != self.n {
+                self.ok = false;
+            }
+            self.n = 0;
+        }
+        self.ok
+    }
+}
+
+impl Sink for UnbufferedSink {
+    fn put(&mut self, bytes: &[u8]) -> bool {
+        if bytes.len() > file::BUFSIZ - self.n && !self.flush() {
+            return false;
+        }
+        if bytes.len() >= file::BUFSIZ {
+            self.ok = unsafe { file::write_bytes(self.f, bytes.as_ptr(), bytes.len()) } == bytes.len();
+            return self.ok;
+        }
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.buf.as_mut_ptr().cast::<u8>().add(self.n), bytes.len()) };
+        self.n += bytes.len();
+        true
     }
     fn partial_output_on_error(&self) -> bool {
         false
@@ -313,6 +370,12 @@ impl Sink for FileSink {
 unsafe fn stream_printf(f: *mut FILE, format: *const c_char, va: &mut VaList) -> c_int {
     unsafe {
         locked!(f, move || {
+            if (*f).flags & file::F_UNBUF != 0 {
+                let mut sink = UnbufferedSink { f, n: 0, ok: true, buf: core::mem::MaybeUninit::uninit() };
+                let r = run(&mut sink, format, va);
+                let written = sink.flush();
+                return if r >= 0 && !written { -1 } else { r };
+            }
             let mut sink = FileSink(f);
             run(&mut sink, format, va)
         })

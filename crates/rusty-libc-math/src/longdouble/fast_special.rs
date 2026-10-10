@@ -3,6 +3,7 @@ use super::fast::*;
 use super::fast_tables::{INV_PI_DD, LN_PI_DD, PI_DD, PIO2_DD, TWO_OVER_PI_DD};
 use super::fast_special_tables::*;
 use super::fast_asin_tables::*;
+use super::fast_atan_tables::*;
 use crate::trig::dd::{D, fast_two_sum, fma, two_prod, two_sum};
 
 const F: bool = true;
@@ -158,7 +159,7 @@ fn lgamma_a(u: D) -> D {
     let j = ((bits >> 47) & 31) as usize;
     let row = ((ex + 1) * 32) as usize + j;
     let t = u.0 - pow2(ex) * (1.0 + (2 * j + 1) as f64 * (1.0 / 64.0));
-    let f = poly_dd::<{ LGAMMA_D_DEG + 1 }, { LGAMMA_D_K }>(&LGAMMA_D_HI[row], &LGAMMA_D_LO[row], t, u.1);
+    let f = poly_dd_dom::<{ LGAMMA_D_DEG + 1 }, { LGAMMA_D_K }>(&LGAMMA_D_HI[row], &LGAMMA_D_LO[row], t, u.1);
     let (a, ae) = two_sum(u.0, -1.0);
     let um1 = fast_two_sum(a, ae + u.1);
     let (b, be) = two_sum(u.0, -2.0);
@@ -218,7 +219,7 @@ fn lgamma_pos(x: D) -> D {
         let row = ((ex - 2) * 32) as usize + j;
         let c = pow2(ex) * (1.0 + (2 * j + 1) as f64 * (1.0 / 64.0));
         let t = xh - c;
-        return poly_dd::<{ LGAMMA_C_DEG + 1 }, { LGAMMA_C_K }>(&LGAMMA_C_HI[row], &LGAMMA_C_LO[row], t, x.1);
+        return poly_dd_dom::<{ LGAMMA_C_DEG + 1 }, { LGAMMA_C_K }>(&LGAMMA_C_HI[row], &LGAMMA_C_LO[row], t, x.1);
     }
     if xh >= 0.5 {
         return lgamma_a(x);
@@ -278,7 +279,7 @@ fn lgammal_any_body(x: F80) -> Option<(F80, bool)> {
 
 #[inline(always)]
 pub fn lgammal_any(x: F80) -> Option<(F80, bool)> {
-    if x.mant_() == 1 << 63 && matches!(x.sign_exp_(), 0x3fff | 0x4000) {
+    if is_int(x) {
         guarded(|| lgammal_any_body(x))
     } else {
         lgammal_any_body(x)
@@ -302,7 +303,7 @@ fn tgammal_any_body(x: F80) -> Option<F80> {
 
 #[inline(always)]
 pub fn tgammal_any(x: F80) -> Option<F80> {
-    if is_int(x) && x.sign_exp_() >> 15 == 0 {
+    if is_int(x) {
         guarded(|| tgammal_any_body(x))
     } else {
         tgammal_any_body(x)
@@ -511,6 +512,57 @@ pub fn y1l(x: F80) -> Option<F80> {
 
 pub const TAU_SPECIAL: f64 = 1.0 / 1024.0;
 
+
+#[inline(always)]
+fn tail_c<const N: usize, const K: usize>(hi: &[f64; N], i: usize) -> Option<f64> {
+    if K + i < N { Some(hi[K + i]) } else { None }
+}
+
+#[inline(always)]
+fn tail_join(a: Option<f64>, b: Option<f64>, p: f64) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(fma::<F>(b, p, a)),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+#[inline(always)]
+fn estrin_tail<const N: usize, const K: usize>(hi: &[f64; N], t: f64) -> f64 {
+    const { assert!(N - K <= 16) };
+    let t2 = t * t;
+    let t4 = t2 * t2;
+    let t8 = t4 * t4;
+    let mut q = [None; 8];
+    for (i, qi) in q.iter_mut().enumerate() {
+        *qi = tail_join(tail_c::<N, K>(hi, 2 * i), tail_c::<N, K>(hi, 2 * i + 1), t);
+    }
+    let r0 = tail_join(q[0], q[1], t2);
+    let r1 = tail_join(q[2], q[3], t2);
+    let r2 = tail_join(q[4], q[5], t2);
+    let r3 = tail_join(q[6], q[7], t2);
+    let s0 = tail_join(r0, r1, t4);
+    let s1 = tail_join(r2, r3, t4);
+    tail_join(s0, s1, t8).unwrap_or(0.0)
+}
+
+#[inline(always)]
+fn poly_dd_dom<const N: usize, const K: usize>(hi: &[f64; N], lo: &[f64; K], th: f64, tl: f64) -> D {
+    let mut h = estrin_tail::<N, K>(hi, th);
+    let mut l = 0.0;
+    let mut k = K;
+    while k > 0 {
+        k -= 1;
+        let ph = h * th;
+        let pe = fma::<F>(h, th, -ph);
+        let s = hi[k] + ph;
+        let e = (hi[k] - s) + ph;
+        l = fma::<F>(l, th, fma::<F>(h, tl, pe + lo[k]) + e);
+        h = s;
+    }
+    fast_two_sum(h, l)
+}
+
 #[inline(always)]
 fn asin_rows(a: D) -> D {
     let sum = a.0 * 256.0 + 6755399441055744.0;
@@ -521,7 +573,55 @@ fn asin_rows(a: D) -> D {
     } else {
         two_sum(a.0 - j * (1.0 / 256.0), a.1)
     };
-    poly_dd::<{ ASIN_TAB_DEG + 1 }, { ASIN_TAB_K }>(&ASIN_TAB_HI[row], &ASIN_TAB_LO[row], th, tl)
+    poly_dd_dom::<{ ASIN_TAB_DEG + 1 }, { ASIN_TAB_K }>(&ASIN_TAB_HI[row], &ASIN_TAB_LO[row], th, tl)
+}
+
+#[inline(always)]
+fn asin_half_rest(ax: D) -> D {
+    let (s1, e1) = two_sum(1.0 - ax.0, -ax.1);
+    let p = fast_two_sum(s1, e1);
+    let y = sqrt_of((0.5 * p.0, 0.5 * p.1));
+    asin_rows(y)
+}
+
+#[inline(always)]
+pub(crate) fn acos_dd(ax: D, neg: bool) -> D {
+    if ax.0 < 0.75 {
+        let r = asin_rows(ax);
+        let (rh, rl) = if neg { r } else { (-r.0, -r.1) };
+        let (h, l) = two_sum(PIO2_DD.0, rh);
+        fast_two_sum(h, l + (PIO2_DD.1 + rl))
+    } else {
+        let r = asin_half_rest(ax);
+        if neg {
+            let (h, l) = two_sum(2.0 * PIO2_DD.0, -2.0 * r.0);
+            fast_two_sum(h, l + (2.0 * PIO2_DD.1 - 2.0 * r.1))
+        } else {
+            (2.0 * r.0, 2.0 * r.1)
+        }
+    }
+}
+
+#[inline(always)]
+pub fn acosl(x: F80) -> Option<F80> {
+    let (xh, xl, e) = split(x)?;
+    if xh.abs() >= 1.0 || e < -37 || !ready() {
+        return None;
+    }
+    let (ax, neg) = abs_dd(xh, xl);
+    let r = acos_dd(ax, neg);
+    to_f80(r.0, r.1, 0, TAU_ATAN)
+}
+
+#[inline(always)]
+pub(crate) fn asin_dd(ax: D) -> D {
+    if ax.0 < 0.75 {
+        asin_rows(ax)
+    } else {
+        let r = asin_half_rest(ax);
+        let (h, l) = two_sum(PIO2_DD.0, -2.0 * r.0);
+        fast_two_sum(h, l + (PIO2_DD.1 - 2.0 * r.1))
+    }
 }
 
 #[inline(always)]
@@ -531,16 +631,43 @@ pub fn asinl(x: F80) -> Option<F80> {
         return None;
     }
     let (ax, neg) = abs_dd(xh, xl);
-    let r = if ax.0 < 0.75 {
-        asin_rows(ax)
+    let r = asin_dd(ax);
+    let (hi, lo) = neg_if(r, neg);
+    to_f80(hi, lo, 0, TAU_ATAN)
+}
+
+#[inline(always)]
+pub(crate) fn atan_rows(a: D) -> D {
+    let sum = a.0 * 256.0 + 6755399441055744.0;
+    let row = (sum.to_bits() & 0x1ff) as usize;
+    let j = sum - 6755399441055744.0;
+    let (th, tl) = if row == 0 {
+        (a.0, a.1)
     } else {
-        let (s1, e1) = two_sum(1.0 - ax.0, -ax.1);
-        let p = fast_two_sum(s1, e1);
-        let y = sqrt_of((0.5 * p.0, 0.5 * p.1));
-        let r = asin_rows(y);
-        let (h, l) = two_sum(PIO2_DD.0, -2.0 * r.0);
-        fast_two_sum(h, l + (PIO2_DD.1 - 2.0 * r.1))
+        two_sum(a.0 - j * (1.0 / 256.0), a.1)
     };
+    poly_dd_dom::<{ ATAN_TAB_DEG + 1 }, { ATAN_TAB_K }>(&ATAN_TAB_HI[row], &ATAN_TAB_LO[row], th, tl)
+}
+
+#[inline(always)]
+pub(crate) fn atan_dd(ax: D) -> D {
+    if ax.0 <= 1.0 {
+        atan_rows(ax)
+    } else {
+        let q = atan_rows(div_dd((1.0, 0.0), ax));
+        let (h, l) = two_sum(PIO2_DD.0, -q.0);
+        fast_two_sum(h, l + (PIO2_DD.1 - q.1))
+    }
+}
+
+#[inline(always)]
+pub fn atanl(x: F80) -> Option<F80> {
+    let (xh, xl, e) = split(x)?;
+    if !(-37..=37).contains(&e) || !ready() {
+        return None;
+    }
+    let (ax, neg) = abs_dd(xh, xl);
+    let r = atan_dd(ax);
     let (hi, lo) = neg_if(r, neg);
     to_f80(hi, lo, 0, TAU_ATAN)
 }

@@ -9,8 +9,19 @@ use core::arch::x86_64::*;
 #[allow(non_camel_case_types)]
 pub type locale_t = *mut c_void;
 
-#[inline]
+#[inline(always)]
 unsafe fn scan_bounded(p: *const u32, n: usize, c: u32, stop_nul: bool) -> usize {
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        if (p as usize) & 3 == 0 && crate::wvec::avx2() {
+            return crate::wvec::scan(p, n, c, stop_nul);
+        }
+        scan_bounded_generic(p, n, c, stop_nul)
+    }
+}
+
+#[inline(never)]
+unsafe fn scan_bounded_generic(p: *const u32, n: usize, c: u32, stop_nul: bool) -> usize {
     unsafe {
         let mut i = 0usize;
         while i < n && (p.add(i) as usize) & 15 != 0 {
@@ -48,8 +59,19 @@ unsafe fn scan_bounded(p: *const u32, n: usize, c: u32, stop_nul: bool) -> usize
     }
 }
 
-#[inline]
+#[inline(always)]
 unsafe fn scan_nul(p: *const u32, c: u32, stop_nul_only: bool) -> usize {
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        if (p as usize) & 3 == 0 && crate::wvec::avx2() {
+            return if stop_nul_only { crate::wvec::strlen(p) } else { crate::wvec::strchrnul(p, c) };
+        }
+        scan_nul_generic(p, c, stop_nul_only)
+    }
+}
+
+#[inline(never)]
+unsafe fn scan_nul_generic(p: *const u32, c: u32, stop_nul_only: bool) -> usize {
     unsafe {
         #[cfg(target_arch = "x86_64")]
         {
@@ -96,7 +118,19 @@ pub unsafe extern "C" fn wcslen(s: *const wchar_t) -> usize {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wcsnlen(s: *const wchar_t, n: usize) -> usize {
-    unsafe { scan_bounded(s.cast(), n, 0, true) }
+    unsafe {
+        if (s as usize) & 3 == 0 && crate::wvec::avx2() {
+            return crate::wvec::wcsnlen_k(s.cast(), n);
+        }
+        wcsnlen_generic(s, n)
+    }
+}
+
+#[inline(never)]
+unsafe fn wcsnlen_generic(s: *const wchar_t, n: usize) -> usize {
+    unsafe {
+        scan_bounded(s.cast(), n, 0, true)
+    }
 }
 
 pub fn len(s: &[u32]) -> usize {
@@ -109,6 +143,16 @@ pub fn nlen(s: &[u32], n: usize) -> usize {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wcscpy(dest: *mut wchar_t, src: *const wchar_t) -> *mut wchar_t {
+    unsafe {
+        if (src as usize) & 3 == 0 && crate::wvec::avx2() {
+            return crate::wvec::wcscpy_k(dest.cast(), src.cast()).cast();
+        }
+        wcscpy_generic(dest, src)
+    }
+}
+
+#[inline(never)]
+unsafe fn wcscpy_generic(dest: *mut wchar_t, src: *const wchar_t) -> *mut wchar_t {
     unsafe {
         let n = wcslen(src) + 1;
         copy_forward(dest, src, n);
@@ -128,6 +172,16 @@ pub unsafe extern "C" fn wcpcpy(dest: *mut wchar_t, src: *const wchar_t) -> *mut
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wcsncpy(dest: *mut wchar_t, src: *const wchar_t, n: usize) -> *mut wchar_t {
     unsafe {
+        if (src as usize) & 3 == 0 && crate::wvec::avx2() {
+            return crate::wvec::wcsncpy_k(dest.cast(), src.cast(), n, false).cast();
+        }
+        wcsncpy_generic(dest, src, n)
+    }
+}
+
+#[inline(never)]
+unsafe fn wcsncpy_generic(dest: *mut wchar_t, src: *const wchar_t, n: usize) -> *mut wchar_t {
+    unsafe {
         let l = wcsnlen(src, n);
         copy_forward(dest, src, l);
         fill(dest.add(l), 0, n - l);
@@ -137,6 +191,16 @@ pub unsafe extern "C" fn wcsncpy(dest: *mut wchar_t, src: *const wchar_t, n: usi
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wcpncpy(dest: *mut wchar_t, src: *const wchar_t, n: usize) -> *mut wchar_t {
+    unsafe {
+        if (src as usize) & 3 == 0 && crate::wvec::avx2() {
+            return crate::wvec::wcsncpy_k(dest.cast(), src.cast(), n, true).cast();
+        }
+        wcpncpy_generic(dest, src, n)
+    }
+}
+
+#[inline(never)]
+unsafe fn wcpncpy_generic(dest: *mut wchar_t, src: *const wchar_t, n: usize) -> *mut wchar_t {
     unsafe {
         let l = wcsnlen(src, n);
         copy_forward(dest, src, l);
@@ -213,6 +277,9 @@ pub unsafe extern "C" fn wcsdup(s: *const wchar_t) -> *mut wchar_t {
 #[inline]
 unsafe fn copy_forward(dest: *mut wchar_t, src: *const wchar_t, n: usize) {
     unsafe {
+        if n <= 64 && crate::wvec::avx2() {
+            return crate::wvec::copy(dest.cast(), src.cast(), n);
+        }
         rusty_libc_mem::memcpy(dest.cast(), src.cast(), n * 4);
     }
 }
@@ -220,6 +287,9 @@ unsafe fn copy_forward(dest: *mut wchar_t, src: *const wchar_t, n: usize) {
 #[inline]
 unsafe fn fill(dest: *mut wchar_t, c: wchar_t, n: usize) {
     unsafe {
+        if n >= 8 && crate::wvec::avx2() {
+            return crate::wvec::fill(dest.cast(), c as u32, n);
+        }
         for i in 0..n {
             *dest.add(i) = c;
         }
@@ -240,6 +310,16 @@ fn sign(a: wchar_t, b: wchar_t) -> i32 {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wcscmp(s1: *const wchar_t, s2: *const wchar_t) -> c_int {
     unsafe {
+        if crate::wvec::avx2() {
+            return crate::wvec::wcscmp_k(s1, s2);
+        }
+        wcscmp_generic(s1, s2)
+    }
+}
+
+#[inline(never)]
+unsafe fn wcscmp_generic(s1: *const wchar_t, s2: *const wchar_t) -> c_int {
+    unsafe {
         let mut i = 0;
         loop {
             let (a, b) = (*s1.add(i), *s2.add(i));
@@ -253,6 +333,16 @@ pub unsafe extern "C" fn wcscmp(s1: *const wchar_t, s2: *const wchar_t) -> c_int
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wcsncmp(s1: *const wchar_t, s2: *const wchar_t, n: usize) -> c_int {
+    unsafe {
+        if crate::wvec::avx2() {
+            return crate::wvec::wcsncmp_k(s1, s2, n);
+        }
+        wcsncmp_generic(s1, s2, n)
+    }
+}
+
+#[inline(never)]
+unsafe fn wcsncmp_generic(s1: *const wchar_t, s2: *const wchar_t, n: usize) -> c_int {
     unsafe {
         for i in 0..n {
             let (a, b) = (*s1.add(i), *s2.add(i));
@@ -313,6 +403,16 @@ pub unsafe extern "C" fn wcsncasecmp_l(s1: *const wchar_t, s2: *const wchar_t, n
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wcschr(s: *const wchar_t, c: wchar_t) -> *mut wchar_t {
     unsafe {
+        if (s as usize) & 3 == 0 && crate::wvec::avx2() {
+            return crate::wvec::wcschr_k(s.cast(), c as u32).cast();
+        }
+        wcschr_generic(s, c)
+    }
+}
+
+#[inline(never)]
+unsafe fn wcschr_generic(s: *const wchar_t, c: wchar_t) -> *mut wchar_t {
+    unsafe {
         let p = wcschrnul(s, c);
         if *p == c { p } else { null_mut() }
     }
@@ -325,6 +425,16 @@ pub unsafe extern "C" fn wcschrnul(s: *const wchar_t, c: wchar_t) -> *mut wchar_
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wcsrchr(s: *const wchar_t, c: wchar_t) -> *mut wchar_t {
+    unsafe {
+        if (s as usize) & 3 == 0 && crate::wvec::avx2() {
+            return crate::wvec::wcsrchr_k(s.cast(), c as u32).cast();
+        }
+        wcsrchr_generic(s, c)
+    }
+}
+
+#[inline(never)]
+unsafe fn wcsrchr_generic(s: *const wchar_t, c: wchar_t) -> *mut wchar_t {
     unsafe {
         let n = wcslen(s);
         if c == 0 {
@@ -549,13 +659,35 @@ pub unsafe extern "C" fn wmemmove(dest: *mut wchar_t, src: *const wchar_t, n: us
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wmemset(dest: *mut wchar_t, c: wchar_t, n: usize) -> *mut wchar_t {
     unsafe {
-        fill(dest, c, n);
+        if n >= 8 && crate::wvec::avx2() {
+            return crate::wvec::wmemset_k(dest.cast(), c as u32, n).cast();
+        }
+        wmemset_generic(dest, c, n)
+    }
+}
+
+#[inline(never)]
+unsafe fn wmemset_generic(dest: *mut wchar_t, c: wchar_t, n: usize) -> *mut wchar_t {
+    unsafe {
+        for i in 0..n {
+            *dest.add(i) = c;
+        }
         dest
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wmemcmp(s1: *const wchar_t, s2: *const wchar_t, n: usize) -> c_int {
+    unsafe {
+        if crate::wvec::avx2() {
+            return crate::wvec::cmp_mem(s1, s2, n);
+        }
+        wmemcmp_generic(s1, s2, n)
+    }
+}
+
+#[inline(never)]
+unsafe fn wmemcmp_generic(s1: *const wchar_t, s2: *const wchar_t, n: usize) -> c_int {
     unsafe {
         let (a, b) = (core::slice::from_raw_parts(s1, n), core::slice::from_raw_parts(s2, n));
         match a.iter().zip(b).position(|(x, y)| x != y) {
@@ -567,6 +699,16 @@ pub unsafe extern "C" fn wmemcmp(s1: *const wchar_t, s2: *const wchar_t, n: usiz
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wmemchr(s: *const wchar_t, c: wchar_t, n: usize) -> *mut wchar_t {
+    unsafe {
+        if (s as usize) & 3 == 0 && crate::wvec::avx2() {
+            return crate::wvec::wmemchr_k(s.cast(), n, c as u32).cast();
+        }
+        wmemchr_generic(s, c, n)
+    }
+}
+
+#[inline(never)]
+unsafe fn wmemchr_generic(s: *const wchar_t, c: wchar_t, n: usize) -> *mut wchar_t {
     unsafe {
         let i = scan_bounded(s.cast(), n, c as u32, false);
         if i < n { s.add(i) as *mut wchar_t } else { null_mut() }
