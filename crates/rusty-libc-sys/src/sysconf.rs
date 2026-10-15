@@ -1,6 +1,8 @@
 use crate::unistd::{self, EBADF, EINVAL, ENOENT, ENOSYS, fail, nr};
 use core::arch::x86_64::CpuidResult;
 use core::ffi::{c_char, c_int, c_long};
+use crate::kernel::plain;
+use rusty_libc_core::sync_cell::SyncCell;
 use rusty_libc_core::{Errno, errno, syscall};
 
 pub const CS_PATH: c_int = 0;
@@ -575,21 +577,19 @@ fn getrlimit(res: c_int) -> Option<u64> {
 }
 
 fn read_file(path: &core::ffi::CStr, buf: &mut [u8]) -> usize {
-    unsafe {
-        let fd = syscall::syscall4(nr::OPENAT, unistd::AT_FDCWD as usize, path.as_ptr() as usize, 0o2000000, 0);
-        if syscall::check(fd).is_err() {
-            return 0;
-        }
-        let mut n = 0;
-        while n < buf.len() {
-            match syscall::check(syscall::syscall3(nr::READ, fd, buf.as_mut_ptr() as usize + n, buf.len() - n)) {
-                Ok(0) | Err(_) => break,
-                Ok(k) => n += k,
-            }
-        }
-        syscall::syscall1(nr::CLOSE, fd);
-        n
+    let fd = crate::kernel::open_nocancel(path, 0o2000000, 0);
+    if syscall::check(fd).is_err() {
+        return 0;
     }
+    let mut n = 0;
+    while n < buf.len() {
+        match syscall::check(crate::kernel::read_nocancel(fd, &mut buf[n..])) {
+            Ok(0) | Err(_) => break,
+            Ok(k) => n += k,
+        }
+    }
+    plain!(nr::CLOSE, fd);
+    n
 }
 
 fn parse_uint(s: &[u8]) -> Option<(u64, usize)> {
@@ -602,80 +602,12 @@ fn parse_uint(s: &[u8]) -> Option<(u64, usize)> {
     if i == 0 { None } else { Some((v, i)) }
 }
 
-fn sysfs_count(path: &core::ffi::CStr) -> i32 {
-    let mut buf = [0u8; 1024];
-    let n = read_file(path, &mut buf);
-    let s = &buf[..n];
-    let mut i = 0;
-    let mut result: i64 = 0;
-    if s.is_empty() {
-        return 0;
-    }
-    loop {
-        let Some((a, k)) = parse_uint(&s[i..]) else { return 0 };
-        i += k;
-        let mut b = a;
-        if i < s.len() && s[i] == b'-' {
-            i += 1;
-            let Some((m, k)) = parse_uint(&s[i..]) else { return 0 };
-            i += k;
-            b = m;
-        }
-        if b >= a {
-            result += (b - a + 1) as i64;
-        }
-        if i < s.len() && s[i] == b',' {
-            i += 1;
-        }
-        if !(i < s.len() && s[i] != b'\n') {
-            break;
-        }
-    }
-    result as i32
-}
-
-fn nprocs_stat() -> i32 {
-    let mut buf = [0u8; 65536];
-    let n = read_file(c"/proc/stat", &mut buf);
-    let mut count = 0;
-    for line in buf[..n].split(|&c| c == b'\n') {
-        if !line.starts_with(b"cpu") {
-            break;
-        }
-        if line.len() > 3 && line[3].is_ascii_digit() {
-            count += 1;
-        }
-    }
-    count
-}
-
-fn nprocs_sched() -> i32 {
-    let mut mask = [0u64; 512];
-    let r = unsafe { syscall::syscall3(nr::SCHED_GETAFFINITY, 0, 4096, mask.as_mut_ptr() as usize) };
-    match syscall::check(r) {
-        Ok(n) if n > 0 => mask[..n.div_ceil(8)].iter().map(|w| w.count_ones() as i32).sum(),
-        Err(Errno(EINVAL)) => 32768,
-        _ => 0,
-    }
-}
-
-fn nprocs_fallback() -> i32 {
-    let r = nprocs_stat();
-    if r != 0 {
-        return r;
-    }
-    let r = nprocs_sched();
-    if r != 0 { r } else { 2 }
-}
-
 pub extern "C" fn get_nprocs() -> c_int {
-    let r = sysfs_count(c"/sys/devices/system/cpu/online");
-    if r != 0 { r } else { nprocs_fallback() }
+    rusty_libc_rs_core::cpus::online()
 }
 
 pub extern "C" fn get_nprocs_conf() -> c_int {
-    let r = sysfs_count(c"/sys/devices/system/cpu/possible");
-    if r != 0 { r } else { nprocs_fallback() }
+    rusty_libc_rs_core::cpus::configured()
 }
 
 #[repr(C)]
@@ -730,8 +662,8 @@ pub extern "C" fn get_avphys_pages() -> c_long {
 
 const SNAP_MAX: usize = 24;
 static SNAP_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-static mut SNAP: [(u32, u32, [u32; 4]); SNAP_MAX] = [(0, 0, [0; 4]); SNAP_MAX];
-static mut SNAP_LEN: usize = 0;
+type Snapshot = ([(u32, u32, [u32; 4]); SNAP_MAX], usize);
+static SNAP: SyncCell<Snapshot> = SyncCell::new(([(0, 0, [0; 4]); SNAP_MAX], 0));
 
 fn cpuid_now(leaf: u32, sub: u32) -> CpuidResult {
     core::arch::x86_64::__cpuid_count(leaf, sub)
@@ -780,10 +712,7 @@ pub extern "C" fn __rusty_libc_init_cacheinfo() {
             }
         }
     }
-    unsafe {
-        *core::ptr::addr_of_mut!(SNAP) = t;
-        *core::ptr::addr_of_mut!(SNAP_LEN) = n;
-    }
+    unsafe { SNAP.write((t, n)) };
     SNAP_STATE.store(2, Release);
 }
 
@@ -793,8 +722,8 @@ fn __cpuid_count(leaf: u32, sub: u32) -> CpuidResult {
         __rusty_libc_init_cacheinfo();
     }
     if SNAP_STATE.load(Acquire) == 2 {
-        let (t, n) = unsafe { (&*core::ptr::addr_of!(SNAP), *core::ptr::addr_of!(SNAP_LEN)) };
-        if let Some(&(_, _, r)) = t[..n].iter().find(|e| e.0 == leaf && e.1 == sub) {
+        let (t, n): &Snapshot = unsafe { &*SNAP.as_ptr() };
+        if let Some(&(_, _, r)) = t[..*n].iter().find(|e| e.0 == leaf && e.1 == sub) {
             return CpuidResult { eax: r[0], ebx: r[1], ecx: r[2], edx: r[3] };
         }
     }
@@ -1012,21 +941,10 @@ fn cache_sysconf(name: c_int) -> i64 {
 }
 
 fn minsigstksz() -> i64 {
-    let mut buf = [0u8; 2048];
-    let n = read_file(c"/proc/self/auxv", &mut buf);
-    let mut i = 0;
-    while i + 16 <= n {
-        let key = u64::from_ne_bytes(buf[i..i + 8].try_into().unwrap());
-        let val = u64::from_ne_bytes(buf[i + 8..i + 16].try_into().unwrap());
-        if key == 51 && val != 0 {
-            return val as i64;
-        }
-        if key == 0 {
-            break;
-        }
-        i += 16;
+    match rusty_libc_core::vdso::auxv_entry(51) {
+        0 => 2048,
+        v => v as i64,
     }
-    2048
 }
 
 fn read_ngroups_max() -> Option<i64> {
@@ -1040,15 +958,18 @@ fn read_ngroups_max() -> Option<i64> {
 }
 
 fn ilp32_env(offbig: bool) -> bool {
-    let secure = rusty_libc_core::lock::at_secure().unwrap_or_else(|| unsafe {
-        syscall::syscall0(syscall::SYS_GETUID) != syscall::syscall0(syscall::SYS_GETEUID)
-            || syscall::syscall0(104) != syscall::syscall0(108)
+    let secure = rusty_libc_core::lock::at_secure().unwrap_or_else(|| {
+        plain!(syscall::SYS_GETUID) != plain!(syscall::SYS_GETEUID) || plain!(104) != plain!(108)
     });
-    let env = if secure { core::ptr::null_mut() } else { unsafe { rusty_libc_core::env::getenv(b"GETCONF_DIR") } };
+    let env = if secure {
+        core::ptr::null_mut()
+    } else {
+        unsafe { rusty_libc_core::env::getenv(b"GETCONF_DIR") }
+    };
     let dir: &[u8] = if env.is_null() {
         b"/usr/libexec/getconf"
     } else {
-        unsafe { core::ffi::CStr::from_ptr(env).to_bytes() }
+        unsafe { rusty_libc_core::ffi::cstr_bytes(env) }
     };
     let spec: &[u8] = if offbig { b"/POSIX_V6_ILP32_OFFBIG\0" } else { b"/POSIX_V6_ILP32_OFF32\0" };
     let mut path = [0u8; 4096];
@@ -1057,37 +978,15 @@ fn ilp32_env(offbig: bool) -> bool {
     }
     path[..dir.len()].copy_from_slice(dir);
     path[dir.len()..dir.len() + spec.len()].copy_from_slice(spec);
-    let mut st = [0u64; 32];
-    let r = unsafe { syscall::syscall2(syscall::SYS_STAT, path.as_ptr() as usize, st.as_mut_ptr() as usize) };
+    let Ok(path) = core::ffi::CStr::from_bytes_until_nul(&path) else { return false };
+    let mut st = [0u64; 18];
+    let r = crate::kernel::fstatat(unistd::AT_FDCWD as usize, path, &mut st, 0);
     r <= usize::MAX - 4095
 }
 
-fn width_restricted_envs(name: c_int) -> Option<&'static [u8]> {
-    macro_rules! envs {
-        ($p:literal) => {
-            match (ilp32_env(false), ilp32_env(true)) {
-                (true, true) => concat!($p, "_ILP32_OFF32\n", $p, "_ILP32_OFFBIG\n", $p, "_LP64_OFF64").as_bytes(),
-                (true, false) => concat!($p, "_ILP32_OFF32\n", $p, "_LP64_OFF64").as_bytes(),
-                (false, true) => concat!($p, "_ILP32_OFFBIG\n", $p, "_LP64_OFF64").as_bytes(),
-                (false, false) => concat!($p, "_LP64_OFF64").as_bytes(),
-            }
-        };
-    }
-    Some(match name {
-        CS_V6_WIDTH_RESTRICTED_ENVS => envs!("POSIX_V6"),
-        CS_V5_WIDTH_RESTRICTED_ENVS => envs!("XBS5"),
-        CS_V7_WIDTH_RESTRICTED_ENVS => envs!("POSIX_V7"),
-        _ => return None,
-    })
-}
-
+#[inline(never)]
 fn confstr_str(name: c_int) -> Option<&'static [u8]> {
-    match name {
-        1100 | 1101 | 1116 | 1117 | 1132 | 1133 if !ilp32_env(false) => return Some(b""),
-        1104 | 1105 | 1120 | 1121 | 1136 | 1137 if !ilp32_env(true) => return Some(b""),
-        _ => {}
-    }
-    width_restricted_envs(name).or_else(|| CONFSTR.iter().find(|(n, _)| *n == name).map(|&(_, s)| s))
+    rusty_libc_rs_core::confstr::value(name, ilp32_env)
 }
 
 pub fn sysconf_value(name: c_int) -> Result<i64, i32> {
@@ -1151,70 +1050,6 @@ pub extern "C" fn sysconf(name: c_int) -> c_long {
     }
 }
 
-static CONFSTR: &[(c_int, &[u8])] = &[
-    (0, b"/usr/bin"),
-    (2, b"glibc 2.43"),
-    (3, b"NPTL 2.43"),
-    (1000, b""),
-    (1001, b""),
-    (1002, b""),
-    (1003, b""),
-    (1004, b"-D_LARGEFILE64_SOURCE"),
-    (1005, b""),
-    (1006, b""),
-    (1007, b"-D_LARGEFILE64_SOURCE"),
-    (1100, b"-m32"),
-    (1101, b"-m32"),
-    (1102, b""),
-    (1103, b""),
-    (1104, b"-m32 -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64"),
-    (1105, b"-m32"),
-    (1106, b""),
-    (1107, b""),
-    (1108, b"-m64"),
-    (1109, b"-m64"),
-    (1110, b""),
-    (1111, b""),
-    (1112, b""),
-    (1113, b""),
-    (1114, b""),
-    (1115, b""),
-    (1116, b"-m32"),
-    (1117, b"-m32"),
-    (1118, b""),
-    (1119, b""),
-    (1120, b"-m32 -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64"),
-    (1121, b"-m32"),
-    (1122, b""),
-    (1123, b""),
-    (1124, b"-m64"),
-    (1125, b"-m64"),
-    (1126, b""),
-    (1127, b""),
-    (1128, b""),
-    (1129, b""),
-    (1130, b""),
-    (1131, b""),
-    (1132, b"-m32"),
-    (1133, b"-m32"),
-    (1134, b""),
-    (1135, b""),
-    (1136, b"-m32 -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64"),
-    (1137, b"-m32"),
-    (1138, b""),
-    (1139, b""),
-    (1140, b"-m64"),
-    (1141, b"-m64"),
-    (1142, b""),
-    (1143, b""),
-    (1144, b""),
-    (1145, b""),
-    (1146, b""),
-    (1147, b""),
-    (1148, b"POSIXLY_CORRECT=1"),
-    (1149, b"POSIXLY_CORRECT=1"),
-];
-
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn confstr(name: c_int, buf: *mut c_char, len: usize) -> usize {
     let Some(s) = confstr_str(name) else {
@@ -1223,15 +1058,10 @@ pub unsafe extern "C" fn confstr(name: c_int, buf: *mut c_char, len: usize) -> u
     };
     let total = s.len() + 1;
     if len > 0 && !buf.is_null() {
-        unsafe {
-            if total <= len {
-                core::ptr::copy_nonoverlapping(s.as_ptr(), buf.cast::<u8>(), s.len());
-                *buf.add(s.len()) = 0;
-            } else {
-                core::ptr::copy_nonoverlapping(s.as_ptr(), buf.cast::<u8>(), len - 1);
-                *buf.add(len - 1) = 0;
-            }
-        }
+        let out = unsafe { rusty_libc_core::ffi::bytes_mut(buf.cast::<u8>(), len) };
+        let n = s.len().min(len - 1);
+        out[..n].copy_from_slice(&s[..n]);
+        out[n] = 0;
     }
     total
 }
@@ -1257,10 +1087,12 @@ fn magic_link_max(t: i64) -> Option<i64> {
     })
 }
 
-fn distinguish_ext(path: *const c_char, fd: c_int) -> i64 {
+unsafe fn distinguish_ext(path: *const c_char, fd: c_int) -> i64 {
     let mut st = crate::stat::Stat::zeroed();
-    let r = unsafe {
-        if path.is_null() { crate::stat::fstat(fd, &mut st) } else { crate::stat::stat(path, &mut st) }
+    let r = if path.is_null() {
+        unistd::rc(crate::kernel::fstat(fd as usize, &mut st))
+    } else {
+        unsafe { crate::stat::stat(path, &mut st) }
     };
     if r != 0 {
         return EXT2_LINK_MAX;
@@ -1323,13 +1155,13 @@ fn distinguish_ext(path: *const c_char, fd: c_int) -> i64 {
     result
 }
 
-fn statfs_link_max(r: Result<crate::stat::Statfs, Errno>, path: *const c_char, fd: c_int) -> i64 {
+unsafe fn statfs_link_max(r: Result<crate::stat::Statfs, Errno>, path: *const c_char, fd: c_int) -> i64 {
     match r {
         Err(Errno(ENOSYS)) => LINUX_LINK_MAX,
         Err(e) => fail(e.0) as i64,
         Ok(fs) => {
             if fs.f_type as u64 & 0xffff_ffff == 0xef53 {
-                return distinguish_ext(path, fd);
+                return unsafe { distinguish_ext(path, fd) };
             }
             magic_link_max(fs.f_type).unwrap_or(LINUX_LINK_MAX)
         }
@@ -1407,37 +1239,35 @@ fn async_io_conf(st: crate::stat::Stat, ok: bool) -> i64 {
 }
 
 unsafe fn pathconf_value(path: *const c_char, name: c_int) -> i64 {
-    unsafe {
-        let fs = || crate::stat::statfs_path(path);
-        match name {
-            PC_LINK_MAX => return statfs_link_max(fs(), path, -1),
-            PC_FILESIZEBITS => return statfs_filesize_max(fs()),
-            PC_2_SYMLINKS => return statfs_symlinks(fs()),
-            PC_CHOWN_RESTRICTED => return statfs_chown_restricted(fs()),
-            _ => {}
-        }
-        if *path == 0 {
-            return fail(ENOENT) as i64;
-        }
-        if name == PC_ASYNC_IO {
-            let mut st = crate::stat::Stat::zeroed();
-            let ok = crate::stat::stat(path, &mut st) == 0;
-            return async_io_conf(st, ok);
-        }
-        posix_conf(name, &fs, false)
+    let fs = || unsafe { crate::stat::statfs_path(path) };
+    match name {
+        PC_LINK_MAX => return unsafe { statfs_link_max(fs(), path, -1) },
+        PC_FILESIZEBITS => return statfs_filesize_max(fs()),
+        PC_2_SYMLINKS => return statfs_symlinks(fs()),
+        PC_CHOWN_RESTRICTED => return statfs_chown_restricted(fs()),
+        _ => {}
     }
+    if unsafe { *path } == 0 {
+        return fail(ENOENT) as i64;
+    }
+    if name == PC_ASYNC_IO {
+        let mut st = crate::stat::Stat::zeroed();
+        let ok = unsafe { crate::stat::stat(path, &mut st) } == 0;
+        return async_io_conf(st, ok);
+    }
+    posix_conf(name, &fs, false)
 }
 
 fn fpathconf_value(fd: c_int, name: c_int) -> i64 {
     let fs = || crate::stat::statfs_fd(fd);
     match name {
-        PC_LINK_MAX => return statfs_link_max(fs(), core::ptr::null(), fd),
+        PC_LINK_MAX => return unsafe { statfs_link_max(fs(), core::ptr::null(), fd) },
         PC_FILESIZEBITS => return statfs_filesize_max(fs()),
         PC_2_SYMLINKS => return statfs_symlinks(fs()),
         PC_CHOWN_RESTRICTED => return statfs_chown_restricted(fs()),
         PC_ASYNC_IO => {
             let mut st = crate::stat::Stat::zeroed();
-            let ok = unsafe { crate::stat::fstat(fd, &mut st) } == 0;
+            let ok = unistd::rc(crate::kernel::fstat(fd as usize, &mut st)) == 0;
             return async_io_conf(st, ok);
         }
         _ => {}

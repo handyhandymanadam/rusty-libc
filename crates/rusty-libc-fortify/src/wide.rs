@@ -1,5 +1,6 @@
 use crate::fail::chk_fail;
 use core::ffi::c_char;
+use rusty_libc_core::{ffi, string};
 use rusty_libc_wchar::mbyte;
 use rusty_libc_wchar::wstring as ws;
 use rusty_libc_wchar::{mbstate_t, wchar_t};
@@ -38,26 +39,22 @@ pub unsafe extern "C" fn __wmemset_chk(s: *mut wchar_t, c: wchar_t, n: usize, ds
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __wcscpy_chk(dst: *mut wchar_t, src: *const wchar_t, n: usize) -> *mut wchar_t {
-    unsafe {
-        let len = ws::wcsnlen(src, n);
-        if len >= n {
-            chk_fail();
-        }
-        ws::wmemcpy(dst, src, len + 1);
-        dst
+    let len = unsafe { ws::wcsnlen(src, n) };
+    if len >= n {
+        chk_fail();
     }
+    unsafe { ws::wmemcpy(dst, src, len + 1) };
+    dst
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __wcpcpy_chk(dst: *mut wchar_t, src: *const wchar_t, destlen: usize) -> *mut wchar_t {
-    unsafe {
-        let len = ws::wcsnlen(src, destlen);
-        if len >= destlen {
-            chk_fail();
-        }
-        ws::wmemcpy(dst, src, len + 1);
-        dst.add(len)
+    let len = unsafe { ws::wcsnlen(src, destlen) };
+    if len >= destlen {
+        chk_fail();
     }
+    unsafe { ws::wmemcpy(dst, src, len + 1) };
+    dst.wrapping_add(len)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -78,37 +75,33 @@ pub unsafe extern "C" fn __wcpncpy_chk(dst: *mut wchar_t, src: *const wchar_t, n
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __wcscat_chk(dst: *mut wchar_t, src: *const wchar_t, destlen: usize) -> *mut wchar_t {
-    unsafe {
-        let dl = ws::wcsnlen(dst, destlen);
-        if dl == destlen {
-            chk_fail();
-        }
-        let room = destlen - dl;
-        let sl = ws::wcsnlen(src, room);
-        if sl >= room {
-            chk_fail();
-        }
-        ws::wmemcpy(dst.add(dl), src, sl + 1);
-        dst
+    let dl = unsafe { ws::wcsnlen(dst, destlen) };
+    if dl == destlen {
+        chk_fail();
     }
+    let room = destlen - dl;
+    let sl = unsafe { ws::wcsnlen(src, room) };
+    if sl >= room {
+        chk_fail();
+    }
+    unsafe { ws::wmemcpy(dst.wrapping_add(dl), src, sl + 1) };
+    dst
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __wcsncat_chk(dst: *mut wchar_t, src: *const wchar_t, n: usize, destlen: usize) -> *mut wchar_t {
-    unsafe {
-        let dl = ws::wcsnlen(dst, destlen);
-        if dl == destlen {
-            chk_fail();
-        }
-        let room = destlen - dl;
-        let k = ws::wcsnlen(src, n);
-        if k >= room {
-            chk_fail();
-        }
-        ws::wmemcpy(dst.add(dl), src, k);
-        *dst.add(dl + k) = 0;
-        dst
+    let dl = unsafe { ws::wcsnlen(dst, destlen) };
+    if dl == destlen {
+        chk_fail();
     }
+    let room = destlen - dl;
+    let k = unsafe { ws::wcsnlen(src, n) };
+    if k >= room {
+        chk_fail();
+    }
+    unsafe { ws::wmemcpy(dst.wrapping_add(dl), src, k) };
+    unsafe { dst.wrapping_add(dl + k).write(0) };
+    dst
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -177,28 +170,25 @@ pub unsafe extern "C" fn __wcstombs_chk(dst: *mut c_char, src: *const wchar_t, l
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __wctomb_chk(s: *mut c_char, wc: wchar_t, buflen: usize) -> core::ffi::c_int {
-    unsafe {
-        if buflen < mbyte::__ctype_get_mb_cur_max() {
-            chk_fail();
-        }
-        mbyte::wctomb(s, wc)
+    if buflen < unsafe { mbyte::__ctype_get_mb_cur_max() } {
+        chk_fail();
     }
+    unsafe { mbyte::wctomb(s, wc) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __wcrtomb_chk(s: *mut c_char, wc: wchar_t, ps: *mut mbstate_t, buflen: usize) -> usize {
-    unsafe {
-        if s.is_null() {
-            return mbyte::wcrtomb(s, wc, ps);
-        }
-        let mut tmp = [0 as c_char; 16];
-        let r = mbyte::wcrtomb(tmp.as_mut_ptr(), wc, ps);
-        if r != usize::MAX {
-            if r > buflen {
-                chk_fail();
-            }
-            rusty_libc_mem::memcpy(s.cast(), tmp.as_ptr().cast(), r);
-        }
-        r
+    if s.is_null() {
+        return unsafe { mbyte::wcrtomb(s, wc, ps) };
     }
+    let mut tmp = [0u8; 16];
+    let r = unsafe { mbyte::wcrtomb(tmp.as_mut_ptr().cast(), wc, ps) };
+    if r != usize::MAX {
+        if r > buflen {
+            chk_fail();
+        }
+        let out = unsafe { ffi::bytes_mut(s.cast::<u8>(), r) };
+        string::memcpy(out, &tmp[..r]);
+    }
+    r
 }

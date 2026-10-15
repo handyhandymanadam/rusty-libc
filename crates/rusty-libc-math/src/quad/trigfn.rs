@@ -506,8 +506,6 @@ q_bin!(atan2pif128, atan2pi);
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sincosf128(x: f128, sp: *mut f128, cp: *mut f128) {
     let (s, c) = sincos(F128(x.to_bits()));
-    unsafe {
-        *sp = s.to_f128();
-        *cp = c.to_f128();
-    }
+    unsafe { sp.write(s.to_f128()) };
+    unsafe { cp.write(c.to_f128()) };
 }

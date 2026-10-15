@@ -1,13 +1,13 @@
 use core::ffi::{c_int, c_void};
-use rusty_libc_core::{errno, unistd};
+use rusty_libc_core::{errno, syscall};
 
 #[allow(non_camel_case_types)]
 pub type ssize_t = isize;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> ssize_t {
-    let slice = unsafe { core::slice::from_raw_parts(buf.cast::<u8>(), count) };
-    match unistd::write(fd, slice) {
+    let ret = unsafe { rusty_libc_core::tls::syscall_cp(syscall::SYS_WRITE, fd as usize, buf as usize, count, 0, 0, 0) };
+    match syscall::check(ret) {
         Ok(n) => n as ssize_t,
         Err(e) => {
             errno::set(e.0);

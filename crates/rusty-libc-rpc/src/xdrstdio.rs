@@ -1,54 +1,71 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
+
 use crate::types::*;
 use core::ffi::{c_char, c_int, c_long, c_void};
 use rusty_libc_stdio::file::File as FILE;
 use rusty_libc_stdio::file_api::{fflush, fread, fseek, ftell, fwrite};
 
-#[inline]
-unsafe fn fp(x: *mut XDR) -> *mut FILE {
-    (*x).x_private as *mut FILE
+#[inline(always)]
+unsafe fn fp(x: *const XDR) -> *mut FILE {
+    unsafe { (*x).x_private as *mut FILE }
+}
+
+#[inline(always)]
+unsafe fn sread(x: *const XDR, buf: *mut c_void, size: usize, n: usize) -> usize {
+    let f = unsafe { fp(x) };
+    unsafe { fread(buf, size, n, f) }
+}
+
+#[inline(always)]
+unsafe fn swrite(x: *const XDR, buf: *const c_void, size: usize, n: usize) -> usize {
+    let f = unsafe { fp(x) };
+    unsafe { fwrite(buf, size, n, f) }
 }
 
 unsafe extern "C" fn xdrstdio_destroy(x: *mut XDR) {
-    fflush(fp(x));
+    let f = unsafe { fp(x) };
+    unsafe { fflush(f) };
 }
 
 unsafe extern "C" fn xdrstdio_getlong(x: *mut XDR, lp: *mut c_long) -> bool_t {
-    let mut mycopy: u32 = 0;
-    if fread((&mut mycopy as *mut u32).cast::<c_void>(), 4, 1, fp(x)) != 1 {
+    let mut b = [0u8; 4];
+    if unsafe { sread(x, b.as_mut_ptr().cast(), 4, 1) } != 1 {
         return FALSE;
     }
-    *lp = u32::from_be(mycopy) as c_long;
+    unsafe { *lp = u32::from_be_bytes(b) as c_long };
     TRUE
 }
 
 unsafe extern "C" fn xdrstdio_putlong(x: *mut XDR, lp: *const c_long) -> bool_t {
-    let mycopy = (*lp as u32).to_be();
-    if fwrite((&mycopy as *const u32).cast::<c_void>(), 4, 1, fp(x)) != 1 {
+    let b = (unsafe { *lp } as u32).to_be_bytes();
+    if unsafe { swrite(x, b.as_ptr().cast(), 4, 1) } != 1 {
         return FALSE;
     }
     TRUE
 }
 
 unsafe extern "C" fn xdrstdio_getbytes(x: *mut XDR, addr: caddr_t, len: u_int) -> bool_t {
-    if len != 0 && fread(addr.cast::<c_void>(), len as c_int as usize, 1, fp(x)) != 1 {
+    if len != 0 && unsafe { sread(x, addr.cast(), len as c_int as usize, 1) } != 1 {
         return FALSE;
     }
     TRUE
 }
 
 unsafe extern "C" fn xdrstdio_putbytes(x: *mut XDR, addr: *const c_char, len: u_int) -> bool_t {
-    if len != 0 && fwrite(addr.cast::<c_void>(), len as c_int as usize, 1, fp(x)) != 1 {
+    if len != 0 && unsafe { swrite(x, addr.cast(), len as c_int as usize, 1) } != 1 {
         return FALSE;
     }
     TRUE
 }
 
 unsafe extern "C" fn xdrstdio_getpos(x: *const XDR) -> u_int {
-    ftell((*x).x_private as *mut FILE) as u_int
+    let f = unsafe { fp(x) };
+    unsafe { ftell(f) as u_int }
 }
 
 unsafe extern "C" fn xdrstdio_setpos(x: *mut XDR, pos: u_int) -> bool_t {
-    if fseek(fp(x), pos as c_long, 0) < 0 { FALSE } else { TRUE }
+    let f = unsafe { fp(x) };
+    if unsafe { fseek(f, pos as c_long, 0) } < 0 { FALSE } else { TRUE }
 }
 
 unsafe extern "C" fn xdrstdio_inline(_x: *mut XDR, _len: u_int) -> *mut i32 {
@@ -56,17 +73,17 @@ unsafe extern "C" fn xdrstdio_inline(_x: *mut XDR, _len: u_int) -> *mut i32 {
 }
 
 unsafe extern "C" fn xdrstdio_getint32(x: *mut XDR, ip: *mut i32) -> bool_t {
-    let mut mycopy: i32 = 0;
-    if fread((&mut mycopy as *mut i32).cast::<c_void>(), 4, 1, fp(x)) != 1 {
+    let mut b = [0u8; 4];
+    if unsafe { sread(x, b.as_mut_ptr().cast(), 4, 1) } != 1 {
         return FALSE;
     }
-    *ip = i32::from_be(mycopy);
+    unsafe { *ip = i32::from_be_bytes(b) };
     TRUE
 }
 
 unsafe extern "C" fn xdrstdio_putint32(x: *mut XDR, ip: *const i32) -> bool_t {
-    let mycopy = (*ip).to_be();
-    if fwrite((&mycopy as *const i32).cast::<c_void>(), 4, 1, fp(x)) != 1 {
+    let b = unsafe { *ip }.to_be_bytes();
+    if unsafe { swrite(x, b.as_ptr().cast(), 4, 1) } != 1 {
         return FALSE;
     }
     TRUE
@@ -87,9 +104,10 @@ static XDRSTDIO_OPS: xdr_ops = xdr_ops {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn xdrstdio_create(xdrs: *mut XDR, file: *mut FILE, op: c_int) {
-    (*xdrs).x_op = op;
-    (*xdrs).x_ops = &XDRSTDIO_OPS;
-    (*xdrs).x_private = file as caddr_t;
-    (*xdrs).x_handy = 0;
-    (*xdrs).x_base = core::ptr::null_mut();
+    let x = unsafe { &mut *xdrs };
+    x.x_op = op;
+    x.x_ops = &XDRSTDIO_OPS;
+    x.x_private = file as caddr_t;
+    x.x_handy = 0;
+    x.x_base = core::ptr::null_mut();
 }

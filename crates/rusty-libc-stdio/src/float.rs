@@ -354,7 +354,7 @@ pub fn fast_digits(m: u64, e: i32, conv_l: u8, prec: usize, out: &mut [u8; 48], 
         len -= 1;
     }
     assert!(len <= out.len() && i + len <= buf.len());
-    unsafe { crate::fmt::small_copy(out.as_mut_ptr(), buf.as_ptr().add(i), len) };
+    unsafe { crate::fmt::small_copy(out.as_mut_ptr(), buf.as_ptr().wrapping_add(i), len) };
     let dp = if conv_l == b'f' { nd as i32 - prec as i32 } else { dp };
     Some((len, dp))
 }

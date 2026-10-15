@@ -106,7 +106,7 @@ fn lgamma_both(x: f64) -> (f64, i32) {
 
 #[allow(non_upper_case_globals)]
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub static mut __signgam: i32 = 0;
+pub static __signgam: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 
 #[cfg(feature = "export")]
 core::arch::global_asm!(".weak signgam", ".type signgam, @object", ".set signgam, __signgam", ".size signgam, 4");
@@ -114,7 +114,7 @@ core::arch::global_asm!(".weak signgam", ".type signgam, @object", ".set signgam
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn lgamma(x: f64) -> f64 {
     let (y, s) = lgamma_both(x);
-    unsafe { core::ptr::write_volatile(&raw mut __signgam, s) };
+    __signgam.store(s, core::sync::atomic::Ordering::Relaxed);
     y
 }
 
@@ -122,7 +122,7 @@ pub extern "C" fn lgamma(x: f64) -> f64 {
 pub unsafe extern "C" fn lgamma_r(x: f64, sign: *mut i32) -> f64 {
     let (y, s) = lgamma_both(x);
     if !sign.is_null() {
-        unsafe { *sign = s };
+        unsafe { sign.write(s) };
     }
     y
 }
@@ -307,7 +307,7 @@ pub extern "C" fn tgammaf(x: f32) -> f32 {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn lgammaf(x: f32) -> f32 {
     let (y, s) = lgammaf_both(x);
-    unsafe { core::ptr::write_volatile(&raw mut __signgam, s) };
+    __signgam.store(s, core::sync::atomic::Ordering::Relaxed);
     y
 }
 
@@ -315,7 +315,7 @@ pub extern "C" fn lgammaf(x: f32) -> f32 {
 pub unsafe extern "C" fn lgammaf_r(x: f32, sign: *mut i32) -> f32 {
     let (y, s) = lgammaf_both(x);
     if !sign.is_null() {
-        unsafe { *sign = s };
+        unsafe { sign.write(s) };
     }
     y
 }

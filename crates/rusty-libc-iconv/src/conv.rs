@@ -334,13 +334,25 @@ impl Converter {
         Self::open(to.as_bytes(), from.as_bytes())
     }
 
+    pub fn open_ccs(name: &[u8]) -> Result<(Converter, Converter), OpenError> {
+        let key = names::ccs_key(name).ok_or(OpenError::UnknownCharset)?;
+        match names::lookup_key(key.key()) {
+            None | Some(Cs::Special(SP_INTERNAL)) => Err(OpenError::UnknownCharset),
+            Some(_) => {
+                let mut enc = Self::open(key.key(), b"WCHAR_T")?;
+                enc.c1.flags |= INTERNAL_USE | TRANSLIT;
+                enc.c2.flags |= INTERNAL_USE | TRANSLIT;
+                Ok((Self::open(b"WCHAR_T", key.key())?, enc))
+            }
+        }
+    }
+
     pub fn open(to: &[u8], from: &[u8]) -> Result<Converter, OpenError> {
         let pt = names::parse(to).ok_or(OpenError::UnknownCharset)?;
         let pf = names::parse(from).ok_or(OpenError::UnknownCharset)?;
         let resolve = |p: &names::Parsed| -> Option<Cs> {
             if p.key() == b"//" {
-                let d = rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE);
-                let cs: &[u8] = if d.is_null() { b"ANSI_X3.4-1968" } else { unsafe { (*d).bytes(14) } };
+                let cs: &[u8] = rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE).map_or(b"ANSI_X3.4-1968", |d| d.bytes(14));
                 let mut buf = [0u8; 64];
                 let n = cs.len().min(60);
                 buf[..n].copy_from_slice(&cs[..n]);
@@ -459,14 +471,25 @@ impl Converter {
     }
 
     fn single(&mut self, inp: &[u8], ip: &mut usize, out: &mut [u8], op: &mut usize, irr: &mut usize) -> St {
-        let mut buf = [0u32; CHUNK];
+        let rem = inp.len() - *ip;
+        if rem + 2 <= 64 {
+            self.single_n::<64>(inp, ip, out, op, irr)
+        } else if rem + 2 <= 1024 {
+            self.single_n::<1024>(inp, ip, out, op, irr)
+        } else {
+            self.single_n::<CHUNK>(inp, ip, out, op, irr)
+        }
+    }
+
+    fn single_n<const N: usize>(&mut self, inp: &[u8], ip: &mut usize, out: &mut [u8], op: &mut usize, irr: &mut usize) -> St {
+        let mut buf = [0u32; N];
         if let Some(dec) = self.dec.as_mut() {
             if let Some(st) = dec.prepare(&mut self.c1, inp, ip) {
                 return st;
             }
             let mut sticky = false;
             loop {
-                let cap = ((out.len() - *op) / 4).min(CHUNK);
+                let cap = ((out.len() - *op) / 4).min(N);
                 let mut n = 0;
                 let mut l = 0;
                 let st = dec.run(&mut self.c1, inp, ip, &mut buf[..cap], &mut n, &mut l);
@@ -479,7 +502,7 @@ impl Converter {
                 *op += 4 * n;
                 self.c1.inv += 1;
                 let more = (out.len() - *op) / 4 > 0;
-                if st == St::Full && cap == CHUNK && more {
+                if st == St::Full && cap == N && more {
                     continue;
                 }
                 if st == St::Illegal && self.c1.flags & IGNORE != 0 && *ip != inp.len() {
@@ -493,7 +516,7 @@ impl Converter {
         let mut sticky = false;
         loop {
             let avail = (inp.len() - *ip) / 4;
-            let cnt = avail.min(CHUNK);
+            let cnt = avail.min(N);
             for k in 0..cnt {
                 let b = &inp[*ip + 4 * k..];
                 buf[k] = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
@@ -509,7 +532,7 @@ impl Converter {
                 (if c == cnt { St::Empty } else { St::Full }, c)
             };
             *ip += 4 * used;
-            if st == St::Empty && cnt == CHUNK && *ip != inp.len() {
+            if st == St::Empty && cnt == N && *ip != inp.len() {
                 continue;
             }
             if st == St::Empty && inp.len() - *ip < 4 && *ip != inp.len() {

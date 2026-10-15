@@ -409,9 +409,10 @@ pub const fn err_ptrs() -> ErrPtrs {
 
 #[inline(never)]
 pub fn error_message(code: i32) -> Option<&'static core::ffi::CStr> {
-    if (0..ERRLIST.len() as i32).contains(&code) && !ERRLIST[code as usize].is_empty() {
+    if (0..ERRLIST.len() as i32).contains(&code) && ERR_BLOB[ERR_OFF[code as usize] as usize] != 0 {
         let at = ERR_OFF[code as usize] as usize;
-        Some(unsafe { core::ffi::CStr::from_ptr(ERR_BLOB.as_ptr().add(at).cast()) })
+        let p = unsafe { ERR_BLOB.as_ptr().add(at) };
+        Some(unsafe { core::ffi::CStr::from_ptr(p.cast()) })
     } else {
         None
     }
@@ -419,9 +420,10 @@ pub fn error_message(code: i32) -> Option<&'static core::ffi::CStr> {
 
 #[inline(never)]
 pub fn error_name(code: i32) -> Option<&'static core::ffi::CStr> {
-    if (0..ERRNAMES.len() as i32).contains(&code) && !ERRNAMES[code as usize].is_empty() {
+    if (0..ERRNAMES.len() as i32).contains(&code) && NAME_BLOB[NAME_OFF[code as usize] as usize] != 0 {
         let at = NAME_OFF[code as usize] as usize;
-        Some(unsafe { core::ffi::CStr::from_ptr(NAME_BLOB.as_ptr().add(at).cast()) })
+        let p = unsafe { NAME_BLOB.as_ptr().add(at) };
+        Some(unsafe { core::ffi::CStr::from_ptr(p.cast()) })
     } else {
         None
     }
@@ -429,19 +431,27 @@ pub fn error_name(code: i32) -> Option<&'static core::ffi::CStr> {
 
 #[inline(never)]
 pub fn signal_message(sig: i32) -> Option<&'static core::ffi::CStr> {
-    if (0..SIGLIST.len() as i32).contains(&sig) && !SIGLIST[sig as usize].is_empty() {
+    if (0..SIGLIST.len() as i32).contains(&sig) && SIG_BLOB[SIG_OFF[sig as usize] as usize] != 0 {
         let at = SIG_OFF[sig as usize] as usize;
-        Some(unsafe { core::ffi::CStr::from_ptr(SIG_BLOB.as_ptr().add(at).cast()) })
+        let p = unsafe { SIG_BLOB.as_ptr().add(at) };
+        Some(unsafe { core::ffi::CStr::from_ptr(p.cast()) })
     } else {
         None
     }
 }
 
 #[thread_local]
-static mut STRERROR_BUF: *mut u8 = core::ptr::null_mut();
+static STRERROR_BUF: core::cell::Cell<*mut u8> = core::cell::Cell::new(core::ptr::null_mut());
 
 pub fn strerror_buf_slot() -> *mut *mut u8 {
-    core::ptr::addr_of_mut!(STRERROR_BUF)
+    STRERROR_BUF.as_ptr()
+}
+
+#[thread_local]
+static STRSIGNAL_BUF: core::cell::Cell<*mut u8> = core::cell::Cell::new(core::ptr::null_mut());
+
+pub fn strsignal_buf_slot() -> *mut *mut u8 {
+    STRSIGNAL_BUF.as_ptr()
 }
 
 pub fn write_unknown(buf: &mut [u8], prefix: &[u8], n: i32) -> usize {
@@ -466,4 +476,32 @@ pub fn write_unknown(buf: &mut [u8], prefix: &[u8], n: i32) -> usize {
     k += 12 - i;
     buf[k] = 0;
     k
+}
+
+#[inline]
+pub fn error_message_tr(code: i32) -> Option<&'static core::ffi::CStr> {
+    error_message(code).map(crate::i18n::tr)
+}
+
+pub fn write_prefixed_number(buf: &mut [u8], prefix: &[u8], n: i32) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+    let mut tmp = [0u8; 12];
+    let k = write_unknown(&mut tmp, b"", n);
+    let room = buf.len() - 1;
+    let a = prefix.len().min(room);
+    buf[..a].copy_from_slice(&prefix[..a]);
+    let b = k.min(room - a);
+    buf[a..a + b].copy_from_slice(&tmp[..b]);
+    buf[a + b] = 0;
+    a + b
+}
+
+pub fn strerror_r_text(code: i32, buf: &mut [u8]) -> &[u8] {
+    if let Some(m) = error_message_tr(code) {
+        return m.to_bytes();
+    }
+    let n = write_prefixed_number(buf, crate::i18n::tr(c"Unknown error ").to_bytes(), code);
+    &buf[..n]
 }

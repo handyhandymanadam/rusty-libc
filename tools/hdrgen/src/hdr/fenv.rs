@@ -69,6 +69,13 @@ pub static HDR: Header = Header {
                     ]),
                 ] },
             ], ""),
+            Item::Gate(&[
+                Branch { head: "if defined __RLIBC_MATH_EXT && defined FE_INVALID && defined __SUPPORT_SNAN__", items: &[
+                    Item::Consts(&[
+                        ("FE_SNANS_ALWAYS_SIGNAL", V::Dec(1)),
+                    ]),
+                ] },
+            ], ""),
             Item::Blank,
             Item::Include("<bits/rlibc-fenvcalls.h>"),
             Item::Blank,

@@ -132,10 +132,10 @@ pub(crate) fn nearbyint_soft<F: Fp>(x: F) -> F {
 
 macro_rules! hw_round {
     ($name:ident, $ty:ty, $ins:literal, $imm:literal) => {
-        #[inline]
-        fn $name(x: $ty) -> $ty {
+        #[inline(always)]
+        pub(crate) fn $name(x: $ty) -> $ty {
             let r: $ty;
-            unsafe { asm!(concat!($ins, " {0}, {1}, ", $imm), out(xmm_reg) r, in(xmm_reg) x, options(nomem, nostack, preserves_flags)) };
+            unsafe { asm!(concat!($ins, " {0}, {0}, ", $imm), inout(xmm_reg) x => r, options(nomem, nostack, preserves_flags)) };
             r
         }
     };

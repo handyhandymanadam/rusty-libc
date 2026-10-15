@@ -274,7 +274,7 @@ pub fn remquof_pair(x: f32, y: f32) -> (f32, c_int) {
 pub unsafe extern "C" fn remquo(x: f64, y: f64, quo: *mut c_int) -> f64 {
     let (r, q) = remquo_g(x, y);
     if let Some(q) = q {
-        unsafe { *quo = q };
+        unsafe { quo.write(q) };
     }
     r
 }
@@ -282,7 +282,7 @@ pub unsafe extern "C" fn remquo(x: f64, y: f64, quo: *mut c_int) -> f64 {
 pub unsafe extern "C" fn remquof(x: f32, y: f32, quo: *mut c_int) -> f32 {
     let (r, q) = remquo_g(x, y);
     if let Some(q) = q {
-        unsafe { *quo = q };
+        unsafe { quo.write(q) };
     }
     r
 }

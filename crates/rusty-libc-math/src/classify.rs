@@ -355,13 +355,13 @@ pub fn frexpf_pair(x: f32) -> (f32, i32) {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn frexp(x: f64, eptr: *mut c_int) -> f64 {
     let (f, e) = frexp_g(x);
-    unsafe { *eptr = e };
+    unsafe { eptr.write(e) };
     f
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn frexpf(x: f32, eptr: *mut c_int) -> f32 {
     let (f, e) = frexp_g(x);
-    unsafe { *eptr = e };
+    unsafe { eptr.write(e) };
     f
 }
 
@@ -396,13 +396,13 @@ pub fn modff_pair(x: f32) -> (f32, f32) {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn modf(x: f64, iptr: *mut f64) -> f64 {
     let (f, i) = modf_g(x);
-    unsafe { *iptr = i };
+    unsafe { iptr.write(i) };
     f
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn modff(x: f32, iptr: *mut f32) -> f32 {
     let (f, i) = modf_g(x);
-    unsafe { *iptr = i };
+    unsafe { iptr.write(i) };
     f
 }
 
@@ -650,13 +650,7 @@ pub fn nanf_from_tag(tag: &[u8]) -> f32 {
     nan_g(tag)
 }
 
-unsafe fn c_tag<'a>(tag: *const c_char) -> &'a [u8] {
-    let mut n = 0;
-    while unsafe { *tag.add(n) } != 0 {
-        n += 1;
-    }
-    unsafe { core::slice::from_raw_parts(tag.cast::<u8>(), n) }
-}
+use rusty_libc_core::ffi::cstr_bytes_scalar as c_tag;
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn nan(tagp: *const c_char) -> f64 {
@@ -677,11 +671,11 @@ fn getpayload_g<F: Fp>(x: F) -> F {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getpayload(x: *const f64) -> f64 {
-    getpayload_g(unsafe { *x })
+    getpayload_g(unsafe { x.read() })
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getpayloadf(x: *const f32) -> f32 {
-    getpayload_g(unsafe { *x })
+    getpayload_g(unsafe { x.read() })
 }
 
 fn setpayload_g<F: Fp>(payload: F, signaling: bool) -> (F, i32) {
@@ -708,38 +702,40 @@ fn setpayload_g<F: Fp>(payload: F, signaling: bool) -> (F, i32) {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setpayload(x: *mut f64, payload: f64) -> c_int {
     let (v, r) = setpayload_g(payload, false);
-    unsafe { *x = v };
+    unsafe { x.write(v) };
     r
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setpayloadf(x: *mut f32, payload: f32) -> c_int {
     let (v, r) = setpayload_g(payload, false);
-    unsafe { *x = v };
+    unsafe { x.write(v) };
     r
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setpayloadsig(x: *mut f64, payload: f64) -> c_int {
     let (v, r) = setpayload_g(payload, true);
-    unsafe { *x = v };
+    unsafe { x.write(v) };
     r
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setpayloadsigf(x: *mut f32, payload: f32) -> c_int {
     let (v, r) = setpayload_g(payload, true);
-    unsafe { *x = v };
+    unsafe { x.write(v) };
     r
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn canonicalize(cx: *mut f64, x: *const f64) -> c_int {
-    let v = unsafe { *x };
-    unsafe { *cx = if v.is_signaling_() { v.add(v) } else { v } };
+    let v = unsafe { x.read() };
+    let r = if v.is_signaling_() { v.add(v) } else { v };
+    unsafe { cx.write(r) };
     0
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn canonicalizef(cx: *mut f32, x: *const f32) -> c_int {
-    let v = unsafe { *x };
-    unsafe { *cx = if v.is_signaling_() { v.add(v) } else { v } };
+    let v = unsafe { x.read() };
+    let r = if v.is_signaling_() { v.add(v) } else { v };
+    unsafe { cx.write(r) };
     0
 }
 
@@ -758,19 +754,27 @@ fn totalordermag_g<F: Fp>(x: F, y: F) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn totalorder(x: *const f64, y: *const f64) -> c_int {
-    totalorder_g(unsafe { *x }, unsafe { *y })
+    let x = unsafe { x.read() };
+    let y = unsafe { y.read() };
+    totalorder_g(x, y)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn totalorderf(x: *const f32, y: *const f32) -> c_int {
-    totalorder_g(unsafe { *x }, unsafe { *y })
+    let x = unsafe { x.read() };
+    let y = unsafe { y.read() };
+    totalorder_g(x, y)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn totalordermag(x: *const f64, y: *const f64) -> c_int {
-    totalordermag_g(unsafe { *x }, unsafe { *y })
+    let x = unsafe { x.read() };
+    let y = unsafe { y.read() };
+    totalordermag_g(x, y)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn totalordermagf(x: *const f32, y: *const f32) -> c_int {
-    totalordermag_g(unsafe { *x }, unsafe { *y })
+    let x = unsafe { x.read() };
+    let y = unsafe { y.read() };
+    totalordermag_g(x, y)
 }
 
 const FP_NAN: c_int = 0;

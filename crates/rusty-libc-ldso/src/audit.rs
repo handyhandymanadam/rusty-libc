@@ -1,7 +1,11 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use crate::elf::*;
+use crate::ffi::CStrRef;
 use crate::lookup::*;
 use crate::map::*;
+use crate::sync_cell::SyncCell;
 use crate::util::*;
+use core::ffi::CStr;
 use core::ptr::null_mut;
 
 pub const LAV_CURRENT: u32 = 2;
@@ -17,21 +21,31 @@ pub const LA_FLG_BINDTO: u32 = 1;
 pub const LA_FLG_BINDFROM: u32 = 2;
 pub const MAX_AUDIT: usize = 8;
 
+type VersionFn = unsafe extern "C" fn(u32) -> u32;
+type ObjsearchFn = unsafe extern "C" fn(*const u8, *mut usize, u32) -> *const u8;
+type ActivityFn = unsafe extern "C" fn(*mut usize, u32);
+type ObjopenFn = unsafe extern "C" fn(*mut LinkMap, isize, *mut usize) -> u32;
+type PreinitFn = unsafe extern "C" fn(*mut usize);
+type Symbind64Fn = unsafe extern "C" fn(*const Sym, u32, *mut usize, *mut usize, *mut u32, *const u8) -> usize;
+type ObjcloseFn = unsafe extern "C" fn(*mut usize) -> u32;
+type PltEnter = unsafe extern "C" fn(*mut Sym, u32, *mut usize, *mut usize, *mut Regs, *mut u32, *const u8, *mut isize) -> usize;
+type PltExit = unsafe extern "C" fn(*mut Sym, u32, *mut usize, *mut usize, *const Regs, *mut Retval, *const u8) -> u32;
+
 #[derive(Clone, Copy)]
 pub struct Lib {
-    pub map: *mut LinkMap,
+    pub map: Option<Map>,
     pub version: u32,
-    pub f_objsearch: usize,
-    pub f_activity: usize,
-    pub f_objopen: usize,
-    pub f_preinit: usize,
-    pub f_symbind64: usize,
-    pub f_objclose: usize,
-    pub f_pltenter: usize,
-    pub f_pltexit: usize,
+    f_objsearch: Option<ObjsearchFn>,
+    f_activity: Option<ActivityFn>,
+    f_objopen: Option<ObjopenFn>,
+    f_preinit: Option<PreinitFn>,
+    f_symbind64: Option<Symbind64Fn>,
+    f_objclose: Option<ObjcloseFn>,
+    f_pltenter: Option<PltEnter>,
+    f_pltexit: Option<PltExit>,
 }
 
-const NO_LIB: Lib = Lib { map: null_mut(), version: 0, f_objsearch: 0, f_activity: 0, f_objopen: 0, f_preinit: 0, f_symbind64: 0, f_objclose: 0, f_pltenter: 0, f_pltexit: 0 };
+const NO_LIB: Lib = Lib { map: None, version: 0, f_objsearch: None, f_activity: None, f_objopen: None, f_preinit: None, f_symbind64: None, f_objclose: None, f_pltenter: None, f_pltexit: None };
 
 pub const LA_SYMB_NOPLTENTER: u32 = 1;
 pub const LA_SYMB_NOPLTEXIT: u32 = 2;
@@ -42,12 +56,18 @@ pub struct Audit {
     pub libs: [Lib; MAX_AUDIT],
     pub n: usize,
     pub ready: bool,
-    pub maps: [*mut LinkMap; 64],
+    maps: [Option<Map>; 64],
     pub nmaps: usize,
     pub ns_mask: u32,
 }
 
-pub static mut AUDIT: Audit = Audit { libs: [NO_LIB; MAX_AUDIT], n: 0, ready: false, maps: [null_mut(); 64], nmaps: 0, ns_mask: 0 };
+impl Audit {
+    pub fn maps(&self) -> impl DoubleEndedIterator<Item = Map> + '_ {
+        self.maps[..self.nmaps].iter().flatten().copied()
+    }
+}
+
+static AUDIT: SyncCell<Audit> = SyncCell::new(Audit { libs: [NO_LIB; MAX_AUDIT], n: 0, ready: false, maps: [None; 64], nmaps: 0, ns_mask: 0 });
 
 #[inline(always)]
 pub fn is_audit_ns(ns: usize) -> bool {
@@ -56,7 +76,7 @@ pub fn is_audit_ns(ns: usize) -> bool {
 
 #[inline(always)]
 pub fn au() -> &'static mut Audit {
-    unsafe { &mut *(&raw mut AUDIT) }
+    unsafe { &mut *AUDIT.as_ptr() }
 }
 
 #[inline(always)]
@@ -66,394 +86,338 @@ pub fn active() -> bool {
 
 #[inline(always)]
 pub fn wants_objsearch() -> bool {
-    active() && au().libs[..au().n].iter().any(|l| l.f_objsearch != 0)
+    active() && au().libs[..au().n].iter().any(|l| l.f_objsearch.is_some())
 }
 
-pub unsafe fn objsearch(mut name: *const u8, l: *mut LinkMap, code: u32) -> *const u8 {
-    unsafe {
-        if l.is_null() || code == 0 || !wants_objsearch() || is_audit_map(l) {
-            return name;
-        }
-        for i in 0..au().n {
-            let f = au().libs[i].f_objsearch;
-            if f != 0 {
-                let f: unsafe extern "C" fn(*const u8, *mut usize, u32) -> *const u8 = core::mem::transmute(f);
-                name = f(name, &raw mut (*l).audit_cookie[i], code);
-                if name.is_null() {
-                    return name;
-                }
+pub fn objsearch(name: &CStr, l: Option<Map>, code: u32) -> *const u8 {
+    let mut name = name.as_ptr() as *const u8;
+    let Some(l) = l else { return name };
+    if code == 0 || !wants_objsearch() || is_audit_map(l) {
+        return name;
+    }
+    for i in 0..au().n {
+        if let Some(f) = au().libs[i].f_objsearch {
+            name = unsafe { f(name, l.audit_cookie_ptr(i), code) };
+            if name.is_null() {
+                return name;
             }
         }
-        name
+    }
+    name
+}
+
+fn find_fn(m: Map, name: &[u8]) -> usize {
+    let own = [m];
+    let fl = Flags { plt: false, skip: None, newest: false };
+    match lookup(name, None, &[&own], &fl) {
+        Some(f) => sym_addr(&f),
+        None => 0,
     }
 }
 
-unsafe fn find_fn(m: *mut LinkMap, name: &[u8]) -> usize {
-    unsafe {
-        let own = [m];
-        let fl = Flags { plt: false, skip: null_mut(), newest: false };
-        match lookup(name, None, &[&own], &fl) {
-            Some(f) => sym_addr(&f),
-            None => 0,
+unsafe fn audit_fn<F: Copy>(m: Map, name: &[u8]) -> Option<F> {
+    const { assert!(core::mem::size_of::<F>() == core::mem::size_of::<usize>()) };
+    let a = find_fn(m, name);
+    if a == 0 { None } else { Some(unsafe { core::mem::transmute_copy::<usize, F>(&a) }) }
+}
+
+pub fn load(list: &[u8], from_option: bool) {
+    for name in list.split(|&c| c == b':' || c == b' ') {
+        if name.is_empty() || au().n >= MAX_AUDIT {
+            continue;
         }
+        let Some(nsid) = crate::dl::new_namespace() else {
+            set_error_at(name, 22, format_args!("no more namespaces available for dlmopen()"));
+            report_fail(name, from_option);
+            continue;
+        };
+        au().ns_mask |= 1 << nsid;
+        crate::debug_initialize(nsid);
+        let m = load_library(nsid, name, None);
+        let Some(m) = m.filter(|&m| load_deps(m)) else {
+            report_fail(name, from_option);
+            crate::dl::discard_from(ns(nsid).head);
+            au().ns_mask &= !(1 << nsid);
+            trim_nns();
+            continue;
+        };
+        for cur in ns(nsid).maps() {
+            if au().nmaps < 64 && !cur.is_ldso() {
+                let k = au().nmaps;
+                au().maps[k] = Some(cur);
+                au().nmaps += 1;
+                cur.set_nodelete(true);
+                cur.set_refcount(cur.refcount() + 1);
+            }
+        }
+        crate::build_scope(m);
+        for cur in ns(nsid).maps() {
+            if cur.scope_ptr().is_null() {
+                unsafe { cur.set_scope(m.scope_ptr()) };
+                unsafe { cur.set_nscope(m.nscope()) };
+            }
+        }
+        let mut l = NO_LIB;
+        l.map = Some(m);
+        let k = au().n;
+        au().libs[k] = l;
+        au().n += 1;
     }
 }
 
-pub unsafe fn load(list: &[u8], from_option: bool) {
-    unsafe {
-        for name in list.split(|&c| c == b':' || c == b' ') {
-            if name.is_empty() || au().n >= MAX_AUDIT {
-                continue;
-            }
-            let Some(nsid) = crate::dl::new_namespace() else {
-                set_error(format_args!("{}: no more namespaces available for dlmopen(): Invalid argument", Bytes(name)));
-                report_fail(name, from_option);
-                continue;
-            };
-            au().ns_mask |= 1 << nsid;
-            crate::debug_initialize(nsid);
-            let m = load_library(nsid, name, null_mut());
-            if m.is_null() || !load_deps(m) {
-                report_fail(name, from_option);
-                crate::dl::discard_from(ns(nsid).head);
-                au().ns_mask &= !(1 << nsid);
-                trim_nns();
-                continue;
-            }
-            let mut cur = ns(nsid).head;
-            while !cur.is_null() {
-                if au().nmaps < 64 && !(*cur).is_ldso {
-                    au().maps[au().nmaps] = cur;
-                    au().nmaps += 1;
-                    (*cur).nodelete = true;
-                    (*cur).refcount += 1;
-                }
-                cur = (*cur).l_next;
-            }
-            crate::build_scope(m);
-            let mut cur = ns(nsid).head;
-            while !cur.is_null() {
-                if (*cur).scope.is_null() {
-                    (*cur).scope = (*m).scope;
-                    (*cur).nscope = (*m).nscope;
-                }
-                cur = (*cur).l_next;
-            }
-            let mut l = NO_LIB;
-            l.map = m;
-            au().libs[au().n] = l;
-            au().n += 1;
-        }
-    }
-}
-
-unsafe fn report_fail(name: &[u8], _from_option: bool) {
+fn report_fail(name: &[u8], _from_option: bool) {
     let e = error_str();
     let e = e.strip_prefix(name).and_then(|r| r.strip_prefix(b": ")).unwrap_or(e);
     let reason: &[u8] = if e.starts_with(b"cannot open shared object file") { b"cannot open shared object file" } else { e };
     crate::eprint!("ERROR: ld.so: object '{}' cannot be loaded as audit interface: {}; ignored.\n", Bytes(name), Bytes(reason));
 }
 
-unsafe fn load_deps(m: *mut LinkMap) -> bool {
-    unsafe {
-        let mut cur = m;
-        while !cur.is_null() {
-            let c = cur;
-            if !(*c).is_ldso && (*c).needed.is_null() {
-                let mut count = 0usize;
-                needed_names(c, |_| count += 1);
-                (*c).needed = alloc_perm(count.max(1) * 8, 8) as *mut *mut LinkMap;
-                (*c).nneeded = 0;
-                let mut ok = true;
-                needed_names(c, |name| {
-                    if !ok {
-                        return;
-                    }
-                    let d = load_library((*c).l_ns as usize, name, c);
-                    if d.is_null() {
-                        ok = false;
-                        return;
-                    }
-                    *(*c).needed.add((*c).nneeded) = d;
-                    (*c).nneeded += 1;
-                });
-                if !ok {
-                    return false;
-                }
-            }
-            cur = (*c).l_next;
+fn load_deps(m: Map) -> bool {
+    let mut cur = Some(m);
+    while let Some(c) = cur {
+        if !c.is_ldso() && c.needed_ptr().is_null() && !crate::load_needed(c, false, |_| {}) {
+            return false;
         }
-        true
+        cur = c.next();
     }
+    true
 }
 
 pub unsafe fn announce_open() {
-    unsafe {
-        let mut kept = 0usize;
-        for i in 0..au().n {
-            let mut l = au().libs[i];
-            let fv = find_fn(l.map, b"la_version");
-            if fv == 0 {
-                crate::eprint!("ERROR: ld.so: object '{}' cannot be loaded as audit interface: undefined symbol: la_version; ignored.\n", Bytes(cstr((*l.map).l_name)));
-                continue;
-            }
-            let f: unsafe extern "C" fn(u32) -> u32 = core::mem::transmute(fv);
-            let v = f(LAV_CURRENT);
-            if v == 0 || v > LAV_CURRENT {
-                crate::eprint!("ERROR: audit interface '{}' requires version {} (maximum supported version {}); ignored.\n", Bytes(cstr((*l.map).l_name)), v, LAV_CURRENT);
-                continue;
-            }
-            l.version = v;
-            l.f_objsearch = find_fn(l.map, b"la_objsearch");
-            l.f_activity = find_fn(l.map, b"la_activity");
-            l.f_objopen = find_fn(l.map, b"la_objopen");
-            l.f_preinit = find_fn(l.map, b"la_preinit");
-            l.f_symbind64 = find_fn(l.map, b"la_symbind64");
-            l.f_objclose = find_fn(l.map, b"la_objclose");
-            l.f_pltenter = find_fn(l.map, b"la_x86_64_gnu_pltenter");
-            l.f_pltexit = find_fn(l.map, b"la_x86_64_gnu_pltexit");
-            au().libs[kept] = l;
-            kept += 1;
-        }
-        au().n = kept;
-        au().ready = kept != 0;
-        if kept == 0 {
-            return;
-        }
-        objopen(st().main_map);
-        objopen(st().ldso_map);
-        activity(LA_ACT_ADD);
-        let mut cur = ns(0).head;
-        while !cur.is_null() {
-            if !is_audit_map(cur) && !(*cur).is_main && !(*cur).is_ldso {
-                objopen(cur);
-            }
-            cur = (*cur).l_next;
-        }
-        activity(LA_ACT_CONSISTENT);
-    }
-}
-
-pub unsafe fn announce_preinit() {
-    unsafe {
-        if !active() {
-            return;
-        }
-        for i in 0..au().n {
-            let l = au().libs[i];
-            if l.f_preinit != 0 {
-                let f: unsafe extern "C" fn(*mut usize) = core::mem::transmute(l.f_preinit);
-                f(&raw mut (*st().main_map).audit_cookie[i]);
-            }
-        }
-    }
-}
-
-pub unsafe fn plt_hooks_for(m: *mut LinkMap) -> bool {
-    unsafe { active() && au().libs[..au().n].iter().any(|l| l.f_pltenter != 0 || l.f_pltexit != 0) && !is_audit_map(m) }
-}
-
-pub unsafe fn is_audit_map(m: *mut LinkMap) -> bool {
-    unsafe { is_audit_ns((*m).l_ns as usize) }
-}
-
-pub unsafe fn activity(flag: u32) {
-    unsafe { activity_map(st().main_map, flag) }
-}
-
-pub unsafe fn ns_head(n: usize) -> *mut LinkMap {
-    unsafe { if n == 0 { st().main_map } else { ns(n).head } }
-}
-
-pub unsafe fn activity_ns(nsid: usize, flag: u32) {
-    unsafe {
-        let head = ns_head(nsid);
-        if !head.is_null() {
-            activity_map(head, flag);
-        }
-    }
-}
-
-pub unsafe fn activity_map(head: *mut LinkMap, flag: u32) {
-    unsafe {
-        if !active() {
-            return;
-        }
-        for i in 0..au().n {
-            let l = au().libs[i];
-            if !(*head).audit_opened {
-                (*head).audit_cookie[i] = head as usize;
-            }
-            if l.f_activity != 0 {
-                let f: unsafe extern "C" fn(*mut usize, u32) = core::mem::transmute(l.f_activity);
-                f(&raw mut (*head).audit_cookie[i], flag);
-            }
-        }
-    }
-}
-
-static mut CLOSING: *mut LinkMap = core::ptr::null_mut();
-
-pub unsafe fn close_one(m: *mut LinkMap) {
-    unsafe {
-        if !active() || !(*m).audit_opened {
-            return;
-        }
-        if CLOSING.is_null() {
-            CLOSING = ns_head((*m).l_ns as usize);
-            activity_map(CLOSING, LA_ACT_DELETE);
-        }
-        objclose(m);
-        (*m).audit_opened = false;
-    }
-}
-
-pub unsafe fn close_done() {
-    unsafe {
-        if !CLOSING.is_null() {
-            let h = CLOSING;
-            CLOSING = core::ptr::null_mut();
-            let n = (*h).l_ns as usize;
-            if n == 0 || !ns(n).head.is_null() {
-                activity_map(h, LA_ACT_CONSISTENT);
-            }
-        }
-    }
-}
-
-pub unsafe fn objopen(m: *mut LinkMap) {
-    unsafe {
-        if !active() {
-            return;
-        }
-        (*m).audit_opened = true;
-        make_libnames(m);
-        for i in 0..au().n {
-            let l = au().libs[i];
-            (*m).audit_cookie[i] = m as usize;
-            if l.f_objopen != 0 {
-                let f: unsafe extern "C" fn(*mut LinkMap, isize, *mut usize) -> u32 = core::mem::transmute(l.f_objopen);
-                (*m).audit_flags[i] = f(m, (*m).l_ns as isize, &raw mut (*m).audit_cookie[i]);
-                (*m).audit_any_plt |= (*m).audit_flags[i] != 0;
-            }
-        }
-    }
-}
-
-unsafe fn make_libnames(m: *mut LinkMap) {
-    unsafe {
-        if !(*m).l_libname.is_null() {
-            return;
-        }
-        let first: *const u8 = if (*m).is_main {
-            c"".as_ptr() as *const u8
-        } else if !(*m).req_name.is_null() {
-            (*m).req_name
-        } else {
-            (*m).l_name
+    let mut kept = 0usize;
+    for i in 0..au().n {
+        let mut l = au().libs[i];
+        let Some(lm) = l.map else { continue };
+        let Some(fv) = (unsafe { audit_fn::<VersionFn>(lm, b"la_version") }) else {
+            crate::eprint!("ERROR: ld.so: object '{}' cannot be loaded as audit interface: undefined symbol: la_version; ignored.\n", Bytes(lm.name()));
+            continue;
         };
-        let a = alloc_perm(core::mem::size_of::<LibName>(), 8) as *mut LibName;
-        (*a).name = first;
-        (*a).dont_free = 1;
-        (*m).l_libname = a;
-        if !(*m).soname.is_null() && cstr((*m).soname) != cstr(first) {
-            let b = alloc_perm(core::mem::size_of::<LibName>(), 8) as *mut LibName;
-            (*b).name = (*m).soname;
-            (*b).dont_free = 1;
-            (*a).next = b;
+        let v = unsafe { fv(LAV_CURRENT) };
+        if v == 0 || v > LAV_CURRENT {
+            crate::eprint!("ERROR: audit interface '{}' requires version {} (maximum supported version {}); ignored.\n", Bytes(lm.name()), v, LAV_CURRENT);
+            continue;
+        }
+        l.version = v;
+        l.f_objsearch = unsafe { audit_fn(lm, b"la_objsearch") };
+        l.f_activity = unsafe { audit_fn(lm, b"la_activity") };
+        l.f_objopen = unsafe { audit_fn(lm, b"la_objopen") };
+        l.f_preinit = unsafe { audit_fn(lm, b"la_preinit") };
+        l.f_symbind64 = unsafe { audit_fn(lm, b"la_symbind64") };
+        l.f_objclose = unsafe { audit_fn(lm, b"la_objclose") };
+        l.f_pltenter = unsafe { audit_fn(lm, b"la_x86_64_gnu_pltenter") };
+        l.f_pltexit = unsafe { audit_fn(lm, b"la_x86_64_gnu_pltexit") };
+        au().libs[kept] = l;
+        kept += 1;
+    }
+    au().n = kept;
+    au().ready = kept != 0;
+    if kept == 0 {
+        return;
+    }
+    objopen(main_map());
+    objopen(ldso_map());
+    activity(LA_ACT_ADD);
+    for cur in ns(0).maps() {
+        if !is_audit_map(cur) && !cur.is_main() && !cur.is_ldso() {
+            objopen(cur);
+        }
+    }
+    activity(LA_ACT_CONSISTENT);
+}
+
+pub fn announce_preinit() {
+    if !active() {
+        return;
+    }
+    for i in 0..au().n {
+        if let Some(f) = au().libs[i].f_preinit {
+            unsafe { f(main_map().audit_cookie_ptr(i)) };
         }
     }
 }
 
-pub unsafe fn objclose(m: *mut LinkMap) {
-    unsafe {
-        if !active() {
-            return;
+pub fn plt_hooks_for(m: Map) -> bool {
+    active() && au().libs[..au().n].iter().any(|l| l.f_pltenter.is_some() || l.f_pltexit.is_some()) && !is_audit_map(m)
+}
+
+pub fn is_audit_map(m: Map) -> bool {
+    is_audit_ns(m.l_ns() as usize)
+}
+
+pub fn activity(flag: u32) {
+    activity_map(main_map(), flag)
+}
+
+pub fn ns_head(n: usize) -> Option<Map> {
+    if n == 0 { st().main_map } else { ns(n).head }
+}
+
+pub fn activity_ns(nsid: usize, flag: u32) {
+    if let Some(head) = ns_head(nsid) {
+        activity_map(head, flag);
+    }
+}
+
+pub fn activity_map(head: Map, flag: u32) {
+    if !active() {
+        return;
+    }
+    for i in 0..au().n {
+        let l = au().libs[i];
+        if !head.audit_opened() {
+            head.set_audit_cookie(i, head.as_ptr() as usize);
         }
-        for i in 0..au().n {
-            let l = au().libs[i];
-            if l.f_objclose != 0 && (*m).audit_opened {
-                let f: unsafe extern "C" fn(*mut usize) -> u32 = core::mem::transmute(l.f_objclose);
-                f(&raw mut (*m).audit_cookie[i]);
-            }
+        if let Some(f) = l.f_activity {
+            unsafe { f(head.audit_cookie_ptr(i), flag) };
         }
     }
 }
 
-pub unsafe fn symbind(sym: *const Sym, defmap: *mut LinkMap, refmap: *mut LinkMap, name: &[u8], mut addr: usize, jmp_slot: bool) -> usize {
-    unsafe {
-        if !active() || defmap.is_null() || refmap.is_null() {
-            return addr;
+static CLOSING: SyncCell<Option<Map>> = SyncCell::new(None);
+
+pub fn close_one(m: Map) {
+    if !active() || !m.audit_opened() {
+        return;
+    }
+    if unsafe { CLOSING.read() }.is_none() {
+        let h = ns_head(m.l_ns() as usize);
+        unsafe { CLOSING.write(h) };
+        if let Some(h) = h {
+            activity_map(h, LA_ACT_DELETE);
         }
-        let ndx = (sym as usize - (*defmap).symtab as usize) / core::mem::size_of::<Sym>();
-        let mut nbuf = [0u8; 256];
-        let n = name.len().min(255);
-        nbuf[..n].copy_from_slice(&name[..n]);
-        for i in 0..au().n {
-            let l = au().libs[i];
-            if l.f_symbind64 == 0 {
-                continue;
-            }
-            if (*refmap).audit_flags[i] & LA_FLG_BINDFROM == 0 || (*defmap).audit_flags[i] & LA_FLG_BINDTO == 0 {
-                continue;
-            }
-            let f: unsafe extern "C" fn(*const Sym, u32, *mut usize, *mut usize, *mut u32, *const u8) -> usize = core::mem::transmute(l.f_symbind64);
-            let mut flags = if jmp_slot { LA_SYMB_NOPLTENTER | LA_SYMB_NOPLTEXIT } else { 0u32 };
-            let mut copy = *sym;
-            copy.value = addr as u64;
-            let new = f(&copy, ndx as u32, &raw mut (*refmap).audit_cookie[i], &raw mut (*defmap).audit_cookie[i], &mut flags, nbuf.as_ptr());
-            if new != 0 {
-                addr = new;
-            }
+    }
+    objclose(m);
+    m.set_audit_opened(false);
+}
+
+pub fn close_done() {
+    if let Some(h) = unsafe { CLOSING.read() } {
+        unsafe { CLOSING.write(None) };
+        let n = h.l_ns() as usize;
+        if n == 0 || ns(n).head.is_some() {
+            activity_map(h, LA_ACT_CONSISTENT);
         }
-        addr
     }
 }
 
-pub unsafe fn symbind_dlsym(caller: *mut LinkMap, sym: *const Sym, defmap: *mut LinkMap, name: &[u8], mut addr: usize) -> usize {
-    unsafe {
-        let caller = if caller.is_null() { st().main_map } else { caller };
-        if !active() || defmap.is_null() || caller.is_null() || !((*caller).audit_any_plt || (*defmap).audit_any_plt) {
-            return addr;
+pub fn objopen(m: Map) {
+    if !active() {
+        return;
+    }
+    m.set_audit_opened(true);
+    make_libnames(m);
+    for i in 0..au().n {
+        let l = au().libs[i];
+        m.set_audit_cookie(i, m.as_ptr() as usize);
+        if let Some(f) = l.f_objopen {
+            let fl = unsafe { f(m.as_ptr(), m.l_ns(), m.audit_cookie_ptr(i)) };
+            m.set_audit_flags(i, fl);
+            m.set_audit_any_plt(m.audit_any_plt() | (fl != 0));
         }
-        let ndx = (sym as usize - (*defmap).symtab as usize) / core::mem::size_of::<Sym>();
-        let mut nbuf = [0u8; 256];
-        let n = name.len().min(255);
-        nbuf[..n].copy_from_slice(&name[..n]);
+    }
+}
+
+fn make_libnames(m: Map) {
+    if !m.l_libname().is_null() {
+        return;
+    }
+    let first: *const u8 = if m.is_main() {
+        c"".as_ptr() as *const u8
+    } else if !m.req_name_ptr().is_null() {
+        m.req_name_ptr()
+    } else {
+        m.l_name()
+    };
+    let a = alloc_perm(core::mem::size_of::<LibName>(), 8) as *mut LibName;
+    unsafe { a.write(LibName { name: first, next: null_mut(), dont_free: 1 }) };
+    unsafe { m.set_l_libname(a) };
+    let first_bytes: &[u8] = if m.is_main() { b"" } else if let Some(r) = m.req_name() { r } else { m.name() };
+    if let Some(so) = m.soname()
+        && so != first_bytes
+    {
+        let b = alloc_perm(core::mem::size_of::<LibName>(), 8) as *mut LibName;
+        unsafe { b.write(LibName { name: m.soname_ptr(), next: null_mut(), dont_free: 1 }) };
+        unsafe { (*a).next = b };
+    }
+}
+
+pub fn objclose(m: Map) {
+    if !active() {
+        return;
+    }
+    for i in 0..au().n {
+        if let Some(f) = au().libs[i].f_objclose
+            && m.audit_opened()
+        {
+            unsafe { f(m.audit_cookie_ptr(i)) };
+        }
+    }
+}
+
+fn name_buf(name: &[u8]) -> [u8; 256] {
+    let mut nbuf = [0u8; 256];
+    let n = name.len().min(255);
+    nbuf[..n].copy_from_slice(&name[..n]);
+    nbuf
+}
+
+pub fn symbind(sym: &'static Sym, defmap: Option<Map>, refmap: Option<Map>, name: &[u8], mut addr: usize, jmp_slot: bool) -> usize {
+    let (Some(defmap), Some(refmap)) = (defmap, refmap) else { return addr };
+    if !active() {
+        return addr;
+    }
+    let ndx = defmap.sym_index(sym);
+    let nbuf = name_buf(name);
+    for i in 0..au().n {
+        let Some(f) = au().libs[i].f_symbind64 else { continue };
+        if refmap.audit_flags(i) & LA_FLG_BINDFROM == 0 || defmap.audit_flags(i) & LA_FLG_BINDTO == 0 {
+            continue;
+        }
+        let mut flags = if jmp_slot { LA_SYMB_NOPLTENTER | LA_SYMB_NOPLTEXIT } else { 0u32 };
         let mut copy = *sym;
         copy.value = addr as u64;
-        let mut alt = 0u32;
-        for i in 0..au().n {
-            let l = au().libs[i];
-            if l.f_symbind64 != 0 && ((*caller).audit_flags[i] & LA_FLG_BINDFROM != 0 || (*defmap).audit_flags[i] & LA_FLG_BINDTO != 0) {
-                let f: unsafe extern "C" fn(*const Sym, u32, *mut usize, *mut usize, *mut u32, *const u8) -> usize = core::mem::transmute(l.f_symbind64);
-                let mut flags = alt | LA_SYMB_DLSYM;
-                let new = f(&copy, ndx as u32, &raw mut (*caller).audit_cookie[i], &raw mut (*defmap).audit_cookie[i], &mut flags, nbuf.as_ptr());
-                if new as u64 != copy.value {
-                    alt = LA_SYMB_ALTVALUE;
-                    copy.value = new as u64;
-                }
+        let new = unsafe { f(&copy, ndx as u32, refmap.audit_cookie_ptr(i), defmap.audit_cookie_ptr(i), &mut flags, nbuf.as_ptr()) };
+        if new != 0 {
+            addr = new;
+        }
+    }
+    addr
+}
+
+pub fn symbind_dlsym(caller: Option<Map>, sym: &'static Sym, defmap: Map, name: &[u8], addr: usize) -> usize {
+    let Some(caller) = caller.or(st().main_map) else { return addr };
+    if !active() || !(caller.audit_any_plt() || defmap.audit_any_plt()) {
+        return addr;
+    }
+    let ndx = defmap.sym_index(sym);
+    let nbuf = name_buf(name);
+    let mut copy = *sym;
+    copy.value = addr as u64;
+    let mut alt = 0u32;
+    for i in 0..au().n {
+        let Some(f) = au().libs[i].f_symbind64 else { continue };
+        if caller.audit_flags(i) & LA_FLG_BINDFROM != 0 || defmap.audit_flags(i) & LA_FLG_BINDTO != 0 {
+            let mut flags = alt | LA_SYMB_DLSYM;
+            let new = unsafe { f(&copy, ndx as u32, caller.audit_cookie_ptr(i), defmap.audit_cookie_ptr(i), &mut flags, nbuf.as_ptr()) };
+            if new as u64 != copy.value {
+                alt = LA_SYMB_ALTVALUE;
+                copy.value = new as u64;
             }
         }
-        addr = copy.value as usize;
-        addr
+    }
+    copy.value as usize
+}
+
+pub fn objclose_once(m: Map) {
+    if m.audit_opened() {
+        objclose(m);
+        m.set_audit_opened(false);
     }
 }
 
-pub unsafe fn objclose_once(m: *mut LinkMap) {
-    unsafe {
-        if (*m).audit_opened {
-            objclose(m);
-            (*m).audit_opened = false;
-        }
-    }
-}
-
-pub unsafe fn finish() {
-    unsafe {
-        if active() {
-            au().ready = false;
-        }
+pub fn finish() {
+    if active() {
+        au().ready = false;
     }
 }
 
@@ -485,92 +449,87 @@ pub struct Retval {
     pub unused: [u8; 32],
 }
 
-pub unsafe fn symbind_slot(sym: *const Sym, defmap: *mut LinkMap, refmap: *mut LinkMap, name: &[u8], addr: usize) -> (usize, u32, u32) {
-    unsafe {
-        if !active() || defmap.is_null() || refmap.is_null() || !((*refmap).audit_any_plt || (*defmap).audit_any_plt) {
-            return (addr, 0xffff, 0);
-        }
-        let ndx = (sym as usize - (*defmap).symtab as usize) / core::mem::size_of::<Sym>();
-        let mut nbuf = [0u8; 256];
-        let n = name.len().min(255);
-        nbuf[..n].copy_from_slice(&name[..n]);
-        let mut copy = *sym;
-        copy.value = addr as u64;
-        let mut enterexit = 3u32;
-        let mut flags = 0u32;
-        for i in 0..au().n {
-            let l = au().libs[i];
-            if (*refmap).audit_flags[i] & LA_FLG_BINDFROM != 0 && (*defmap).audit_flags[i] & LA_FLG_BINDTO != 0 {
-                if l.f_symbind64 != 0 {
-                    let f: unsafe extern "C" fn(*const Sym, u32, *mut usize, *mut usize, *mut u32, *const u8) -> usize = core::mem::transmute(l.f_symbind64);
-                    let new = f(&copy, ndx as u32, &raw mut (*refmap).audit_cookie[i], &raw mut (*defmap).audit_cookie[i], &mut flags, nbuf.as_ptr());
-                    if new as u64 != copy.value {
-                        flags |= LA_SYMB_ALTVALUE;
-                        copy.value = new as u64;
-                    }
-                }
-                enterexit &= flags & 3;
-                enterexit |= (flags & 3) << ((i + 1) * 2);
-            } else {
-                enterexit |= 3 << ((i + 1) * 2);
-            }
-        }
-        (copy.value as usize, enterexit, flags)
+pub fn symbind_slot(sym: &'static Sym, defmap: Map, refmap: Map, name: &[u8], addr: usize) -> (usize, u32, u32) {
+    if !active() || !(refmap.audit_any_plt() || defmap.audit_any_plt()) {
+        return (addr, 0xffff, 0);
     }
-}
-
-type PltEnter = unsafe extern "C" fn(*mut Sym, u32, *mut usize, *mut usize, *mut Regs, *mut u32, *const u8, *mut isize) -> usize;
-type PltExit = unsafe extern "C" fn(*mut Sym, u32, *mut usize, *mut usize, *const Regs, *mut Retval, *const u8) -> u32;
-
-pub unsafe fn pltenter(m: *mut LinkMap, bound: *mut LinkMap, ndx: u32, enterexit: &mut u32, slot_flags: u32, value: &mut usize, regs: *mut Regs, framesize: &mut isize) {
-    unsafe {
-        if !active() || *enterexit & LA_SYMB_NOPLTENTER != 0 || bound.is_null() {
-            return;
-        }
-        let defsym = (*bound).symtab.add(ndx as usize);
-        let name = (*bound).strtab.add((*defsym).name as usize);
-        let mut sym = *defsym;
-        sym.value = *value as u64;
-        let mut flags = slot_flags;
-        for i in 0..au().n {
-            let l = au().libs[i];
-            if l.f_pltenter != 0 && *enterexit & (LA_SYMB_NOPLTENTER << (2 * (i + 1))) == 0 {
-                let f: PltEnter = core::mem::transmute(l.f_pltenter);
-                let mut new_framesize: isize = -1;
-                let new = f(&mut sym, ndx, &raw mut (*m).audit_cookie[i], &raw mut (*bound).audit_cookie[i], regs, &mut flags, name, &mut new_framesize);
-                if new as u64 != sym.value {
+    let ndx = defmap.sym_index(sym);
+    let nbuf = name_buf(name);
+    let mut copy = *sym;
+    copy.value = addr as u64;
+    let mut enterexit = 3u32;
+    let mut flags = 0u32;
+    for i in 0..au().n {
+        let l = au().libs[i];
+        if refmap.audit_flags(i) & LA_FLG_BINDFROM != 0 && defmap.audit_flags(i) & LA_FLG_BINDTO != 0 {
+            if let Some(f) = l.f_symbind64 {
+                let new = unsafe { f(&copy, ndx as u32, refmap.audit_cookie_ptr(i), defmap.audit_cookie_ptr(i), &mut flags, nbuf.as_ptr()) };
+                if new as u64 != copy.value {
                     flags |= LA_SYMB_ALTVALUE;
-                    sym.value = new as u64;
-                }
-                *enterexit |= (flags & 3) << (2 * (i + 1));
-                if *enterexit & (LA_SYMB_NOPLTEXIT << (2 * (i + 1))) == 0 && new_framesize != -1 && *framesize != -2 {
-                    if *framesize == -1 {
-                        *framesize = new_framesize;
-                    } else if new_framesize != *framesize {
-                        *framesize = new_framesize.max(*framesize);
-                    }
+                    copy.value = new as u64;
                 }
             }
+            enterexit &= flags & 3;
+            enterexit |= (flags & 3) << ((i + 1) * 2);
+        } else {
+            enterexit |= 3 << ((i + 1) * 2);
         }
-        *value = sym.value as usize;
     }
+    (copy.value as usize, enterexit, flags)
 }
 
-pub unsafe fn pltexit(m: *mut LinkMap, bound: *mut LinkMap, ndx: u32, enterexit: u32, addr: usize, inregs: *const Regs, outregs: *mut Retval) {
-    unsafe {
-        if !active() || bound.is_null() {
-            return;
-        }
-        let defsym = (*bound).symtab.add(ndx as usize);
-        let name = (*bound).strtab.add((*defsym).name as usize);
-        let mut sym = *defsym;
-        sym.value = addr as u64;
-        for i in 0..au().n {
-            let l = au().libs[i];
-            if l.f_pltexit != 0 && enterexit & (LA_SYMB_NOPLTEXIT >> (2 * i)) == 0 {
-                let f: PltExit = core::mem::transmute(l.f_pltexit);
-                f(&mut sym, ndx, &raw mut (*m).audit_cookie[i], &raw mut (*bound).audit_cookie[i], inregs, outregs, name);
+fn plt_sym(bound: Map, ndx: u32) -> (&'static Sym, CStrRef) {
+    let defsym = unsafe { bound.sym(ndx as usize) };
+    (defsym, bound.sym_name(defsym))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn pltenter(m: Map, bound: Option<Map>, ndx: u32, enterexit: &mut u32, slot_flags: u32, value: &mut usize, regs: *mut Regs, framesize: &mut isize) {
+    let Some(bound) = bound else { return };
+    if !active() || *enterexit & LA_SYMB_NOPLTENTER != 0 {
+        return;
+    }
+    let (defsym, name) = plt_sym(bound, ndx);
+    let mut sym = *defsym;
+    sym.value = *value as u64;
+    let mut flags = slot_flags;
+    for i in 0..au().n {
+        let l = au().libs[i];
+        let Some(f) = l.f_pltenter else { continue };
+        if *enterexit & (LA_SYMB_NOPLTENTER << (2 * (i + 1))) == 0 {
+            let mut new_framesize: isize = -1;
+            let new = unsafe { f(&mut sym, ndx, m.audit_cookie_ptr(i), bound.audit_cookie_ptr(i), regs, &mut flags, name.as_ptr(), &mut new_framesize) };
+            if new as u64 != sym.value {
+                flags |= LA_SYMB_ALTVALUE;
+                sym.value = new as u64;
             }
+            *enterexit |= (flags & 3) << (2 * (i + 1));
+            if *enterexit & (LA_SYMB_NOPLTEXIT << (2 * (i + 1))) == 0 && new_framesize != -1 && *framesize != -2 {
+                if *framesize == -1 {
+                    *framesize = new_framesize;
+                } else if new_framesize != *framesize {
+                    *framesize = new_framesize.max(*framesize);
+                }
+            }
+        }
+    }
+    *value = sym.value as usize;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn pltexit(m: Map, bound: Option<Map>, ndx: u32, enterexit: u32, addr: usize, inregs: *const Regs, outregs: *mut Retval) {
+    let Some(bound) = bound else { return };
+    if !active() {
+        return;
+    }
+    let (defsym, name) = plt_sym(bound, ndx);
+    let mut sym = *defsym;
+    sym.value = addr as u64;
+    for i in 0..au().n {
+        let l = au().libs[i];
+        let Some(f) = l.f_pltexit else { continue };
+        if enterexit & (LA_SYMB_NOPLTEXIT >> (2 * i)) == 0 {
+            unsafe { f(&mut sym, ndx, m.audit_cookie_ptr(i), bound.audit_cookie_ptr(i), inregs, outregs, name.as_ptr()) };
         }
     }
 }

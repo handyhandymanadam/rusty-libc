@@ -225,7 +225,25 @@ fn attr_table() -> BTreeMap<&'static str, Vec<(String, String)>> {
     s.push(("strdup".into(), "__THROW __attribute_malloc__ __nonnull ((1))".into()));
     s.push(("strndup".into(), "__THROW __attribute_malloc__ __nonnull ((1))".into()));
     s.push(("strerror".into(), "__THROW".into()));
+    s.push(("explicit_bzero".into(), "__THROW __nonnull ((1)) __fortified_attr_access (__write_only__, 1, 2)".into()));
+    s.push(("strlcpy".into(), "__THROW __nonnull ((1, 2)) __attr_access ((__write_only__, 1, 3))".into()));
+    s.push(("strlcat".into(), "__THROW __nonnull ((1, 2)) __attr_access ((__read_write__, 1, 3))".into()));
     m.insert("string.h", s);
+    m.insert("unistd.h", vec![
+        ("read".into(), "__wur __fortified_attr_access (__write_only__, 2, 3)".into()),
+        ("pread".into(), "__wur __fortified_attr_access (__write_only__, 2, 3)".into()),
+        ("pread64".into(), "__wur __fortified_attr_access (__write_only__, 2, 3)".into()),
+        ("confstr".into(), "__THROW __fortified_attr_access (__write_only__, 2, 3)".into()),
+        ("getgroups".into(), "__THROW __wur __fortified_attr_access (__write_only__, 2, 1)".into()),
+        ("ttyname_r".into(), "__THROW __nonnull ((2)) __wur __fortified_attr_access (__write_only__, 2, 3)".into()),
+        ("readlink".into(), "__THROW __nonnull ((1, 2)) __wur __fortified_attr_access (__write_only__, 2, 3)".into()),
+        ("readlinkat".into(), "__THROW __nonnull ((2, 3)) __wur __fortified_attr_access (__write_only__, 3, 4)".into()),
+        ("gethostname".into(), "__THROW __nonnull ((1)) __fortified_attr_access (__write_only__, 1, 2)".into()),
+        ("getdomainname".into(), "__THROW __nonnull ((1)) __wur __fortified_attr_access (__write_only__, 1, 2)".into()),
+    ]);
+    m.insert("bits/rlibc_util_unistd.h", vec![
+        ("getlogin_r".into(), "__nonnull ((1)) __fortified_attr_access (__write_only__, 1, 2)".into()),
+    ]);
     m.insert("strings.h", vec![
         ("bcmp".into(), p("1, 2")), ("bcopy".into(), t("1, 2")), ("bzero".into(), t("1")), ("index".into(), p("1")), ("rindex".into(), p("1")),
         ("strcasecmp".into(), p("1, 2")), ("strncasecmp".into(), p("1, 2")),
@@ -244,6 +262,9 @@ fn attr_table() -> BTreeMap<&'static str, Vec<(String, String)>> {
     sl.push(("getenv".into(), "__THROW __nonnull ((1))".into()));
     sl.push(("malloc".into(), "__THROW __attribute_malloc__".into()));
     sl.push(("calloc".into(), "__THROW __attribute_malloc__".into()));
+    sl.push(("wcstombs".into(), "__THROW __fortified_attr_access (__write_only__, 1, 3) __attr_access ((__read_only__, 2))".into()));
+    sl.push(("mbstowcs".into(), "__THROW __attr_access ((__read_only__, 2))".into()));
+    sl.push(("ptsname_r".into(), "__THROW __nonnull ((2)) __fortified_attr_access (__write_only__, 2, 3)".into()));
     m.insert("stdlib.h", sl);
     m.insert("ctype.h", "isalnum isalpha iscntrl isdigit islower isgraph isprint ispunct isspace isupper isxdigit isblank tolower toupper isascii toascii".split(' ').map(|n| (n.to_string(), "__THROW".to_string())).collect());
     m
@@ -577,7 +598,24 @@ pub fn post_passes(files: &mut BTreeMap<String, String>) {
     add_const_pure(files);
     untypedef(files);
     add_features_include(files);
+    add_floatn_include(files);
     add_extern_c(files);
+}
+
+pub fn add_floatn_include(files: &mut BTreeMap<String, String>) {
+    let uses = |t: &str| ["_Float32", "_Float64", "_Float128"].iter().any(|w| t.contains(w));
+    let frags: Vec<String> = files.iter().filter(|(p, t)| p.starts_with("bits/rlibc-") && uses(t)).map(|(p, _)| format!("<{p}>")).collect();
+    for (path, text) in files.iter_mut() {
+        if path.starts_with("bits/") || path.starts_with("gnu/") || !path.ends_with(".h") {
+            continue;
+        }
+        if !(uses(text) || frags.iter().any(|f| text.contains(f.as_str()))) {
+            continue;
+        }
+        let Some(at) = text.find("#include <features.h>\n") else { continue };
+        let at = at + "#include <features.h>\n".len();
+        text.insert_str(at, "#include <bits/floatn.h>\n");
+    }
 }
 
 pub fn full_tree(root: &Path, tmp: &Path) -> BTreeMap<String, String> {

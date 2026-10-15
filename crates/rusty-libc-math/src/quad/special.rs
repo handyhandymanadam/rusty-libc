@@ -139,7 +139,7 @@ pub fn lgamma_r(x: F128, sign: &mut i32) -> F128 {
 pub fn lgamma(x: F128) -> F128 {
     let mut s = 1;
     let r = lgamma_r(x, &mut s);
-    unsafe { core::ptr::write_volatile(&raw mut crate::special::__signgam, s) };
+    crate::special::__signgam.store(s, core::sync::atomic::Ordering::Relaxed);
     r
 }
 
@@ -506,7 +506,7 @@ pub unsafe extern "C" fn lgammaf128_r(x: f128, sign: *mut i32) -> f128 {
     let mut s = 1;
     let r = lgamma_r(F128(x.to_bits()), &mut s);
     if !sign.is_null() {
-        unsafe { *sign = s };
+        unsafe { sign.write(s) };
     }
     r.to_f128()
 }

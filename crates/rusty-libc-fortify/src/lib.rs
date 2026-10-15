@@ -2,6 +2,7 @@
 #![feature(linkage)]
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_snake_case)]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 
 pub mod fail;
 pub mod io;

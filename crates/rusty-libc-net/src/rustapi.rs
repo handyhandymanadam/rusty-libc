@@ -1,3 +1,4 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::gai;
 use crate::inet;
 use crate::sock;
@@ -5,6 +6,20 @@ use crate::types::*;
 use crate::util::Buf;
 use core::ffi::{c_char, c_int, c_void};
 use rusty_libc_core::Errno;
+use rusty_libc_core::ffi;
+
+const _: () = assert!(core::mem::size_of::<sockaddr_storage>() == 128 && core::mem::offset_of!(sockaddr_storage, __ss_align) == 120);
+
+fn ss_bytes(ss: &sockaddr_storage) -> &[u8; 128] {
+    unsafe { &*(ss as *const sockaddr_storage).cast::<[u8; 128]>() }
+}
+
+fn ss_bytes_mut(ss: &mut sockaddr_storage) -> &mut [u8; 128] {
+    unsafe { &mut *(ss as *mut sockaddr_storage).cast::<[u8; 128]>() }
+}
+
+#[repr(C, align(8))]
+struct CBuf([u8; 128]);
 
 pub use crate::inet::{format_ipv4, format_ipv6, parse_ipv4, parse_ipv6};
 
@@ -107,48 +122,47 @@ impl SockAddr {
     }
     pub fn to_raw(&self) -> (sockaddr_storage, socklen_t) {
         let mut ss = sockaddr_storage::default();
-        let len = unsafe {
-            match self {
-                SockAddr::V4 { addr, port } => {
-                    let p = &mut ss as *mut _ as *mut sockaddr_in;
-                    *p = sockaddr_in { sin_family: AF_INET as u16, sin_port: port.to_be(), sin_addr: in_addr { s_addr: u32::from_ne_bytes(*addr) }, sin_zero: [0; 8] };
-                    16
-                }
-                SockAddr::V6 { addr, port, flowinfo, scope_id } => {
-                    let p = &mut ss as *mut _ as *mut sockaddr_in6;
-                    *p = sockaddr_in6 { sin6_family: AF_INET6 as u16, sin6_port: port.to_be(), sin6_flowinfo: flowinfo.to_be(), sin6_addr: in6_addr { s6_addr: *addr }, sin6_scope_id: *scope_id };
-                    28
-                }
-                SockAddr::Unix { path, len } => {
-                    let p = &mut ss as *mut _ as *mut sockaddr_un;
-                    *p = sockaddr_un { sun_family: AF_UNIX as u16, sun_path: *path };
-                    (2 + *len + usize::from(*len > 0 && path[0] != 0)).min(110) as u32
-                }
+        let b = ss_bytes_mut(&mut ss);
+        let len = match self {
+            SockAddr::V4 { addr, port } => {
+                b[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+                b[2..4].copy_from_slice(&port.to_be_bytes());
+                b[4..8].copy_from_slice(addr);
+                16
+            }
+            SockAddr::V6 { addr, port, flowinfo, scope_id } => {
+                b[0..2].copy_from_slice(&(AF_INET6 as u16).to_ne_bytes());
+                b[2..4].copy_from_slice(&port.to_be_bytes());
+                b[4..8].copy_from_slice(&flowinfo.to_be_bytes());
+                b[8..24].copy_from_slice(addr);
+                b[24..28].copy_from_slice(&scope_id.to_ne_bytes());
+                28
+            }
+            SockAddr::Unix { path, len } => {
+                b[0..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+                b[2..110].copy_from_slice(path);
+                (2 + *len + usize::from(*len > 0 && path[0] != 0)).min(110) as u32
             }
         };
         (ss, len)
     }
     pub fn from_raw(ss: &sockaddr_storage, len: socklen_t) -> Option<SockAddr> {
-        unsafe {
-            match ss.ss_family as c_int {
-                AF_INET if len >= 16 => {
-                    let p = ss as *const _ as *const sockaddr_in;
-                    Some(SockAddr::V4 { addr: (*p).sin_addr.s_addr.to_ne_bytes(), port: u16::from_be((*p).sin_port) })
-                }
-                AF_INET6 if len >= 28 => {
-                    let p = ss as *const _ as *const sockaddr_in6;
-                    Some(SockAddr::V6 { addr: (*p).sin6_addr.s6_addr, port: u16::from_be((*p).sin6_port), flowinfo: u32::from_be((*p).sin6_flowinfo), scope_id: (*p).sin6_scope_id })
-                }
-                AF_UNIX => {
-                    let p = ss as *const _ as *const sockaddr_un;
-                    let n = (len as usize).saturating_sub(2).min(108);
-                    let mut path = [0u8; 108];
-                    core::ptr::copy_nonoverlapping((&raw const (*p).sun_path) as *const u8, path.as_mut_ptr(), n);
-                    let l = if n > 0 && path[0] != 0 { path[..n].iter().position(|&c| c == 0).unwrap_or(n) } else { n };
-                    Some(SockAddr::Unix { path, len: l })
-                }
-                _ => None,
+        let b = ss_bytes(ss);
+        let u16at = |o: usize| u16::from_ne_bytes([b[o], b[o + 1]]);
+        let u32at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        match ss.ss_family as c_int {
+            AF_INET if len >= 16 => Some(SockAddr::V4 { addr: [b[4], b[5], b[6], b[7]], port: u16::from_be(u16at(2)) }),
+            AF_INET6 if len >= 28 => {
+                Some(SockAddr::V6 { addr: b[8..24].try_into().unwrap(), port: u16::from_be(u16at(2)), flowinfo: u32::from_be(u32at(4)), scope_id: u32at(24) })
             }
+            AF_UNIX => {
+                let n = (len as usize).saturating_sub(2).min(108);
+                let mut path = [0u8; 108];
+                path[..n].copy_from_slice(&b[2..2 + n]);
+                let l = if n > 0 && path[0] != 0 { path[..n].iter().position(|&c| c == 0).unwrap_or(n) } else { n };
+                Some(SockAddr::Unix { path, len: l })
+            }
+            _ => None,
         }
     }
 }
@@ -180,7 +194,7 @@ pub struct Socket {
 
 impl Socket {
     pub fn new(domain: c_int, ty: c_int, protocol: c_int) -> Result<Socket, Errno> {
-        Ok(Socket { fd: ck(unsafe { sock::socket(domain, ty | SOCK_CLOEXEC, protocol) })? })
+        Ok(Socket { fd: ck(sock::socket(domain, ty | SOCK_CLOEXEC, protocol))? })
     }
     pub fn from_raw_fd(fd: c_int) -> Socket {
         Socket { fd }
@@ -279,49 +293,53 @@ impl Socket {
         self.set_opt_int(SOL_SOCKET, SO_REUSEADDR, on as c_int)
     }
     pub fn send_fds(&self, data: &[u8], fds: &[c_int]) -> Result<usize, Errno> {
-        let mut cbuf = [0u64; 16];
+        let mut cbuf = CBuf([0; 128]);
         if fds.len() > 60 {
             return Err(Errno(EINVAL));
         }
         let mut iov = iovec { iov_base: data.as_ptr() as *mut c_void, iov_len: data.len() };
         let mut m = msghdr { msg_name: core::ptr::null_mut(), msg_namelen: 0, msg_iov: &mut iov, msg_iovlen: 1, msg_control: core::ptr::null_mut(), msg_controllen: 0, msg_flags: 0 };
         if !fds.is_empty() {
-            let space = sock::cmsg_space(fds.len() * 4);
-            m.msg_control = cbuf.as_mut_ptr() as *mut c_void;
-            m.msg_controllen = space;
-            unsafe {
-                let c = sock::cmsg_firsthdr(&m);
-                (*c).cmsg_len = sock::cmsg_len(fds.len() * 4);
-                (*c).cmsg_level = SOL_SOCKET;
-                (*c).cmsg_type = SCM_RIGHTS;
-                core::ptr::copy_nonoverlapping(fds.as_ptr() as *const u8, sock::cmsg_data(c), fds.len() * 4);
+            let c = &mut cbuf.0;
+            c[0..8].copy_from_slice(&sock::cmsg_len(fds.len() * 4).to_ne_bytes());
+            c[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+            c[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+            for (k, fd) in fds.iter().enumerate() {
+                c[16 + 4 * k..20 + 4 * k].copy_from_slice(&fd.to_ne_bytes());
             }
+            m.msg_control = c.as_mut_ptr() as *mut c_void;
+            m.msg_controllen = sock::cmsg_space(fds.len() * 4);
         }
         cks(unsafe { sock::sendmsg(self.fd, &m, MSG_NOSIGNAL) })
     }
     pub fn recv_fds(&self, data: &mut [u8], fds: &mut [c_int]) -> Result<(usize, usize), Errno> {
-        let mut cbuf = [0u64; 16];
+        let mut cbuf = CBuf([0; 128]);
         let mut iov = iovec { iov_base: data.as_mut_ptr() as *mut c_void, iov_len: data.len() };
-        let mut m = msghdr { msg_name: core::ptr::null_mut(), msg_namelen: 0, msg_iov: &mut iov, msg_iovlen: 1, msg_control: cbuf.as_mut_ptr() as *mut c_void, msg_controllen: core::mem::size_of_val(&cbuf), msg_flags: 0 };
+        let mut m = msghdr { msg_name: core::ptr::null_mut(), msg_namelen: 0, msg_iov: &mut iov, msg_iovlen: 1, msg_control: cbuf.0.as_mut_ptr() as *mut c_void, msg_controllen: cbuf.0.len(), msg_flags: 0 };
         let n = cks(unsafe { sock::recvmsg(self.fd, &mut m, MSG_CMSG_CLOEXEC) })?;
         let mut nfds = 0;
-        unsafe {
-            let mut c = sock::cmsg_firsthdr(&m);
-            while !c.is_null() {
-                if (*c).cmsg_level == SOL_SOCKET && (*c).cmsg_type == SCM_RIGHTS {
-                    let cnt = ((*c).cmsg_len - sock::cmsg_len(0)) / 4;
-                    for k in 0..cnt {
-                        let fd = core::ptr::read_unaligned(sock::cmsg_data(c).add(k * 4) as *const c_int);
-                        if nfds < fds.len() {
-                            fds[nfds] = fd;
-                            nfds += 1;
-                        } else {
-                            let _ = rusty_libc_core::unistd::close(fd);
-                        }
+        let c = &cbuf.0[..m.msg_controllen.min(cbuf.0.len())];
+        let hdr = core::mem::size_of::<cmsghdr>();
+        let mut off = if c.len() >= hdr { Some(0) } else { None };
+        while let Some(o) = off {
+            let len = usize::from_ne_bytes(c[o..o + 8].try_into().unwrap());
+            let level = c_int::from_ne_bytes(c[o + 8..o + 12].try_into().unwrap());
+            let ty = c_int::from_ne_bytes(c[o + 12..o + 16].try_into().unwrap());
+            if level == SOL_SOCKET && ty == SCM_RIGHTS {
+                let cnt = (len - sock::cmsg_len(0)) / 4;
+                for k in 0..cnt {
+                    let at = o + 16 + k * 4;
+                    let Some(b) = c.get(at..at + 4) else { break };
+                    let fd = c_int::from_ne_bytes(b.try_into().unwrap());
+                    if nfds < fds.len() {
+                        fds[nfds] = fd;
+                        nfds += 1;
+                    } else {
+                        let _ = rusty_libc_core::unistd::close(fd);
                     }
                 }
-                c = sock::__cmsg_nxthdr(&mut m, c);
             }
+            off = sock::cmsg_next_offset(0, c.len(), o, len).map(|d| o + d).filter(|&p| p + hdr <= c.len());
         }
         Ok((n, nfds))
     }
@@ -437,7 +455,7 @@ impl AddrList {
             return None;
         }
         let p = unsafe { (*self.head).ai_canonname };
-        if p.is_null() { None } else { Some(unsafe { crate::util::cbytes(p) }) }
+        unsafe { ffi::cstr(p) }.map(core::ffi::CStr::to_bytes)
     }
 }
 
@@ -454,7 +472,7 @@ impl Iterator for AddrIter<'_> {
             self.cur = ai.ai_next;
             let mut ss = sockaddr_storage::default();
             let n = (ai.ai_addrlen as usize).min(core::mem::size_of::<sockaddr_storage>());
-            unsafe { core::ptr::copy_nonoverlapping(ai.ai_addr as *const u8, &mut ss as *mut _ as *mut u8, n) };
+            ss_bytes_mut(&mut ss)[..n].copy_from_slice(unsafe { ffi::bytes(ai.ai_addr as *const u8, n) });
             if let Some(addr) = SockAddr::from_raw(&ss, n as socklen_t) {
                 return Some(Resolved { addr, family: ai.ai_family, socktype: ai.ai_socktype, protocol: ai.ai_protocol });
             }

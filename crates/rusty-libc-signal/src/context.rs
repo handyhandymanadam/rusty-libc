@@ -243,30 +243,28 @@ unsafe extern "C" fn __start_context() -> ! {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn makecontext(ucp: *mut UContext, func: extern "C" fn(), argc: c_int, mut args: ...) {
-    unsafe {
-        let ucp = &mut *ucp;
-        let top = ucp.uc_stack.ss_sp as usize + ucp.uc_stack.ss_size;
-        let stack_args = if argc > 6 { argc as usize - 6 } else { 0 };
-        let sp = (((top as *mut i64).sub(stack_args + 1) as usize) & !15usize) - 8;
-        let sp = sp as *mut i64;
-        let idx_uc_link = stack_args + 1;
-        let g = &mut ucp.uc_mcontext.gregs;
-        g[REG_RIP] = func as usize as i64;
-        g[REG_RBX] = sp.add(idx_uc_link) as usize as i64;
-        g[REG_RSP] = sp as usize as i64;
-        *sp = __start_context as *const () as usize as i64;
-        *sp.add(idx_uc_link) = ucp.uc_link as usize as i64;
-        for i in 0..argc.max(0) as usize {
-            let v: i64 = args.next_arg::<i64>();
-            match i {
-                0 => g[REG_RDI] = v,
-                1 => g[REG_RSI] = v,
-                2 => g[REG_RDX] = v,
-                3 => g[REG_RCX] = v,
-                4 => g[REG_R8] = v,
-                5 => g[REG_R9] = v,
-                _ => *sp.add(i - 5) = v,
-            }
+    let ucp = unsafe { &mut *ucp };
+    let top = ucp.uc_stack.ss_sp as usize + ucp.uc_stack.ss_size;
+    let stack_args = if argc > 6 { argc as usize - 6 } else { 0 };
+    let sp = (((top as *mut i64).wrapping_sub(stack_args + 1) as usize) & !15usize) - 8;
+    let sp = sp as *mut i64;
+    let idx_uc_link = stack_args + 1;
+    let g = &mut ucp.uc_mcontext.gregs;
+    g[REG_RIP] = func as usize as i64;
+    g[REG_RBX] = sp.wrapping_add(idx_uc_link) as usize as i64;
+    g[REG_RSP] = sp as usize as i64;
+    unsafe { sp.write(__start_context as *const () as usize as i64) };
+    unsafe { sp.wrapping_add(idx_uc_link).write(ucp.uc_link as usize as i64) };
+    for i in 0..argc.max(0) as usize {
+        let v: i64 = unsafe { args.next_arg::<i64>() };
+        match i {
+            0 => g[REG_RDI] = v,
+            1 => g[REG_RSI] = v,
+            2 => g[REG_RDX] = v,
+            3 => g[REG_RCX] = v,
+            4 => g[REG_R8] = v,
+            5 => g[REG_R9] = v,
+            _ => unsafe { sp.wrapping_add(i - 5).write(v) },
         }
     }
 }

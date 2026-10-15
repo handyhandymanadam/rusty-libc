@@ -6,12 +6,21 @@ SH=crates/rusty-libc-cabi/shared
 LIBC_A=target/so/x86_64-unknown-linux-gnu/release/librusty_libc_cabi.a
 LDSO_A=target/ldso/x86_64-unknown-linux-gnu/release/librusty_libc_ldso.a
 mkdir -p "$OUT"
+RL_MOLD=${RL_MOLD-$(command -v mold || true)}
+LD=ld.bfd
+MOLD_ARGS=
+if [ -n "$RL_MOLD" ] && [ -x "$RL_MOLD" ] && "$RL_MOLD" --help 2>/dev/null | grep -q -- '--section-ordering-file' \
+    && "$RL_MOLD" --help 2>/dev/null | grep -q -- '-z mark-plt' && "$RL_MOLD" --help 2>/dev/null | grep -q -- '-z noseparate-relro'; then
+    LD=$RL_MOLD
+    MOLD_ARGS="-z noseparate-relro"
+fi
+echo "build-shared: linking with $LD"
 if [ "${1:-}" != "--no-cargo" ]; then
     tools/so-cargo.sh -p rusty-libc-cabi --features shared
-    RUSTFLAGS="-C relocation-model=pic -Z tls-model=initial-exec -Z location-detail=none" cargo +nightly build --release \
+    RUSTFLAGS="-C relocation-model=pic -Z tls-model=initial-exec -Z location-detail=none -Z relax-elf-relocations=yes" cargo +nightly build --release \
         -Zbuild-std=core,compiler_builtins --target x86_64-unknown-linux-gnu \
         --manifest-path crates/rusty-libc-ldso/Cargo.toml --target-dir target/ldso
-    RUSTFLAGS="-C relocation-model=pic -Z location-detail=none" cargo +nightly build --release \
+    RUSTFLAGS="-C relocation-model=pic -Z location-detail=none -Z relax-elf-relocations=yes" cargo +nightly build --release \
         -Zbuild-std=core,compiler_builtins --target x86_64-unknown-linux-gnu \
         --manifest-path crates/rusty-libc-mvec/Cargo.toml --target-dir target/mvec
 fi
@@ -34,7 +43,8 @@ split_archive() {
 }
 
 split_archive "$LDSO_A" "$OUT/work"
-ld -shared -soname ld-linux-x86-64.so.2 -e _start --version-script=$SH/ld.map -Bsymbolic -z now -z relro \
+LDSO_ORDER=; [ -f $SH/ldso-hot-order.ld ] && LDSO_ORDER=--section-ordering-file=$SH/ldso-hot-order.ld
+"$LD" $MOLD_ARGS -shared $LDSO_ORDER -soname ld-linux-x86-64.so.2 -e _start --version-script=$SH/ld.map --undefined-version -Bsymbolic -z now -z relro \
     --hash-style=both -z noexecstack -z text --no-undefined --eh-frame-hdr \
     --whole-archive "$OUT/work/libours.a" --no-whole-archive "$OUT/work/librt.a" -o "$OUT/ld-linux-x86-64.so.2"
 rm -rf "$OUT/work"
@@ -60,7 +70,7 @@ needs_args() {
 
 split_archive "$LIBC_A" "$OUT/work"
 ORDER=; [ -f $SH/hot-order.ld ] && ORDER=--section-ordering-file=$SH/hot-order.ld
-ld -shared ${LDMAP:+-Map=$LDMAP} $ORDER -soname libc.so.6 --version-script=$SH/libc.map -Bsymbolic --dynamic-list=$SH/libc.dynlist \
+"$LD" $MOLD_ARGS -shared ${LDMAP:+-Map=$LDMAP} $ORDER -soname libc.so.6 --version-script=$SH/libc.map --undefined-version -Bsymbolic --dynamic-list=$SH/libc.dynlist \
     --hash-style=gnu -z noexecstack -z text -z relro --eh-frame-hdr -z pack-relative-relocs \
     $(needs_args libc.so.6 "$OUT/work/ours.syms") \
     --whole-archive "$OUT/work/libours.a" --no-whole-archive "$OUT/work/librt.a" $(needs_files libc.so.6) -o "$OUT/libc.so.6"
@@ -72,19 +82,19 @@ for lib in libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 libutil.so.1 libresol
     target/hdrgen/release/hdrgen stubsrc $lib "$OUT/stub"
     as "$OUT/stub.s" -o "$OUT/stub.o"
     python3 -c 'import json, sys; print("\n".join(s["name"] for s in json.load(open(sys.argv[1]))["symbols"]))' "$SH/$lib.json" > "$OUT/stub.own"
-    ld -shared -soname $lib --version-script="$OUT/stub.map" --hash-style=both -z noexecstack -F libc.so.6 \
+    "$LD" $MOLD_ARGS -shared -soname $lib --version-script="$OUT/stub.map" --hash-style=both -z noexecstack -F libc.so.6 \
         $(needs_args $lib "$OUT/stub.own") "$OUT/stub.o" "$OUT/libc.so.6" $(needs_files $lib) -o "$OUT/$lib"
 done
 rm -f "$OUT/stub.s" "$OUT/stub.o" "$OUT/stub.map" "$OUT/stub.own"
 
-ld -shared -soname libnss_dns.so.2 --hash-style=both -z noexecstack --no-as-needed "$OUT/libresolv.so.2" "$OUT/libc.so.6" -o "$OUT/libnss_dns.so.2"
+"$LD" $MOLD_ARGS -shared -soname libnss_dns.so.2 --hash-style=both -z noexecstack --no-as-needed "$OUT/libresolv.so.2" "$OUT/libc.so.6" -o "$OUT/libnss_dns.so.2"
 printf 'GLIBC_PRIVATE { local: *; };\n' > "$OUT/compat.map"
-ld -shared -soname libnss_compat.so.2 --version-script="$OUT/compat.map" --hash-style=both -z noexecstack --no-as-needed "$OUT/libc.so.6" -o "$OUT/libnss_compat.so.2"
+"$LD" $MOLD_ARGS -shared -soname libnss_compat.so.2 --version-script="$OUT/compat.map" --hash-style=both -z noexecstack --no-as-needed "$OUT/libc.so.6" -o "$OUT/libnss_compat.so.2"
 rm -f "$OUT/compat.map"
 
 MVEC_A=target/mvec/x86_64-unknown-linux-gnu/release/librusty_libc_mvec.a
 split_archive "$MVEC_A" "$OUT/work"
-ld -shared -soname libmvec.so.1 --version-script=crates/rusty-libc-mvec/libmvec.map --hash-style=both -z noexecstack -z relro -z now \
+"$LD" $MOLD_ARGS -shared -soname libmvec.so.1 --version-script=crates/rusty-libc-mvec/libmvec.map --hash-style=both -z noexecstack -z relro -z now \
     --eh-frame-hdr --whole-archive "$OUT/work/libours.a" --no-whole-archive "$OUT/work/librt.a" "$OUT/libc.so.6" -o "$OUT/libmvec.so.1"
 rm -rf "$OUT/work"
 

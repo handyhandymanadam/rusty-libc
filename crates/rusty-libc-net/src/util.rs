@@ -1,5 +1,6 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use core::cell::UnsafeCell;
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{CStr, c_char, c_int, c_void};
 use rusty_libc_core::cleanup::CleanupBuf;
 use core::sync::atomic::{AtomicBool, Ordering};
 use rusty_libc_core::errno;
@@ -71,19 +72,11 @@ impl<T> Drop for SpinGuard<'_, T> {
     }
 }
 
-#[inline]
-pub(crate) unsafe fn cstrlen(p: *const c_char) -> usize {
-    unsafe { rusty_libc_mem::strlen(p.cast()) }
-}
-
-#[inline]
-pub(crate) unsafe fn cbytes<'a>(p: *const c_char) -> &'a [u8] {
-    unsafe { core::slice::from_raw_parts(p as *const u8, cstrlen(p)) }
-}
+pub(crate) use rusty_libc_core::ffi::{cstr_bytes as cbytes, cstr_len as cstrlen};
 
 pub(crate) fn getenv(name: &[u8]) -> Option<&'static [u8]> {
     let p = unsafe { rusty_libc_core::env::getenv(name) };
-    if p.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts(p as *const u8, cstrlen(p)) }) }
+    unsafe { rusty_libc_core::ffi::cstr(p) }.map(core::ffi::CStr::to_bytes)
 }
 
 #[derive(Clone, Copy)]
@@ -158,20 +151,61 @@ pub(crate) fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
 
-#[allow(dead_code)]
-pub(crate) fn put_str(dst: &mut [u8], off: &mut usize, s: &[u8]) -> Option<*mut c_char> {
-    if *off + s.len() + 1 > dst.len() {
-        return None;
-    }
-    let p = unsafe { dst.as_mut_ptr().add(*off) };
-    dst[*off..*off + s.len()].copy_from_slice(s);
-    dst[*off + s.len()] = 0;
-    *off += s.len() + 1;
-    Some(p as *mut c_char)
+pub(crate) struct Carve<'a> {
+    rest: &'a mut [u8],
+    dead: bool,
 }
 
-pub(crate) fn align_up(v: usize, a: usize) -> usize {
-    (v + a - 1) & !(a - 1)
+impl<'a> Carve<'a> {
+    pub(crate) fn new(buf: &'a mut [u8]) -> Carve<'a> {
+        let pad = (buf.as_ptr() as usize).wrapping_neg() & 7;
+        let rest = if buf.len() < pad { &mut [] } else { &mut buf[pad..] };
+        Carve { rest, dead: false }
+    }
+
+    pub(crate) fn take(&mut self, n: usize) -> Option<&'a mut [u8]> {
+        if self.dead || n > self.rest.len() {
+            self.dead = true;
+            return None;
+        }
+        let (head, tail) = core::mem::take(&mut self.rest).split_at_mut(n);
+        self.rest = tail;
+        Some(head)
+    }
+
+    pub(crate) fn align(&mut self, a: usize) -> Option<()> {
+        let pad = (self.rest.as_ptr() as usize).wrapping_neg() & (a - 1);
+        self.take(pad).map(|_| ())
+    }
+
+    pub(crate) fn bytes(&mut self, b: &[u8]) -> Option<*mut u8> {
+        let d = self.take(b.len())?;
+        d.copy_from_slice(b);
+        Some(d.as_mut_ptr())
+    }
+
+    pub(crate) fn string(&mut self, s: &[u8]) -> Option<*mut c_char> {
+        let d = self.take(s.len() + 1)?;
+        d[..s.len()].copy_from_slice(s);
+        d[s.len()] = 0;
+        Some(d.as_mut_ptr().cast::<c_char>())
+    }
+
+    pub(crate) fn ptr_array(&mut self, n: usize) -> Option<&'a mut [*mut c_char]> {
+        self.align(8)?;
+        let d = self.take(n.checked_mul(8)?)?;
+        d.fill(0);
+        Some(unsafe { core::slice::from_raw_parts_mut(d.as_mut_ptr().cast::<*mut c_char>(), n) })
+    }
+
+    pub(crate) fn string_list<'w>(&mut self, words: impl Iterator<Item = &'w [u8]> + Clone) -> Option<*mut *mut c_char> {
+        let n = words.clone().count();
+        let arr = self.ptr_array(n + 1)?;
+        for (slot, w) in arr.iter_mut().zip(words) {
+            *slot = self.string(w)?;
+        }
+        Some(arr.as_mut_ptr())
+    }
 }
 
 pub struct HeapVec<T: Copy> {
@@ -189,7 +223,7 @@ impl<T: Copy> HeapVec<T> {
         if self.len == self.cap && !self.grow(1) {
             return false;
         }
-        unsafe { self.ptr.add(self.len).write(v) };
+        unsafe { self.ptr.wrapping_add(self.len).write(v) };
         self.len += 1;
         true
     }
@@ -198,7 +232,7 @@ impl<T: Copy> HeapVec<T> {
         if self.cap - self.len < s.len() && !self.grow(s.len()) {
             return false;
         }
-        unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), self.ptr.add(self.len), s.len()) };
+        unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), self.ptr.wrapping_add(self.len), s.len()) };
         self.len += s.len();
         true
     }
@@ -231,18 +265,29 @@ impl HeapVec<u8> {
     pub fn as_bytes(&self) -> &[u8] {
         self
     }
+
+    pub fn zeroed(n: usize) -> Option<Self> {
+        let mut v = HeapVec::new();
+        let zeros = [0u8; 256];
+        while v.len() < n {
+            if !v.extend_from(&zeros[..(n - v.len()).min(zeros.len())]) {
+                return None;
+            }
+        }
+        Some(v)
+    }
 }
 
 impl<T: Copy> core::ops::Deref for HeapVec<T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
-        if self.len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(self.ptr, self.len) } }
+        unsafe { rusty_libc_core::ffi::slice(self.ptr, self.len) }
     }
 }
 
 impl<T: Copy> core::ops::DerefMut for HeapVec<T> {
     fn deref_mut(&mut self) -> &mut [T] {
-        if self.len == 0 { &mut [] } else { unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) } }
+        unsafe { rusty_libc_core::ffi::slice_mut(self.ptr, self.len) }
     }
 }
 
@@ -264,4 +309,8 @@ impl<T: Copy> Default for HeapVec<T> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+pub fn open(path: &CStr, flags: c_int, mode: u32) -> Result<c_int, rusty_libc_core::Errno> {
+    unsafe { rusty_libc_core::unistd::open(path.as_ptr(), flags, mode) }
 }

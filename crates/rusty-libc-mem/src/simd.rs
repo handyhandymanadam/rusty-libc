@@ -34,27 +34,25 @@ pub const AVX2_NEEDS: &[&[u8]] = &[b"AVX2", b"AVX", b"BMI1", b"BMI2", b"LZCNT", 
 #[inline(never)]
 fn detect() -> u32 {
     let mut f = F_INIT;
-    unsafe {
-        let leaf1 = __cpuid_count(1, 0);
-        let leaf7 = __cpuid_count(7, 0);
-        let osxsave = leaf1.ecx & (1 << 27) != 0;
-        let mut ymm = false;
-        let mut zmm = false;
-        if osxsave {
-            let (lo, hi): (u32, u32);
-            core::arch::asm!("xgetbv", in("ecx") 0, out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
-            let _ = hi;
-            ymm = lo & 6 == 6;
-            zmm = lo & 0xe6 == 0xe6;
-        }
-        let abm = __cpuid(0x8000_0001).ecx & (1 << 5) != 0;
-        if ymm && leaf7.ebx & (1 << 5) != 0 && leaf7.ebx & (1 << 3) != 0 && leaf7.ebx & (1 << 8) != 0 && abm
-            && !NO_AVX2.load(Ordering::Relaxed)
-        {
-            f |= F_AVX2;
-            if zmm && leaf7.ebx & (1 << 16) != 0 && leaf7.ebx & (1 << 30) != 0 && leaf7.ebx & (1 << 31) != 0 {
-                f |= F_AVX512;
-            }
+    let leaf1 = __cpuid_count(1, 0);
+    let leaf7 = __cpuid_count(7, 0);
+    let osxsave = leaf1.ecx & (1 << 27) != 0;
+    let mut ymm = false;
+    let mut zmm = false;
+    if osxsave {
+        let (lo, hi): (u32, u32);
+        unsafe { core::arch::asm!("xgetbv", in("ecx") 0, out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags)) };
+        let _ = hi;
+        ymm = lo & 6 == 6;
+        zmm = lo & 0xe6 == 0xe6;
+    }
+    let abm = __cpuid(0x8000_0001).ecx & (1 << 5) != 0;
+    if ymm && leaf7.ebx & (1 << 5) != 0 && leaf7.ebx & (1 << 3) != 0 && leaf7.ebx & (1 << 8) != 0 && abm
+        && !NO_AVX2.load(Ordering::Relaxed)
+    {
+        f |= F_AVX2;
+        if zmm && leaf7.ebx & (1 << 16) != 0 && leaf7.ebx & (1 << 30) != 0 && leaf7.ebx & (1 << 31) != 0 {
+            f |= F_AVX512;
         }
     }
     FEATURES.store(f, Ordering::Relaxed);
@@ -89,14 +87,35 @@ pub(crate) trait Vector: Copy {
     unsafe fn store(p: *mut u8, v: Self);
     unsafe fn splat(b: u8) -> Self;
     unsafe fn zero() -> Self;
-    unsafe fn eq(a: Self, b: Self) -> Self;
-    unsafe fn min(a: Self, b: Self) -> Self;
-    unsafe fn or(a: Self, b: Self) -> Self;
-    unsafe fn and(a: Self, b: Self) -> Self;
-    unsafe fn xor(a: Self, b: Self) -> Self;
-    unsafe fn add(a: Self, b: Self) -> Self;
-    unsafe fn gt(a: Self, b: Self) -> Self;
-    unsafe fn mask(v: Self) -> u32;
+    fn eq(a: Self, b: Self) -> Self;
+    fn min(a: Self, b: Self) -> Self;
+    fn or(a: Self, b: Self) -> Self;
+    fn and(a: Self, b: Self) -> Self;
+    fn xor(a: Self, b: Self) -> Self;
+    fn add(a: Self, b: Self) -> Self;
+    fn gt(a: Self, b: Self) -> Self;
+    fn mask(v: Self) -> u32;
+
+    #[inline(always)]
+    unsafe fn loadu_at(p: *const u8, off: usize) -> Self {
+        let q = unsafe { p.add(off) };
+        unsafe { Self::loadu(q) }
+    }
+    #[inline(always)]
+    unsafe fn load_at(p: *const u8, off: usize) -> Self {
+        let q = unsafe { p.add(off) };
+        unsafe { Self::load(q) }
+    }
+    #[inline(always)]
+    unsafe fn storeu_at(p: *mut u8, off: usize, v: Self) {
+        let q = unsafe { p.add(off) };
+        unsafe { Self::storeu(q, v) }
+    }
+    #[inline(always)]
+    unsafe fn store_at(p: *mut u8, off: usize, v: Self) {
+        let q = unsafe { p.add(off) };
+        unsafe { Self::store(q, v) }
+    }
 }
 
 #[inline(always)]
@@ -144,35 +163,35 @@ impl Vector for Sse2 {
         Sse2(unsafe { _mm_setzero_si128() })
     }
     #[inline(always)]
-    unsafe fn eq(a: Self, b: Self) -> Self {
+    fn eq(a: Self, b: Self) -> Self {
         Sse2(unsafe { _mm_cmpeq_epi8(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn min(a: Self, b: Self) -> Self {
+    fn min(a: Self, b: Self) -> Self {
         Sse2(unsafe { _mm_min_epu8(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn or(a: Self, b: Self) -> Self {
+    fn or(a: Self, b: Self) -> Self {
         Sse2(unsafe { _mm_or_si128(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn and(a: Self, b: Self) -> Self {
+    fn and(a: Self, b: Self) -> Self {
         Sse2(unsafe { _mm_and_si128(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn xor(a: Self, b: Self) -> Self {
+    fn xor(a: Self, b: Self) -> Self {
         Sse2(unsafe { _mm_xor_si128(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn add(a: Self, b: Self) -> Self {
+    fn add(a: Self, b: Self) -> Self {
         Sse2(unsafe { _mm_add_epi8(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn gt(a: Self, b: Self) -> Self {
+    fn gt(a: Self, b: Self) -> Self {
         Sse2(unsafe { _mm_cmpgt_epi8(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn mask(v: Self) -> u32 {
+    fn mask(v: Self) -> u32 {
         unsafe { _mm_movemask_epi8(v.0) as u32 }
     }
 }
@@ -207,35 +226,35 @@ impl Vector for Avx2 {
         Avx2(unsafe { _mm256_setzero_si256() })
     }
     #[inline(always)]
-    unsafe fn eq(a: Self, b: Self) -> Self {
+    fn eq(a: Self, b: Self) -> Self {
         Avx2(unsafe { _mm256_cmpeq_epi8(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn min(a: Self, b: Self) -> Self {
+    fn min(a: Self, b: Self) -> Self {
         Avx2(unsafe { _mm256_min_epu8(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn or(a: Self, b: Self) -> Self {
+    fn or(a: Self, b: Self) -> Self {
         Avx2(unsafe { _mm256_or_si256(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn and(a: Self, b: Self) -> Self {
+    fn and(a: Self, b: Self) -> Self {
         Avx2(unsafe { _mm256_and_si256(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn xor(a: Self, b: Self) -> Self {
+    fn xor(a: Self, b: Self) -> Self {
         Avx2(unsafe { _mm256_xor_si256(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn add(a: Self, b: Self) -> Self {
+    fn add(a: Self, b: Self) -> Self {
         Avx2(unsafe { _mm256_add_epi8(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn gt(a: Self, b: Self) -> Self {
+    fn gt(a: Self, b: Self) -> Self {
         Avx2(unsafe { _mm256_cmpgt_epi8(a.0, b.0) })
     }
     #[inline(always)]
-    unsafe fn mask(v: Self) -> u32 {
+    fn mask(v: Self) -> u32 {
         unsafe { _mm256_movemask_epi8(v.0) as u32 }
     }
 }

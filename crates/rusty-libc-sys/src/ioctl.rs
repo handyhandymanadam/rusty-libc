@@ -9,9 +9,7 @@ pub unsafe fn ioctl_r(fd: i32, request: u64, arg: usize) -> Result<usize, Errno>
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ioctl(fd: c_int, request: c_ulong, mut args: ...) -> c_int {
-    unsafe {
-        let arg = args.next_arg::<usize>();
-        sc(syscall3(SYS_IOCTL, fd as usize, request as usize, arg)) as c_int
-    }
+    let arg = unsafe { args.next_arg::<usize>() };
+    sc(unsafe { syscall3(SYS_IOCTL, fd as usize, request as usize, arg) }) as c_int
 }
 

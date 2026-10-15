@@ -1,3 +1,4 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use crate::{Errno, syscall};
 
 pub const SIGINT: i32 = 2;
@@ -27,6 +28,45 @@ impl KSigaction {
     pub const IGNORE: KSigaction = KSigaction { handler: SIG_IGN, flags: 0, restorer: 0, mask: 0 };
 }
 
+#[macro_export]
+macro_rules! restorer_asm {
+    ($name:literal) => {
+        concat!(
+            ".pushsection .text,\"ax\",@progbits\n",
+            ".cfi_startproc simple\n",
+            ".cfi_signal_frame\n",
+            ".cfi_escape 0x0f, 0x04, 0x77, 0xa0, 0x01, 0x06\n",
+            ".cfi_escape 0x10, 0x08, 0x02, 0x77, 0x28\n",
+            ".cfi_escape 0x10, 0x09, 0x02, 0x77, 0x30\n",
+            ".cfi_escape 0x10, 0x0a, 0x02, 0x77, 0x38\n",
+            ".cfi_escape 0x10, 0x0b, 0x03, 0x77, 0xc0, 0x00\n",
+            ".cfi_escape 0x10, 0x0c, 0x03, 0x77, 0xc8, 0x00\n",
+            ".cfi_escape 0x10, 0x0d, 0x03, 0x77, 0xd0, 0x00\n",
+            ".cfi_escape 0x10, 0x0e, 0x03, 0x77, 0xd8, 0x00\n",
+            ".cfi_escape 0x10, 0x0f, 0x03, 0x77, 0xe0, 0x00\n",
+            ".cfi_escape 0x10, 0x05, 0x03, 0x77, 0xe8, 0x00\n",
+            ".cfi_escape 0x10, 0x04, 0x03, 0x77, 0xf0, 0x00\n",
+            ".cfi_escape 0x10, 0x06, 0x03, 0x77, 0xf8, 0x00\n",
+            ".cfi_escape 0x10, 0x03, 0x03, 0x77, 0x80, 0x01\n",
+            ".cfi_escape 0x10, 0x01, 0x03, 0x77, 0x88, 0x01\n",
+            ".cfi_escape 0x10, 0x00, 0x03, 0x77, 0x90, 0x01\n",
+            ".cfi_escape 0x10, 0x02, 0x03, 0x77, 0x98, 0x01\n",
+            ".cfi_escape 0x10, 0x07, 0x03, 0x77, 0xa0, 0x01\n",
+            ".cfi_escape 0x10, 0x10, 0x03, 0x77, 0xa8, 0x01\n",
+            "nop\n",
+            ".balign 16\n",
+            ".globl ", $name, "\n",
+            ".type ", $name, ",@function\n",
+            $name, ":\n",
+            "mov rax, 15\n",
+            "syscall\n",
+            ".size ", $name, ", . - ", $name, "\n",
+            ".cfi_endproc\n",
+            ".popsection\n",
+        )
+    };
+}
+
 pub const fn bit(sig: i32) -> u64 {
     1u64 << (sig - 1)
 }
@@ -45,3 +85,16 @@ pub fn sigaction(sig: i32, act: Option<&KSigaction>) -> Result<KSigaction, Errno
     let ret = unsafe { syscall::syscall4(syscall::SYS_RT_SIGACTION, sig as usize, actp, &mut old as *mut KSigaction as usize, 8) };
     syscall::check(ret).map(|_| old)
 }
+
+#[inline]
+pub fn kill(pid: i32, sig: i32) -> Result<(), Errno> {
+    let ret = unsafe { syscall::syscall2(syscall::SYS_KILL, pid as usize, sig as usize) };
+    syscall::check(ret).map(|_| ())
+}
+
+#[inline]
+pub fn tgkill(tgid: i32, tid: i32, sig: i32) -> Result<(), Errno> {
+    let ret = unsafe { syscall::syscall3(syscall::SYS_TGKILL, tgid as usize, tid as usize, sig as usize) };
+    syscall::check(ret).map(|_| ())
+}
+

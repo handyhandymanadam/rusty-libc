@@ -1,25 +1,51 @@
 use crate::calendar::{self, Tm};
 use crate::clock::LocaleT;
-use crate::timeloc::{self, TimeLoc};
+use crate::mbuf::MBuf;
+use crate::sys;
+use crate::timeloc::{self, TimeLoc, no_nul};
 use crate::tz;
 use core::ffi::{c_char, c_int};
-use rusty_libc_core::{env, errno, syscall};
+use core::sync::atomic::{AtomicI32, Ordering::Relaxed};
+use rusty_libc_core::sync_cell::SyncCell;
+use rusty_libc_core::ffi;
+use rusty_libc_core::locale::Loc;
+use rusty_libc_stdlib::zstr::{Unit, ZStr};
+use timeloc::Fmt;
 
-const EINVAL: i32 = 22;
+fn upcase<C: Ch>(s: &mut [C], tl: &TimeLoc, wc: Wc) {
+    for c in s {
+        *c = c.upper(tl, wc);
+    }
+}
 
+struct NulCopy<C: Unit> {
+    stack: Option<[C; 128]>,
+    heap: Option<MBuf<C>>,
+}
+
+impl<C: Unit> NulCopy<C> {
+    fn new() -> Self {
+        NulCopy { stack: None, heap: None }
+    }
+
+    fn z(&mut self, s: &[C]) -> Option<ZStr<'_, C>> {
+        let n = s.len();
+        let b: &mut [C] = if n < 128 {
+            &mut self.stack.insert([C::NUL; 128])[..=n]
+        } else {
+            self.heap.insert(MBuf::filled(n + 1, C::NUL)?)
+        };
+        b[..n].copy_from_slice(s);
+        ZStr::from_nul_terminated(b)
+    }
+}
+
+fn with_nul<C: Unit, R>(s: &[C], f: impl FnOnce(ZStr<'_, C>) -> R) -> Option<R> {
+    NulCopy::new().z(s).map(f)
+}
 
 fn isleap(y: i32) -> bool {
     y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
-}
-
-unsafe fn cstrlen(s: *const u8) -> usize {
-    unsafe {
-        let mut n = 0;
-        while *s.add(n) != 0 {
-            n += 1;
-        }
-        n
-    }
 }
 
 fn iso_week_days(yday: i32, wday: i32) -> i32 {
@@ -28,26 +54,56 @@ fn iso_week_days(yday: i32, wday: i32) -> i32 {
 }
 
 #[inline(always)]
-unsafe fn copy_units<C>(src: *const C, dst: *mut C, n: usize) {
-    unsafe {
-        if size_of::<C>() == 1 && n <= 16 {
-            let (s, d) = (src as *const u8, dst as *mut u8);
-            if n >= 8 {
-                let (a, b) = ((s as *const u64).read_unaligned(), (s.add(n - 8) as *const u64).read_unaligned());
-                (d as *mut u64).write_unaligned(a);
-                (d.add(n - 8) as *mut u64).write_unaligned(b);
-            } else if n >= 4 {
-                let (a, b) = ((s as *const u32).read_unaligned(), (s.add(n - 4) as *const u32).read_unaligned());
-                (d as *mut u32).write_unaligned(a);
-                (d.add(n - 4) as *mut u32).write_unaligned(b);
-            } else {
-                for k in 0..n {
-                    *d.add(k) = *s.add(k);
-                }
-            }
-        } else {
-            core::ptr::copy_nonoverlapping(src, dst, n);
+fn copy_bytes(dst: &mut [u8], src: &[u8]) {
+    let n = src.len();
+    let dst = &mut dst[..n];
+    if n <= 16 {
+        if n >= 8 {
+            let (a, b) = (u64::from_ne_bytes(src[..8].try_into().unwrap()), u64::from_ne_bytes(src[n - 8..].try_into().unwrap()));
+            dst[..8].copy_from_slice(&a.to_ne_bytes());
+            dst[n - 8..].copy_from_slice(&b.to_ne_bytes());
+        } else if n >= 4 {
+            let (a, b) = (u32::from_ne_bytes(src[..4].try_into().unwrap()), u32::from_ne_bytes(src[n - 4..].try_into().unwrap()));
+            dst[..4].copy_from_slice(&a.to_ne_bytes());
+            dst[n - 4..].copy_from_slice(&b.to_ne_bytes());
+        } else if n >= 2 {
+            let (a, b) = (u16::from_ne_bytes(src[..2].try_into().unwrap()), u16::from_ne_bytes(src[n - 2..].try_into().unwrap()));
+            dst[..2].copy_from_slice(&a.to_ne_bytes());
+            dst[n - 2..].copy_from_slice(&b.to_ne_bytes());
+        } else if n == 1 {
+            dst[0] = src[0];
         }
+    } else {
+        dst.copy_from_slice(src);
+    }
+}
+
+#[inline(always)]
+fn copy_units32(dst: &mut [u32], src: &[u32]) {
+    let n = src.len();
+    let dst = &mut dst[..n];
+    #[inline(always)]
+    fn mv<const K: usize>(dst: &mut [u32], src: &[u32], at: usize) {
+        let a: [u32; K] = src[at..at + K].try_into().unwrap();
+        dst[at..at + K].copy_from_slice(&a);
+    }
+    if n <= 16 {
+        if n >= 8 {
+            mv::<4>(dst, src, 0);
+            mv::<4>(dst, src, 4);
+            mv::<4>(dst, src, n - 8);
+            mv::<4>(dst, src, n - 4);
+        } else if n >= 4 {
+            mv::<4>(dst, src, 0);
+            mv::<4>(dst, src, n - 4);
+        } else if n >= 2 {
+            mv::<2>(dst, src, 0);
+            mv::<2>(dst, src, n - 2);
+        } else if n == 1 {
+            dst[0] = src[0];
+        }
+    } else {
+        dst.copy_from_slice(src);
     }
 }
 
@@ -85,25 +141,57 @@ fn tm_number(fc: u8, tp: &Tm) -> i32 {
 }
 
 #[derive(Clone, Copy)]
-enum Next<C> {
+pub enum Text<C: 'static> {
+    Static(&'static [C]),
+    Tmp(usize),
+}
+
+impl<C: Copy> Text<C> {
+    #[inline(always)]
+    fn get<'a>(&self, tmp: &'a [C; TMP]) -> &'a [C] {
+        match *self {
+            Text::Static(s) => s,
+            Text::Tmp(n) => &tmp[..n],
+        }
+    }
+    #[inline(always)]
+    fn len(&self) -> usize {
+        match *self {
+            Text::Static(s) => s.len(),
+            Text::Tmp(n) => n,
+        }
+    }
+}
+
+const TMP: usize = 32;
+
+#[derive(Clone, Copy)]
+pub enum SubF<C: Unit + 'static> {
+    Z(ZStr<'static, C>),
+    Tmp(usize),
+    S(&'static [C]),
+}
+
+#[derive(Clone, Copy)]
+enum Next<C: Unit + 'static> {
     Switch,
     Number(i32, i32, bool),
-    Sub(*const C),
+    Sub(SubF<C>),
     Bad,
 }
 
 #[derive(Clone, Copy)]
 pub struct Wc {
-    pub up: fn(u32, usize) -> u32,
-    pub low: fn(u32, usize) -> u32,
-    pub loc: usize,
+    pub up: fn(u32, Loc) -> u32,
+    pub low: fn(u32, Loc) -> u32,
+    pub loc: Loc,
 }
 
-fn same(c: u32, _loc: usize) -> u32 {
+fn same(c: u32, _loc: Loc) -> u32 {
     c
 }
 
-const NARROW: Wc = Wc { up: same, low: same, loc: 0 };
+const NARROW: Wc = Wc { up: same, low: same, loc: Loc::CURRENT };
 
 #[derive(Clone, Copy)]
 pub enum It<'a> {
@@ -127,19 +215,21 @@ pub enum It<'a> {
     Lit(&'static [u8]),
 }
 
-pub trait Ch: Copy + 'static {
+pub trait Ch: Copy + 'static + Unit {
     const WIDE: bool;
     fn asc(self) -> u8;
     fn from_u8(b: u8) -> Self;
     fn lower(self, tl: &TimeLoc, wc: Wc) -> Self;
     fn upper(self, tl: &TimeLoc, wc: Wc) -> Self;
-    fn text(tl: &TimeLoc, it: It, tmp: &mut [Self; 96]) -> (*const Self, usize);
+    fn text(tl: &TimeLoc, it: It, tmp: &mut [Self; TMP]) -> Text<Self>;
+    fn subfmt(tl: &TimeLoc, it: It, tmp: &mut [Self; TMP]) -> SubF<Self>;
+    fn copy(dst: &mut [Self], src: &[Self]);
+    fn copy_ascii(dst: &mut [Self], src: &[u8]);
 }
 
 #[inline(never)]
-fn narrow_text(tl: &TimeLoc, it: It) -> (*const u8, usize) {
-    let cs = |p: *const u8| -> (*const u8, usize) { (p, unsafe { cstrlen(p) }) };
-    let sl: &[u8] = match it {
+fn narrow_text(tl: &TimeLoc, it: It) -> &'static [u8] {
+    match it {
         It::AbDay(i) => tl.abday(i),
         It::Day(i) => tl.day(i),
         It::AbMon(i) => tl.abmon(i),
@@ -147,19 +237,18 @@ fn narrow_text(tl: &TimeLoc, it: It) -> (*const u8, usize) {
         It::AltMon(i) => tl.altmon(i),
         It::AbAltMon(i) => tl.abaltmon(i),
         It::AmPm(pm) => tl.ampm(pm),
-        It::DTFmt => return cs(tl.d_t_fmt()),
-        It::DFmt => return cs(tl.d_fmt()),
-        It::TFmt => return cs(tl.t_fmt()),
-        It::TFmtAmpm => return cs(tl.t_fmt_ampm()),
-        It::EraDTFmt => return cs(tl.era_d_t_fmt()),
-        It::EraDFmt => return cs(tl.era_d_fmt()),
-        It::EraTFmt => return cs(tl.era_t_fmt()),
+        It::DTFmt => tl.d_t_fmt(),
+        It::DFmt => tl.d_fmt(),
+        It::TFmt => tl.t_fmt(),
+        It::TFmtAmpm => tl.t_fmt_ampm(),
+        It::EraDTFmt => tl.era_d_t_fmt(),
+        It::EraDFmt => tl.era_d_fmt(),
+        It::EraTFmt => tl.era_t_fmt(),
         It::EraName(e) => e.name,
         It::EraFormat(e) => e.format,
         It::AltDigit(n) => tl.alt_digit(n).unwrap_or(b""),
-        It::Lit(l) => &l[..l.len() - 1],
-    };
-    (sl.as_ptr(), sl.len())
+        It::Lit(l) => no_nul(l),
+    }
 }
 
 impl Ch for u8 {
@@ -181,7 +270,28 @@ impl Ch for u8 {
         tl.toupper(self)
     }
     #[inline(always)]
-    fn text(tl: &TimeLoc, it: It, _tmp: &mut [u8; 96]) -> (*const u8, usize) {
+    fn subfmt(tl: &TimeLoc, it: It, _tmp: &mut [u8; TMP]) -> SubF<u8> {
+        let z: Option<&'static core::ffi::CStr> = match it {
+            It::Lit(l) => {
+                if let Some(z) = ZStr::from_nul_terminated(l) {
+                    return SubF::Z(z);
+                }
+                None
+            }
+            _ if !tl.is_c() => None,
+            It::DTFmt => Some(timeloc::C_D_T_FMT_Z),
+            It::DFmt => Some(timeloc::C_D_FMT_Z),
+            It::TFmt => Some(timeloc::C_T_FMT_Z),
+            It::TFmtAmpm => Some(timeloc::C_T_FMT_AMPM_Z),
+            _ => None,
+        };
+        match z {
+            Some(z) => SubF::Z(ZStr::from(z)),
+            None => SubF::S(narrow_text(tl, it)),
+        }
+    }
+    #[inline(always)]
+    fn text(tl: &TimeLoc, it: It, _tmp: &mut [u8; TMP]) -> Text<u8> {
         if tl.is_c() {
             let sl: Option<&'static [u8]> = match it {
                 It::AbDay(i) => Some(tl.abday(i)),
@@ -192,10 +302,18 @@ impl Ch for u8 {
                 _ => None,
             };
             if let Some(sl) = sl {
-                return (sl.as_ptr(), sl.len());
+                return Text::Static(sl);
             }
         }
-        narrow_text(tl, it)
+        Text::Static(narrow_text(tl, it))
+    }
+    #[inline(always)]
+    fn copy(dst: &mut [u8], src: &[u8]) {
+        copy_bytes(dst, src)
+    }
+    #[inline(always)]
+    fn copy_ascii(dst: &mut [u8], src: &[u8]) {
+        copy_bytes(dst, src)
     }
 }
 
@@ -215,8 +333,27 @@ impl Ch for u32 {
     fn upper(self, _tl: &TimeLoc, wc: Wc) -> u32 {
         (wc.up)(self, wc.loc)
     }
-    fn text(tl: &TimeLoc, it: It, tmp: &mut [u32; 96]) -> (*const u32, usize) {
+    fn subfmt(tl: &TimeLoc, it: It, tmp: &mut [u32; TMP]) -> SubF<u32> {
+        match Self::text(tl, it, tmp) {
+            Text::Static(s) => SubF::S(s),
+            Text::Tmp(n) => SubF::Tmp(n),
+        }
+    }
+    fn text(tl: &TimeLoc, it: It, tmp: &mut [u32; TMP]) -> Text<u32> {
         use rusty_libc_core::locale::idx;
+        if tl.is_c() {
+            let sl: Option<&&'static [u32]> = match it {
+                It::AbDay(i) => timeloc::W_AB_WEEKDAY.get(i),
+                It::Day(i) => timeloc::W_WEEKDAY.get(i),
+                It::AbMon(i) | It::AbAltMon(i) => timeloc::W_AB_MONTH.get(i),
+                It::Mon(i) | It::AltMon(i) => timeloc::W_MONTH.get(i),
+                It::AmPm(pm) => Some(&timeloc::W_AMPM[pm as usize]),
+                _ => None,
+            };
+            if let Some(&sl) = sl {
+                return Text::Static(sl);
+            }
+        }
         let wide = match it {
             It::AbDay(i) => Some(idx::WABDAY_1 + i),
             It::Day(i) => Some(idx::WDAY_1 + i),
@@ -237,29 +374,47 @@ impl Ch for u32 {
         if let Some(ix) = wide
             && let Some(r) = tl.wide_item(ix)
         {
-            return r;
+            return Text::Static(r);
         }
         match it {
-            It::EraName(e) => return (e.wname.as_ptr(), e.wname.len()),
-            It::EraFormat(e) => return (e.wformat.as_ptr(), e.wformat.len()),
-            It::AltDigit(n) => return tl.walt_digit(n).unwrap_or((tmp.as_ptr(), 0)),
+            It::EraName(e) => return Text::Static(e.wname),
+            It::EraFormat(e) => return Text::Static(e.wformat),
+            It::AltDigit(n) => return Text::Static(tl.walt_digit(n).unwrap_or(&[])),
             _ => {}
         }
-        let (p, n) = narrow_text(tl, it);
-        let n = n.min(tmp.len() - 1);
-        for (k, t) in tmp.iter_mut().enumerate().take(n) {
-            *t = u32::from(unsafe { *p.add(k) });
+        let narrow = narrow_text(tl, it);
+        let n = narrow.len().min(tmp.len() - 1);
+        for (t, &b) in tmp.iter_mut().zip(&narrow[..n]) {
+            *t = u32::from(b);
         }
         tmp[n] = 0;
-        (tmp.as_ptr(), n)
+        Text::Tmp(n)
+    }
+    #[inline(always)]
+    fn copy(dst: &mut [u32], src: &[u32]) {
+        copy_units32(dst, src)
+    }
+    #[inline(always)]
+    fn copy_ascii(dst: &mut [u32], src: &[u8]) {
+        for (d, &b) in dst.iter_mut().zip(src) {
+            *d = u32::from(b);
+        }
     }
 }
 
-unsafe fn fill<C: Ch>(p: *mut C, b: u8, n: usize) {
-    unsafe {
-        for k in 0..n {
-            *p.add(k) = C::from_u8(b);
-        }
+#[inline(never)]
+fn fill<C: Ch>(dst: &mut [C], b: u8) {
+    for d in dst {
+        *d = C::from_u8(b);
+    }
+}
+
+#[inline(always)]
+fn pad_units<C: Ch>(dst: &mut [C], b: u8) {
+    if let [d] = dst {
+        *d = C::from_u8(b);
+    } else {
+        fill(dst, b);
     }
 }
 
@@ -275,675 +430,765 @@ const DIGIT_PAIRS: [u8; 200] = {
 };
 
 #[inline(always)]
-unsafe fn rv<T: Copy>(r: &T) -> T {
+fn rv<T: Copy>(r: &T) -> T {
     unsafe { core::ptr::read_volatile(r) }
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn strftime_internal<C: Ch>(s: *mut C, maxsize: usize, format: *const C, tp_ref: &Tm, tzset_called: &mut bool, tl: &TimeLoc, wc: Wc, yr_spec: u8) -> usize {
-    unsafe {
-        let mut yr_spec = yr_spec;
-        let tp: *const Tm = tp_ref;
-        let mut zone: *const u8 = rv(&(*tp).tm_zone).cast();
-        macro_rules! hour12 {
-            () => {{
-                let h = rv(&(*tp).tm_hour);
-                if h > 12 { h - 12 } else if h == 0 { 12 } else { h }
+fn strftime_internal<C: Ch>(s: Option<&mut [C]>, maxsize: usize, mut fz: ZStr<'_, C>, tp: &Tm, tzset_called: &mut bool, tl: &TimeLoc, wc: Wc, yr_spec: u8) -> usize {
+    let mut yr_spec = yr_spec;
+    let mut zone: *const c_char = rv(&tp.tm_zone);
+    macro_rules! hour12 {
+        () => {{
+            let h = rv(&tp.tm_hour);
+            if h > 12 { h - 12 } else if h == 0 { 12 } else { h }
+        }};
+    }
+    let mut i = 0usize;
+    let mut out = s;
+    let mut buf = [0u8; 24];
+    let mut tmp = [C::from_u8(0); TMP];
+
+    while !fz.at_end() {
+        let mut pad: u8 = 0;
+        let mut width: i32 = -1;
+        let mut to_lowcase = false;
+        let mut to_uppcase = false;
+        let mut change_case = false;
+
+        macro_rules! room {
+            () => {
+                match &out {
+                    Some(o) => o.len(),
+                    None => maxsize.wrapping_sub(i),
+                }
+            };
+        }
+        macro_rules! add {
+            ($n:expr, |$q:ident| $body:expr) => {{
+                let n: i32 = $n as i32;
+                let delta = width - n;
+                let incr = n + if delta > 0 { delta } else { 0 };
+                match out.take() {
+                    Some(o) => {
+                        if (incr as usize) >= o.len() {
+                            return 0;
+                        }
+                        let mut at = 0;
+                        if delta > 0 {
+                            pad_units(&mut o[..delta as usize], if pad == b'0' { b'0' } else { b' ' });
+                            at = delta as usize;
+                        }
+                        {
+                            let $q = &mut o[at..];
+                            $body;
+                        }
+                        out = Some(&mut o[incr as usize..]);
+                    }
+                    None => {
+                        if (incr as usize) >= maxsize.wrapping_sub(i) {
+                            return 0;
+                        }
+                    }
+                }
+                i += incr as usize;
             }};
         }
-        let mut i = 0usize;
-        let mut p = s;
-        let mut f = format;
-        let mut buf = [0u8; 24];
-        let mut tmp = [C::from_u8(0); 96];
-
-        while (*f).asc() != 0 {
-            let mut pad: u8 = 0;
-            let mut width: i32 = -1;
-            let mut to_lowcase = false;
-            let mut to_uppcase = false;
-            let mut change_case = false;
-
-            macro_rules! add {
-                ($n:expr, |$q:ident| $body:expr) => {{
-                    let n: i32 = $n as i32;
-                    let delta = width - n;
-                    let incr = n + if delta > 0 { delta } else { 0 };
-                    if (incr as usize) >= maxsize.wrapping_sub(i) {
-                        return 0;
-                    }
-                    if !p.is_null() {
-                        if delta > 0 {
-                            fill(p, if pad == b'0' { b'0' } else { b' ' }, delta as usize);
-                            p = p.add(delta as usize);
+        macro_rules! cpy {
+            ($src:expr) => {{
+                let src: &[C] = $src;
+                let nn = src.len();
+                add!(nn, |q| {
+                    if !to_lowcase && !to_uppcase {
+                        C::copy(&mut q[..nn], src);
+                    } else {
+                        for (d, &c) in q.iter_mut().zip(src) {
+                            *d = if to_lowcase { c.lower(tl, wc) } else { c.upper(tl, wc) };
                         }
-                        let $q = p;
-                        $body;
-                        p = p.add(n as usize);
                     }
-                    i += incr as usize;
-                }};
-            }
-            macro_rules! cpy {
-                ($n:expr, $src:expr) => {{
-                    let src: *const C = $src;
-                    let nn: usize = $n;
-                    add!(nn, |q| {
-                        if !to_lowcase && !to_uppcase {
-                            copy_units(src, q, nn);
+                });
+            }};
+        }
+        macro_rules! cpyb {
+            ($src:expr) => {{
+                let src: &[u8] = $src;
+                let nn = src.len();
+                add!(nn, |q| {
+                    if !to_lowcase && !to_uppcase {
+                        C::copy_ascii(&mut q[..nn], src);
+                    } else {
+                        for (d, &b) in q.iter_mut().zip(src) {
+                            let c = C::from_u8(b);
+                            *d = if to_lowcase { c.lower(tl, wc) } else { c.upper(tl, wc) };
+                        }
+                    }
+                });
+            }};
+        }
+
+        macro_rules! emit_number {
+            ($buf:ident, $bp:expr, $negative:expr, $digits:expr) => {{
+                let mut bp: usize = $bp;
+                let negative: bool = $negative;
+                let digits: i32 = $digits;
+                if negative {
+                    bp -= 1;
+                    $buf[bp] = b'-';
+                }
+                if pad != b'-' {
+                    let padding = digits - ($buf.len() - bp) as i32;
+                    if padding > 0 {
+                        if pad == b'_' {
+                            if (padding as usize) >= room!() {
+                                return 0;
+                            }
+                            if let Some(o) = out.take() {
+                                let (head, rest) = o.split_at_mut(padding as usize);
+                                pad_units(head, b' ');
+                                out = Some(rest);
+                            }
+                            i += padding as usize;
+                            width = if width > padding { width - padding } else { 0 };
                         } else {
-                            for k in 0..nn {
-                                let c = *src.add(k);
-                                *q.add(k) = if to_lowcase { c.lower(tl, wc) } else { c.upper(tl, wc) };
+                            if (digits as usize) >= room!() {
+                                return 0;
                             }
-                        }
-                    });
-                }};
-            }
-            macro_rules! cpyb {
-                ($n:expr, $src:expr) => {{
-                    let src: *const u8 = $src;
-                    let nn: usize = $n;
-                    add!(nn, |q| {
-                        if !to_lowcase && !to_uppcase {
-                            if size_of::<C>() == 1 {
-                                copy_units(src as *const C, q, nn);
-                            } else {
-                                for k in 0..nn {
-                                    *q.add(k) = C::from_u8(*src.add(k));
+                            if negative {
+                                bp += 1;
+                                if let Some(o) = out.take() {
+                                    let (head, rest) = o.split_at_mut(1);
+                                    head[0] = C::from_u8(b'-');
+                                    out = Some(rest);
                                 }
+                                i += 1;
                             }
-                        } else {
-                            for k in 0..nn {
-                                let c = C::from_u8(*src.add(k));
-                                *q.add(k) = if to_lowcase { c.lower(tl, wc) } else { c.upper(tl, wc) };
+                            if let Some(o) = out.take() {
+                                let (head, rest) = o.split_at_mut(padding as usize);
+                                pad_units(head, b'0');
+                                out = Some(rest);
                             }
+                            i += padding as usize;
+                            width = 0;
                         }
-                    });
-                }};
-            }
+                    }
+                }
+                cpyb!(&$buf[bp..]);
+            }};
+        }
 
-            macro_rules! emit_number {
-                ($buf:ident, $bp:expr, $negative:expr, $digits:expr) => {{
-                    let mut bp: usize = $bp;
-                    let negative: bool = $negative;
-                    let digits: i32 = $digits;
-                    if negative {
-                        bp -= 1;
-                        $buf[bp] = b'-';
-                    }
-                    if pad != b'-' {
-                        let padding = digits - ($buf.len() - bp) as i32;
-                        if padding > 0 {
-                            if pad == b'_' {
-                                if (padding as usize) >= maxsize.wrapping_sub(i) {
-                                    return 0;
-                                }
-                                if !p.is_null() {
-                                    fill(p, b' ', padding as usize);
-                                    p = p.add(padding as usize);
-                                }
-                                i += padding as usize;
-                                width = if width > padding { width - padding } else { 0 };
-                            } else {
-                                if (digits as usize) >= maxsize.wrapping_sub(i) {
-                                    return 0;
-                                }
-                                if negative {
-                                    bp += 1;
-                                    if !p.is_null() {
-                                        *p = C::from_u8(b'-');
-                                        p = p.add(1);
-                                    }
-                                    i += 1;
-                                }
-                                if !p.is_null() {
-                                    fill(p, b'0', padding as usize);
-                                    p = p.add(padding as usize);
-                                }
-                                i += padding as usize;
-                                width = 0;
-                            }
-                        }
-                    }
-                    let len = $buf.len() - bp;
-                    cpyb!(len, $buf.as_ptr().add(bp));
-                }};
-            }
-
-            if (*f).asc() != b'%' {
-                let mut run = 1usize;
-                loop {
-                    let a = (*f.add(run)).asc();
-                    if a == b'%' || a == 0 {
-                        break;
-                    }
-                    run += 1;
+        if fz.cur().asc() != b'%' {
+            let c = fz.cur();
+            let mut t = fz;
+            t.bump();
+            if t.at_end() || t.cur().asc() == b'%' {
+                if 1 >= room!() {
+                    return 0;
                 }
-                if run >= maxsize.wrapping_sub(i) {
-                    run = 1;
-                    if run >= maxsize.wrapping_sub(i) {
-                        return 0;
-                    }
+                if let Some(o) = out.take()
+                    && let Some((h, rest)) = o.split_first_mut()
+                {
+                    *h = c;
+                    out = Some(rest);
                 }
-                if !p.is_null() {
-                    copy_units(f, p, run);
-                    p = p.add(run);
-                }
-                i += run;
-                f = f.add(run);
+                i += 1;
+                fz = t;
                 continue;
             }
-            loop {
-                f = f.add(1);
-                match (*f).asc() {
-                    b'_' | b'-' | b'0' => {
-                        pad = (*f).asc();
-                        continue;
+            let start = fz.pos();
+            while !t.at_end() && t.cur().asc() != b'%' {
+                t.bump();
+            }
+            if t.pos() - start >= room!() {
+                if 1 >= room!() {
+                    return 0;
+                }
+                t = fz;
+                t.bump();
+            }
+            let run = &t.scanned()[start..];
+            if let Some(o) = out.take() {
+                let (head, rest) = o.split_at_mut(run.len());
+                C::copy(head, run);
+                out = Some(rest);
+            }
+            i += run.len();
+            fz = t;
+            continue;
+        }
+        loop {
+            fz.bump();
+            match fz.cur().asc() {
+                b'_' | b'-' | b'0' => {
+                    pad = fz.cur().asc();
+                    continue;
+                }
+                b'^' => {
+                    to_uppcase = true;
+                    continue;
+                }
+                b'#' => {
+                    change_case = true;
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        if fz.cur().asc().is_ascii_digit() {
+            width = 0;
+            while fz.cur().asc().is_ascii_digit() {
+                let d = (fz.cur().asc() - b'0') as i32;
+                if width > i32::MAX / 10 || (width == i32::MAX / 10 && d > i32::MAX % 10) {
+                    width = i32::MAX;
+                } else {
+                    width = width * 10 + d;
+                }
+                fz.bump();
+            }
+        }
+        let modifier = if fz.cur().asc() == b'E' || fz.cur().asc() == b'O' {
+            let m = fz.cur().asc();
+            fz.bump();
+            m
+        } else {
+            0
+        };
+        let format_char = fz.cur().asc();
+        let next: Next<C> = 'sw: {
+            {
+                {
+                    macro_rules! number {
+                        ($d:expr, $v:expr) => {{
+                            let d: i32 = $d;
+                            break 'sw Next::Number(d, $v, false);
+                        }};
                     }
-                    b'^' => {
-                        to_uppcase = true;
-                        continue;
+                    macro_rules! number_sp {
+                        ($d:expr, $v:expr) => {{
+                            let d: i32 = $d;
+                            break 'sw Next::Number(d, $v, true);
+                        }};
                     }
-                    b'#' => {
-                        change_case = true;
-                        continue;
+                    macro_rules! bad {
+                        () => {{
+                            break 'sw Next::Bad;
+                        }};
                     }
-                    _ => break,
+                    macro_rules! text {
+                        ($it:expr) => {
+                            C::text(tl, $it, &mut tmp)
+                        };
+                    }
+                    macro_rules! sub {
+                        ($it:expr) => {
+                            C::subfmt(tl, $it, &mut tmp)
+                        };
+                    }
+                    match format_char {
+                        b'%' => {
+                            if modifier != 0 {
+                                bad!();
+                            }
+                            add!(1, |q| q[0] = C::from_u8(b'%'));
+                        }
+                        b'a' => {
+                            if modifier != 0 {
+                                bad!();
+                            }
+                            if change_case {
+                                to_uppcase = true;
+                                to_lowcase = false;
+                            }
+                            let t = if (0..=6).contains(&rv(&tp.tm_wday)) { text!(It::AbDay(rv(&tp.tm_wday) as usize)) } else { text!(It::Lit(b"?\0")) };
+                            cpy!(t.get(&tmp));
+                        }
+                        b'A' => {
+                            if modifier != 0 {
+                                bad!();
+                            }
+                            if change_case {
+                                to_uppcase = true;
+                                to_lowcase = false;
+                            }
+                            let t = if (0..=6).contains(&rv(&tp.tm_wday)) { text!(It::Day(rv(&tp.tm_wday) as usize)) } else { text!(It::Lit(b"?\0")) };
+                            cpy!(t.get(&tmp));
+                        }
+                        b'b' | b'h' => {
+                            if change_case {
+                                to_uppcase = true;
+                                to_lowcase = false;
+                            }
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            let t = if !(0..=11).contains(&rv(&tp.tm_mon)) {
+                                text!(It::Lit(b"?\0"))
+                            } else if modifier == b'O' {
+                                text!(It::AbAltMon(rv(&tp.tm_mon) as usize))
+                            } else {
+                                text!(It::AbMon(rv(&tp.tm_mon) as usize))
+                            };
+                            cpy!(t.get(&tmp));
+                        }
+                        b'B' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            if change_case {
+                                to_uppcase = true;
+                                to_lowcase = false;
+                            }
+                            let t = if !(0..=11).contains(&rv(&tp.tm_mon)) {
+                                text!(It::Lit(b"?\0"))
+                            } else if modifier == b'O' {
+                                text!(It::AltMon(rv(&tp.tm_mon) as usize))
+                            } else {
+                                text!(It::Mon(rv(&tp.tm_mon) as usize))
+                            };
+                            cpy!(t.get(&tmp));
+                        }
+                        b'c' => {
+                            if modifier == b'O' {
+                                bad!();
+                            }
+                            let e = text!(It::EraDTFmt);
+                            let sub = if modifier == b'E' && e.len() != 0 { sub!(It::EraDTFmt) } else { sub!(It::DTFmt) };
+                            break 'sw Next::Sub(sub);
+                        }
+                        b'C' => {
+                            if modifier == b'E'
+                                && let Some(era) = tl.era_for(rv(&tp.tm_year), rv(&tp.tm_mon), rv(&tp.tm_mday))
+                            {
+                                let t = text!(It::EraName(&era));
+                                cpy!(t.get(&tmp));
+                                break 'sw Next::Switch;
+                            }
+                            number!(1, tm_number(b'C', tp));
+                        }
+                        b'x' => {
+                            if modifier == b'O' {
+                                bad!();
+                            }
+                            let e = text!(It::EraDFmt);
+                            let sub = if modifier == b'E' && e.len() != 0 { sub!(It::EraDFmt) } else { sub!(It::DFmt) };
+                            break 'sw Next::Sub(sub);
+                        }
+                        b'D' => {
+                            if modifier != 0 {
+                                bad!();
+                            }
+                            break 'sw Next::Sub(sub!(It::Lit(b"%m/%d/%y\0")));
+                        }
+                        b'd' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            number!(2, rv(&tp.tm_mday));
+                        }
+                        b'e' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            number_sp!(2, rv(&tp.tm_mday));
+                        }
+                        b'F' => {
+                            if modifier != 0 {
+                                bad!();
+                            }
+                            break 'sw Next::Sub(sub!(It::Lit(b"%Y-%m-%d\0")));
+                        }
+                        b'H' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            number!(2, rv(&tp.tm_hour));
+                        }
+                        b'I' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            number!(2, hour12!());
+                        }
+                        b'k' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            number_sp!(2, rv(&tp.tm_hour));
+                        }
+                        b'l' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            number_sp!(2, hour12!());
+                        }
+                        b'j' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            number!(3, 1i32.wrapping_add(rv(&tp.tm_yday)));
+                        }
+                        b'M' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            number!(2, rv(&tp.tm_min));
+                        }
+                        b'm' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            number!(2, rv(&tp.tm_mon).wrapping_add(1));
+                        }
+                        b'n' => {
+                            add!(1, |q| q[0] = C::from_u8(b'\n'));
+                        }
+                        b'P' | b'p' => {
+                            if format_char == b'P' {
+                                to_lowcase = true;
+                            }
+                            if change_case {
+                                to_uppcase = false;
+                                to_lowcase = true;
+                            }
+                            let t = text!(It::AmPm(rv(&tp.tm_hour) > 11));
+                            cpy!(t.get(&tmp));
+                        }
+                        b'R' => {
+                            break 'sw Next::Sub(sub!(It::Lit(b"%H:%M\0")));
+                        }
+                        b'r' => {
+                            let e = text!(It::TFmtAmpm);
+                            break 'sw Next::Sub(if e.len() == 0 { sub!(It::Lit(timeloc::C_T_FMT_AMPM)) } else { sub!(It::TFmtAmpm) });
+                        }
+                        b'S' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            number!(2, rv(&tp.tm_sec));
+                        }
+                        b's' => {
+                            let mut ltm = *tp;
+                            let t = calendar::mktime_tm(&mut ltm);
+                            let negative = t < 0;
+                            let mut tt = t;
+                            let mut bp = buf.len();
+                            loop {
+                                let mut d = (tt % 10) as i32;
+                                tt /= 10;
+                                if negative {
+                                    d = -d;
+                                }
+                                bp -= 1;
+                                buf[bp] = b'0' + d as u8;
+                                if tt == 0 {
+                                    break;
+                                }
+                            }
+                            emit_number!(buf, bp, negative, 1);
+                        }
+                        b'X' => {
+                            if modifier == b'O' {
+                                bad!();
+                            }
+                            let e = text!(It::EraTFmt);
+                            let sub = if modifier == b'E' && e.len() != 0 { sub!(It::EraTFmt) } else { sub!(It::TFmt) };
+                            break 'sw Next::Sub(sub);
+                        }
+                        b'T' => {
+                            break 'sw Next::Sub(sub!(It::Lit(b"%H:%M:%S\0")));
+                        }
+                        b't' => {
+                            add!(1, |q| q[0] = C::from_u8(b'\t'));
+                        }
+                        b'u' => {
+                            number!(1, tm_number(b'u', tp));
+                        }
+                        b'U' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            number!(2, tm_number(b'U', tp));
+                        }
+                        b'V' | b'g' | b'G' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            match format_char {
+                                b'g' => number!(2, tm_number(b'g', tp)),
+                                b'G' => number!(1, tm_number(b'G', tp)),
+                                _ => number!(2, tm_number(b'V', tp)),
+                            }
+                        }
+                        b'W' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            number!(2, tm_number(b'W', tp));
+                        }
+                        b'w' => {
+                            if modifier == b'E' {
+                                bad!();
+                            }
+                            number!(1, rv(&tp.tm_wday));
+                        }
+                        b'Y' => {
+                            if modifier == b'E'
+                                && let Some(era) = tl.era_for(rv(&tp.tm_year), rv(&tp.tm_mon), rv(&tp.tm_mday))
+                            {
+                                if pad != 0 {
+                                    yr_spec = pad;
+                                }
+                                break 'sw Next::Sub(sub!(It::EraFormat(&era)));
+                            }
+                            if modifier == b'O' {
+                                bad!();
+                            }
+                            number!(1, rv(&tp.tm_year).wrapping_add(1900));
+                        }
+                        b'y' => {
+                            if modifier == b'E'
+                                && let Some(era) = tl.era_for(rv(&tp.tm_year), rv(&tp.tm_mon), rv(&tp.tm_mday))
+                            {
+                                let delta = rv(&tp.tm_year) - era.start_date[0];
+                                if yr_spec != 0 {
+                                    pad = yr_spec;
+                                }
+                                number!(2, era.offset + delta * era.absolute_direction);
+                            }
+                            number!(2, tm_number(b'y', tp));
+                        }
+                        b'Z' => {
+                            if change_case && !C::WIDE {
+                                to_uppcase = false;
+                                to_lowcase = true;
+                            }
+                            if C::WIDE && pad == b'-' {
+                                width = -1;
+                            }
+                            let mut zb: Option<&[u8]> = unsafe { ffi::cstr(zone) }.map(|z| z.to_bytes());
+                            if zb.is_none_or(|z| z.is_empty()) && rv(&tp.tm_isdst) >= 0 {
+                                if !*tzset_called {
+                                    tz::tzset_now();
+                                    *tzset_called = true;
+                                }
+                                zone = if rv(&tp.tm_isdst) <= 1 { tz::tzname_ptr(rv(&tp.tm_isdst) as usize) } else { c"?".as_ptr() };
+                                zb = unsafe { ffi::cstr(zone) }.map(|z| z.to_bytes());
+                            }
+                            cpyb!(zb.unwrap_or(b""));
+                        }
+                        b'z' => {
+                            if rv(&tp.tm_isdst) < 0 {
+                            } else {
+                                let mut diff = rv(&tp.tm_gmtoff) as i32;
+                                if diff < 0 {
+                                    add!(1, |q| q[0] = C::from_u8(b'-'));
+                                    diff = diff.wrapping_neg();
+                                } else {
+                                    add!(1, |q| q[0] = C::from_u8(b'+'));
+                                }
+                                diff /= 60;
+                                number!(4, (diff / 60) * 100 + diff % 60);
+                            }
+                        }
+                        0 => {
+                            bad!();
+                        }
+                        _ => {
+                            bad!();
+                        }
+                    }
+                    Next::Switch
                 }
             }
-            if (*f).asc().is_ascii_digit() {
-                width = 0;
-                while (*f).asc().is_ascii_digit() {
-                    let d = ((*f).asc() - b'0') as i32;
-                    if width > i32::MAX / 10 || (width == i32::MAX / 10 && d > i32::MAX % 10) {
-                        width = i32::MAX;
+        };
+        'tail: {
+            match next {
+                Next::Switch => {}
+                Next::Number(digits, number_value, spacepad) => {
+                    let digits = if digits > width { digits } else { width };
+                    if spacepad && pad != b'0' && pad != b'-' {
+                        pad = b'_';
+                    }
+                    if modifier == b'O' && number_value >= 0 {
+                        let t = C::text(tl, It::AltDigit(number_value as u32), &mut tmp);
+                        if t.len() != 0 {
+                            cpy!(t.get(&tmp));
+                            break 'tail;
+                        }
+                    }
+                    let mut bp = buf.len();
+                    let negative = number_value < 0;
+                    let mut u = number_value as u32;
+                    if negative {
+                        u = u.wrapping_neg();
+                    }
+                    while u >= 100 {
+                        let r = (u % 100) as usize;
+                        u /= 100;
+                        bp -= 2;
+                        buf[bp..bp + 2].copy_from_slice(&DIGIT_PAIRS[2 * r..2 * r + 2]);
+                    }
+                    if u >= 10 {
+                        bp -= 2;
+                        buf[bp..bp + 2].copy_from_slice(&DIGIT_PAIRS[2 * u as usize..2 * u as usize + 2]);
                     } else {
-                        width = width * 10 + d;
+                        bp -= 1;
+                        buf[bp] = u as u8 + b'0';
                     }
-                    f = f.add(1);
+                    emit_number!(buf, bp, negative, digits);
+                    break 'tail;
+                }
+                Next::Sub(subt) => {
+                    match sub_format(subt, &tmp, out.take(), i, maxsize, width, pad, to_uppcase, tp, tzset_called, tl, wc, yr_spec) {
+                        Some((o, n)) => {
+                            out = o;
+                            i = n;
+                        }
+                        None => return 0,
+                    }
+                    break 'tail;
+                }
+                Next::Bad => {
+                    let mut t = fz;
+                    t.bump();
+                    let seen = t.scanned();
+                    let start = seen.iter().rposition(|&c| c.asc() == b'%').unwrap_or(0);
+                    cpy!(&seen[start..]);
+                    break 'tail;
                 }
             }
-            let modifier = if (*f).asc() == b'E' || (*f).asc() == b'O' {
-                let m = (*f).asc();
-                f = f.add(1);
-                m
-            } else {
-                0
-            };
-            let format_char = (*f).asc();
-            let mut next: Next<C> = Next::Switch;
-
-            'dispatch: loop {
-                match next {
-                    Next::Switch => {
-                        macro_rules! number {
-                            ($d:expr, $v:expr) => {{
-                                let d: i32 = $d;
-                                next = Next::Number(d, $v, false);
-                                continue 'dispatch;
-                            }};
-                        }
-                        macro_rules! number_sp {
-                            ($d:expr, $v:expr) => {{
-                                let d: i32 = $d;
-                                next = Next::Number(d, $v, true);
-                                continue 'dispatch;
-                            }};
-                        }
-                        macro_rules! bad {
-                            () => {{
-                                next = Next::Bad;
-                                continue 'dispatch;
-                            }};
-                        }
-                        match format_char {
-                            b'%' => {
-                                if modifier != 0 {
-                                    bad!();
-                                }
-                                add!(1, |q| *q = C::from_u8(b'%'));
-                            }
-                            b'a' => {
-                                if modifier != 0 {
-                                    bad!();
-                                }
-                                if change_case {
-                                    to_uppcase = true;
-                                    to_lowcase = false;
-                                }
-                                let (np, nl) = if (0..=6).contains(&rv(&(*tp).tm_wday)) { C::text(tl, It::AbDay(rv(&(*tp).tm_wday) as usize), &mut tmp) } else { C::text(tl, It::Lit(b"?\0"), &mut tmp) };
-                                cpy!(nl, np);
-                            }
-                            b'A' => {
-                                if modifier != 0 {
-                                    bad!();
-                                }
-                                if change_case {
-                                    to_uppcase = true;
-                                    to_lowcase = false;
-                                }
-                                let (np, nl) = if (0..=6).contains(&rv(&(*tp).tm_wday)) { C::text(tl, It::Day(rv(&(*tp).tm_wday) as usize), &mut tmp) } else { C::text(tl, It::Lit(b"?\0"), &mut tmp) };
-                                cpy!(nl, np);
-                            }
-                            b'b' | b'h' => {
-                                if change_case {
-                                    to_uppcase = true;
-                                    to_lowcase = false;
-                                }
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                let (np, nl) = if !(0..=11).contains(&rv(&(*tp).tm_mon)) {
-                                    C::text(tl, It::Lit(b"?\0"), &mut tmp)
-                                } else if modifier == b'O' {
-                                    C::text(tl, It::AbAltMon(rv(&(*tp).tm_mon) as usize), &mut tmp)
-                                } else {
-                                    C::text(tl, It::AbMon(rv(&(*tp).tm_mon) as usize), &mut tmp)
-                                };
-                                cpy!(nl, np);
-                            }
-                            b'B' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                if change_case {
-                                    to_uppcase = true;
-                                    to_lowcase = false;
-                                }
-                                let (np, nl) = if !(0..=11).contains(&rv(&(*tp).tm_mon)) {
-                                    C::text(tl, It::Lit(b"?\0"), &mut tmp)
-                                } else if modifier == b'O' {
-                                    C::text(tl, It::AltMon(rv(&(*tp).tm_mon) as usize), &mut tmp)
-                                } else {
-                                    C::text(tl, It::Mon(rv(&(*tp).tm_mon) as usize), &mut tmp)
-                                };
-                                cpy!(nl, np);
-                            }
-                            b'c' => {
-                                if modifier == b'O' {
-                                    bad!();
-                                }
-                                let e = C::text(tl, It::EraDTFmt, &mut tmp);
-                                let sub = if modifier == b'E' && e.1 != 0 { e.0 } else { C::text(tl, It::DTFmt, &mut tmp).0 };
-                                next = Next::Sub(sub);
-                                continue 'dispatch;
-                            }
-                            b'C' => {
-                                if modifier == b'E'
-                                    && let Some(era) = tl.era_for(rv(&(*tp).tm_year), rv(&(*tp).tm_mon), rv(&(*tp).tm_mday))
-                                {
-                                    let (np, nl) = C::text(tl, It::EraName(&era), &mut tmp);
-                                    cpy!(nl, np);
-                                    break 'dispatch;
-                                }
-                                number!(1, tm_number(b'C', &*tp));
-                            }
-                            b'x' => {
-                                if modifier == b'O' {
-                                    bad!();
-                                }
-                                let e = C::text(tl, It::EraDFmt, &mut tmp);
-                                let sub = if modifier == b'E' && e.1 != 0 { e.0 } else { C::text(tl, It::DFmt, &mut tmp).0 };
-                                next = Next::Sub(sub);
-                                continue 'dispatch;
-                            }
-                            b'D' => {
-                                if modifier != 0 {
-                                    bad!();
-                                }
-                                next = Next::Sub(C::text(tl, It::Lit(b"%m/%d/%y\0"), &mut tmp).0);
-                                continue 'dispatch;
-                            }
-                            b'd' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                number!(2, rv(&(*tp).tm_mday));
-                            }
-                            b'e' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                number_sp!(2, rv(&(*tp).tm_mday));
-                            }
-                            b'F' => {
-                                if modifier != 0 {
-                                    bad!();
-                                }
-                                next = Next::Sub(C::text(tl, It::Lit(b"%Y-%m-%d\0"), &mut tmp).0);
-                                continue 'dispatch;
-                            }
-                            b'H' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                number!(2, rv(&(*tp).tm_hour));
-                            }
-                            b'I' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                number!(2, hour12!());
-                            }
-                            b'k' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                number_sp!(2, rv(&(*tp).tm_hour));
-                            }
-                            b'l' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                number_sp!(2, hour12!());
-                            }
-                            b'j' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                number!(3, 1i32.wrapping_add(rv(&(*tp).tm_yday)));
-                            }
-                            b'M' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                number!(2, rv(&(*tp).tm_min));
-                            }
-                            b'm' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                number!(2, rv(&(*tp).tm_mon).wrapping_add(1));
-                            }
-                            b'n' => {
-                                add!(1, |q| *q = C::from_u8(b'\n'));
-                            }
-                            b'P' | b'p' => {
-                                if format_char == b'P' {
-                                    to_lowcase = true;
-                                }
-                                if change_case {
-                                    to_uppcase = false;
-                                    to_lowcase = true;
-                                }
-                                let (np, nl) = C::text(tl, It::AmPm(rv(&(*tp).tm_hour) > 11), &mut tmp);
-                                cpy!(nl, np);
-                            }
-                            b'R' => {
-                                next = Next::Sub(C::text(tl, It::Lit(b"%H:%M\0"), &mut tmp).0);
-                                continue 'dispatch;
-                            }
-                            b'r' => {
-                                let e = C::text(tl, It::TFmtAmpm, &mut tmp);
-                                next = Next::Sub(if e.1 == 0 { C::text(tl, It::Lit(timeloc::C_T_FMT_AMPM), &mut tmp).0 } else { e.0 });
-                                continue 'dispatch;
-                            }
-                            b'S' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                number!(2, rv(&(*tp).tm_sec));
-                            }
-                            b's' => {
-                                let mut ltm = *tp;
-                                let t = calendar::mktime(&mut ltm);
-                                let negative = t < 0;
-                                let mut tt = t;
-                                let mut bp = buf.len();
-                                loop {
-                                    let mut d = (tt % 10) as i32;
-                                    tt /= 10;
-                                    if negative {
-                                        d = -d;
-                                    }
-                                    bp -= 1;
-                                    buf[bp] = b'0' + d as u8;
-                                    if tt == 0 {
-                                        break;
-                                    }
-                                }
-                                emit_number!(buf, bp, negative, 1);
-                            }
-                            b'X' => {
-                                if modifier == b'O' {
-                                    bad!();
-                                }
-                                let e = C::text(tl, It::EraTFmt, &mut tmp);
-                                let sub = if modifier == b'E' && e.1 != 0 { e.0 } else { C::text(tl, It::TFmt, &mut tmp).0 };
-                                next = Next::Sub(sub);
-                                continue 'dispatch;
-                            }
-                            b'T' => {
-                                next = Next::Sub(C::text(tl, It::Lit(b"%H:%M:%S\0"), &mut tmp).0);
-                                continue 'dispatch;
-                            }
-                            b't' => {
-                                add!(1, |q| *q = C::from_u8(b'\t'));
-                            }
-                            b'u' => {
-                                number!(1, tm_number(b'u', &*tp));
-                            }
-                            b'U' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                number!(2, tm_number(b'U', &*tp));
-                            }
-                            b'V' | b'g' | b'G' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                match format_char {
-                                    b'g' => number!(2, tm_number(b'g', &*tp)),
-                                    b'G' => number!(1, tm_number(b'G', &*tp)),
-                                    _ => number!(2, tm_number(b'V', &*tp)),
-                                }
-                            }
-                            b'W' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                number!(2, tm_number(b'W', &*tp));
-                            }
-                            b'w' => {
-                                if modifier == b'E' {
-                                    bad!();
-                                }
-                                number!(1, rv(&(*tp).tm_wday));
-                            }
-                            b'Y' => {
-                                if modifier == b'E'
-                                    && let Some(era) = tl.era_for(rv(&(*tp).tm_year), rv(&(*tp).tm_mon), rv(&(*tp).tm_mday))
-                                {
-                                    if pad != 0 {
-                                        yr_spec = pad;
-                                    }
-                                    next = Next::Sub(C::text(tl, It::EraFormat(&era), &mut tmp).0);
-                                    continue 'dispatch;
-                                }
-                                if modifier == b'O' {
-                                    bad!();
-                                }
-                                number!(1, rv(&(*tp).tm_year).wrapping_add(1900));
-                            }
-                            b'y' => {
-                                if modifier == b'E'
-                                    && let Some(era) = tl.era_for(rv(&(*tp).tm_year), rv(&(*tp).tm_mon), rv(&(*tp).tm_mday))
-                                {
-                                    let delta = rv(&(*tp).tm_year) - era.start_date[0];
-                                    if yr_spec != 0 {
-                                        pad = yr_spec;
-                                    }
-                                    number!(2, era.offset + delta * era.absolute_direction);
-                                }
-                                number!(2, tm_number(b'y', &*tp));
-                            }
-                            b'Z' => {
-                                if change_case && !C::WIDE {
-                                    to_uppcase = false;
-                                    to_lowcase = true;
-                                }
-                                if C::WIDE && pad == b'-' {
-                                    width = -1;
-                                }
-                                if (zone.is_null() || *zone == 0) && rv(&(*tp).tm_isdst) >= 0 {
-                                    if !*tzset_called {
-                                        tz::tzset();
-                                        *tzset_called = true;
-                                    }
-                                    zone = if rv(&(*tp).tm_isdst) <= 1 { tz::tzname_ptr(rv(&(*tp).tm_isdst) as usize).cast() } else { c"?".as_ptr().cast() };
-                                }
-                                if zone.is_null() {
-                                    zone = c"".as_ptr().cast();
-                                }
-                                cpyb!(cstrlen(zone), zone);
-                            }
-                            b'z' => {
-                                if rv(&(*tp).tm_isdst) < 0 {
-                                } else {
-                                    let mut diff = rv(&(*tp).tm_gmtoff) as i32;
-                                    if diff < 0 {
-                                        add!(1, |q| *q = C::from_u8(b'-'));
-                                        diff = diff.wrapping_neg();
-                                    } else {
-                                        add!(1, |q| *q = C::from_u8(b'+'));
-                                    }
-                                    diff /= 60;
-                                    number!(4, (diff / 60) * 100 + diff % 60);
-                                }
-                            }
-                            0 => {
-                                f = f.sub(1);
-                                bad!();
-                            }
-                            _ => {
-                                bad!();
-                            }
-                        }
-                        break 'dispatch;
-                    }
-                    Next::Number(digits, number_value, spacepad) => {
-                        let digits = if digits > width { digits } else { width };
-                        if spacepad && pad != b'0' && pad != b'-' {
-                            pad = b'_';
-                        }
-                        if modifier == b'O' && number_value >= 0 {
-                            let (cp, cl) = C::text(tl, It::AltDigit(number_value as u32), &mut tmp);
-                            if cl != 0 {
-                                cpy!(cl, cp);
-                                break 'dispatch;
-                            }
-                        }
-                        let mut bp = buf.len();
-                        let negative = number_value < 0;
-                        let mut u = number_value as u32;
-                        if negative {
-                            u = u.wrapping_neg();
-                        }
-                        while u >= 100 {
-                            let r = (u % 100) as usize;
-                            u /= 100;
-                            bp -= 2;
-                            buf[bp] = DIGIT_PAIRS[2 * r];
-                            buf[bp + 1] = DIGIT_PAIRS[2 * r + 1];
-                        }
-                        if u >= 10 {
-                            bp -= 2;
-                            buf[bp] = DIGIT_PAIRS[2 * u as usize];
-                            buf[bp + 1] = DIGIT_PAIRS[2 * u as usize + 1];
-                        } else {
-                            bp -= 1;
-                            buf[bp] = u as u8 + b'0';
-                        }
-                        emit_number!(buf, bp, negative, digits);
-                        break 'dispatch;
-                    }
-                    Next::Sub(subfmt) => {
-                        let old_start = p;
-                        let mut scratch = core::mem::MaybeUninit::<[C; 128]>::uninit();
-                        let sp = scratch.as_mut_ptr() as *mut C;
-                        let mut tz2 = *tzset_called;
-                        let r = strftime_internal(sp, 128, subfmt, tp_ref, &mut tz2, tl, wc, yr_spec);
-                        if r != 0 {
-                            *tzset_called = tz2;
-                            add!(r, |q| {
-                                copy_units(sp as *const C, q, r);
-                                *q.add(r) = C::from_u8(0);
-                            });
-                        } else {
-                            let mut tz2 = *tzset_called;
-                            let len = strftime_internal(core::ptr::null_mut(), usize::MAX, subfmt, tp_ref, &mut tz2, tl, wc, yr_spec);
-                            *tzset_called = tz2;
-                            add!(len, |q| {
-                                let r = strftime_internal(q, maxsize.wrapping_sub(i), subfmt, tp_ref, tzset_called, tl, wc, yr_spec);
-                                let _ = r;
-                            });
-                        }
-                        if to_uppcase && !old_start.is_null() {
-                            let mut q = old_start;
-                            while q < p {
-                                *q = (*q).upper(tl, wc);
-                                q = q.add(1);
-                            }
-                        }
-                        break 'dispatch;
-                    }
-                    Next::Bad => {
-                        let mut flen = 1usize;
-                        while (*f.sub(flen - 1)).asc() != b'%' {
-                            flen += 1;
-                        }
-                        cpy!(flen, f.sub(flen - 1));
-                        break 'dispatch;
-                    }
-                }
-            }
-            f = f.add(1);
-
         }
-        if !p.is_null() && maxsize != 0 {
-            *p = C::from_u8(0);
-        }
-        i
+        fz.bump();
     }
+    if let Some(o) = out
+        && maxsize != 0
+        && let Some(end) = o.first_mut()
+    {
+        *end = C::from_u8(0);
+    }
+    i
 }
 
+#[inline(never)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn sub_format<'o, C: Ch>(subt: SubF<C>, tmp: &[C; TMP], mut out: Option<&'o mut [C]>, i: usize, maxsize: usize, width: i32, pad: u8, to_uppcase: bool, tp: &Tm, tzset_called: &mut bool, tl: &TimeLoc, wc: Wc, yr_spec: u8) -> Option<(Option<&'o mut [C]>, usize)> {
+    let mut copy = NulCopy::new();
+    let subfmt: ZStr<'_, C> = match subt {
+        SubF::Z(z) => z,
+        SubF::Tmp(n) => match ZStr::from_nul_terminated(&tmp[..=n]) {
+            Some(z) => z,
+            None => return Some((out, i)),
+        },
+        SubF::S(sl) => copy.z(sl)?,
+    };
+    if width <= 0
+        && tl.is_c()
+        && let Some(o) = out.take()
+    {
+        if o.len() > 128 {
+            let room = o.len();
+            let n = strftime_internal(Some(&mut o[..]), room, subfmt, tp, tzset_called, tl, wc, yr_spec);
+            if to_uppcase {
+                upcase(&mut o[..n], tl, wc);
+            }
+            return Some((Some(&mut o[n..]), i + n));
+        }
+        out = Some(o);
+    }
+    let mut scratch = [C::from_u8(0); 64];
+    let mut tz2 = *tzset_called;
+    let r = strftime_internal(Some(&mut scratch), 64, subfmt, tp, &mut tz2, tl, wc, yr_spec);
+    let quick = r != 0;
+    let n = if quick {
+        *tzset_called = tz2;
+        r
+    } else {
+        let mut tz2 = *tzset_called;
+        let len = strftime_internal(None, usize::MAX, subfmt, tp, &mut tz2, tl, wc, yr_spec);
+        *tzset_called = tz2;
+        len
+    };
+    let nn = n as i32;
+    let delta = width - nn;
+    let incr = nn + if delta > 0 { delta } else { 0 };
+    match out.take() {
+        Some(o) => {
+            if (incr as usize) >= o.len() {
+                return None;
+            }
+            let mut at = 0;
+            if delta > 0 {
+                fill(&mut o[..delta as usize], if pad == b'0' { b'0' } else { b' ' });
+                at = delta as usize;
+            }
+            let q = &mut o[at..];
+            if quick {
+                C::copy(&mut q[..n], &scratch[..n]);
+                q[n] = C::from_u8(0);
+            } else {
+                let room = q.len();
+                let _ = strftime_internal(Some(&mut q[..]), room, subfmt, tp, tzset_called, tl, wc, yr_spec);
+            }
+            if to_uppcase {
+                upcase(&mut q[..n], tl, wc);
+            }
+            out = Some(&mut o[incr as usize..]);
+        }
+        None => {
+            if (incr as usize) >= maxsize.wrapping_sub(i) {
+                return None;
+            }
+        }
+    }
+    Some((out, i + incr as usize))
+}
+
+unsafe fn out_buf<'a, C>(s: *mut C, maxsize: usize) -> (Option<&'a mut [C]>, usize) {
+    if s.is_null() {
+        return (None, maxsize);
+    }
+    let cap = maxsize.min(isize::MAX as usize / size_of::<C>());
+    (Some(unsafe { ffi::slice_mut(s, cap) }), cap)
+}
+
+unsafe fn strftime_c(s: *mut c_char, maxsize: usize, format: *const c_char, tp: *const Tm, tl: &TimeLoc) -> usize {
+    let format = unsafe { ZStr::new(format.cast::<u8>()) };
+    let tm = unsafe { sys::arg(tp) };
+    let (out, cap) = unsafe { out_buf(s.cast::<u8>(), maxsize) };
+    let mut tzset_called = false;
+    strftime_internal::<u8>(out, cap, format, tm, &mut tzset_called, tl, NARROW, 0)
+}
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strftime(s: *mut c_char, maxsize: usize, format: *const c_char, tp: *const Tm) -> usize {
-    unsafe {
-        let mut tzset_called = false;
-        strftime_internal::<u8>(s.cast(), maxsize, format.cast(), &*tp, &mut tzset_called, &TimeLoc::current(), NARROW, 0)
-    }
+    unsafe { strftime_c(s, maxsize, format, tp, &TimeLoc::current()) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strftime_l(s: *mut c_char, maxsize: usize, format: *const c_char, tp: *const Tm, loc: LocaleT) -> usize {
-    unsafe {
-        let mut tzset_called = false;
-        strftime_internal::<u8>(s.cast(), maxsize, format.cast(), &*tp, &mut tzset_called, &TimeLoc::of_locale(loc as usize), NARROW, 0)
-    }
+    let tl = unsafe { TimeLoc::of_locale(loc as usize) };
+    unsafe { strftime_c(s, maxsize, format, tp, &tl) }
 }
 
 pub unsafe fn wcsftime_with(s: *mut u32, maxsize: usize, format: *const u32, tp: *const Tm, loc: usize, wc: Wc) -> usize {
-    unsafe {
-        let mut tzset_called = false;
-        let tl = if loc == 0 { TimeLoc::current() } else { TimeLoc::of_locale(loc) };
-        strftime_internal::<u32>(s, maxsize, format, &*tp, &mut tzset_called, &tl, Wc { loc, ..wc }, 0)
-    }
+    let format = unsafe { ZStr::new(format) };
+    let tm = unsafe { sys::arg(tp) };
+    let (out, cap) = unsafe { out_buf(s, maxsize) };
+    let mut tzset_called = false;
+    let tl = if loc == 0 { TimeLoc::current() } else { unsafe { TimeLoc::of_locale(loc) } };
+    let loc = unsafe { Loc::from_raw(loc) };
+    strftime_internal::<u32>(out, cap, format, tm, &mut tzset_called, &tl, Wc { loc, ..wc }, 0)
 }
 
 pub fn format(out: &mut [u8], format: &[u8], tm: &Tm) -> Option<usize> {
-    let mut fz = [0u8; 256];
-    if format.len() >= fz.len() || out.is_empty() {
+    if format.len() >= 256 || out.is_empty() {
         return None;
     }
-    fz[..format.len()].copy_from_slice(format);
-    let n = unsafe { strftime(out.as_mut_ptr().cast(), out.len(), fz.as_ptr().cast(), tm) };
+    let fmt = &format[..format.iter().position(|&c| c == 0).unwrap_or(format.len())];
+    let mut tzset_called = false;
+    let cap = out.len();
+    let n = with_nul(fmt, |z| strftime_internal::<u8>(Some(out), cap, z, tm, &mut tzset_called, &TimeLoc::current(), NARROW, 0))?;
     if n == 0 && !format.is_empty() { None } else { Some(n) }
 }
-
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Decided {
@@ -954,21 +1199,38 @@ enum Decided {
 
 #[derive(Clone, Copy)]
 struct PState {
-    have_i: bool,
-    have_wday: bool,
-    have_yday: bool,
-    have_mon: bool,
-    have_mday: bool,
-    have_uweek: bool,
-    have_wweek: bool,
-    is_pm: bool,
-    want_century: bool,
-    want_era: bool,
-    want_xday: bool,
+    flags: u16,
     decided: Decided,
     week_no: i8,
     century: i8,
     era_cnt: i32,
+}
+
+impl PState {
+    const HAVE_I: u16 = 1 << 0;
+    const HAVE_WDAY: u16 = 1 << 1;
+    const HAVE_YDAY: u16 = 1 << 2;
+    const HAVE_MON: u16 = 1 << 3;
+    const HAVE_MDAY: u16 = 1 << 4;
+    const HAVE_UWEEK: u16 = 1 << 5;
+    const HAVE_WWEEK: u16 = 1 << 6;
+    const IS_PM: u16 = 1 << 7;
+    const WANT_CENTURY: u16 = 1 << 8;
+    const WANT_ERA: u16 = 1 << 9;
+    const WANT_XDAY: u16 = 1 << 10;
+
+    #[inline(always)]
+    fn has(&self, f: u16) -> bool {
+        self.flags & f != 0
+    }
+    #[inline(always)]
+    fn set(&mut self, f: u16) {
+        self.flags |= f;
+    }
+    #[inline(always)]
+    fn clear(&mut self, f: u16) {
+        self.flags &= !f;
+    }
 }
 
 const FLAT_MON_YDAY: [i32; 26] = [
@@ -1010,84 +1272,57 @@ fn day_of_the_year(tm: &mut Tm) {
     tm.tm_yday = mon_yday(isleap(1900i32.wrapping_add(tm.tm_year)), tm.tm_mon as isize).wrapping_add(tm.tm_mday.wrapping_sub(1));
 }
 
-unsafe fn match_string(name: &[u8], s: &mut *const u8) -> bool {
-    unsafe {
-        let ct = if rusty_libc_core::locale::ctype_special() { rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE) } else { core::ptr::null() };
-        for (k, &c) in name.iter().enumerate() {
-            let x = *(*s).add(k);
-            if x != c && rusty_libc_core::locale::tolower_in(ct, i32::from(x)) != rusty_libc_core::locale::tolower_in(ct, i32::from(c)) {
-                return false;
-            }
+#[inline(always)]
+fn match_string(name: &[u8], rp: &mut ZStr<'_, u8>) -> bool {
+    let ct = if rusty_libc_core::locale::ctype_special() { rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE) } else { None };
+    let mut t = *rp;
+    for &c in name {
+        let x = t.cur();
+        if x != c && rusty_libc_core::locale::tolower_in(ct, i32::from(x)) != rusty_libc_core::locale::tolower_in(ct, i32::from(c)) {
+            return false;
         }
-        *s = (*s).add(name.len());
-        true
+        t.bump();
     }
-}
-
-unsafe fn cstr_eq(mut a: *const u8, mut b: *const u8) -> bool {
-    unsafe {
-        while *a == *b {
-            if *a == 0 {
-                return true;
-            }
-            a = a.add(1);
-            b = b.add(1);
-        }
-        false
-    }
+    *rp = t;
+    true
 }
 
 #[allow(clippy::manual_range_contains, clippy::absurd_extreme_comparisons, unused_comparisons)]
-unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm, state: Option<&mut PState>, tl: &TimeLoc) -> *const u8 {
-    unsafe {
-        let nested = state.is_some();
+fn strptime_internal<'a>(mut rp: ZStr<'a, u8>, mut fz: ZStr<'_, u8>, tmp: &mut Tm, state: Option<&mut PState>, tl: &TimeLoc) -> Option<ZStr<'a, u8>> {
+    {
         let mut s = match &state {
             Some(st) => **st,
             None => PState {
-                have_i: false,
-                have_wday: false,
-                have_yday: false,
-                have_mon: false,
-                have_mday: false,
-                have_uweek: false,
-                have_wweek: false,
-                is_pm: false,
-                want_century: false,
-                want_era: false,
-                want_xday: false,
+                flags: 0,
                 decided: Decided::Not,
                 week_no: 0,
                 century: -1,
                 era_cnt: -1,
             },
         };
-        let mut tmb = core::mem::MaybeUninit::<Tm>::uninit();
-        if nested {
-            tmb.write(*tmp);
-        }
-        let tm: &mut Tm = if nested { &mut *tmb.as_mut_ptr() } else { tmp };
+        let tm: &mut Tm = tmp;
         let mut val: usize;
 
         macro_rules! fail {
             () => {
-                return core::ptr::null()
+                return None
             };
         }
         macro_rules! get_number {
             ($from:expr, $to:expr, $n:expr) => {{
                 let mut n: i32 = $n;
                 val = 0;
-                while isspace_c(*rp) {
-                    rp = rp.add(1);
+                while isspace_c(rp.cur()) {
+                    rp.bump();
                 }
-                if *rp < b'0' || *rp > b'9' {
+                if rp.cur() < b'0' || rp.cur() > b'9' {
                     fail!();
                 }
                 loop {
-                    val = val.wrapping_mul(10).wrapping_add((*rp - b'0') as usize);
-                    rp = rp.add(1);
+                    val = val.wrapping_mul(10).wrapping_add((rp.cur() - b'0') as usize);
+                    rp.bump();
                     n -= 1;
-                    if n <= 0 || val * 10 > $to || !(*rp).is_ascii_digit() {
+                    if n <= 0 || val * 10 > $to || !rp.cur().is_ascii_digit() {
                         break;
                     }
                 }
@@ -1116,74 +1351,75 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
         }
                 macro_rules! recursive {
             ($f:expr) => {{
-                let nf: *const u8 = $f;
-                if *nf == 0 {
+                let nf: Fmt = $f;
+                if nf.is_empty() {
                     false
                 } else {
                     let mut s2 = s;
                     let mut tm2 = *tm;
-                    let r = strptime_internal(rp, nf, &mut tm2, Some(&mut s2), tl);
-                    if r.is_null() {
-                        false
-                    } else {
+                    let r = match nf {
+                        Fmt::Z(z) => strptime_internal(rp, z, &mut tm2, Some(&mut s2), tl),
+                        Fmt::S(f) => with_nul(f, |z| strptime_internal(rp, z, &mut tm2, Some(&mut s2), tl)).flatten(),
+                    };
+                    if let Some(r) = r {
                         rp = r;
                         s = s2;
                         *tm = tm2;
                         true
+                    } else {
+                        false
                     }
                 }
             }};
         }
 
-        while *fmt != 0 {
-            if isspace_c(*fmt) {
-                while isspace_c(*rp) {
-                    rp = rp.add(1);
+        while !fz.at_end() {
+            if isspace_c(fz.cur()) {
+                while isspace_c(rp.cur()) {
+                    rp.bump();
                 }
-                fmt = fmt.add(1);
+                fz.bump();
                 continue;
             }
-            if *fmt != b'%' {
-                let (a, b) = (*fmt, *rp);
-                fmt = fmt.add(1);
-                rp = rp.add(1);
-                if a != b {
+            if fz.cur() != b'%' {
+                if fz.cur() != rp.cur() {
                     fail!();
                 }
+                fz.bump();
+                rp.bump();
                 continue;
             }
-            fmt = fmt.add(1);
-            while matches!(*fmt, b'-' | b'_' | b'0' | b'^' | b'#') {
-                fmt = fmt.add(1);
+            fz.bump();
+            while matches!(fz.cur(), b'-' | b'_' | b'0' | b'^' | b'#') {
+                fz.bump();
             }
-            while (*fmt).is_ascii_digit() {
-                fmt = fmt.add(1);
+            while fz.cur().is_ascii_digit() {
+                fz.bump();
             }
             'start_over: loop {
                 let rp_backup = rp;
                 let _ = rp_backup;
-                let conv = *fmt;
-                fmt = fmt.add(1);
+                let conv = fz.cur();
+                fz.bump();
                 match conv {
                     b'%' => {
-                        let c = *rp;
-                        rp = rp.add(1);
-                        if c != b'%' {
+                        if rp.cur() != b'%' {
                             fail!();
                         }
+                        rp.bump();
                     }
                     b'a' | b'A' => {
                         let c = TimeLoc::c();
-                        let mut rp_longest: *const u8 = core::ptr::null();
+                        let mut rp_longest: Option<ZStr<'a, u8>> = None;
                         let mut decided_longest = s.decided;
                         let mut cnt_longest: i32 = -1;
                         for cnt in 0..7usize {
-                            let mut trp: *const u8;
+                            let mut trp: ZStr<'a, u8>;
                             if s.decided != Decided::Raw {
                                 for (name, cname) in [(tl.day(cnt), c.day(cnt)), (tl.abday(cnt), c.abday(cnt))] {
                                     trp = rp;
-                                    if match_string(name, &mut trp) && trp > rp_longest {
-                                        rp_longest = trp;
+                                    if match_string(name, &mut trp) && rp_longest.is_none_or(|l| trp.pos() > l.pos()) {
+                                        rp_longest = Some(trp);
                                         cnt_longest = cnt as i32;
                                         if s.decided == Decided::Not && name != cname {
                                             decided_longest = Decided::Loc;
@@ -1193,39 +1429,37 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                             }
                             if s.decided != Decided::Loc {
                                 trp = rp;
-                                let full = match_string(c.day(cnt), &mut trp) && trp > rp_longest;
+                                let full = match_string(c.day(cnt), &mut trp) && rp_longest.is_none_or(|l| trp.pos() > l.pos());
                                 let mut hit = full;
                                 if !full {
                                     trp = rp;
-                                    hit = match_string(c.abday(cnt), &mut rp) && trp > rp_longest;
+                                    hit = match_string(c.abday(cnt), &mut rp) && rp_longest.is_none_or(|l| trp.pos() > l.pos());
                                 }
                                 if hit {
-                                    rp_longest = trp;
+                                    rp_longest = Some(trp);
                                     cnt_longest = cnt as i32;
                                     decided_longest = Decided::Raw;
                                 }
                             }
                         }
-                        if rp_longest.is_null() {
-                            fail!();
-                        }
-                        rp = rp_longest;
+                        let longest = rp_longest?;
+                        rp = longest;
                         s.decided = decided_longest;
                         tm.tm_wday = cnt_longest;
-                        s.have_wday = true;
+                        s.set(PState::HAVE_WDAY);
                     }
                     b'b' | b'B' | b'h' => {
                         let c = TimeLoc::c();
-                        let mut rp_longest: *const u8 = core::ptr::null();
+                        let mut rp_longest: Option<ZStr<'a, u8>> = None;
                         let mut decided_longest = s.decided;
                         let mut cnt_longest: i32 = -1;
                         for cnt in 0..12usize {
-                            let mut trp: *const u8;
+                            let mut trp: ZStr<'a, u8>;
                             if s.decided != Decided::Raw {
                                 for (name, cname) in [(tl.mon(cnt), c.mon(cnt)), (tl.abmon(cnt), c.abmon(cnt)), (tl.altmon(cnt), c.altmon(cnt)), (tl.abaltmon(cnt), c.altmon(cnt))] {
                                     trp = rp;
-                                    if match_string(name, &mut trp) && trp > rp_longest {
-                                        rp_longest = trp;
+                                    if match_string(name, &mut trp) && rp_longest.is_none_or(|l| trp.pos() > l.pos()) {
+                                        rp_longest = Some(trp);
                                         cnt_longest = cnt as i32;
                                         if s.decided == Decided::Not && name != cname {
                                             decided_longest = Decided::Loc;
@@ -1236,8 +1470,8 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                             if s.decided != Decided::Loc {
                                 for name in [c.mon(cnt), c.abmon(cnt), c.altmon(cnt), c.abaltmon(cnt)] {
                                     trp = rp;
-                                    if match_string(name, &mut trp) && trp > rp_longest {
-                                        rp_longest = trp;
+                                    if match_string(name, &mut trp) && rp_longest.is_none_or(|l| trp.pos() > l.pos()) {
+                                        rp_longest = Some(trp);
                                         cnt_longest = cnt as i32;
                                         decided_longest = Decided::Raw;
                                         break;
@@ -1245,102 +1479,100 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                                 }
                             }
                         }
-                        if rp_longest.is_null() {
-                            fail!();
-                        }
-                        rp = rp_longest;
+                        let longest = rp_longest?;
+                        rp = longest;
                         s.decided = decided_longest;
                         tm.tm_mon = cnt_longest;
-                        s.have_mon = true;
-                        s.want_xday = true;
+                        s.set(PState::HAVE_MON);
+                        s.set(PState::WANT_XDAY);
                     }
                     b'c' => {
                         if s.decided != Decided::Raw {
-                            if !recursive!(tl.d_t_fmt()) {
+                            if !recursive!(tl.d_t_fmt_z()) {
                                 if s.decided == Decided::Loc {
                                     fail!();
                                 }
                                 rp = rp_backup;
                             } else {
-                                if s.decided == Decided::Not && !cstr_eq(tl.d_t_fmt(), timeloc::C_D_T_FMT.as_ptr()) {
+                                if s.decided == Decided::Not && tl.d_t_fmt() != no_nul(timeloc::C_D_T_FMT) {
                                     s.decided = Decided::Loc;
                                 }
-                                s.want_xday = true;
+                                s.set(PState::WANT_XDAY);
                                 break 'start_over;
                             }
                             s.decided = Decided::Raw;
                         }
-                        if !recursive!(timeloc::C_D_T_FMT.as_ptr()) {
+                        if !recursive!(Fmt::Z(ZStr::from(timeloc::C_D_T_FMT_Z))) {
                             fail!();
                         }
-                        s.want_xday = true;
+                        s.set(PState::WANT_XDAY);
                     }
                     b'C' => {
                         get_number!(0, 99, 2);
                         s.century = val as i8;
-                        s.want_xday = true;
+                        s.set(PState::WANT_XDAY);
                     }
                     b'd' | b'e' => {
                         get_number!(1, 31, 2);
                         tm.tm_mday = val as c_int;
-                        s.have_mday = true;
-                        s.want_xday = true;
+                        s.set(PState::HAVE_MDAY);
+                        s.set(PState::WANT_XDAY);
                     }
                     b'F' => {
-                        if !recursive!(c"%Y-%m-%d".as_ptr().cast()) {
+                        if !recursive!(Fmt::Z(ZStr::from(c"%Y-%m-%d"))) {
                             fail!();
                         }
-                        s.want_xday = true;
+                        s.set(PState::WANT_XDAY);
                     }
                     b'x' | b'D' => {
                         if conv == b'x' && s.decided != Decided::Raw {
-                            if !recursive!(tl.d_fmt()) {
+                            if !recursive!(tl.d_fmt_z()) {
                                 if s.decided == Decided::Loc {
                                     fail!();
                                 }
                                 rp = rp_backup;
                             } else {
-                                if s.decided == Decided::Not && !cstr_eq(tl.d_fmt(), timeloc::C_D_FMT.as_ptr()) {
+                                if s.decided == Decided::Not && tl.d_fmt() != no_nul(timeloc::C_D_FMT) {
                                     s.decided = Decided::Loc;
                                 }
-                                s.want_xday = true;
+                                s.set(PState::WANT_XDAY);
                                 break 'start_over;
                             }
                             s.decided = Decided::Raw;
                         }
-                        if !recursive!(timeloc::C_D_FMT.as_ptr()) {
+                        if !recursive!(Fmt::Z(ZStr::from(timeloc::C_D_FMT_Z))) {
                             fail!();
                         }
-                        s.want_xday = true;
+                        s.set(PState::WANT_XDAY);
                     }
                     b'k' | b'H' => {
                         get_number!(0, 23, 2);
                         tm.tm_hour = val as c_int;
-                        s.have_i = false;
+                        s.clear(PState::HAVE_I);
                     }
                     b'l' | b'I' => {
                         get_number!(1, 12, 2);
                         tm.tm_hour = (val % 12) as c_int;
-                        s.have_i = true;
+                        s.set(PState::HAVE_I);
                     }
                     b'j' => {
                         get_number!(1, 366, 3);
                         tm.tm_yday = val as c_int - 1;
-                        s.have_yday = true;
+                        s.set(PState::HAVE_YDAY);
                     }
                     b'm' => {
                         get_number!(1, 12, 2);
                         tm.tm_mon = val as c_int - 1;
-                        s.have_mon = true;
-                        s.want_xday = true;
+                        s.set(PState::HAVE_MON);
+                        s.set(PState::WANT_XDAY);
                     }
                     b'M' => {
                         get_number!(0, 59, 2);
                         tm.tm_min = val as c_int;
                     }
                     b'n' | b't' => {
-                        while isspace_c(*rp) {
-                            rp = rp.add(1);
+                        while isspace_c(rp.cur()) {
+                            rp.bump();
                         }
                     }
                     b'p' => {
@@ -1349,63 +1581,63 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                                 if tl.ampm(false) != b"AM" {
                                     s.decided = Decided::Loc;
                                 }
-                                s.is_pm = false;
+                                s.clear(PState::IS_PM);
                                 break 'start_over;
                             }
                             if match_string(tl.ampm(true), &mut rp) {
                                 if tl.ampm(true) != b"PM" {
                                     s.decided = Decided::Loc;
                                 }
-                                s.is_pm = true;
+                                s.set(PState::IS_PM);
                                 break 'start_over;
                             }
                             s.decided = Decided::Raw;
                         }
                         if match_string(b"AM", &mut rp) {
-                            s.is_pm = false;
+                            s.clear(PState::IS_PM);
                         } else if match_string(b"PM", &mut rp) {
-                            s.is_pm = true;
+                            s.set(PState::IS_PM);
                         } else {
                             fail!();
                         }
                     }
                     b'r' => {
                         if s.decided != Decided::Raw {
-                            if !recursive!(tl.t_fmt_ampm()) {
+                            if !recursive!(tl.t_fmt_ampm_z()) {
                                 if s.decided == Decided::Loc {
                                     fail!();
                                 }
                                 rp = rp_backup;
                             } else {
-                                if s.decided == Decided::Not && !cstr_eq(tl.t_fmt_ampm(), timeloc::C_T_FMT_AMPM.as_ptr()) {
+                                if s.decided == Decided::Not && tl.t_fmt_ampm() != no_nul(timeloc::C_T_FMT_AMPM) {
                                     s.decided = Decided::Loc;
                                 }
                                 break 'start_over;
                             }
                             s.decided = Decided::Raw;
                         }
-                        if !recursive!(timeloc::C_T_FMT_AMPM.as_ptr()) {
+                        if !recursive!(Fmt::Z(ZStr::from(timeloc::C_T_FMT_AMPM_Z))) {
                             fail!();
                         }
                     }
                     b'R' => {
-                        if !recursive!(c"%H:%M".as_ptr().cast()) {
+                        if !recursive!(Fmt::Z(ZStr::from(c"%H:%M"))) {
                             fail!();
                         }
                     }
                     b's' => {
                         let mut secs: i64 = 0;
-                        if *rp < b'0' || *rp > b'9' {
+                        if rp.cur() < b'0' || rp.cur() > b'9' {
                             fail!();
                         }
                         loop {
-                            secs = secs.wrapping_mul(10).wrapping_add((*rp - b'0') as i64);
-                            rp = rp.add(1);
-                            if !(*rp >= b'0' && *rp <= b'9') {
+                            secs = secs.wrapping_mul(10).wrapping_add((rp.cur() - b'0') as i64);
+                            rp.bump();
+                            if !(rp.cur() >= b'0' && rp.cur() <= b'9') {
                                 break;
                             }
                         }
-                        if calendar::localtime_r(&secs, tm).is_null() {
+                        if !tz::tz_convert(secs, true, tm, false) {
                             fail!();
                         }
                     }
@@ -1415,38 +1647,38 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                     }
                     b'X' | b'T' => {
                         if conv == b'X' && s.decided != Decided::Raw {
-                            if !recursive!(tl.t_fmt()) {
+                            if !recursive!(tl.t_fmt_z()) {
                                 if s.decided == Decided::Loc {
                                     fail!();
                                 }
                                 rp = rp_backup;
                             } else {
-                                if !cstr_eq(tl.t_fmt(), timeloc::C_T_FMT.as_ptr()) {
+                                if tl.t_fmt() != no_nul(timeloc::C_T_FMT) {
                                     s.decided = Decided::Loc;
                                 }
                                 break 'start_over;
                             }
                             s.decided = Decided::Raw;
                         }
-                        if !recursive!(timeloc::C_T_FMT.as_ptr()) {
+                        if !recursive!(Fmt::Z(ZStr::from(timeloc::C_T_FMT_Z))) {
                             fail!();
                         }
                     }
                     b'u' => {
                         get_number!(1, 7, 1);
                         tm.tm_wday = (val % 7) as c_int;
-                        s.have_wday = true;
+                        s.set(PState::HAVE_WDAY);
                     }
                     b'g' => {
                         get_number!(0, 99, 2);
                     }
                     b'G' => {
-                        if *rp < b'0' || *rp > b'9' {
+                        if rp.cur() < b'0' || rp.cur() > b'9' {
                             fail!();
                         }
                         loop {
-                            rp = rp.add(1);
-                            if !(*rp >= b'0' && *rp <= b'9') {
+                            rp.bump();
+                            if !(rp.cur() >= b'0' && rp.cur() <= b'9') {
                                 break;
                             }
                         }
@@ -1454,12 +1686,12 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                     b'U' => {
                         get_number!(0, 53, 2);
                         s.week_no = val as i8;
-                        s.have_uweek = true;
+                        s.set(PState::HAVE_UWEEK);
                     }
                     b'W' => {
                         get_number!(0, 53, 2);
                         s.week_no = val as i8;
-                        s.have_wweek = true;
+                        s.set(PState::HAVE_WWEEK);
                     }
                     b'V' => {
                         get_number!(0, 53, 2);
@@ -1467,49 +1699,49 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                     b'w' => {
                         get_number!(0, 6, 1);
                         tm.tm_wday = val as c_int;
-                        s.have_wday = true;
+                        s.set(PState::HAVE_WDAY);
                     }
                     b'y' => {
                         get_number!(0, 99, 2);
                         tm.tm_year = if val >= 69 { val as c_int } else { val as c_int + 100 };
-                        s.want_century = true;
-                        s.want_xday = true;
+                        s.set(PState::WANT_CENTURY);
+                        s.set(PState::WANT_XDAY);
                     }
                     b'Y' => {
                         get_number!(0, 9999, 4);
                         tm.tm_year = val as c_int - 1900;
-                        s.want_century = false;
-                        s.want_xday = true;
+                        s.clear(PState::WANT_CENTURY);
+                        s.set(PState::WANT_XDAY);
                     }
                     b'Z' => {
-                        while isspace_c(*rp) {
-                            rp = rp.add(1);
+                        while isspace_c(rp.cur()) {
+                            rp.bump();
                         }
-                        while !isspace_c(*rp) && *rp != 0 {
-                            rp = rp.add(1);
+                        while !isspace_c(rp.cur()) && rp.cur() != 0 {
+                            rp.bump();
                         }
                     }
                     b'z' => {
                         val = 0;
-                        while isspace_c(*rp) {
-                            rp = rp.add(1);
+                        while isspace_c(rp.cur()) {
+                            rp.bump();
                         }
-                        if *rp == b'Z' {
-                            rp = rp.add(1);
+                        if rp.cur() == b'Z' {
+                            rp.bump();
                             tm.tm_gmtoff = 0;
                         } else {
-                            if *rp != b'+' && *rp != b'-' {
+                            if rp.cur() != b'+' && rp.cur() != b'-' {
                                 fail!();
                             }
-                            let neg = *rp == b'-';
-                            rp = rp.add(1);
+                            let neg = rp.cur() == b'-';
+                            rp.bump();
                             let mut n = 0;
-                            while n < 4 && *rp >= b'0' && *rp <= b'9' {
-                                val = val * 10 + (*rp - b'0') as usize;
-                                rp = rp.add(1);
+                            while n < 4 && rp.cur() >= b'0' && rp.cur() <= b'9' {
+                                val = val * 10 + (rp.cur() - b'0') as usize;
+                                rp.bump();
                                 n += 1;
-                                if *rp == b':' && n == 2 && (*rp.add(1)).is_ascii_digit() {
-                                    rp = rp.add(1);
+                                if rp.cur() == b':' && n == 2 && rp.peek(1).is_ascii_digit() {
+                                    rp.bump();
                                 }
                             }
                             if n == 2 {
@@ -1522,33 +1754,31 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                         }
                     }
                     b'E' => {
-                        let m = *fmt;
-                        fmt = fmt.add(1);
+                        let m = fz.cur();
+                        fz.bump();
                         match m {
                             b'c' => {
                                 if s.decided != Decided::Raw {
-                                    let mut f2 = tl.era_d_t_fmt();
-                                    if *f2 == 0 {
-                                        f2 = tl.d_t_fmt();
-                                    }
+                                    let e2 = tl.era_d_t_fmt();
+                                    let (f2, f2s) = if e2.is_empty() { (tl.d_t_fmt_z(), tl.d_t_fmt()) } else { (Fmt::S(e2), e2) };
                                     if !recursive!(f2) {
                                         if s.decided == Decided::Loc {
                                             fail!();
                                         }
                                         rp = rp_backup;
                                     } else {
-                                        if !cstr_eq(f2, timeloc::C_D_T_FMT.as_ptr()) {
+                                        if f2s != no_nul(timeloc::C_D_T_FMT) {
                                             s.decided = Decided::Loc;
                                         }
-                                        s.want_xday = true;
+                                        s.set(PState::WANT_XDAY);
                                         break 'start_over;
                                     }
                                     s.decided = Decided::Raw;
                                 }
-                                if !recursive!(timeloc::C_D_T_FMT.as_ptr()) {
+                                if !recursive!(Fmt::Z(ZStr::from(timeloc::C_D_T_FMT_Z))) {
                                     fail!();
                                 }
-                                s.want_xday = true;
+                                s.set(PState::WANT_XDAY);
                             }
                             b'C' => {
                                 if s.decided != Decided::Raw {
@@ -1584,15 +1814,15 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                                 }
                                 get_number!(0, 99, 2);
                                 s.century = val as i8;
-                                s.want_xday = true;
+                                s.set(PState::WANT_XDAY);
                             }
                             b'y' => {
                                 if s.decided != Decided::Raw {
                                     get_number!(0, 9999, 4);
                                     tm.tm_year = val as c_int;
-                                    s.want_era = true;
-                                    s.want_xday = true;
-                                    s.want_century = true;
+                                    s.set(PState::WANT_ERA);
+                                    s.set(PState::WANT_XDAY);
+                                    s.set(PState::WANT_CENTURY);
                                     let in_era = |e: &timeloc::Era, year: c_int| -> bool {
                                         let delta = (year - e.offset) * e.absolute_direction;
                                         delta >= 0 && (delta as i64) < ((e.stop_date[0] as i64 - e.start_date[0] as i64) * e.absolute_direction as i64 + 1)
@@ -1625,8 +1855,8 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                                 }
                                 get_number!(0, 99, 2);
                                 tm.tm_year = if val >= 69 { val as c_int } else { val as c_int + 100 };
-                                s.want_century = true;
-                                s.want_xday = true;
+                                s.set(PState::WANT_CENTURY);
+                                s.set(PState::WANT_XDAY);
                             }
                             b'Y' => {
                                 if s.decided != Decided::Raw {
@@ -1634,7 +1864,7 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                                     s.era_cnt = 0;
                                     while s.era_cnt < n {
                                         if let Some(e) = tl.era(s.era_cnt as usize)
-                                            && recursive!(e.format.as_ptr())
+                                            && recursive!(Fmt::S(e.format))
                                         {
                                             break;
                                         }
@@ -1655,52 +1885,48 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                                 }
                                 get_number!(0, 9999, 4);
                                 tm.tm_year = val as c_int - 1900;
-                                s.want_century = false;
-                                s.want_xday = true;
+                                s.clear(PState::WANT_CENTURY);
+                                s.set(PState::WANT_XDAY);
                             }
                             b'x' => {
                                 if s.decided != Decided::Raw {
-                                    let mut f2 = tl.era_d_fmt();
-                                    if *f2 == 0 {
-                                        f2 = tl.d_fmt();
-                                    }
+                                    let e2 = tl.era_d_fmt();
+                                    let (f2, f2s) = if e2.is_empty() { (tl.d_fmt_z(), tl.d_fmt()) } else { (Fmt::S(e2), e2) };
                                     if !recursive!(f2) {
                                         if s.decided == Decided::Loc {
                                             fail!();
                                         }
                                         rp = rp_backup;
                                     } else {
-                                        if !cstr_eq(f2, timeloc::C_D_FMT.as_ptr()) {
+                                        if f2s != no_nul(timeloc::C_D_FMT) {
                                             s.decided = Decided::Loc;
                                         }
                                         break 'start_over;
                                     }
                                     s.decided = Decided::Raw;
                                 }
-                                if !recursive!(timeloc::C_D_FMT.as_ptr()) {
+                                if !recursive!(Fmt::Z(ZStr::from(timeloc::C_D_FMT_Z))) {
                                     fail!();
                                 }
                             }
                             b'X' => {
                                 if s.decided != Decided::Raw {
-                                    let mut f2 = tl.era_t_fmt();
-                                    if *f2 == 0 {
-                                        f2 = tl.t_fmt();
-                                    }
+                                    let e2 = tl.era_t_fmt();
+                                    let (f2, f2s) = if e2.is_empty() { (tl.t_fmt_z(), tl.t_fmt()) } else { (Fmt::S(e2), e2) };
                                     if !recursive!(f2) {
                                         if s.decided == Decided::Loc {
                                             fail!();
                                         }
                                         rp = rp_backup;
                                     } else {
-                                        if !cstr_eq(f2, timeloc::C_T_FMT.as_ptr()) {
+                                        if f2s != no_nul(timeloc::C_T_FMT) {
                                             s.decided = Decided::Loc;
                                         }
                                         break 'start_over;
                                     }
                                     s.decided = Decided::Raw;
                                 }
-                                if !recursive!(timeloc::C_T_FMT.as_ptr()) {
+                                if !recursive!(Fmt::Z(ZStr::from(timeloc::C_T_FMT_Z))) {
                                     fail!();
                                 }
                             }
@@ -1708,34 +1934,35 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                         }
                     }
                     b'O' => {
-                        let m = *fmt;
-                        fmt = fmt.add(1);
+                        let at_m = fz;
+                        let m = fz.cur();
+                        fz.bump();
                         match m {
                             b'b' | b'B' | b'h' => {
-                                fmt = fmt.sub(1);
+                                fz = at_m;
                                 continue 'start_over;
                             }
                             b'd' | b'e' => {
                                 get_alt_number!(1, 31, 2);
                                 tm.tm_mday = val as c_int;
-                                s.have_mday = true;
-                                s.want_xday = true;
+                                s.set(PState::HAVE_MDAY);
+                                s.set(PState::WANT_XDAY);
                             }
                             b'H' => {
                                 get_alt_number!(0, 23, 2);
                                 tm.tm_hour = val as c_int;
-                                s.have_i = false;
+                                s.clear(PState::HAVE_I);
                             }
                             b'I' => {
                                 get_alt_number!(1, 12, 2);
                                 tm.tm_hour = (val % 12) as c_int;
-                                s.have_i = true;
+                                s.set(PState::HAVE_I);
                             }
                             b'm' => {
                                 get_alt_number!(1, 12, 2);
                                 tm.tm_mon = val as c_int - 1;
-                                s.have_mon = true;
-                                s.want_xday = true;
+                                s.set(PState::HAVE_MON);
+                                s.set(PState::WANT_XDAY);
                             }
                             b'M' => {
                                 get_alt_number!(0, 59, 2);
@@ -1748,12 +1975,12 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                             b'U' => {
                                 get_alt_number!(0, 53, 2);
                                 s.week_no = val as i8;
-                                s.have_uweek = true;
+                                s.set(PState::HAVE_UWEEK);
                             }
                             b'W' => {
                                 get_alt_number!(0, 53, 2);
                                 s.week_no = val as i8;
-                                s.have_wweek = true;
+                                s.set(PState::HAVE_WWEEK);
                             }
                             b'V' => {
                                 get_alt_number!(0, 53, 2);
@@ -1761,12 +1988,12 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
                             b'w' => {
                                 get_alt_number!(0, 6, 1);
                                 tm.tm_wday = val as c_int;
-                                s.have_wday = true;
+                                s.set(PState::HAVE_WDAY);
                             }
                             b'y' => {
                                 get_alt_number!(0, 99, 2);
                                 tm.tm_year = if val >= 69 { val as c_int } else { val as c_int + 100 };
-                                s.want_xday = true;
+                                s.set(PState::WANT_XDAY);
                             }
                             _ => fail!(),
                         }
@@ -1779,116 +2006,131 @@ unsafe fn strptime_internal(mut rp: *const u8, mut fmt: *const u8, tmp: &mut Tm,
 
         if let Some(st) = state {
             *st = s;
-            *tmp = *tm;
-            return rp;
+            return Some(rp);
         }
 
-        if s.have_i && s.is_pm {
+        if s.has(PState::HAVE_I) && s.has(PState::IS_PM) {
             tm.tm_hour += 12;
         }
         if s.century != -1 {
-            if s.want_century {
+            if s.has(PState::WANT_CENTURY) {
                 tm.tm_year = tm.tm_year % 100 + (s.century as c_int - 19) * 100;
             } else {
                 tm.tm_year = (s.century as c_int - 19) * 100;
             }
         }
         if s.era_cnt != -1 {
-            let Some(e) = tl.era(s.era_cnt as usize) else { return core::ptr::null() };
-            if s.want_era {
+            let e = tl.era(s.era_cnt as usize)?;
+            if s.has(PState::WANT_ERA) {
                 tm.tm_year = e.start_date[0] + (tm.tm_year - e.offset) * e.absolute_direction;
             } else {
                 tm.tm_year = e.start_date[0];
             }
-        } else if s.want_era && s.want_century && s.century == -1 && tm.tm_year < 69 {
+        } else if s.has(PState::WANT_ERA) && s.has(PState::WANT_CENTURY) && s.century == -1 && tm.tm_year < 69 {
             tm.tm_year += 100;
         }
-        let mon_ok = |tm: &Tm, s: &PState| s.have_mon || (tm.tm_mon as u32) <= 11;
-        if s.want_xday && !s.have_wday {
-            if !(s.have_mon && s.have_mday) && s.have_yday {
+        let mon_ok = |tm: &Tm, s: &PState| s.has(PState::HAVE_MON) || (tm.tm_mon as u32) <= 11;
+        if s.has(PState::WANT_XDAY) && !s.has(PState::HAVE_WDAY) {
+            if !(s.has(PState::HAVE_MON) && s.has(PState::HAVE_MDAY)) && s.has(PState::HAVE_YDAY) {
                 let leap = isleap(1900 + tm.tm_year);
                 let mut t_mon = 0usize;
                 while t_mon < 40 && mon_yday(leap, t_mon as isize) <= tm.tm_yday {
                     t_mon += 1;
                 }
-                if !s.have_mon {
+                if !s.has(PState::HAVE_MON) {
                     tm.tm_mon = t_mon as c_int - 1;
                 }
-                if !s.have_mday {
+                if !s.has(PState::HAVE_MDAY) {
                     tm.tm_mday = tm.tm_yday - mon_yday(leap, t_mon as isize - 1) + 1;
                 }
-                s.have_mon = true;
-                s.have_mday = true;
+                s.set(PState::HAVE_MON);
+                s.set(PState::HAVE_MDAY);
             }
             if mon_ok(tm, &s) {
                 day_of_the_week(tm);
             }
         }
-        if s.want_xday && !s.have_yday && mon_ok(tm, &s) {
+        if s.has(PState::WANT_XDAY) && !s.has(PState::HAVE_YDAY) && mon_ok(tm, &s) {
             day_of_the_year(tm);
         }
-        if (s.have_uweek || s.have_wweek) && s.have_wday {
+        if (s.has(PState::HAVE_UWEEK) || s.has(PState::HAVE_WWEEK)) && s.has(PState::HAVE_WDAY) {
             let save_wday = tm.tm_wday;
             let save_mday = tm.tm_mday;
             let save_mon = tm.tm_mon;
-            let w_offset = if s.have_uweek { 0 } else { 1 };
+            let w_offset = if s.has(PState::HAVE_UWEEK) { 0 } else { 1 };
             tm.tm_mday = 1;
             tm.tm_mon = 0;
             day_of_the_week(tm);
-            if s.have_mday {
+            if s.has(PState::HAVE_MDAY) {
                 tm.tm_mday = save_mday;
             }
-            if s.have_mon {
+            if s.has(PState::HAVE_MON) {
                 tm.tm_mon = save_mon;
             }
-            if !s.have_yday {
+            if !s.has(PState::HAVE_YDAY) {
                 tm.tm_yday = (7 - (tm.tm_wday - w_offset)) % 7 + (s.week_no as c_int - 1) * 7 + (save_wday - w_offset + 7) % 7;
             }
-            if !s.have_mday || !s.have_mon {
+            if !s.has(PState::HAVE_MDAY) || !s.has(PState::HAVE_MON) {
                 let leap = isleap(1900 + tm.tm_year);
                 let mut t_mon = 0usize;
                 while t_mon < 40 && mon_yday(leap, t_mon as isize) <= tm.tm_yday {
                     t_mon += 1;
                 }
-                if !s.have_mon {
+                if !s.has(PState::HAVE_MON) {
                     tm.tm_mon = t_mon as c_int - 1;
                 }
-                if !s.have_mday {
+                if !s.has(PState::HAVE_MDAY) {
                     tm.tm_mday = tm.tm_yday - mon_yday(leap, t_mon as isize - 1) + 1;
                 }
             }
             tm.tm_wday = save_wday;
         }
-        rp
+        Some(rp)
+    }
+}
+
+unsafe fn strptime_c(buf: *const c_char, format: *const c_char, tm: *mut Tm, tl: &TimeLoc) -> *mut c_char {
+    let input = unsafe { ZStr::new(buf.cast::<u8>()) };
+    let fmt = unsafe { ZStr::new(format.cast::<u8>()) };
+    let tm = unsafe { sys::arg_mut(tm) };
+    match strptime_internal(input, fmt, tm, None, tl) {
+        Some(end) => buf.wrapping_add(end.pos()).cast_mut(),
+        None => core::ptr::null_mut(),
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strptime(buf: *const c_char, format: *const c_char, tm: *mut Tm) -> *mut c_char {
-    unsafe { strptime_internal(buf.cast(), format.cast(), &mut *tm, None, &TimeLoc::current()) as *mut c_char }
+    unsafe { strptime_c(buf, format, tm, &TimeLoc::current()) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strptime_l(buf: *const c_char, format: *const c_char, tm: *mut Tm, loc: LocaleT) -> *mut c_char {
-    unsafe { strptime_internal(buf.cast(), format.cast(), &mut *tm, None, &TimeLoc::of_locale(loc as usize)) as *mut c_char }
+    let tl = unsafe { TimeLoc::of_locale(loc as usize) };
+    unsafe { strptime_c(buf, format, tm, &tl) }
+}
+
+pub fn parse(input: &[u8], format: &[u8], tm: &mut Tm) -> Option<usize> {
+    let tl = TimeLoc::current();
+    let with = |s: &[u8], f: &mut dyn FnMut(ZStr<'_, u8>) -> Option<usize>| -> Option<usize> {
+        match ZStr::from_slice(s) {
+            Some(z) => f(z),
+            None => with_nul(s, &mut *f).flatten(),
+        }
+    };
+    with(input, &mut |zi| with(format, &mut |zf| strptime_internal(zi, zf, tm, None, &tl).map(|e| e.pos())))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[allow(non_upper_case_globals)]
-pub static mut getdate_err: c_int = 0;
-
-const SYS_STAT: usize = 4;
-const SYS_ACCESS: usize = 21;
-const SYS_OPEN: usize = 2;
-const SYS_READ: usize = 0;
-const SYS_CLOSE: usize = 3;
+pub static getdate_err: AtomicI32 = AtomicI32::new(0);
 
 fn first_wday(year: i32, mon: i32, wday: i32) -> i32 {
     if wday == i32::MIN {
         return 1;
     }
     let mut tm = Tm { tm_year: year, tm_mon: mon, tm_mday: 1, ..Tm::default() };
-    unsafe { calendar::mktime(&mut tm) };
+    calendar::mktime_tm(&mut tm);
     1 + (wday - tm.tm_wday + 7) % 7
 }
 
@@ -1901,185 +2143,154 @@ fn check_mday(year: i32, mon: i32, mday: i32) -> bool {
     }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn getdate_r(string: *const c_char, tp: *mut Tm) -> c_int {
-    unsafe {
-        let datemsk = env::getenv(b"DATEMSK");
-        if datemsk.is_null() || *datemsk == 0 {
-            return 1;
-        }
-        #[repr(C)]
-        struct St {
-            dev: u64,
-            ino: u64,
-            nlink: u64,
-            mode: u32,
-            rest: [u8; 116],
-        }
-        let mut st: St = core::mem::zeroed();
-        if syscall::check(syscall::syscall2(SYS_STAT, datemsk as usize, &mut st as *mut St as usize)).is_err() {
-            return 3;
-        }
-        if st.mode & 0o170000 != 0o100000 {
-            return 4;
-        }
-        if syscall::check(syscall::syscall2(SYS_ACCESS, datemsk as usize, 4)).is_err() {
-            return 2;
-        }
-        let fd = syscall::syscall3(SYS_OPEN, datemsk as usize, 0o2000000, 0);
-        if syscall::check(fd).is_err() {
-            return 2;
-        }
-        let mut cap = 4096usize;
-        let mut data: *mut u8 = rusty_libc_malloc::malloc(cap + 1).cast();
-        let mut len = 0usize;
-        let mut read_error = data.is_null();
-        while !read_error {
-            if len == cap {
-                cap *= 2;
-                let n: *mut u8 = rusty_libc_malloc::realloc(data.cast(), cap + 1).cast();
-                if n.is_null() {
-                    read_error = true;
-                    break;
-                }
-                data = n;
-            }
-            let r = syscall::syscall3(SYS_READ, fd, data.add(len) as usize, cap - len);
-            match syscall::check(r) {
-                Ok(0) => break,
-                Ok(n) => len += n,
-                Err(e) if e.0 == rusty_libc_core::errno::EINTR => {}
-                Err(_) => {
-                    read_error = true;
-                }
-            }
-        }
-        syscall::syscall1(SYS_CLOSE, fd);
-        if data.is_null() {
-            return 6;
-        }
-        if read_error {
-            rusty_libc_malloc::free(data.cast());
-            return 5;
-        }
-        *data.add(len) = 0;
-        let mut input = string.cast::<u8>();
-        while isspace_c(*input) {
-            input = input.add(1);
-        }
-        let mut inlen = cstrlen(input);
-        while inlen > 0 && isspace_c(*input.add(inlen - 1)) {
-            inlen -= 1;
-        }
-        let instr: *mut u8 = rusty_libc_malloc::malloc(inlen + 1).cast();
-        if instr.is_null() {
-            rusty_libc_malloc::free(data.cast());
-            return 6;
-        }
-        core::ptr::copy_nonoverlapping(input, instr, inlen);
-        *instr.add(inlen) = 0;
-
-        let tp = &mut *tp;
-        let mut found = false;
-        let mut pos = 0usize;
-        while pos < len {
-            let start = pos;
-            while pos < len && *data.add(pos) != b'\n' {
-                pos += 1;
-            }
-            if pos < len {
-                *data.add(pos) = 0;
-                pos += 1;
-            }
-            tp.tm_year = i32::MIN;
-            tp.tm_mon = i32::MIN;
-            tp.tm_mday = i32::MIN;
-            tp.tm_wday = i32::MIN;
-            tp.tm_hour = i32::MIN;
-            tp.tm_sec = i32::MIN;
-            tp.tm_min = i32::MIN;
-            tp.tm_isdst = -1;
-            tp.tm_gmtoff = 0;
-            tp.tm_zone = core::ptr::null();
-            let r = strptime_internal(instr, data.add(start), tp, None, &TimeLoc::current());
-            if !r.is_null() && *r == 0 {
-                found = true;
+pub fn getdate_tm<'a>(input: impl FnOnce() -> &'a [u8], tp: &mut Tm) -> c_int {
+    let Some(datemsk) = sys::getenv_c(b"DATEMSK").filter(|d| !d.is_empty()) else { return 1 };
+    let Ok(st) = sys::stat(datemsk) else { return 3 };
+    if st.st_mode & 0o170000 != 0o100000 {
+        return 4;
+    }
+    if sys::access(datemsk, 4).is_err() {
+        return 2;
+    }
+    let Ok(fd) = sys::open_rdonly_cloexec(datemsk) else { return 2 };
+    let mut cap = 4096usize;
+    let mut data = MBuf::filled(cap + 1, 0u8);
+    let mut len = 0usize;
+    let mut read_error = data.is_none();
+    while let Some(d) = data.as_mut()
+        && !read_error
+    {
+        if len == cap {
+            cap *= 2;
+            if !d.grow(cap + 1, 0) {
+                read_error = true;
                 break;
             }
         }
-        rusty_libc_malloc::free(instr.cast());
-        rusty_libc_malloc::free(data.cast());
-        if !found {
-            return 7;
-        }
-        let timer = crate::clock::unix_time();
-        let mut tm = Tm::default();
-        calendar::localtime_r(&timer, &mut tm);
-        let mut mday_ok = false;
-        if (0..=6).contains(&tp.tm_wday) && tp.tm_year == i32::MIN && tp.tm_mon == i32::MIN && tp.tm_mday == i32::MIN {
-            tp.tm_year = tm.tm_year;
-            tp.tm_mon = tm.tm_mon;
-            tp.tm_mday = tm.tm_mday + (tp.tm_wday - tm.tm_wday + 7) % 7;
-            mday_ok = true;
-        }
-        if (0..=11).contains(&tp.tm_mon) && tp.tm_mday == i32::MIN {
-            if tp.tm_year == i32::MIN {
-                tp.tm_year = tm.tm_year + if tp.tm_mon - tm.tm_mon < 0 { 1 } else { 0 };
+        match rusty_libc_core::unistd::read_nocancel(fd, &mut d[len..cap]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.0 == rusty_libc_core::errno::EINTR => {}
+            Err(_) => {
+                read_error = true;
             }
-            tp.tm_mday = first_wday(tp.tm_year, tp.tm_mon, tp.tm_wday);
-            mday_ok = true;
         }
-        if tp.tm_hour == i32::MIN && tp.tm_min == i32::MIN && tp.tm_sec == i32::MIN {
-            tp.tm_hour = tm.tm_hour;
-            tp.tm_min = tm.tm_min;
-            tp.tm_sec = tm.tm_sec;
-        }
-        if tp.tm_hour == i32::MIN {
-            tp.tm_hour = 0;
-        }
-        if tp.tm_min == i32::MIN {
-            tp.tm_min = 0;
-        }
-        if tp.tm_sec == i32::MIN {
-            tp.tm_sec = 0;
-        }
-        if (0..=23).contains(&tp.tm_hour) && tp.tm_mon == i32::MIN && tp.tm_mday == i32::MIN && tp.tm_wday == i32::MIN {
-            tp.tm_mon = tm.tm_mon;
-            tp.tm_mday = tm.tm_mday + if tp.tm_hour - tm.tm_hour < 0 { 1 } else { 0 };
-            mday_ok = true;
-        }
-        if tp.tm_year == i32::MIN {
-            tp.tm_year = tm.tm_year;
-        }
-        if tp.tm_mon == i32::MIN {
-            tp.tm_mon = tm.tm_mon;
-        }
-        if (!mday_ok && !check_mday(1900i32.wrapping_add(tp.tm_year), tp.tm_mon, tp.tm_mday)) || calendar::mktime(tp) == -1 {
-            return 8;
-        }
-        0
     }
+    let _ = rusty_libc_core::unistd::close(fd);
+    let Some(data) = data else { return 6 };
+    if read_error {
+        return 5;
+    }
+    let input = input();
+    let mut start = 0;
+    while start < input.len() && isspace_c(input[start]) {
+        start += 1;
+    }
+    let mut end = input.len();
+    while end > start && isspace_c(input[end - 1]) {
+        end -= 1;
+    }
+    let inlen = end - start;
+    let Some(mut instr) = MBuf::filled(inlen + 1, 0u8) else { return 6 };
+    instr[..inlen].copy_from_slice(&input[start..end]);
+
+    let mut found = false;
+    let mut pos = 0usize;
+    while pos < len {
+        let line_start = pos;
+        while pos < len && data[pos] != b'\n' {
+            pos += 1;
+        }
+        let line = &data[line_start..pos];
+        if pos < len {
+            pos += 1;
+        }
+        tp.tm_year = i32::MIN;
+        tp.tm_mon = i32::MIN;
+        tp.tm_mday = i32::MIN;
+        tp.tm_wday = i32::MIN;
+        tp.tm_hour = i32::MIN;
+        tp.tm_sec = i32::MIN;
+        tp.tm_min = i32::MIN;
+        tp.tm_isdst = -1;
+        tp.tm_gmtoff = 0;
+        tp.tm_zone = core::ptr::null();
+        let zin = ZStr::from_nul_terminated(&instr).unwrap_or(ZStr::from(c""));
+        if with_nul(line, |zl| strptime_internal(zin, zl, tp, None, &TimeLoc::current()).map(|e| e.pos())).flatten() == Some(inlen) {
+            found = true;
+            break;
+        }
+    }
+    drop(data);
+    if !found {
+        return 7;
+    }
+    let timer = crate::clock::unix_time();
+    let mut tm = Tm::default();
+    tz::tz_convert(timer, true, &mut tm, false);
+    let mut mday_ok = false;
+    if (0..=6).contains(&tp.tm_wday) && tp.tm_year == i32::MIN && tp.tm_mon == i32::MIN && tp.tm_mday == i32::MIN {
+        tp.tm_year = tm.tm_year;
+        tp.tm_mon = tm.tm_mon;
+        tp.tm_mday = tm.tm_mday + (tp.tm_wday - tm.tm_wday + 7) % 7;
+        mday_ok = true;
+    }
+    if (0..=11).contains(&tp.tm_mon) && tp.tm_mday == i32::MIN {
+        if tp.tm_year == i32::MIN {
+            tp.tm_year = tm.tm_year + if tp.tm_mon - tm.tm_mon < 0 { 1 } else { 0 };
+        }
+        tp.tm_mday = first_wday(tp.tm_year, tp.tm_mon, tp.tm_wday);
+        mday_ok = true;
+    }
+    if tp.tm_hour == i32::MIN && tp.tm_min == i32::MIN && tp.tm_sec == i32::MIN {
+        tp.tm_hour = tm.tm_hour;
+        tp.tm_min = tm.tm_min;
+        tp.tm_sec = tm.tm_sec;
+    }
+    if tp.tm_hour == i32::MIN {
+        tp.tm_hour = 0;
+    }
+    if tp.tm_min == i32::MIN {
+        tp.tm_min = 0;
+    }
+    if tp.tm_sec == i32::MIN {
+        tp.tm_sec = 0;
+    }
+    if (0..=23).contains(&tp.tm_hour) && tp.tm_mon == i32::MIN && tp.tm_mday == i32::MIN && tp.tm_wday == i32::MIN {
+        tp.tm_mon = tm.tm_mon;
+        tp.tm_mday = tm.tm_mday + if tp.tm_hour - tm.tm_hour < 0 { 1 } else { 0 };
+        mday_ok = true;
+    }
+    if tp.tm_year == i32::MIN {
+        tp.tm_year = tm.tm_year;
+    }
+    if tp.tm_mon == i32::MIN {
+        tp.tm_mon = tm.tm_mon;
+    }
+    if (!mday_ok && !check_mday(1900i32.wrapping_add(tp.tm_year), tp.tm_mon, tp.tm_mday)) || calendar::mktime_tm(tp) == -1 {
+        return 8;
+    }
+    0
 }
 
-static mut GETDATE_TM: Tm = Tm { tm_sec: 0, tm_min: 0, tm_hour: 0, tm_mday: 0, tm_mon: 0, tm_year: 0, tm_wday: 0, tm_yday: 0, tm_isdst: 0, tm_gmtoff: 0, tm_zone: core::ptr::null() };
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn getdate_r(string: *const c_char, tp: *mut Tm) -> c_int {
+    let input = || unsafe { ffi::cstr_bytes(string) };
+    let tp = unsafe { sys::arg_mut(tp) };
+    getdate_tm(input, tp)
+}
+
+static GETDATE_TM: SyncCell<Tm> = SyncCell::new(Tm { tm_sec: 0, tm_min: 0, tm_hour: 0, tm_mday: 0, tm_mon: 0, tm_year: 0, tm_wday: 0, tm_yday: 0, tm_isdst: 0, tm_gmtoff: 0, tm_zone: core::ptr::null() });
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getdate(string: *const c_char) -> *mut Tm {
-    unsafe {
-        let e = getdate_r(string, &raw mut GETDATE_TM);
-        if e != 0 {
-            getdate_err = e;
-            return core::ptr::null_mut();
-        }
-        &raw mut GETDATE_TM
+    let input = || unsafe { ffi::cstr_bytes(string) };
+    let e = unsafe { GETDATE_TM.with_unsync(|tm| getdate_tm(input, tm)) };
+    if e != 0 {
+        getdate_err.store(e, Relaxed);
+        return core::ptr::null_mut();
     }
-}
-
-#[allow(dead_code)]
-const _: i32 = EINVAL;
-#[allow(dead_code)]
-fn _unused() {
-    let _ = errno::get();
+    GETDATE_TM.as_ptr()
 }
 
 rusty_libc_core::tail_alias!(__strftime_l => strftime_l);

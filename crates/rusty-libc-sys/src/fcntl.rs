@@ -1,6 +1,7 @@
 use crate::unistd::{AT_FDCWD, EINVAL, ENODEV, ENOSYS, EOPNOTSUPP, ESPIPE, fail, nr, rc, rl};
 use core::ffi::{c_char, c_int, c_uint, c_void};
 use rusty_libc_core::{Errno, errno, syscall};
+use crate::kernel::{on_path_cp, plain, plain_cp};
 
 pub const O_ACCMODE: c_int = 0o3;
 pub const O_RDONLY: c_int = 0;
@@ -84,34 +85,26 @@ fn wants_mode(flags: c_int) -> bool {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mut args: ...) -> c_int {
-    unsafe {
-        let mode = if wants_mode(flags) { args.next_arg::<c_uint>() } else { 0 };
-        rc(rusty_libc_core::tls::syscall_cp(nr::OPENAT, AT_FDCWD as usize, path as usize, flags as usize, mode as usize, 0, 0))
-    }
+    let mode = if wants_mode(flags) { unsafe { args.next_arg::<c_uint>() } } else { 0 };
+    rc(unsafe { rusty_libc_core::tls::syscall_cp(nr::OPENAT, AT_FDCWD as usize, path as usize, flags as usize, mode as usize, 0, 0) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mut args: ...) -> c_int {
-    unsafe {
-        let mode = if wants_mode(flags) { args.next_arg::<c_uint>() } else { 0 };
-        rc(rusty_libc_core::tls::syscall_cp(nr::OPENAT, AT_FDCWD as usize, path as usize, flags as usize, mode as usize, 0, 0))
-    }
+    let mode = if wants_mode(flags) { unsafe { args.next_arg::<c_uint>() } } else { 0 };
+    rc(unsafe { rusty_libc_core::tls::syscall_cp(nr::OPENAT, AT_FDCWD as usize, path as usize, flags as usize, mode as usize, 0, 0) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mut args: ...) -> c_int {
-    unsafe {
-        let mode = if wants_mode(flags) { args.next_arg::<c_uint>() } else { 0 };
-        rc(rusty_libc_core::tls::syscall_cp(nr::OPENAT, dirfd as usize, path as usize, flags as usize, mode as usize, 0, 0))
-    }
+    let mode = if wants_mode(flags) { unsafe { args.next_arg::<c_uint>() } } else { 0 };
+    rc(unsafe { rusty_libc_core::tls::syscall_cp(nr::OPENAT, dirfd as usize, path as usize, flags as usize, mode as usize, 0, 0) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn openat64(dirfd: c_int, path: *const c_char, flags: c_int, mut args: ...) -> c_int {
-    unsafe {
-        let mode = if wants_mode(flags) { args.next_arg::<c_uint>() } else { 0 };
-        rc(rusty_libc_core::tls::syscall_cp(nr::OPENAT, dirfd as usize, path as usize, flags as usize, mode as usize, 0, 0))
-    }
+    let mode = if wants_mode(flags) { unsafe { args.next_arg::<c_uint>() } } else { 0 };
+    rc(unsafe { rusty_libc_core::tls::syscall_cp(nr::OPENAT, dirfd as usize, path as usize, flags as usize, mode as usize, 0, 0) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -121,97 +114,91 @@ pub unsafe extern "C" fn openat2(dirfd: c_int, path: *const c_char, how: *mut c_
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn creat(path: *const c_char, mode: u32) -> c_int {
-    rc(unsafe { rusty_libc_core::tls::syscall_cp(nr::OPENAT, AT_FDCWD as usize, path as usize, (O_WRONLY | O_CREAT | O_TRUNC) as usize, mode as usize, 0, 0) })
+    rc(unsafe { rusty_libc_core::tls::syscall_cp(SYS_CREAT, path as usize, mode as usize, 0, 0, 0, 0) })
 }
+
+const SYS_CREAT: usize = 85;
 crate::unistd::alias!(
     creat64 => creat(path: *const c_char, mode: u32) -> c_int
 );
 
 unsafe fn do_fcntl(fd: c_int, cmd: c_int, arg: usize) -> c_int {
-    unsafe {
-        if cmd == F_GETOWN {
-            let mut ex = FOwnerEx::default();
-            let r = syscall::syscall3(nr::FCNTL, fd as usize, F_GETOWN_EX as usize, &mut ex as *mut FOwnerEx as usize);
-            return match syscall::check(r) {
-                Ok(_) => {
-                    if ex.kind == F_OWNER_PGRP {
-                        -ex.pid
-                    } else {
-                        ex.pid
-                    }
+    if cmd == F_GETOWN {
+        let mut ex = FOwnerEx::default();
+        let r = unsafe { syscall::syscall3(nr::FCNTL, fd as usize, F_GETOWN_EX as usize, &mut ex as *mut FOwnerEx as usize) };
+        return match syscall::check(r) {
+            Ok(_) => {
+                if ex.kind == F_OWNER_PGRP {
+                    -ex.pid
+                } else {
+                    ex.pid
                 }
-                Err(e) => fail(e.0),
-            };
-        }
-        if cmd == F_SETLKW || cmd == F_OFD_SETLKW {
-            return rc(rusty_libc_core::tls::syscall_cp(nr::FCNTL, fd as usize, cmd as usize, arg, 0, 0, 0));
-        }
-        rc(syscall::syscall3(nr::FCNTL, fd as usize, cmd as usize, arg))
+            }
+            Err(e) => fail(e.0),
+        };
     }
+    if cmd == F_SETLKW || cmd == F_OFD_SETLKW {
+        return rc(unsafe { rusty_libc_core::tls::syscall_cp(nr::FCNTL, fd as usize, cmd as usize, arg, 0, 0, 0) });
+    }
+    rc(unsafe { syscall::syscall3(nr::FCNTL, fd as usize, cmd as usize, arg) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fcntl(fd: c_int, cmd: c_int, mut args: ...) -> c_int {
-    unsafe {
-        let arg: usize = args.next_arg();
-        do_fcntl(fd, cmd, arg)
-    }
+    let arg: usize = unsafe { args.next_arg() };
+    unsafe { do_fcntl(fd, cmd, arg) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fcntl64(fd: c_int, cmd: c_int, mut args: ...) -> c_int {
-    unsafe {
-        let arg: usize = args.next_arg();
-        do_fcntl(fd, cmd, arg)
-    }
+    let arg: usize = unsafe { args.next_arg() };
+    unsafe { do_fcntl(fd, cmd, arg) }
 }
 
-unsafe fn do_lockf(fd: c_int, cmd: c_int, len: i64) -> c_int {
-    unsafe {
-        let mut fl = Flock { l_type: 0, l_whence: 1 , l_start: 0, l_len: len, l_pid: 0 };
-        let fcmd = match cmd {
-            F_TEST => {
-                fl.l_type = F_RDLCK;
-                if do_fcntl(fd, F_GETLK, &mut fl as *mut Flock as usize) < 0 {
-                    return -1;
-                }
-                if fl.l_type == F_UNLCK || fl.l_pid == crate::unistd::getpid() {
-                    return 0;
-                }
-                return fail(crate::unistd::EACCES);
+fn do_lockf(fd: c_int, cmd: c_int, len: i64) -> c_int {
+    let mut fl = Flock { l_type: 0, l_whence: 1 , l_start: 0, l_len: len, l_pid: 0 };
+    let fcmd = match cmd {
+        F_TEST => {
+            fl.l_type = F_RDLCK;
+            if unsafe { do_fcntl(fd, F_GETLK, &mut fl as *mut Flock as usize) } < 0 {
+                return -1;
             }
-            F_ULOCK => {
-                fl.l_type = F_UNLCK;
-                F_SETLK
+            if fl.l_type == F_UNLCK || fl.l_pid == crate::unistd::getpid() {
+                return 0;
             }
-            F_LOCK => {
-                fl.l_type = F_WRLCK;
-                F_SETLKW
-            }
-            F_TLOCK => {
-                fl.l_type = F_WRLCK;
-                F_SETLK
-            }
-            _ => return fail(EINVAL),
-        };
-        do_fcntl(fd, fcmd, &mut fl as *mut Flock as usize)
-    }
+            return fail(crate::unistd::EACCES);
+        }
+        F_ULOCK => {
+            fl.l_type = F_UNLCK;
+            F_SETLK
+        }
+        F_LOCK => {
+            fl.l_type = F_WRLCK;
+            F_SETLKW
+        }
+        F_TLOCK => {
+            fl.l_type = F_WRLCK;
+            F_SETLK
+        }
+        _ => return fail(EINVAL),
+    };
+    unsafe { do_fcntl(fd, fcmd, &mut fl as *mut Flock as usize) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn lockf(fd: c_int, cmd: c_int, len: i64) -> c_int {
-    unsafe { do_lockf(fd, cmd, len) }
+    do_lockf(fd, cmd, len)
 }
 crate::unistd::alias!(lockf64 => lockf(fd: c_int, cmd: c_int, len: i64) -> c_int);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
-    rc(unsafe { syscall::syscall2(73, fd as usize, operation as usize) })
+    rc(plain!(73, fd as usize, operation as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int {
-    match syscall::check(unsafe { syscall::syscall4(nr::FADVISE64, fd as usize, offset as usize, len as usize, advice as usize) }) {
+    match syscall::check(plain!(nr::FADVISE64, fd as usize, offset as usize, len as usize, advice as usize)) {
         Ok(_) => 0,
         Err(e) => e.0,
     }
@@ -220,13 +207,13 @@ crate::unistd::alias!(posix_fadvise64 => posix_fadvise(fd: c_int, offset: i64, l
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn fallocate(fd: c_int, mode: c_int, offset: i64, len: i64) -> c_int {
-    rc(unsafe { rusty_libc_core::tls::syscall_cp(nr::FALLOCATE, fd as usize, mode as usize, offset as usize, len as usize, 0, 0) })
+    rc(plain_cp!(nr::FALLOCATE, fd as usize, mode as usize, offset as usize, len as usize))
 }
 crate::unistd::alias!(fallocate64 => fallocate(fd: c_int, mode: c_int, offset: i64, len: i64) -> c_int);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn posix_fallocate(fd: c_int, offset: i64, len: i64) -> c_int {
-    let r = unsafe { syscall::syscall4(nr::FALLOCATE, fd as usize, 0, offset as usize, len as usize) };
+    let r = plain!(nr::FALLOCATE, fd as usize, 0, offset as usize, len as usize);
     match syscall::check(r) {
         Ok(_) => 0,
         Err(e) if e.0 == EOPNOTSUPP || e.0 == ENOSYS => posix_fallocate_emulated(fd, offset, len),
@@ -235,53 +222,51 @@ pub extern "C" fn posix_fallocate(fd: c_int, offset: i64, len: i64) -> c_int {
 }
 
 pub(crate) fn posix_fallocate_emulated(fd: c_int, offset: i64, len: i64) -> c_int {
-    unsafe {
-        let mut st = crate::stat::Stat::zeroed();
-        if let Err(e) = syscall::check(syscall::syscall2(5, fd as usize, &mut st as *mut _ as usize)) {
-            return e.0;
-        }
-        if st.file_type() == crate::stat::S_IFIFO {
-            return ESPIPE;
-        }
-        if !st.is_reg() {
-            return ENODEV;
-        }
-        if offset < 0 || len <= 0 {
-            return EINVAL;
-        }
-        let end = match offset.checked_add(len) {
-            Some(v) => v,
-            None => return 27,
-        };
-        if st.st_size < end
-            && let Err(e) = syscall::check(syscall::syscall2(nr::FTRUNCATE, fd as usize, end as usize))
-        {
-            return e.0;
-        }
-        let step = if st.st_blksize > 0 { st.st_blksize } else { 512 };
-        let mut off = offset;
-        while off < end {
-            let mut b = 0u8;
-            if let Err(e) = syscall::check(rusty_libc_core::tls::syscall_cp(nr::PREAD64, fd as usize, &mut b as *mut u8 as usize, 1, off as usize, 0, 0)) {
-                return e.0;
-            }
-            if let Err(e) = syscall::check(rusty_libc_core::tls::syscall_cp(nr::PWRITE64, fd as usize, &b as *const u8 as usize, 1, off as usize, 0, 0)) {
-                return e.0;
-            }
-            off += step - (off % step);
-        }
-        0
+    let mut st = crate::stat::Stat::zeroed();
+    if let Err(e) = syscall::check(crate::kernel::fstat(fd as usize, &mut st)) {
+        return e.0;
     }
+    if st.file_type() == crate::stat::S_IFIFO {
+        return ESPIPE;
+    }
+    if !st.is_reg() {
+        return ENODEV;
+    }
+    if offset < 0 || len <= 0 {
+        return EINVAL;
+    }
+    let end = match offset.checked_add(len) {
+        Some(v) => v,
+        None => return 27,
+    };
+    if st.st_size < end
+        && let Err(e) = syscall::check(plain!(nr::FTRUNCATE, fd as usize, end as usize))
+    {
+        return e.0;
+    }
+    let step = if st.st_blksize > 0 { st.st_blksize } else { 512 };
+    let mut off = offset;
+    while off < end {
+        let mut b = 0u8;
+        if let Err(e) = syscall::check(unsafe { rusty_libc_core::tls::syscall_cp(nr::PREAD64, fd as usize, &mut b as *mut u8 as usize, 1, off as usize, 0, 0) }) {
+            return e.0;
+        }
+        if let Err(e) = syscall::check(unsafe { rusty_libc_core::tls::syscall_cp(nr::PWRITE64, fd as usize, &b as *const u8 as usize, 1, off as usize, 0, 0) }) {
+            return e.0;
+        }
+        off += step - (off % step);
+    }
+    0
 }
 crate::unistd::alias!(posix_fallocate64 => posix_fallocate(fd: c_int, offset: i64, len: i64) -> c_int);
 
 pub extern "C" fn readahead(fd: c_int, offset: i64, count: usize) -> isize {
-    rl(unsafe { syscall::syscall3(nr::READAHEAD, fd as usize, offset as usize, count) })
+    rl(plain!(nr::READAHEAD, fd as usize, offset as usize, count))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sync_file_range(fd: c_int, offset: i64, nbytes: i64, flags: c_uint) -> c_int {
-    rc(unsafe { rusty_libc_core::tls::syscall_cp(nr::SYNC_FILE_RANGE, fd as usize, offset as usize, nbytes as usize, flags as usize, 0, 0) })
+    rc(plain_cp!(nr::SYNC_FILE_RANGE, fd as usize, offset as usize, nbytes as usize, flags as usize))
 }
 
 pub unsafe extern "C" fn splice(fd_in: c_int, off_in: *mut i64, fd_out: c_int, off_out: *mut i64, len: usize, flags: c_uint) -> isize {
@@ -289,7 +274,7 @@ pub unsafe extern "C" fn splice(fd_in: c_int, off_in: *mut i64, fd_out: c_int, o
 }
 
 pub extern "C" fn tee(fd_in: c_int, fd_out: c_int, len: usize, flags: c_uint) -> isize {
-    rl(unsafe { syscall::syscall4(nr::TEE, fd_in as usize, fd_out as usize, len, flags as usize) })
+    rl(plain!(nr::TEE, fd_in as usize, fd_out as usize, len, flags as usize))
 }
 
 pub unsafe extern "C" fn vmsplice(fd: c_int, iov: *const c_void, nr_segs: usize, flags: c_uint) -> isize {
@@ -314,10 +299,10 @@ pub mod rs {
         openat(AT_FDCWD, path, flags, mode)
     }
     pub fn openat(dirfd: i32, path: &CStr, flags: i32, mode: u32) -> Result<i32, Errno> {
-        crate::unistd::val(unsafe { rusty_libc_core::tls::syscall_cp(nr::OPENAT, dirfd as usize, path.as_ptr() as usize, flags as usize, mode as usize, 0, 0) }).map(|v| v as i32)
+        crate::unistd::val(on_path_cp!(Second nr::OPENAT, dirfd as usize, path, flags as usize, mode as usize)).map(|v| v as i32)
     }
     pub fn creat(path: &CStr, mode: u32) -> Result<i32, Errno> {
-        open(path, O_WRONLY | O_CREAT | O_TRUNC, mode)
+        crate::unistd::val(on_path_cp!(First SYS_CREAT, path, mode as usize, 0, 0)).map(|v| v as i32)
     }
     pub unsafe fn fcntl(fd: i32, cmd: i32, arg: usize) -> Result<i32, Errno> {
         errno::set(0);
@@ -337,7 +322,7 @@ pub mod rs {
         }
     }
     pub fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> Result<(), Errno> {
-        crate::unistd::unit(unsafe { syscall::syscall4(nr::FALLOCATE, fd as usize, mode as usize, offset as usize, len as usize) })
+        crate::unistd::unit(plain!(nr::FALLOCATE, fd as usize, mode as usize, offset as usize, len as usize))
     }
 }
 

@@ -1,3 +1,4 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::types::*;
 use core::ffi::{c_char, c_int, c_void};
 #[cfg(feature = "export")]
@@ -41,35 +42,40 @@ fn functions() -> Option<&'static Functions> {
 
 #[cfg(feature = "export")]
 fn functions() -> Option<&'static Functions> {
-    let p = FUNCS.load(Ordering::Acquire);
-    if !p.is_null() {
-        return Some(unsafe { &*p });
+    let mut p = FUNCS.load(Ordering::Acquire);
+    if p.is_null() {
+        p = load_functions()?;
     }
-    unsafe {
-        let h = dlopen(c"libidn2.so.0".as_ptr(), 1);
-        if h.is_null() {
-            return None;
-        }
-        let v = c"IDN2_0.0.0".as_ptr();
-        let a = dlvsym(h, c"idn2_lookup_ul".as_ptr(), v);
-        let b = dlvsym(h, c"idn2_to_unicode_lzlz".as_ptr(), v);
-        if a.is_null() || b.is_null() {
-            dlclose(h);
-            return None;
-        }
-        let f = rusty_libc_malloc::malloc(core::mem::size_of::<Functions>()) as *mut Functions;
-        if f.is_null() {
-            dlclose(h);
-            return None;
-        }
-        f.write(Functions { lookup_ul: core::mem::transmute::<*mut c_void, Idn2Fn>(a), to_unicode_lzlz: core::mem::transmute::<*mut c_void, Idn2Fn>(b) });
-        match FUNCS.compare_exchange(core::ptr::null_mut(), f, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => Some(&*f),
-            Err(winner) => {
-                rusty_libc_malloc::free(f as *mut c_void);
-                dlclose(h);
-                Some(&*winner)
-            }
+    Some(unsafe { &*p })
+}
+
+#[cfg(feature = "export")]
+fn load_functions() -> Option<*mut Functions> {
+    let h = unsafe { dlopen(c"libidn2.so.0".as_ptr(), 1) };
+    if h.is_null() {
+        return None;
+    }
+    let v = c"IDN2_0.0.0".as_ptr();
+    let syms = [c"idn2_lookup_ul", c"idn2_to_unicode_lzlz"].map(|n| unsafe { dlvsym(h, n.as_ptr(), v) });
+    let close = || {
+        unsafe { dlclose(h) };
+    };
+    if syms.iter().any(|a| a.is_null()) {
+        close();
+        return None;
+    }
+    let [lookup_ul, to_unicode_lzlz] = syms.map(|a| unsafe { core::mem::transmute::<*mut c_void, Idn2Fn>(a) });
+    let f = crate::nss::heap_new(Functions { lookup_ul, to_unicode_lzlz });
+    if f.is_null() {
+        close();
+        return None;
+    }
+    match FUNCS.compare_exchange(core::ptr::null_mut(), f, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Some(f),
+        Err(winner) => {
+            unsafe { rusty_libc_malloc::free(f as *mut c_void) };
+            close();
+            Some(winner)
         }
     }
 }
@@ -88,25 +94,20 @@ impl Drop for IdnStr {
     }
 }
 
-struct CCopy(*mut u8);
+struct CCopy(crate::nss::ZBuf);
 
 impl CCopy {
     fn new(name: &[u8]) -> Option<CCopy> {
-        let p = unsafe { rusty_libc_malloc::malloc(name.len() + 1) } as *mut u8;
-        if p.is_null() {
+        let mut z = crate::nss::ZBuf::new();
+        if !z.grow(name.len() + 1) {
             return None;
         }
-        unsafe {
-            core::ptr::copy_nonoverlapping(name.as_ptr(), p, name.len());
-            *p.add(name.len()) = 0;
-        }
-        Some(CCopy(p))
+        z.as_mut_slice()[..name.len()].copy_from_slice(name);
+        Some(CCopy(z))
     }
-}
 
-impl Drop for CCopy {
-    fn drop(&mut self) {
-        unsafe { rusty_libc_malloc::free(self.0 as *mut c_void) }
+    fn with_nul(&self) -> &[u8] {
+        self.0.as_slice()
     }
 }
 
@@ -119,14 +120,15 @@ enum Class {
     Error,
 }
 
-fn classify(name: &CCopy, len: usize) -> Class {
+fn classify(name: &CCopy) -> Class {
     let mut st = [0u64; 1];
     let mut p = 0usize;
-    let end = len + 1;
+    let s = name.with_nul();
     let (mut nonascii, mut backslash) = (false, false);
     loop {
         let mut wc: i32 = 0;
-        let r = unsafe { mbrtowc(&mut wc, name.0.add(p) as *const c_char, end - p, st.as_mut_ptr() as *mut c_void) };
+        let rest = &s[p..];
+        let r = unsafe { mbrtowc(&mut wc, rest.as_ptr() as *const c_char, rest.len(), st.as_mut_ptr() as *mut c_void) };
         if r == 0 {
             break;
         } else if r == usize::MAX - 1 {
@@ -160,7 +162,7 @@ pub fn to_dns(name: &[u8]) -> Result<Option<IdnStr>, c_int> {
         return Ok(None);
     }
     let c = CCopy::new(name).ok_or(EAI_MEMORY)?;
-    match classify(&c, name.len()) {
+    match classify(&c) {
         Class::Ascii => return Ok(None),
         Class::NonAscii => {}
         Class::NonAsciiBackslash | Class::EncodingError => return Err(EAI_IDN_ENCODE),
@@ -179,7 +181,7 @@ pub fn from_dns(name: &[u8]) -> Result<Option<IdnStr>, c_int> {
 
 fn call(func: Idn2Fn, c: &CCopy) -> Result<IdnStr, c_int> {
     let mut out: *mut c_char = core::ptr::null_mut();
-    let r = unsafe { func(c.0 as *const c_char, &mut out, 0) };
+    let r = unsafe { func(c.with_nul().as_ptr() as *const c_char, &mut out, 0) };
     if r == 0 && !out.is_null() {
         Ok(IdnStr(out))
     } else if r == IDN2_MALLOC {

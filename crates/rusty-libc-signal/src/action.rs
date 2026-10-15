@@ -2,27 +2,16 @@ use crate::consts::{
     EINVAL, ENOSYS, NSIG, SA_INTERRUPT, SA_NODEFER, SA_RESETHAND, SA_RESTART, SIG_BLOCK, SIG_ERR, SIG_HOLD, SIG_IGN, SIG_SETMASK,
     SIG_UNBLOCK,
 };
-use crate::sigset::{is_internal_signal, sigaddset, sigdelset};
+use crate::sigset::{add_or_errno, del_or_errno, is_internal_signal};
 use crate::types::{Sigaction, Sighandler, Sigset};
-use crate::wait::{sigprocmask, sigsuspend};
-use crate::fail;
+use crate::wait::sigmask_c;
+use crate::{fail, finish, sys};
 use core::ffi::c_int;
 use core::sync::atomic::{AtomicU64, Ordering};
 use rusty_libc_core::signal::{KSigaction, SA_RESTORER};
-use rusty_libc_core::{Errno, errno};
+use rusty_libc_core::{Errno, errno, ffi};
 
-core::arch::global_asm!(
-    ".pushsection .text,\"ax\",@progbits",
-    "nop",
-    ".balign 16",
-    ".globl __restore_rt",
-    ".type __restore_rt,@function",
-    "__restore_rt:",
-    "mov rax, 15",
-    "syscall",
-    ".size __restore_rt, . - __restore_rt",
-    ".popsection",
-);
+core::arch::global_asm!(rusty_libc_core::restorer_asm!("__restore_rt"));
 
 pub fn restorer_address() -> usize {
     let a: usize;
@@ -43,42 +32,45 @@ const SV_RESETHAND: c_int = 4;
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sigvec(sig: c_int, vec: *const Sigvec, ovec: *mut Sigvec) -> c_int {
-    unsafe {
-        let new = vec.as_ref().map(|v| {
-            let mut a = Sigaction { sa_handler: v.sv_handler, sa_mask: Sigset::EMPTY, sa_flags: 0, sa_restorer: 0 };
-            a.sa_mask.val[0] = v.sv_mask as u32 as u64;
-            if v.sv_flags & SV_ONSTACK != 0 {
-                a.sa_flags |= crate::consts::SA_ONSTACK;
+    let new = unsafe { vec.as_ref() }.map(sigvec_to_action);
+    match sigaction_rs(sig, new.as_ref()) {
+        Ok(old) => {
+            if let Some(o) = unsafe { ffi::out(ovec) } {
+                *o = action_to_sigvec(&old);
             }
-            if v.sv_flags & SV_RESETHAND != 0 {
-                a.sa_flags |= SA_RESETHAND;
-            }
-            if v.sv_flags & SV_INTERRUPT == 0 {
-                a.sa_flags |= SA_RESTART;
-            }
-            a
-        });
-        match sigaction_rs(sig, new.as_ref()) {
-            Ok(old) => {
-                if let Some(o) = ovec.as_mut() {
-                    o.sv_handler = old.sa_handler;
-                    o.sv_mask = old.sa_mask.val[0] as c_int;
-                    o.sv_flags = 0;
-                    if old.sa_flags & crate::consts::SA_ONSTACK != 0 {
-                        o.sv_flags |= SV_ONSTACK;
-                    }
-                    if old.sa_flags & SA_RESETHAND != 0 {
-                        o.sv_flags |= SV_RESETHAND;
-                    }
-                    if old.sa_flags & SA_RESTART == 0 {
-                        o.sv_flags |= SV_INTERRUPT;
-                    }
-                }
-                0
-            }
-            Err(e) => fail(e.0),
+            0
         }
+        Err(e) => fail(e.0),
     }
+}
+
+fn sigvec_to_action(v: &Sigvec) -> Sigaction {
+    let mut a = Sigaction { sa_handler: v.sv_handler, sa_mask: Sigset::EMPTY, sa_flags: 0, sa_restorer: 0 };
+    a.sa_mask.val[0] = v.sv_mask as u32 as u64;
+    if v.sv_flags & SV_ONSTACK != 0 {
+        a.sa_flags |= crate::consts::SA_ONSTACK;
+    }
+    if v.sv_flags & SV_RESETHAND != 0 {
+        a.sa_flags |= SA_RESETHAND;
+    }
+    if v.sv_flags & SV_INTERRUPT == 0 {
+        a.sa_flags |= SA_RESTART;
+    }
+    a
+}
+
+fn action_to_sigvec(old: &Sigaction) -> Sigvec {
+    let mut flags = 0;
+    if old.sa_flags & crate::consts::SA_ONSTACK != 0 {
+        flags |= SV_ONSTACK;
+    }
+    if old.sa_flags & SA_RESETHAND != 0 {
+        flags |= SV_RESETHAND;
+    }
+    if old.sa_flags & SA_RESTART == 0 {
+        flags |= SV_INTERRUPT;
+    }
+    Sigvec { sv_handler: old.sa_handler, sv_mask: old.sa_mask.val[0] as c_int, sv_flags: flags }
 }
 
 static SIGINTR: AtomicU64 = AtomicU64::new(0);
@@ -107,16 +99,15 @@ pub fn sigaction_rs(sig: i32, act: Option<&Sigaction>) -> Result<Sigaction, Errn
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sigaction(sig: c_int, act: *const Sigaction, oact: *mut Sigaction) -> c_int {
-    unsafe {
-        match sigaction_rs(sig, act.as_ref()) {
-            Ok(old) => {
-                if !oact.is_null() {
-                    *oact = old;
-                }
-                0
+    let act = unsafe { act.as_ref() };
+    match sigaction_rs(sig, act) {
+        Ok(old) => {
+            if let Some(o) = unsafe { ffi::out(oact) } {
+                *o = old;
             }
-            Err(e) => fail(e.0),
+            0
         }
+        Err(e) => fail(e.0),
     }
 }
 
@@ -202,62 +193,56 @@ pub extern "C" fn siginterrupt(sig: c_int, interrupt: c_int) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sigset(sig: c_int, disp: Sighandler) -> Sighandler {
-    unsafe {
-        let mut set = Sigset::EMPTY;
-        let mut oset = Sigset::EMPTY;
-        if sigaddset(&mut set, sig) < 0 {
+    let mut set = Sigset::EMPTY;
+    let mut oset = Sigset::EMPTY;
+    if !add_or_errno(&mut set, sig) {
+        return SIG_ERR;
+    }
+    if disp == SIG_HOLD {
+        if sigmask_c(SIG_BLOCK, Some(&set), Some(&mut oset)) < 0 {
             return SIG_ERR;
         }
-        if disp == SIG_HOLD {
-            if sigprocmask(SIG_BLOCK, &set, &mut oset) < 0 {
-                return SIG_ERR;
-            }
-            if oset.has(sig) {
-                return SIG_HOLD;
-            }
-            return match sigaction_rs(sig, None) {
-                Ok(old) => old.sa_handler,
-                Err(e) => {
-                    errno::set(e.0);
-                    SIG_ERR
-                }
-            };
+        if oset.has(sig) {
+            return SIG_HOLD;
         }
-        let act = Sigaction { sa_handler: disp, sa_mask: Sigset::EMPTY, sa_flags: 0, sa_restorer: 0 };
-        let old = match sigaction_rs(sig, Some(&act)) {
-            Ok(o) => o,
+        return match sigaction_rs(sig, None) {
+            Ok(old) => old.sa_handler,
             Err(e) => {
                 errno::set(e.0);
-                return SIG_ERR;
+                SIG_ERR
             }
         };
-        if sigprocmask(SIG_UNBLOCK, &set, &mut oset) < 0 {
+    }
+    let act = Sigaction { sa_handler: disp, sa_mask: Sigset::EMPTY, sa_flags: 0, sa_restorer: 0 };
+    let old = match sigaction_rs(sig, Some(&act)) {
+        Ok(o) => o,
+        Err(e) => {
+            errno::set(e.0);
             return SIG_ERR;
         }
-        if oset.has(sig) { SIG_HOLD } else { old.sa_handler }
+    };
+    if sigmask_c(SIG_UNBLOCK, Some(&set), Some(&mut oset)) < 0 {
+        return SIG_ERR;
     }
+    if oset.has(sig) { SIG_HOLD } else { old.sa_handler }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sighold(sig: c_int) -> c_int {
-    unsafe {
-        let mut set = Sigset::EMPTY;
-        if sigaddset(&mut set, sig) < 0 {
-            return -1;
-        }
-        sigprocmask(SIG_BLOCK, &set, core::ptr::null_mut())
+    let mut set = Sigset::EMPTY;
+    if !add_or_errno(&mut set, sig) {
+        return -1;
     }
+    sigmask_c(SIG_BLOCK, Some(&set), None)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sigrelse(sig: c_int) -> c_int {
-    unsafe {
-        let mut set = Sigset::EMPTY;
-        if sigaddset(&mut set, sig) < 0 {
-            return -1;
-        }
-        sigprocmask(SIG_UNBLOCK, &set, core::ptr::null_mut())
+    let mut set = Sigset::EMPTY;
+    if !add_or_errno(&mut set, sig) {
+        return -1;
     }
+    sigmask_c(SIG_UNBLOCK, Some(&set), None)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -275,26 +260,22 @@ fn old_mask_to_set(mask: c_int) -> Sigset {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sigblock(mask: c_int) -> c_int {
-    unsafe {
-        let set = old_mask_to_set(mask);
-        let mut oset = Sigset::EMPTY;
-        if sigprocmask(SIG_BLOCK, &set, &mut oset) < 0 {
-            return -1;
-        }
-        oset.val[0] as u32 as c_int
+    let set = old_mask_to_set(mask);
+    let mut oset = Sigset::EMPTY;
+    if sigmask_c(SIG_BLOCK, Some(&set), Some(&mut oset)) < 0 {
+        return -1;
     }
+    oset.val[0] as u32 as c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sigsetmask(mask: c_int) -> c_int {
-    unsafe {
-        let set = old_mask_to_set(mask);
-        let mut oset = Sigset::EMPTY;
-        if sigprocmask(SIG_SETMASK, &set, &mut oset) < 0 {
-            return -1;
-        }
-        oset.val[0] as u32 as c_int
+    let set = old_mask_to_set(mask);
+    let mut oset = Sigset::EMPTY;
+    if sigmask_c(SIG_SETMASK, Some(&set), Some(&mut oset)) < 0 {
+        return -1;
     }
+    oset.val[0] as u32 as c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -304,18 +285,16 @@ pub extern "C" fn siggetmask() -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn __sigpause(sig_or_mask: c_int, is_sig: c_int) -> c_int {
-    unsafe {
-        let mut set;
-        if is_sig != 0 {
-            set = Sigset::EMPTY;
-            if sigprocmask(0, core::ptr::null(), &mut set) < 0 || sigdelset(&mut set, sig_or_mask) < 0 {
-                return -1;
-            }
-        } else {
-            set = old_mask_to_set(sig_or_mask);
+    let mut set;
+    if is_sig != 0 {
+        set = Sigset::EMPTY;
+        if sigmask_c(0, None, Some(&mut set)) < 0 || !del_or_errno(&mut set, sig_or_mask) {
+            return -1;
         }
-        sigsuspend(&set)
+    } else {
+        set = old_mask_to_set(sig_or_mask);
     }
+    finish(unsafe { sys::rt_sigsuspend_cp(&set) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -329,6 +308,6 @@ pub extern "C" fn __xpg_sigpause(sig: c_int) -> c_int {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn sigreturn(_scp: *mut crate::types::Sigcontext) -> c_int {
+pub extern "C" fn sigreturn(_scp: *mut crate::types::Sigcontext) -> c_int {
     fail(ENOSYS)
 }

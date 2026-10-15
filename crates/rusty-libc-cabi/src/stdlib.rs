@@ -25,7 +25,7 @@ pub extern "C" fn _Exit(status: c_int) -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn __stack_chk_fail() -> ! {
     let msg = b"*** stack smashing detected ***: terminated\n";
-    unsafe { rusty_libc_core::syscall::syscall3(rusty_libc_core::syscall::SYS_WRITE, 2, msg.as_ptr() as usize, msg.len()) };
+    let _ = rusty_libc_core::unistd::write_nocancel(2, msg);
     rusty_libc_core::process::abort()
 }
 
@@ -41,7 +41,7 @@ pub extern "C" fn __cxa_finalize(dso: *mut c_void) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __cxa_thread_atexit_impl(f: Option<unsafe extern "C" fn(*mut c_void)>, obj: *mut c_void, _dso: *mut c_void) -> c_int {
+pub unsafe extern "C" fn __cxa_thread_atexit_impl(f: Option<unsafe extern "C" fn(*mut c_void)>, obj: *mut c_void, dso: *mut c_void) -> c_int {
     let Some(f) = f else { return -1 };
-    if rusty_libc_core::tls::register_thread_dtor(f, obj) { 0 } else { -1 }
+    if rusty_libc_core::tls::register_thread_dtor(f, obj, dso as usize) { 0 } else { -1 }
 }

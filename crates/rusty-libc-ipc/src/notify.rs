@@ -49,14 +49,11 @@ pub type ThreadFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 pub const ATTR_SIZE: usize = 56;
 
 fn block_all() -> u64 {
-    let all = u64::MAX;
-    let mut old = 0u64;
-    unsafe { rusty_libc_core::syscall::syscall4(rusty_libc_core::syscall::SYS_RT_SIGPROCMASK, 0, &all as *const u64 as usize, &mut old as *mut u64 as usize, 8) };
-    old
+    crate::kernel::sigprocmask(0, u64::MAX, true)
 }
 
 fn restore_mask(old: u64) {
-    unsafe { rusty_libc_core::syscall::syscall4(rusty_libc_core::syscall::SYS_RT_SIGPROCMASK, 2, &old as *const u64 as usize, 0, 8) };
+    crate::kernel::sigprocmask(2, old, false);
 }
 
 pub fn with_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
@@ -67,54 +64,58 @@ pub fn with_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
 }
 
 pub fn unblock_all() {
-    let none = 0u64;
-    unsafe { rusty_libc_core::syscall::syscall4(rusty_libc_core::syscall::SYS_RT_SIGPROCMASK, 2, &none as *const u64 as usize, 0, 8) };
+    crate::kernel::sigprocmask(2, 0, false);
 }
 
 pub unsafe fn spawn(f: ThreadFn, arg: *mut c_void, attr: *const c_void, stack: usize) -> c_int {
+    let mut tid = 0;
+    unsafe { spawn_tid(f, arg, attr, stack, &mut tid) }
+}
+
+pub unsafe fn spawn_tid(f: ThreadFn, arg: *mut c_void, attr: *const c_void, stack: usize, tid: &mut c_int) -> c_int {
     use rusty_libc_pthread::attr::*;
-    use rusty_libc_pthread::thread::pthread_create;
-    unsafe {
-        let mut th: rusty_libc_pthread::PthreadT = 0;
-        if !attr.is_null() {
-            return pthread_create(&mut th, attr as *const PthreadAttr, f, arg);
-        }
+    use rusty_libc_pthread::thread::{pthread_create, pthread_gettid_np};
+    let mut th: rusty_libc_pthread::PthreadT = 0;
+    let r = if !attr.is_null() {
+        unsafe { pthread_create(&mut th, attr.cast::<PthreadAttr>(), f, arg) }
+    } else {
         let mut a = core::mem::MaybeUninit::<PthreadAttr>::uninit();
-        pthread_attr_init(a.as_mut_ptr());
-        pthread_attr_setdetachstate(a.as_mut_ptr(), 1);
+        unsafe { pthread_attr_init(a.as_mut_ptr()) };
+        unsafe { pthread_attr_setdetachstate(a.as_mut_ptr(), 1) };
         if stack != 0 {
-            pthread_attr_setstacksize(a.as_mut_ptr(), stack);
+            unsafe { pthread_attr_setstacksize(a.as_mut_ptr(), stack) };
         }
-        let r = pthread_create(&mut th, a.as_ptr(), f, arg);
-        pthread_attr_destroy(a.as_mut_ptr());
+        let r = unsafe { pthread_create(&mut th, a.as_ptr(), f, arg) };
+        unsafe { pthread_attr_destroy(a.as_mut_ptr()) };
         r
+    };
+    if r == 0 {
+        *tid = unsafe { pthread_gettid_np(th) };
     }
+    r
 }
 
 pub unsafe fn attr_clone(src: *const c_void) -> Result<*mut c_void, c_int> {
-    unsafe {
-        if src.is_null() {
-            return Ok(core::ptr::null_mut());
-        }
-        let p = rusty_libc_malloc::malloc(ATTR_SIZE) as *mut rusty_libc_pthread::attr::PthreadAttr;
-        if p.is_null() {
-            return Err(12);
-        }
-        let r = rusty_libc_pthread::attr::attr_copy(p, src as *const rusty_libc_pthread::attr::PthreadAttr);
-        if r != 0 {
-            rusty_libc_malloc::free(p as *mut c_void);
-            return Err(r);
-        }
-        Ok(p as *mut c_void)
+    use rusty_libc_pthread::attr::{PthreadAttr, attr_copy};
+    if src.is_null() {
+        return Ok(core::ptr::null_mut());
     }
+    let p = crate::util::malloc(ATTR_SIZE).cast::<PthreadAttr>();
+    if p.is_null() {
+        return Err(12);
+    }
+    let r = unsafe { attr_copy(p, src.cast::<PthreadAttr>()) };
+    if r != 0 {
+        unsafe { rusty_libc_malloc::free(p.cast()) };
+        return Err(r);
+    }
+    Ok(p.cast())
 }
 
 pub unsafe fn attr_free(p: *mut c_void) {
-    unsafe {
-        if !p.is_null() {
-            rusty_libc_pthread::attr::pthread_attr_destroy(p as *mut rusty_libc_pthread::attr::PthreadAttr);
-            rusty_libc_malloc::free(p);
-        }
+    if !p.is_null() {
+        unsafe { rusty_libc_pthread::attr::pthread_attr_destroy(p.cast()) };
+        unsafe { rusty_libc_malloc::free(p) };
     }
 }
 

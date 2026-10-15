@@ -1,7 +1,9 @@
 use crate::archive;
 use crate::charsets::same_charset;
 use crate::data;
+use crate::mem;
 use core::ffi::c_int;
+use core::sync::atomic::{AtomicPtr, Ordering};
 use rusty_libc_core::errno;
 use rusty_libc_core::locale::CatData;
 
@@ -28,22 +30,12 @@ impl NameBuf {
     }
 }
 
-pub fn cstr_bytes<'a>(p: *const u8) -> &'a [u8] {
-    unsafe {
-        let mut n = 0;
-        while *p.add(n) != 0 {
-            n += 1;
-        }
-        core::slice::from_raw_parts(p, n)
-    }
-}
-
 pub fn env(name: &[u8]) -> Option<&'static [u8]> {
     let p = unsafe { rusty_libc_core::env::getenv(name) };
     if p.is_null() {
         return None;
     }
-    let v = cstr_bytes(p.cast());
+    let v = unsafe { rusty_libc_core::ffi::cstr_bytes_scalar(p) };
     if v.is_empty() { None } else { Some(v) }
 }
 
@@ -158,32 +150,33 @@ fn explode(name: &[u8]) -> Parts<'_> {
 }
 
 struct AliasTable {
-    text: *const u8,
-    tlen: usize,
-    ent: *mut [usize; 4],
-    n: usize,
+    text: &'static [u8],
+    ent: &'static [[usize; 4]],
 }
-static mut ALIASES: Option<AliasTable> = None;
-static mut ALIASES_TRIED: bool = false;
 
-fn load_aliases() -> Option<&'static AliasTable> {
-    unsafe {
-        if !ALIASES_TRIED {
-            ALIASES_TRIED = true;
-            ALIASES = read_aliases();
-        }
-        (*core::ptr::addr_of!(ALIASES)).as_ref()
+static ALIASES: AtomicPtr<AliasTable> = AtomicPtr::new(core::ptr::null_mut());
+static NO_ALIASES: AliasTable = AliasTable { text: &[], ent: &[] };
+
+fn load_aliases() -> &'static AliasTable {
+    let p = ALIASES.load(Ordering::Acquire);
+    if let Some(t) = unsafe { p.as_ref() } {
+        return t;
+    }
+    let new: &'static AliasTable = match read_aliases() {
+        Some(t) => t,
+        None => &NO_ALIASES,
+    };
+    match ALIASES.compare_exchange(core::ptr::null_mut(), new as *const AliasTable as *mut AliasTable, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => new,
+        Err(other) => unsafe { &*other },
     }
 }
 
-fn read_aliases() -> Option<AliasTable> {
-    let (p, len) = archive::map_file(b"/usr/share/locale/locale.alias\0", None)?;
-    let text = unsafe { core::slice::from_raw_parts(p, len) };
+fn read_aliases() -> Option<&'static AliasTable> {
+    let text = archive::map_file(b"/usr/share/locale/locale.alias\0", None)?;
+    let len = text.len();
     let cap = text.iter().filter(|&&c| c == b'\n').count() + 1;
-    let ent = unsafe { rusty_libc_malloc::calloc(cap, core::mem::size_of::<[usize; 4]>()) } as *mut [usize; 4];
-    if ent.is_null() {
-        return None;
-    }
+    let ent = mem::leak_default::<[usize; 4]>(cap)?;
     let mut n = 0;
     let isspace = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
     let mut pos = 0;
@@ -217,10 +210,10 @@ fn read_aliases() -> Option<AliasTable> {
         while i < line.len() && !isspace(line[i]) {
             i += 1;
         }
-        unsafe { *ent.add(n) = [base + a0, a1 - a0, base + v0, i - v0] };
+        ent[n] = [base + a0, a1 - a0, base + v0, i - v0];
         n += 1;
     }
-    let e = unsafe { core::slice::from_raw_parts_mut(ent, n) };
+    let e = &mut ent[..n];
     for i in 1..n {
         let mut j = i;
         while j > 0 && cmp_nocase(&text[e[j - 1][0]..e[j - 1][0] + e[j - 1][1]], &text[e[j][0]..e[j][0] + e[j][1]]) == core::cmp::Ordering::Greater {
@@ -228,7 +221,8 @@ fn read_aliases() -> Option<AliasTable> {
             j -= 1;
         }
     }
-    Some(AliasTable { text: p, tlen: len, ent, n })
+    let ent: &'static [[usize; 4]] = &ent[..n];
+    mem::leak(AliasTable { text, ent }).map(|t| &*t)
 }
 
 fn cmp_nocase(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
@@ -247,9 +241,9 @@ fn cmp_nocase(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
 }
 
 pub fn expand_alias(name: &[u8]) -> Option<NameBuf> {
-    let t = load_aliases()?;
-    let (text, e) = unsafe { (core::slice::from_raw_parts(t.text, t.tlen), core::slice::from_raw_parts(t.ent, t.n)) };
-    let (mut lo, mut hi) = (0, t.n);
+    let t = load_aliases();
+    let (text, e) = (t.text, t.ent);
+    let (mut lo, mut hi) = (0, e.len());
     while lo < hi {
         let mid = (lo + hi) / 2;
         match cmp_nocase(&text[e[mid][0]..e[mid][0] + e[mid][1]], name) {
@@ -261,7 +255,7 @@ pub fn expand_alias(name: &[u8]) -> Option<NameBuf> {
     None
 }
 
-fn from_archive(cat: usize, name: &[u8]) -> Option<*const CatData> {
+fn from_archive(cat: usize, name: &[u8]) -> Option<&'static CatData> {
     let mut nb = NameBuf::new(name);
     if let Some(dot) = name.iter().position(|&c| c == b'.') {
         let after = &name[dot + 1..];
@@ -284,11 +278,10 @@ fn from_archive(cat: usize, name: &[u8]) -> Option<*const CatData> {
         }
     }
     let recs = archive::lookup(nb.as_bytes())?;
-    let (ptr, len) = recs[cat];
-    data::intern(cat, ptr, len)
+    data::intern(cat, recs[cat])
 }
 
-fn from_dirs(cat: usize, work: &[u8], locpath: Option<&[u8]>) -> Result<*const CatData, c_int> {
+fn from_dirs(cat: usize, work: &[u8], locpath: Option<&[u8]>) -> Result<&'static CatData, c_int> {
     let p = explode(work);
     let mut dirs: [&[u8]; 32] = [b""; 32];
     let mut nd = 0;
@@ -342,10 +335,10 @@ fn from_dirs(cat: usize, work: &[u8], locpath: Option<&[u8]>) -> Result<*const C
                 continue;
             }
             path[n] = 0;
-            let Some((ptr, len)) = archive::map_file(&path[..=n], Some(catname)) else { continue };
-            let Some(d) = data::intern(cat, ptr, len) else { continue };
+            let Some(img) = archive::map_file_cached(&path[..=n], Some(catname)) else { continue };
+            let Some(d) = data::intern(cat, img) else { continue };
             if let Some(cs) = p.codeset {
-                let have = unsafe { (*d).bytes(data::CODESET_IDX[cat]) };
+                let have = d.bytes(data::CODESET_IDX[cat]);
                 if !same_charset(cs, have) {
                     return Err(errno::ENOENT);
                 }
@@ -403,7 +396,7 @@ pub fn for_each_candidate(work: &[u8], dir: &[u8], tail: &[u8], mut f: impl FnMu
 }
 
 pub struct Found {
-    pub data: *const CatData,
+    pub data: &'static CatData,
     pub name: NameBuf,
 }
 

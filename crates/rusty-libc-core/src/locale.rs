@@ -1,4 +1,4 @@
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use core::ptr::null;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -59,7 +59,7 @@ pub fn wide_special() -> bool {
 }
 
 #[inline]
-pub fn wide_tables(d: *const CatData) -> Option<&'static WideTables> {
+pub fn wide_tables(d: Option<&CatData>) -> Option<&'static WideTables> {
     let t = ctype_tables(d)?;
     if t.wide.is_null() {
         None
@@ -68,64 +68,71 @@ pub fn wide_tables(d: *const CatData) -> Option<&'static WideTables> {
     }
 }
 
+#[inline(always)]
+unsafe fn word(t: *const u32, i: usize) -> u32 {
+    let p = unsafe { t.add(i) };
+    unsafe { *p }
+}
+
 #[inline]
 unsafe fn tab3(table: *const u8, wc: u32, shift3: bool) -> Option<*const u8> {
-    unsafe {
-        let t = table as *const u32;
-        let shift1 = *t;
-        let index1 = wc >> shift1;
-        if index1 >= *t.add(1) {
-            return None;
-        }
-        let lookup1 = *t.add(5 + index1 as usize);
-        if lookup1 == 0 {
-            return None;
-        }
-        let index2 = (wc >> *t.add(2)) & *t.add(3);
-        let lookup2 = *(table.add(lookup1 as usize) as *const u32).add(index2 as usize);
-        if lookup2 == 0 {
-            return None;
-        }
-        let index3 = if shift3 { (wc >> 5) & *t.add(4) } else { wc & *t.add(4) };
-        Some(table.add(lookup2 as usize + index3 as usize * if shift3 { 4 } else { 1 }))
+    let t = table as *const u32;
+    let shift1 = unsafe { word(t, 0) };
+    let index1 = wc >> shift1;
+    if index1 >= unsafe { word(t, 1) } {
+        return None;
     }
+    let lookup1 = unsafe { word(t, 5 + index1 as usize) };
+    if lookup1 == 0 {
+        return None;
+    }
+    let shift2 = unsafe { word(t, 2) };
+    let index2 = (wc >> shift2) & unsafe { word(t, 3) };
+    let lvl2 = unsafe { table.add(lookup1 as usize) } as *const u32;
+    let lookup2 = unsafe { word(lvl2, index2 as usize) };
+    if lookup2 == 0 {
+        return None;
+    }
+    let mask3 = unsafe { word(t, 4) };
+    let index3 = if shift3 { (wc >> 5) & mask3 } else { wc & mask3 };
+    Some(unsafe { table.add(lookup2 as usize + index3 as usize * if shift3 { 4 } else { 1 }) })
 }
 
 pub unsafe fn class_lookup(table: *const u8, wc: u32) -> bool {
-    unsafe {
-        match tab3(table, wc, true) {
-            Some(p) => (core::ptr::read_unaligned(p as *const u32) >> (wc & 31)) & 1 != 0,
-            None => false,
-        }
+    match unsafe { tab3(table, wc, true) } {
+        Some(p) => (unsafe { core::ptr::read_unaligned(p as *const u32) } >> (wc & 31)) & 1 != 0,
+        None => false,
     }
 }
 
 pub unsafe fn trans_lookup(table: *const u8, wc: u32) -> u32 {
-    unsafe {
-        let t = table as *const u32;
-        let index1 = wc >> *t;
-        if index1 >= *t.add(1) {
-            return wc;
-        }
-        let lookup1 = *t.add(5 + index1 as usize);
-        if lookup1 == 0 {
-            return wc;
-        }
-        let index2 = (wc >> *t.add(2)) & *t.add(3);
-        let lookup2 = *(table.add(lookup1 as usize) as *const u32).add(index2 as usize);
-        if lookup2 == 0 {
-            return wc;
-        }
-        let index3 = wc & *t.add(4);
-        let d = *(table.add(lookup2 as usize) as *const i32).add(index3 as usize);
-        wc.wrapping_add(d as u32)
+    let t = table as *const u32;
+    let index1 = wc >> unsafe { word(t, 0) };
+    if index1 >= unsafe { word(t, 1) } {
+        return wc;
     }
+    let lookup1 = unsafe { word(t, 5 + index1 as usize) };
+    if lookup1 == 0 {
+        return wc;
+    }
+    let shift2 = unsafe { word(t, 2) };
+    let index2 = (wc >> shift2) & unsafe { word(t, 3) };
+    let lvl2 = unsafe { table.add(lookup1 as usize) } as *const u32;
+    let lookup2 = unsafe { word(lvl2, index2 as usize) };
+    if lookup2 == 0 {
+        return wc;
+    }
+    let index3 = wc & unsafe { word(t, 4) };
+    let lvl3 = unsafe { table.add(lookup2 as usize) } as *const u32;
+    let d = unsafe { word(lvl3, index3 as usize) } as i32;
+    wc.wrapping_add(d as u32)
 }
 
 pub unsafe fn class_runs(table: *const u8, emit: &mut dyn FnMut(u32, u32)) {
-    unsafe {
+    {
         let t = table as *const u32;
-        let (shift1, bound1, shift2, mask2, mask3) = (*t, *t.add(1), *t.add(2), *t.add(3), *t.add(4));
+        let hdr = unsafe { *(t as *const [u32; 5]) };
+        let [shift1, bound1, shift2, mask2, mask3] = hdr;
         let mut cur: Option<(u32, u32)> = None;
         fn put(emit: &mut dyn FnMut(u32, u32), cur: &mut Option<(u32, u32)>, lo: u32, hi: u32) {
             match cur {
@@ -139,19 +146,20 @@ pub unsafe fn class_runs(table: *const u8, emit: &mut dyn FnMut(u32, u32)) {
             }
         }
         for i1 in 0..bound1 {
-            let l1 = *t.add(5 + i1 as usize);
+            let l1 = unsafe { word(t, 5 + i1 as usize) };
             if l1 == 0 {
                 continue;
             }
-            let lvl2 = table.add(l1 as usize) as *const u32;
+            let lvl2 = unsafe { table.add(l1 as usize) } as *const u32;
             for i2 in 0..=mask2 {
-                let l2 = *lvl2.add(i2 as usize);
+                let l2 = unsafe { word(lvl2, i2 as usize) };
                 if l2 == 0 {
                     continue;
                 }
-                let lvl3 = table.add(l2 as usize) as *const u32;
+                let lvl3 = unsafe { table.add(l2 as usize) } as *const u32;
                 for i3 in 0..=mask3 {
-                    let mut word = u64::from(core::ptr::read_unaligned(lvl3.add(i3 as usize)));
+                    let w3 = unsafe { lvl3.add(i3 as usize) };
+                    let mut word = u64::from(unsafe { core::ptr::read_unaligned(w3) });
                     if word == 0 {
                         continue;
                     }
@@ -172,23 +180,25 @@ pub unsafe fn class_runs(table: *const u8, emit: &mut dyn FnMut(u32, u32)) {
 }
 
 pub unsafe fn trans_changed(table: *const u8, emit: &mut dyn FnMut(u32, u32)) {
-    unsafe {
+    {
         let t = table as *const u32;
-        let (shift1, bound1, shift2, mask2, mask3) = (*t, *t.add(1), *t.add(2), *t.add(3), *t.add(4));
+        let hdr = unsafe { *(t as *const [u32; 5]) };
+        let [shift1, bound1, shift2, mask2, mask3] = hdr;
         for i1 in 0..bound1 {
-            let l1 = *t.add(5 + i1 as usize);
+            let l1 = unsafe { word(t, 5 + i1 as usize) };
             if l1 == 0 {
                 continue;
             }
-            let lvl2 = table.add(l1 as usize) as *const u32;
+            let lvl2 = unsafe { table.add(l1 as usize) } as *const u32;
             for i2 in 0..=mask2 {
-                let l2 = *lvl2.add(i2 as usize);
+                let l2 = unsafe { word(lvl2, i2 as usize) };
                 if l2 == 0 {
                     continue;
                 }
-                let lvl3 = table.add(l2 as usize) as *const i32;
+                let lvl3 = unsafe { table.add(l2 as usize) } as *const i32;
                 for i3 in 0..=mask3 {
-                    let d = core::ptr::read_unaligned(lvl3.add(i3 as usize));
+                    let e3 = unsafe { lvl3.add(i3 as usize) };
+                    let d = unsafe { core::ptr::read_unaligned(e3) };
                     if d != 0 {
                         let wc = (i1 << shift1) + (i2 << shift2) + i3;
                         emit(wc, wc.wrapping_add(d as u32));
@@ -200,11 +210,9 @@ pub unsafe fn trans_changed(table: *const u8, emit: &mut dyn FnMut(u32, u32)) {
 }
 
 pub unsafe fn width_lookup(table: *const u8, wc: u32) -> u8 {
-    unsafe {
-        match tab3(table, wc, false) {
-            Some(p) => *p,
-            None => 0xff,
-        }
+    match unsafe { tab3(table, wc, false) } {
+        Some(p) => unsafe { *p },
+        None => 0xff,
     }
 }
 
@@ -216,67 +224,88 @@ pub fn ctype_special() -> bool {
 }
 
 #[inline]
-pub fn ctype_tables(d: *const CatData) -> Option<&'static CtypeTables> {
-    if d.is_null() {
-        return None;
-    }
-    unsafe {
-        if (*d).flags & F_CTYPE_TABLES != 0 { Some(&*((*d).aux as *const CtypeTables)) } else { None }
-    }
+pub fn ctype_tables(d: Option<&CatData>) -> Option<&'static CtypeTables> {
+    let d = d?;
+    if d.flags & F_CTYPE_TABLES != 0 { Some(unsafe { &*(d.aux as *const CtypeTables) }) } else { None }
 }
 
 #[inline]
-pub fn toupper_in(d: *const CatData, c: i32) -> i32 {
+pub fn toupper_in(d: Option<&CatData>, c: i32) -> i32 {
     if let Some(t) = ctype_tables(d)
         && (-128..=255).contains(&c)
     {
-        return unsafe { *t.upper.offset(c as isize) };
+        let e = unsafe { t.upper.offset(c as isize) };
+        return unsafe { *e };
     }
     if (b'a' as i32..=b'z' as i32).contains(&c) { c - 32 } else { c }
 }
 
 #[inline]
-pub fn tolower_in(d: *const CatData, c: i32) -> i32 {
+pub fn tolower_in(d: Option<&CatData>, c: i32) -> i32 {
     if let Some(t) = ctype_tables(d)
         && (-128..=255).contains(&c)
     {
-        return unsafe { *t.lower.offset(c as isize) };
+        let e = unsafe { t.lower.offset(c as isize) };
+        return unsafe { *e };
     }
     if (b'A' as i32..=b'Z' as i32).contains(&c) { c + 32 } else { c }
 }
 
 #[repr(C)]
 pub struct CatData {
-    pub nstrings: u32,
-    pub flags: u32,
-    pub values: *const usize,
-    pub aux: *const u8,
+    nstrings: u32,
+    flags: u32,
+    values: *const usize,
+    aux: *const u8,
 }
 unsafe impl Sync for CatData {}
 unsafe impl Send for CatData {}
 
 impl CatData {
+    pub const unsafe fn new(nstrings: u32, flags: u32, values: *const usize, aux: *const u8) -> CatData {
+        CatData { nstrings, flags, values, aux }
+    }
+    #[inline(always)]
+    pub fn nstrings(&self) -> u32 {
+        self.nstrings
+    }
+    #[inline(always)]
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+    #[inline(always)]
+    pub fn values(&self) -> *const usize {
+        self.values
+    }
+    #[inline(always)]
+    pub fn aux(&self) -> *const u8 {
+        self.aux
+    }
     pub fn bytes(&self, i: usize) -> &'static [u8] {
         let p = self.cstr(i);
-        unsafe {
-            let mut n = 0;
-            while *p.add(n) != 0 {
-                n += 1;
+        let mut n = 0;
+        loop {
+            let q = unsafe { p.add(n) };
+            if unsafe { *q } == 0 {
+                break;
             }
-            core::slice::from_raw_parts(p, n)
+            n += 1;
         }
+        unsafe { core::slice::from_raw_parts(p, n) }
     }
     pub fn cstr(&self, i: usize) -> *const u8 {
         if i >= self.nstrings as usize {
             return c"".as_ptr().cast();
         }
-        unsafe { *self.values.add(i) as *const u8 }
+        let v = unsafe { self.values.add(i) };
+        unsafe { *v as *const u8 }
     }
     pub fn word(&self, i: usize) -> u32 {
         if i >= self.nstrings as usize {
             return 0;
         }
-        unsafe { *self.values.add(i) as u32 }
+        let v = unsafe { self.values.add(i) };
+        unsafe { *v as u32 }
     }
     pub fn byte(&self, i: usize) -> u8 {
         unsafe { *self.cstr(i) }
@@ -286,25 +315,25 @@ impl CatData {
 static GLOBAL: [AtomicPtr<CatData>; NCAT] = [const { AtomicPtr::new(core::ptr::null_mut()) }; NCAT];
 
 #[thread_local]
-static mut THREAD: *const *const CatData = null();
+static THREAD: core::cell::Cell<*const *const CatData> = core::cell::Cell::new(null());
 
-pub fn set_global(cat: usize, data: *const CatData) {
+pub fn set_global(cat: usize, data: Option<&'static CatData>) {
     if cat < NCAT {
-        GLOBAL[cat].store(data as *mut CatData, Ordering::Release);
+        GLOBAL[cat].store(data.map_or(core::ptr::null_mut(), |d| core::ptr::from_ref(d).cast_mut()), Ordering::Release);
     }
 }
 
 #[inline]
-pub fn global(cat: usize) -> *const CatData {
-    GLOBAL[cat].load(Ordering::Acquire)
+pub fn global(cat: usize) -> Option<&'static CatData> {
+    unsafe { GLOBAL[cat].load(Ordering::Acquire).as_ref() }
 }
 
-pub fn set_thread(locales: *const *const CatData) {
+pub unsafe fn set_thread(locales: *const *const CatData) {
     if !locales.is_null() {
         THREAD_USED.store(true, Ordering::Relaxed);
         LOCALE_SLOW.store(true, Ordering::Relaxed);
     }
-    unsafe { THREAD = locales };
+    THREAD.set(locales);
 }
 
 pub static THREAD_USED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -314,28 +343,56 @@ pub fn thread() -> *const *const CatData {
     if !THREAD_USED.load(Ordering::Relaxed) {
         return null();
     }
-    unsafe { THREAD }
+    THREAD.get()
+}
+
+#[inline(always)]
+unsafe fn object_cat(obj: *const *const CatData, cat: usize) -> Option<&'static CatData> {
+    let cats = unsafe { &*obj.cast::<[*const CatData; NCAT]>() };
+    unsafe { cats[cat].as_ref() }
 }
 
 #[inline]
-pub fn current(cat: usize) -> *const CatData {
+pub fn current(cat: usize) -> Option<&'static CatData> {
+    cat_of_thread(thread(), cat)
+}
+
+#[inline]
+pub fn current2(a: usize, b: usize) -> (Option<&'static CatData>, Option<&'static CatData>) {
     let t = thread();
+    (cat_of_thread(t, a), cat_of_thread(t, b))
+}
+
+#[inline(always)]
+fn cat_of_thread(t: *const *const CatData, cat: usize) -> Option<&'static CatData> {
     if t.is_null() {
         global(cat)
     } else {
-        unsafe { *t.add(cat) }
+        unsafe { object_cat(t, cat) }
     }
 }
 
 #[inline]
-pub fn of_locale(loc: usize, cat: usize) -> *const CatData {
+pub fn current_key(cat: usize) -> usize {
+    current(cat).map_or(0, |d| core::ptr::from_ref(d) as usize)
+}
+
+#[inline]
+pub unsafe fn of_locale(loc: usize, cat: usize) -> Option<&'static CatData> {
     if loc == 0 {
         current(cat)
     } else if loc == LC_GLOBAL_LOCALE {
         global(cat)
     } else {
-        unsafe { *(loc as *const *const CatData).add(cat) }
+        unsafe { object_cat(loc as *const *const CatData, cat) }
     }
+}
+
+pub use rusty_libc_mem::hooks::Loc;
+
+#[inline]
+pub fn loc_cat(loc: Loc, cat: usize) -> Option<&'static CatData> {
+    unsafe { of_locale(loc.raw(), cat) }
 }
 
 #[derive(Clone, Copy)]
@@ -349,11 +406,10 @@ pub struct Numeric {
 
 pub const C_NUMERIC: Numeric = Numeric { decimal_point: b".", thousands_sep: b"", grouping: b"", decimal_wc: 46, thousands_wc: 0 };
 
-pub fn numeric_of(d: *const CatData) -> Numeric {
-    if d.is_null() {
+pub fn numeric_of(d: Option<&CatData>) -> Numeric {
+    let Some(d) = d else {
         return C_NUMERIC;
-    }
-    let d = unsafe { &*d };
+    };
     Numeric { decimal_point: d.bytes(0), thousands_sep: d.bytes(1), grouping: d.bytes(2), decimal_wc: d.word(3), thousands_wc: d.word(4) }
 }
 
@@ -362,13 +418,13 @@ pub fn numeric() -> Numeric {
     numeric_of(current(LC_NUMERIC))
 }
 
-pub fn numeric_of_locale(loc: usize) -> Numeric {
-    numeric_of(of_locale(loc, LC_NUMERIC))
+pub unsafe fn numeric_of_locale(loc: usize) -> Numeric {
+    numeric_of(unsafe { of_locale(loc, LC_NUMERIC) })
 }
 
 #[inline]
-pub fn numeric_dot(d: *const CatData) -> bool {
-    d.is_null() || unsafe { (*d).flags } & F_DOT != 0
+pub fn numeric_dot(d: Option<&CatData>) -> bool {
+    d.is_none_or(|d| d.flags & F_DOT != 0)
 }
 
 pub type WColl = unsafe fn(a: *const u32, b: *const u32, loc: usize) -> i32;

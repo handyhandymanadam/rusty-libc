@@ -1,8 +1,10 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use crate::consts::EINVAL;
 use core::ffi::{CStr, c_char, c_int, c_long, c_void};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU32, Ordering};
-use rusty_libc_core::syscall::{self, syscall1, syscall3};
+use rusty_libc_core::ffi;
+use rusty_libc_core::sync_cell::SyncCell;
 
 pub const RTLD_LAZY: c_int = 0x00001;
 pub const RTLD_NOW: c_int = 0x00002;
@@ -47,10 +49,11 @@ pub struct LinkMap {
     pub l_prev: *mut LinkMap,
 }
 
-static mut MAIN_MAP: LinkMap = LinkMap { l_addr: 0, l_name: c"".as_ptr(), l_ld: null_mut(), l_next: null_mut(), l_prev: null_mut() };
+static MAIN_MAP: SyncCell<LinkMap> =
+    SyncCell::new(LinkMap { l_addr: 0, l_name: c"".as_ptr(), l_ld: null_mut(), l_next: null_mut(), l_prev: null_mut() });
 
 fn main_handle() -> *mut c_void {
-    (&raw mut MAIN_MAP).cast()
+    MAIN_MAP.as_ptr().cast()
 }
 
 const STUB_NAMES: [&[u8]; 8] =
@@ -60,7 +63,7 @@ const fn stub_map(name: &'static core::ffi::CStr) -> LinkMap {
     LinkMap { l_addr: 0, l_name: name.as_ptr(), l_ld: null_mut(), l_next: null_mut(), l_prev: null_mut() }
 }
 
-static mut STUB_MAPS: [LinkMap; 8] = [
+static STUB_MAPS: SyncCell<[LinkMap; 8]> = SyncCell::new([
     stub_map(c"libc.so.6"),
     stub_map(c"libm.so.6"),
     stub_map(c"libpthread.so.0"),
@@ -69,12 +72,12 @@ static mut STUB_MAPS: [LinkMap; 8] = [
     stub_map(c"libutil.so.1"),
     stub_map(c"libanl.so.1"),
     stub_map(c"libresolv.so.2"),
-];
+]);
 
 static STUB_OPEN: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
 
 fn stub_handle(i: usize) -> *mut c_void {
-    (&raw mut STUB_MAPS).cast::<LinkMap>().wrapping_add(i).cast()
+    STUB_MAPS.as_ptr().cast::<LinkMap>().wrapping_add(i).cast()
 }
 
 fn stub_index(handle: *mut c_void) -> Option<usize> {
@@ -97,37 +100,35 @@ struct DlError {
 }
 
 #[thread_local]
-static mut ERR: *mut DlError = core::ptr::null_mut();
+static ERR: SyncCell<*mut DlError> = SyncCell::new(null_mut());
 
 unsafe extern "C" fn release_err(obj: *mut c_void) {
-    unsafe {
-        let slot = obj as *mut *mut DlError;
-        if !(*slot).is_null() {
-            rusty_libc_malloc::free(*slot as *mut c_void);
-        }
-        *slot = core::ptr::null_mut();
+    let slot = obj.cast::<*mut DlError>();
+    let p = unsafe { slot.replace(null_mut()) };
+    if !p.is_null() {
+        unsafe { rusty_libc_malloc::free(p.cast()) };
     }
 }
 
-unsafe fn err_block(create: bool) -> Option<&'static mut DlError> {
-    unsafe {
-        if ERR.is_null() {
-            if !create {
-                return None;
-            }
-            let p = rusty_libc_malloc::malloc(core::mem::size_of::<DlError>()) as *mut DlError;
-            if p.is_null() {
-                return None;
-            }
-            core::ptr::write_bytes(p, 0, 1);
-            if !rusty_libc_core::tls::register_thread_dtor(release_err, (&raw mut ERR) as *mut c_void) {
-                rusty_libc_malloc::free(p as *mut c_void);
-                return None;
-            }
-            ERR = p;
+fn with_err<R>(create: bool, f: impl FnOnce(&mut DlError) -> R) -> Option<R> {
+    let mut p = unsafe { ERR.read() };
+    if p.is_null() {
+        if !create {
+            return None;
         }
-        Some(&mut *ERR)
+        let q = unsafe { rusty_libc_malloc::malloc(size_of::<DlError>()) }.cast::<DlError>();
+        if q.is_null() {
+            return None;
+        }
+        unsafe { core::ptr::write_bytes(q, 0, 1) };
+        if !rusty_libc_core::tls::register_thread_dtor(release_err, ERR.as_ptr().cast(), 0) {
+            unsafe { rusty_libc_malloc::free(q.cast()) };
+            return None;
+        }
+        unsafe { ERR.write(q) };
+        p = q;
     }
+    Some(f(unsafe { &mut *p }))
 }
 
 fn copy_into(dst: &mut [u8], src: &[u8]) {
@@ -137,34 +138,28 @@ fn copy_into(dst: &mut [u8], src: &[u8]) {
 }
 
 fn fail(objname: &[u8], errstring: &str, errcode: c_int) {
-    unsafe {
-        let Some(e) = err_block(true) else { return };
+    with_err(true, |e| {
         copy_into(&mut e.objname, objname);
         copy_into(&mut e.errstring, errstring.as_bytes());
         e.errcode = errcode;
         e.state = State::Pending;
-    }
+    });
 }
 
 fn succeed() {
-    unsafe {
-        if let Some(e) = err_block(false) {
-            e.state = State::None;
-        }
-    }
+    with_err(false, |e| e.state = State::None);
 }
 
 fn begin() {
-    unsafe {
-        if let Some(e) = err_block(false).filter(|e| e.state == State::Pending) {
+    with_err(false, |e| {
+        if e.state == State::Pending {
             e.state = State::None;
         }
-    }
+    });
 }
 
 fn argv0() -> &'static [u8] {
-    let p = program_name();
-    if p.is_null() { b"<main program>" } else { unsafe { CStr::from_ptr(p) }.to_bytes() }
+    unsafe { ffi::cstr(program_name()) }.map_or(b"<main program>", CStr::to_bytes)
 }
 
 #[cfg(feature = "export")]
@@ -187,142 +182,179 @@ fn program_name() -> *const c_char {
             out(reg) addr,
             options(nostack, readonly, preserves_flags)
         );
-        if addr == 0 { core::ptr::null() } else { *(addr as *const *const c_char) }
     }
+    if addr == 0 {
+        return core::ptr::null();
+    }
+    unsafe { *(addr as *const *const c_char) }
 }
 
-pub(crate) fn program_name_ptr() -> *const c_char {
-    program_name()
+fn compose_message<R>(obj: &[u8], msg: &CStr, code: c_int, out: impl FnOnce(&[&[u8]]) -> R) -> R {
+    let txt: &[u8] = if msg.is_empty() || !rusty_libc_core::i18n::active() {
+        msg.to_bytes()
+    } else {
+        let t = unsafe { rusty_libc_core::i18n::tr_ptr(msg.as_ptr()) };
+        unsafe { ffi::cstr_bytes(t) }
+    };
+    let sep: &[u8] = if obj.is_empty() { b"" } else { b": " };
+    let mut tmp = [0u8; 128];
+    let r = if code != 0 {
+        let s = rusty_libc_core::messages::strerror_r_text(code, &mut tmp);
+        out(&[obj, sep, txt, b": ", s])
+    } else {
+        out(&[obj, sep, txt])
+    };
+    if code != 0 {
+        rusty_libc_core::errno::set(code);
+    }
+    r
+}
+
+fn until_nul(b: &[u8]) -> &[u8] {
+    &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
 }
 
 #[cfg_attr(all(feature = "export", not(feature = "shared")), unsafe(no_mangle))]
 pub extern "C" fn dlerror() -> *mut c_char {
-    unsafe {
-        let Some(e) = err_block(false) else { return core::ptr::null_mut() };
-        match e.state {
-            State::None => core::ptr::null_mut(),
-            State::Delivered => {
-                e.state = State::None;
-                core::ptr::null_mut()
-            }
-            State::Pending => {
-                let obj = &e.objname[..e.objname.iter().position(|&c| c == 0).unwrap_or(0)];
-                let txt = &e.errstring[..e.errstring.iter().position(|&c| c == 0).unwrap_or(0)];
+    with_err(false, |e| match e.state {
+        State::None => core::ptr::null_mut(),
+        State::Delivered => {
+            e.state = State::None;
+            core::ptr::null_mut()
+        }
+        State::Pending => {
+            let txt = CStr::from_bytes_until_nul(&e.errstring).unwrap_or(c"");
+            let msg = &mut e.message;
+            compose_message(until_nul(&e.objname), txt, e.errcode, |parts| {
                 let mut n = 0;
-                let mut put = |s: &[u8], msg: &mut [u8; 560]| {
-                    for &c in s {
-                        if n < 559 {
+                for p in parts {
+                    for &c in *p {
+                        if n < msg.len() - 1 {
                             msg[n] = c;
                             n += 1;
                         }
                     }
-                };
-                put(obj, &mut e.message);
-                if !obj.is_empty() {
-                    put(b": ", &mut e.message);
                 }
-                put(txt, &mut e.message);
-                if e.errcode != 0 {
-                    put(b": ", &mut e.message);
-                    let s: &[u8] = match rusty_libc_core::messages::error_message(e.errcode) {
-                        Some(c) => c.to_bytes(),
-                        None => b"Unknown error",
-                    };
-                    put(s, &mut e.message);
-                }
-                e.message[n] = 0;
-                e.state = State::Delivered;
-                e.message.as_mut_ptr() as *mut c_char
-            }
+                msg[n] = 0;
+            });
+            e.state = State::Delivered;
+            e.message.as_mut_ptr().cast::<c_char>()
         }
-    }
+    })
+    .unwrap_or(core::ptr::null_mut())
 }
 
-unsafe fn cbytes<'a>(p: *const c_char) -> &'a [u8] {
-    unsafe { core::slice::from_raw_parts(p as *const u8, rusty_libc_mem::strlen(p)) }
-}
-
-unsafe fn open_impl(file: *const c_char, mode: c_int) -> *mut c_void {
+#[cfg(all(feature = "export", feature = "shared"))]
+#[unsafe(export_name = "dlerror")]
+pub extern "C" fn dlerror_shared() -> *mut c_char {
+    type RecordFn = unsafe extern "C" fn(*mut *const c_char, *mut *const c_char, *mut c_int) -> c_int;
+    type ComposeFn = unsafe extern "C" fn(*const (*const u8, usize), usize) -> *const c_char;
+    let (r, c): (usize, usize);
     unsafe {
-        begin();
-        if mode & !(RTLD_BINDING_MASK | RTLD_NOLOAD | RTLD_DEEPBIND | RTLD_GLOBAL | RTLD_LOCAL | RTLD_NODELETE | SPROF) != 0 {
-            fail(b"", "invalid mode parameter", 0);
-            return null_mut();
+        core::arch::asm!(
+            ".weak __libc_ldso_dlerror_record",
+            ".weak __libc_ldso_dlerror_compose",
+            "mov {0}, qword ptr [rip + __libc_ldso_dlerror_record@GOTPCREL]",
+            "mov {1}, qword ptr [rip + __libc_ldso_dlerror_compose@GOTPCREL]",
+            out(reg) r,
+            out(reg) c,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    if r == 0 || c == 0 {
+        return core::ptr::null_mut();
+    }
+    let record = unsafe { core::mem::transmute::<usize, RecordFn>(r) };
+    let compose = unsafe { core::mem::transmute::<usize, ComposeFn>(c) };
+    let (mut obj, mut msg, mut code) = (core::ptr::null(), core::ptr::null(), 0);
+    if unsafe { record(&mut obj, &mut msg, &mut code) } == 0 {
+        return core::ptr::null_mut();
+    }
+    let obj = unsafe { ffi::cstr(obj) }.map_or(&b""[..], CStr::to_bytes);
+    let msg = unsafe { ffi::cstr(msg) }.unwrap_or(c"");
+    compose_message(obj, msg, code, |parts| {
+        let mut v: [(*const u8, usize); 5] = [(core::ptr::null(), 0); 5];
+        for (i, p) in parts.iter().enumerate() {
+            v[i] = (p.as_ptr(), p.len());
         }
-        let name: &[u8] = if file.is_null() { b"" } else { cbytes(file) };
-        if mode & RTLD_BINDING_MASK == 0 {
-            fail(name, "invalid mode for dlopen()", EINVAL);
-            return null_mut();
-        }
-        if name.is_empty() {
-            succeed();
-            return main_handle();
-        }
-        if let Some(i) = STUB_NAMES.iter().position(|n| *n == name) {
-            if mode & RTLD_NOLOAD != 0 {
-                succeed();
-                return null_mut();
-            }
-            STUB_OPEN[i].fetch_add(1, Ordering::Relaxed);
-            succeed();
-            return stub_handle(i);
-        }
-        if !name.contains(&b'/') {
-            fail(name, "cannot open shared object file", ENOENT_);
-            return null_mut();
-        }
-        let fd = syscall3(syscall::SYS_OPEN, file as usize, 0o2000000, 0);
-        let e = sys_err(fd);
-        if e != 0 {
-            fail(name, "cannot open shared object file", e);
-            return null_mut();
-        }
-        let fd = fd as c_int;
-        let mut hdr = [0u8; 64];
-        let n = syscall3(syscall::SYS_READ, fd as usize, hdr.as_mut_ptr() as usize, 64);
-        syscall1(syscall::SYS_CLOSE, fd as usize);
-        let e = sys_err(n);
-        if e != 0 {
-            fail(name, "cannot read file data", e);
-            return null_mut();
-        }
-        if n < 64 {
-            fail(name, "file too short", 0);
-            return null_mut();
-        }
-        if &hdr[..4] != b"\x7fELF" || hdr[4] != 2 || hdr[5] != 1 || hdr[6] != 1 {
-            fail(name, "invalid ELF header", 0);
-            return null_mut();
-        }
-        if hdr[16] == 2 {
-            fail(name, "cannot dynamically load executable", 0);
-            return null_mut();
-        }
+        unsafe { compose(v.as_ptr(), parts.len()) }
+    }) as *mut c_char
+}
+
+fn check_file(path: &CStr) -> Result<[u8; 64], (&'static str, c_int)> {
+    let fd = unsafe { rusty_libc_core::unistd::open(path.as_ptr(), 0o2000000, 0) }.map_err(|e| ("cannot open shared object file", e.0))?;
+    let mut hdr = [0u8; 64];
+    let n = rusty_libc_core::unistd::read_nocancel(fd, &mut hdr);
+    let _ = rusty_libc_core::unistd::close(fd);
+    let n = n.map_err(|e| ("cannot read file data", e.0))?;
+    if n < 64 {
+        return Err(("file too short", 0));
+    }
+    Ok(hdr)
+}
+
+pub fn open_r(file: Option<&CStr>, mode: c_int) -> *mut c_void {
+    begin();
+    if mode & !(RTLD_BINDING_MASK | RTLD_NOLOAD | RTLD_DEEPBIND | RTLD_GLOBAL | RTLD_LOCAL | RTLD_NODELETE | SPROF) != 0 {
+        fail(b"", "invalid mode parameter", 0);
+        return null_mut();
+    }
+    let name: &[u8] = file.map_or(b"", CStr::to_bytes);
+    if mode & RTLD_BINDING_MASK == 0 {
+        fail(name, "invalid mode for dlopen()", EINVAL);
+        return null_mut();
+    }
+    let Some(file) = file.filter(|_| !name.is_empty()) else {
+        succeed();
+        return main_handle();
+    };
+    if let Some(i) = STUB_NAMES.iter().position(|n| *n == name) {
         if mode & RTLD_NOLOAD != 0 {
             succeed();
             return null_mut();
         }
-        fail(name, "static binaries cannot load shared objects", 0);
-        null_mut()
+        STUB_OPEN[i].fetch_add(1, Ordering::Relaxed);
+        succeed();
+        return stub_handle(i);
     }
-}
-
-fn sys_err(r: usize) -> c_int {
-    if r > usize::MAX - 4095 { (r as isize).wrapping_neg() as c_int } else { 0 }
+    if !name.contains(&b'/') {
+        fail(name, "cannot open shared object file", ENOENT_);
+        return null_mut();
+    }
+    let hdr = match check_file(file) {
+        Ok(h) => h,
+        Err((text, e)) => {
+            fail(name, text, e);
+            return null_mut();
+        }
+    };
+    if &hdr[..4] != b"\x7fELF" || hdr[4] != 2 || hdr[5] != 1 || hdr[6] != 1 {
+        fail(name, "invalid ELF header", 0);
+        return null_mut();
+    }
+    if hdr[16] == 2 {
+        fail(name, "cannot dynamically load executable", 0);
+        return null_mut();
+    }
+    if mode & RTLD_NOLOAD != 0 {
+        succeed();
+        return null_mut();
+    }
+    fail(name, "static binaries cannot load shared objects", 0);
+    null_mut()
 }
 
 #[cfg_attr(all(feature = "export", not(feature = "shared")), unsafe(no_mangle))]
 pub unsafe extern "C" fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void {
-    unsafe { open_impl(file, mode) }
+    open_r(unsafe { ffi::cstr(file) }, mode)
 }
 
 #[cfg_attr(all(feature = "export", not(feature = "shared")), unsafe(no_mangle))]
 pub unsafe extern "C" fn dlmopen(_nsid: c_long, file: *const c_char, mode: c_int) -> *mut c_void {
-    unsafe { open_impl(file, mode) }
+    open_r(unsafe { ffi::cstr(file) }, mode)
 }
 
-#[cfg_attr(all(feature = "export", not(feature = "shared")), unsafe(no_mangle))]
-pub unsafe extern "C" fn dlclose(handle: *mut c_void) -> c_int {
+pub fn close_r(handle: *mut c_void) -> c_int {
     begin();
     if handle == main_handle() {
         succeed();
@@ -336,6 +368,11 @@ pub unsafe extern "C" fn dlclose(handle: *mut c_void) -> c_int {
         fail(b"", "shared object not open", 0);
         -1
     }
+}
+
+#[cfg_attr(all(feature = "export", not(feature = "shared")), unsafe(no_mangle))]
+pub unsafe extern "C" fn dlclose(handle: *mut c_void) -> c_int {
+    close_r(handle)
 }
 
 fn lookup_fail(handle: *mut c_void, name: &[u8], version: Option<&[u8]>) -> *mut c_void {
@@ -361,29 +398,28 @@ fn lookup_fail(handle: *mut c_void, name: &[u8], version: Option<&[u8]>) -> *mut
     null_mut()
 }
 
-unsafe fn sym_impl(handle: *mut c_void, name: *const c_char, version: Option<*const c_char>) -> *mut c_void {
-    unsafe {
-        begin();
-        if handle as isize == -1 {
-            fail(b"", "RTLD_NEXT used in code not dynamically loaded", 0);
-            return null_mut();
-        }
-        if !handle.is_null() && handle != main_handle() && stub_index(handle).is_none() {
-            fail(b"", "invalid handle", 0);
-            return null_mut();
-        }
-        lookup_fail(handle, cbytes(name), version.map(|v| cbytes(v)))
+pub fn sym_r(handle: *mut c_void, name: &[u8], version: Option<&[u8]>) -> *mut c_void {
+    begin();
+    if handle as isize == -1 {
+        fail(b"", "RTLD_NEXT used in code not dynamically loaded", 0);
+        return null_mut();
     }
+    if !handle.is_null() && handle != main_handle() && stub_index(handle).is_none() {
+        fail(b"", "invalid handle", 0);
+        return null_mut();
+    }
+    lookup_fail(handle, name, version)
 }
 
 #[cfg_attr(all(feature = "export", not(feature = "shared")), unsafe(no_mangle))]
 pub unsafe extern "C" fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void {
-    unsafe { sym_impl(handle, name, None) }
+    sym_r(handle, unsafe { ffi::cstr_bytes(name) }, None)
 }
 
 #[cfg_attr(all(feature = "export", not(feature = "shared")), unsafe(no_mangle))]
 pub unsafe extern "C" fn dlvsym(handle: *mut c_void, name: *const c_char, version: *const c_char) -> *mut c_void {
-    unsafe { sym_impl(handle, name, Some(version)) }
+    let name = unsafe { ffi::cstr_bytes(name) };
+    sym_r(handle, name, Some(unsafe { ffi::cstr_bytes(version) }))
 }
 
 const PT_LOAD: u32 = 1;
@@ -405,19 +441,32 @@ struct Phdr {
 }
 
 fn phdrs() -> (*const Phdr, usize) {
-    unsafe {
-        let p = rusty_libc_util::auxv::getauxval(AT_PHDR) as *const Phdr;
-        let n = rusty_libc_util::auxv::getauxval(AT_PHNUM) as usize;
-        if p.is_null() { (core::ptr::null(), 0) } else { (p, n) }
+    let p = unsafe { rusty_libc_util::auxv::getauxval(AT_PHDR) } as *const Phdr;
+    let n = unsafe { rusty_libc_util::auxv::getauxval(AT_PHNUM) } as usize;
+    if p.is_null() { (core::ptr::null(), 0) } else { (p, n) }
+}
+
+fn phdr_slice() -> &'static [Phdr] {
+    let (p, n) = phdrs();
+    if p.is_null() {
+        return &[];
     }
+    unsafe { ffi::slice(p, n) }
+}
+
+fn has_tls() -> bool {
+    phdr_slice().iter().any(|h| h.p_type == PT_TLS)
 }
 
 pub(crate) fn image() -> Option<(u64, u64, u64)> {
-    let (p, n) = phdrs();
+    let (p, _) = phdrs();
     if p.is_null() {
         return None;
     }
-    let hs = unsafe { core::slice::from_raw_parts(p, n) };
+    image_of(p, phdr_slice())
+}
+
+fn image_of(p: *const Phdr, hs: &[Phdr]) -> Option<(u64, u64, u64)> {
     let mut bias = 0u64;
     for h in hs {
         if h.p_type == PT_PHDR {
@@ -435,92 +484,103 @@ pub(crate) fn image() -> Option<(u64, u64, u64)> {
     Some((bias, lo.wrapping_add(bias), hi.wrapping_add(bias)))
 }
 
+fn image_start_of(addr: *const c_void) -> Option<u64> {
+    match image() {
+        Some((_bias, start, end)) if (addr as u64) >= start && (addr as u64) < end => Some(start),
+        _ => None,
+    }
+}
+
+fn fill_info(info: &mut DlInfo, start: u64) {
+    let name = program_name();
+    info.dli_fname = if name.is_null() { c"".as_ptr() } else { name };
+    info.dli_fbase = start as *mut c_void;
+    info.dli_sname = core::ptr::null();
+    info.dli_saddr = null_mut();
+}
+
+pub fn addr_r(addr: *const c_void, info: &mut DlInfo) -> c_int {
+    match image_start_of(addr) {
+        Some(start) => {
+            fill_info(info, start);
+            1
+        }
+        None => 0,
+    }
+}
+
 #[cfg_attr(all(feature = "export", not(feature = "shared")), unsafe(no_mangle))]
 pub unsafe extern "C" fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int {
-    unsafe {
-        match image() {
-            Some((_bias, start, end)) if (addr as u64) >= start && (addr as u64) < end => {
-                let name = program_name();
-                (*info).dli_fname = if name.is_null() { c"".as_ptr() } else { name };
-                (*info).dli_fbase = start as *mut c_void;
-                (*info).dli_sname = core::ptr::null();
-                (*info).dli_saddr = null_mut();
-                1
-            }
-            _ => 0,
-        }
-    }
+    let Some(start) = image_start_of(addr) else { return 0 };
+    fill_info(unsafe { &mut *info }, start);
+    1
 }
 
 #[cfg_attr(all(feature = "export", not(feature = "shared")), unsafe(no_mangle))]
 pub unsafe extern "C" fn dladdr1(addr: *const c_void, info: *mut DlInfo, extra: *mut *mut c_void, flags: c_int) -> c_int {
-    unsafe {
-        let r = dladdr(addr, info);
-        if r != 0 {
-            match flags {
-                RTLD_DL_SYMENT => *extra = null_mut(),
-                RTLD_DL_LINKMAP => *extra = main_handle(),
-                _ => {}
-            }
-        }
-        r
+    let r = unsafe { dladdr(addr, info) };
+    if r != 0 {
+        let v = match flags {
+            RTLD_DL_SYMENT => null_mut(),
+            RTLD_DL_LINKMAP => main_handle(),
+            _ => return r,
+        };
+        unsafe { extra.write(v) };
     }
+    r
+}
+
+fn origin(buf: &mut [u8; 4096]) -> Result<usize, c_int> {
+    let r = unsafe {
+        rusty_libc_core::syscall::syscall3(SYS_READLINK_NR, c"/proc/self/exe".as_ptr() as usize, buf.as_mut_ptr() as usize, buf.len() - 1)
+    };
+    let n = rusty_libc_core::syscall::check(r).map_err(|e| e.0)?;
+    Ok(buf[..n].iter().rposition(|&c| c == b'/').unwrap_or(0))
 }
 
 #[cfg_attr(all(feature = "export", not(feature = "shared")), unsafe(no_mangle))]
 pub unsafe extern "C" fn dlinfo(handle: *mut c_void, request: c_int, arg: *mut c_void) -> c_int {
-    unsafe {
-        begin();
-        let stub = stub_index(handle);
-        if handle != main_handle() && stub.is_none() {
-            fail(b"", "invalid handle", 0);
-            return -1;
-        }
-        if stub.is_some() && request != RTLD_DI_LMID && request != RTLD_DI_LINKMAP {
-            fail(b"", "unsupported dlinfo request", 0);
-            return -1;
-        }
-        match request {
-            RTLD_DI_LMID => {
-                *(arg as *mut c_long) = 0;
-            }
-            RTLD_DI_LINKMAP => {
-                *(arg as *mut *mut LinkMap) = handle.cast();
-            }
-            RTLD_DI_ORIGIN => {
-                let mut buf = [0u8; 4096];
-                let r = syscall3(SYS_READLINK_NR, c"/proc/self/exe".as_ptr() as usize, buf.as_mut_ptr() as usize, buf.len() - 1);
-                let e = sys_err(r);
-                if e != 0 {
+    begin();
+    let stub = stub_index(handle);
+    if handle != main_handle() && stub.is_none() {
+        fail(b"", "invalid handle", 0);
+        return -1;
+    }
+    if stub.is_some() && request != RTLD_DI_LMID && request != RTLD_DI_LINKMAP {
+        fail(b"", "unsupported dlinfo request", 0);
+        return -1;
+    }
+    match request {
+        RTLD_DI_LMID => unsafe { arg.cast::<c_long>().write(0) },
+        RTLD_DI_LINKMAP => unsafe { arg.cast::<*mut LinkMap>().write(handle.cast()) },
+        RTLD_DI_ORIGIN => {
+            let mut buf = [0u8; 4096];
+            let slash = match origin(&mut buf) {
+                Ok(s) => s,
+                Err(e) => {
                     fail(b"", "cannot determine the origin", e);
                     return -1;
                 }
-                let n = r;
-                let slash = buf[..n].iter().rposition(|&c| c == b'/').unwrap_or(0);
-                let dst = arg as *mut u8;
-                core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, slash);
-                *dst.add(slash) = 0;
-            }
-            RTLD_DI_SERINFOSIZE | RTLD_DI_SERINFO => {
-                let p = arg as *mut usize;
-                if request == RTLD_DI_SERINFOSIZE {
-                    *p = 16;
-                }
-                *(p.add(1) as *mut u32) = 0;
-            }
-            RTLD_DI_TLS_MODID => {
-                let (p, n) = phdrs();
-                let has_tls = !p.is_null() && core::slice::from_raw_parts(p, n).iter().any(|h| h.p_type == PT_TLS);
-                *(arg as *mut usize) = has_tls as usize;
-            }
-            _ => {
-                fail(b"", "unsupported dlinfo request", 0);
-                return -1;
-            }
+            };
+            let dst = unsafe { ffi::bytes_mut(arg.cast::<u8>(), slash + 1) };
+            dst[..slash].copy_from_slice(&buf[..slash]);
+            dst[slash] = 0;
         }
-        succeed();
-        0
+        RTLD_DI_SERINFOSIZE | RTLD_DI_SERINFO => {
+            let p = arg.cast::<usize>();
+            if request == RTLD_DI_SERINFOSIZE {
+                unsafe { p.write(16) };
+            }
+            unsafe { p.wrapping_add(1).cast::<u32>().write(0) };
+        }
+        RTLD_DI_TLS_MODID => unsafe { arg.cast::<usize>().write(has_tls() as usize) },
+        _ => {
+            fail(b"", "unsupported dlinfo request", 0);
+            return -1;
+        }
     }
+    succeed();
+    0
 }
 
 const SYS_READLINK_NR: usize = 89;
@@ -539,16 +599,23 @@ pub struct DlPhdrInfo {
 
 const _: () = assert!(size_of::<DlPhdrInfo>() == 64);
 
+pub fn program_phdr_info() -> DlPhdrInfo {
+    let (p, n) = phdrs();
+    let hs: &[Phdr] = if p.is_null() {
+        &[]
+    } else {
+        unsafe { ffi::slice(p, n) }
+    };
+    let bias = if p.is_null() { 0 } else { image_of(p, hs).map_or(0, |(b, _, _)| b) };
+    let tls = hs.iter().any(|h| h.p_type == PT_TLS);
+    DlPhdrInfo { dlpi_addr: bias, dlpi_name: c"".as_ptr(), dlpi_phdr: p.cast(), dlpi_phnum: n as u16, dlpi_adds: 1, dlpi_subs: 0, dlpi_tls_modid: tls as usize, dlpi_tls_data: null_mut() }
+}
+
 #[cfg_attr(all(feature = "export", not(feature = "shared")), unsafe(no_mangle))]
 pub unsafe extern "C" fn dl_iterate_phdr(callback: Option<unsafe extern "C" fn(*mut DlPhdrInfo, usize, *mut c_void) -> c_int>, data: *mut c_void) -> c_int {
-    unsafe {
-        let (p, n) = phdrs();
-        let Some(cb) = callback else { return 0 };
-        let bias = image().map_or(0, |(b, _, _)| b);
-        let has_tls = !p.is_null() && core::slice::from_raw_parts(p, n).iter().any(|h| h.p_type == PT_TLS);
-        let mut info = DlPhdrInfo { dlpi_addr: bias, dlpi_name: c"".as_ptr(), dlpi_phdr: p.cast(), dlpi_phnum: n as u16, dlpi_adds: 1, dlpi_subs: 0, dlpi_tls_modid: has_tls as usize, dlpi_tls_data: null_mut() };
-        cb(&mut info, size_of::<DlPhdrInfo>(), data)
-    }
+    let Some(cb) = callback else { return 0 };
+    let mut info = program_phdr_info();
+    unsafe { cb(&mut info, size_of::<DlPhdrInfo>(), data) }
 }
 
 #[repr(C)]
@@ -565,29 +632,35 @@ const _: () = assert!(size_of::<DlFindObject>() == 96);
 
 const PT_GNU_EH_FRAME_TYPE: u32 = 0x6474e550;
 
+pub fn find_object_r(pc: *mut c_void) -> Option<DlFindObject> {
+    let (bias, lo, hi) = image()?;
+    let a = pc as u64;
+    if a < lo || a >= hi {
+        return None;
+    }
+    let mut eh = 0u64;
+    for h in phdr_slice() {
+        if h.p_type == PT_GNU_EH_FRAME_TYPE {
+            eh = h.p_vaddr.wrapping_add(bias);
+        }
+    }
+    Some(DlFindObject {
+        dlfo_flags: 0,
+        dlfo_map_start: lo as *mut c_void,
+        dlfo_map_end: hi as *mut c_void,
+        dlfo_link_map: MAIN_MAP.as_ptr(),
+        dlfo_eh_frame: eh as *mut c_void,
+        reserved: [0; 7],
+    })
+}
+
 #[cfg_attr(all(feature = "export", not(feature = "shared")), unsafe(no_mangle))]
 pub unsafe extern "C" fn _dl_find_object(pc: *mut c_void, result: *mut DlFindObject) -> c_int {
-    unsafe {
-        let Some((bias, lo, hi)) = image() else { return -1 };
-        let a = pc as u64;
-        if a < lo || a >= hi {
-            return -1;
+    match find_object_r(pc) {
+        Some(r) => {
+            unsafe { result.write(r) };
+            0
         }
-        let (p, n) = phdrs();
-        let mut eh = 0u64;
-        for h in core::slice::from_raw_parts(p, n) {
-            if h.p_type == PT_GNU_EH_FRAME_TYPE {
-                eh = h.p_vaddr.wrapping_add(bias);
-            }
-        }
-        *result = DlFindObject {
-            dlfo_flags: 0,
-            dlfo_map_start: lo as *mut c_void,
-            dlfo_map_end: hi as *mut c_void,
-            dlfo_link_map: (&raw mut MAIN_MAP).cast(),
-            dlfo_eh_frame: eh as *mut c_void,
-            reserved: [0; 7],
-        };
-        0
+        None => -1,
     }
 }

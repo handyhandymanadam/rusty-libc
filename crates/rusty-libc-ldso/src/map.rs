@@ -1,14 +1,19 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use crate::audit;
 use crate::elf::*;
+use crate::ffi::{CStrRef, at, cstr, cstr_nul, cstr_opt, slice};
+use crate::sync_cell::SyncCell;
 use crate::sys;
 use crate::util::*;
-use core::ptr::{null, null_mut};
+use core::ffi::{CStr, c_int};
+use core::ptr::{NonNull, null, null_mut};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
 
 #[derive(Clone, Copy)]
 pub struct VerInfo {
-    pub name: *const u8,
+    pub name: Option<CStrRef>,
     pub hash: u32,
-    pub file: *const u8,
+    pub file: Option<CStrRef>,
     pub hidden: bool,
 }
 
@@ -133,80 +138,559 @@ pub struct LinkMap {
     pub used: bool,
     pub req_name: *const u8,
     pub audit_any_plt: bool,
+    pub tls_dtor_count: usize,
 }
 
 const _: () = assert!(core::mem::offset_of!(LinkMap, tls_modid) == 504);
 const _: () = assert!(core::mem::offset_of!(LinkMap, tls_offset) == 544);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct Map(NonNull<LinkMap>);
+
+impl core::fmt::Debug for Map {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Map({:p})", self.0)
+    }
+}
+
+impl Map {
+    #[inline(always)]
+    pub unsafe fn from_ptr(p: *mut LinkMap) -> Option<Map> {
+        NonNull::new(p).map(Map)
+    }
+
+    #[inline(always)]
+    pub fn as_ptr(self) -> *mut LinkMap {
+        self.0.as_ptr()
+    }
+
+    #[inline(always)]
+    pub fn opt_ptr(m: Option<Map>) -> *mut LinkMap {
+        match m {
+            Some(m) => m.as_ptr(),
+            None => null_mut(),
+        }
+    }
+}
+
+macro_rules! map_fields {
+    (safe { $($f:ident, $set:ident : $t:ty;)* } unsafe { $($uf:ident => $ug:ident, $uset:ident : $ut:ty;)* }) => {
+        impl Map {
+            $(
+                #[inline(always)]
+                pub fn $f(self) -> $t {
+                    unsafe { (*self.0.as_ptr()).$f }
+                }
+                #[inline(always)]
+                pub fn $set(self, v: $t) {
+                    unsafe { (*self.0.as_ptr()).$f = v }
+                }
+            )*
+            $(
+                #[inline(always)]
+                pub fn $ug(self) -> $ut {
+                    unsafe { (*self.0.as_ptr()).$uf }
+                }
+                #[inline(always)]
+                pub unsafe fn $uset(self, v: $ut) {
+                    unsafe { (*self.0.as_ptr()).$uf = v }
+                }
+            )*
+        }
+    };
+}
+
+map_fields! {
+    safe {
+        l_addr, set_l_addr: usize;
+        l_ns, set_l_ns: isize;
+        entry, set_entry: usize;
+        map_start, set_map_start: usize;
+        map_end, set_map_end: usize;
+        typ, set_typ: u16;
+        gnu_nbuckets, set_gnu_nbuckets: u32;
+        gnu_symoffset, set_gnu_symoffset: u32;
+        gnu_bloom_size, set_gnu_bloom_size: u32;
+        gnu_bloom_shift, set_gnu_bloom_shift: u32;
+        hash_nbucket, set_hash_nbucket: u32;
+        hash_nchain, set_hash_nchain: u32;
+        init, set_init: usize;
+        fini, set_fini: usize;
+        flags, set_flags: u64;
+        flags_1, set_flags_1: u64;
+        bind_now, set_bind_now: bool;
+        rtld_now, set_rtld_now: bool;
+        lazy_plt, set_lazy_plt: bool;
+        textrel, set_textrel: bool;
+        dyn_adjusted, set_dyn_adjusted: bool;
+        relro_start, set_relro_start: usize;
+        relro_len, set_relro_len: usize;
+        eh_frame_hdr, set_eh_frame_hdr: usize;
+        tls_modid, set_tls_modid: usize;
+        tls_align, set_tls_align: usize;
+        tls_offset, set_tls_offset: usize;
+        tls_static, set_tls_static: bool;
+        dev, set_dev: u64;
+        ino, set_ino: u64;
+        relocated, set_relocated: bool;
+        init_called, set_init_called: bool;
+        opening, set_opening: bool;
+        fini_called, set_fini_called: bool;
+        is_main, set_is_main: bool;
+        is_ldso, set_is_ldso: bool;
+        is_vdso, set_is_vdso: bool;
+        in_global, set_in_global: bool;
+        nodelete, set_nodelete: bool;
+        dlopened, set_dlopened: bool;
+        unloading, set_unloading: bool;
+        removed, set_removed: bool;
+        refcount, set_refcount: usize;
+        init_seq, set_init_seq: usize;
+        lazy_pending, set_lazy_pending: bool;
+        deepbind, set_deepbind: bool;
+        audit_opened, set_audit_opened: bool;
+        filter_hard, set_filter_hard: bool;
+        audit_any_plt, set_audit_any_plt: bool;
+        tls_dtor_count, set_tls_dtor_count: usize;
+    }
+    unsafe {
+        l_name => l_name, set_l_name: *const u8;
+        l_ld => l_ld, set_l_ld: *mut Dyn;
+        l_libname => l_libname, set_l_libname: *mut LibName;
+        soname => soname_ptr, set_soname: *const u8;
+        phdr => phdr, set_phdr: *const Phdr;
+        phnum => phnum, set_phnum: usize;
+        strtab => strtab, set_strtab: *const u8;
+        strsz => strsz, set_strsz: usize;
+        symtab => symtab, set_symtab: *const Sym;
+        gnu_bloom => gnu_bloom, set_gnu_bloom: *const u64;
+        gnu_buckets => gnu_buckets, set_gnu_buckets: *const u32;
+        gnu_chain => gnu_chain, set_gnu_chain: *const u32;
+        hash_buckets => hash_buckets, set_hash_buckets: *const u32;
+        hash_chains => hash_chains, set_hash_chains: *const u32;
+        versym => versym, set_versym: *const u16;
+        verdef => verdef, set_verdef: *const Verdef;
+        verdefnum => verdefnum, set_verdefnum: usize;
+        verneed => verneed, set_verneed: *const Verneed;
+        verneednum => verneednum, set_verneednum: usize;
+        vers => vers_ptr, set_vers: *mut VerInfo;
+        nvers => nvers, set_nvers: usize;
+        rela => rela, set_rela: *const Rela;
+        relasz => relasz, set_relasz: usize;
+        jmprel => jmprel, set_jmprel: *const Rela;
+        pltrelsz => pltrelsz, set_pltrelsz: usize;
+        relr => relr, set_relr: *const u64;
+        relrsz => relrsz, set_relrsz: usize;
+        pltgot => pltgot, set_pltgot: *mut usize;
+        init_array => init_array_ptr, set_init_array: *const usize;
+        init_arraysz => init_arraysz, set_init_arraysz: usize;
+        fini_array => fini_array_ptr, set_fini_array: *const usize;
+        fini_arraysz => fini_arraysz, set_fini_arraysz: usize;
+        preinit_array => preinit_array_ptr, set_preinit_array: *const usize;
+        preinit_arraysz => preinit_arraysz, set_preinit_arraysz: usize;
+        audit_str => audit_str, set_audit_str: u64;
+        depaudit_str => depaudit_str, set_depaudit_str: u64;
+        rpath => rpath_ptr, set_rpath: *const u8;
+        runpath => runpath_ptr, set_runpath: *const u8;
+        needed => needed_ptr, set_needed: *mut *mut LinkMap;
+        nneeded => nneeded, set_nneeded: usize;
+        origin => origin_ptr, set_origin: *const u8;
+        tls_image => tls_image, set_tls_image: usize;
+        tls_filesz => tls_filesz, set_tls_filesz: usize;
+        tls_memsz => tls_memsz, set_tls_memsz: usize;
+        reldeps => reldeps_ptr, set_reldeps: *mut *mut LinkMap;
+        nreldeps => nreldeps, set_nreldeps: usize;
+        creldeps => creldeps, set_creldeps: usize;
+        scope => scope_ptr, set_scope: *mut *mut LinkMap;
+        nscope => nscope, set_nscope: usize;
+        xscope => xscope_ptr, set_xscope: *mut *mut LinkMap;
+        nxscope => nxscope, set_nxscope: usize;
+        filtees => filtees_ptr, set_filtees: *mut *mut LinkMap;
+        nfiltees => nfiltees, set_nfiltees: usize;
+        plt_cache => plt_cache, set_plt_cache: *mut usize;
+        req_name => req_name_ptr, set_req_name: *const u8;
+    }
+}
+
+impl Map {
+    #[inline(always)]
+    fn link(p: *mut LinkMap) -> Option<Map> {
+        unsafe { Map::from_ptr(p) }
+    }
+
+    #[inline(always)]
+    fn link_field(self, off: usize) -> *mut *mut LinkMap {
+        (self.as_ptr() as *mut u8).wrapping_add(off) as *mut *mut LinkMap
+    }
+
+    #[inline(always)]
+    fn get_link(self, off: usize) -> Option<Map> {
+        Map::link(unsafe { *self.link_field(off) })
+    }
+
+    #[inline(always)]
+    fn put_link(self, off: usize, v: Option<Map>) {
+        unsafe { *self.link_field(off) = Map::opt_ptr(v) }
+    }
+
+    #[inline(always)]
+    pub fn next(self) -> Option<Map> {
+        self.get_link(core::mem::offset_of!(LinkMap, l_next))
+    }
+    #[inline(always)]
+    pub fn set_next(self, v: Option<Map>) {
+        self.put_link(core::mem::offset_of!(LinkMap, l_next), v)
+    }
+    #[inline(always)]
+    pub fn prev(self) -> Option<Map> {
+        self.get_link(core::mem::offset_of!(LinkMap, l_prev))
+    }
+    #[inline(always)]
+    pub fn set_prev(self, v: Option<Map>) {
+        self.put_link(core::mem::offset_of!(LinkMap, l_prev), v)
+    }
+    #[inline(always)]
+    pub fn real(self) -> Option<Map> {
+        self.get_link(core::mem::offset_of!(LinkMap, l_real))
+    }
+    #[inline(always)]
+    pub fn set_real(self, v: Option<Map>) {
+        self.put_link(core::mem::offset_of!(LinkMap, l_real), v)
+    }
+    #[inline(always)]
+    pub fn loader(self) -> Option<Map> {
+        self.get_link(core::mem::offset_of!(LinkMap, loader))
+    }
+    #[inline(always)]
+    pub fn set_loader(self, v: Option<Map>) {
+        self.put_link(core::mem::offset_of!(LinkMap, loader), v)
+    }
+
+    #[inline(always)]
+    fn used_atomic(self) -> &'static core::sync::atomic::AtomicBool {
+        let p = (self.as_ptr() as *mut u8).wrapping_add(core::mem::offset_of!(LinkMap, used)) as *mut bool;
+        unsafe { core::sync::atomic::AtomicBool::from_ptr(p) }
+    }
+    #[inline(always)]
+    pub fn used(self) -> bool {
+        self.used_atomic().load(core::sync::atomic::Ordering::Relaxed)
+    }
+    #[inline(always)]
+    pub fn set_used(self, v: bool) {
+        self.used_atomic().store(v, core::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    pub fn audit_cookie_ptr(self, i: usize) -> *mut usize {
+        assert!(i < 8);
+        (self.as_ptr() as *mut u8).wrapping_add(core::mem::offset_of!(LinkMap, audit_cookie) + i * 8) as *mut usize
+    }
+    #[inline(always)]
+    pub fn audit_cookie(self, i: usize) -> usize {
+        unsafe { *self.audit_cookie_ptr(i) }
+    }
+    #[inline(always)]
+    pub fn set_audit_cookie(self, i: usize, v: usize) {
+        unsafe { *self.audit_cookie_ptr(i) = v }
+    }
+    #[inline(always)]
+    fn audit_flags_ptr(self, i: usize) -> *mut u32 {
+        assert!(i < 8);
+        (self.as_ptr() as *mut u8).wrapping_add(core::mem::offset_of!(LinkMap, audit_flags) + i * 4) as *mut u32
+    }
+    #[inline(always)]
+    pub fn audit_flags(self, i: usize) -> u32 {
+        unsafe { *self.audit_flags_ptr(i) }
+    }
+    #[inline(always)]
+    pub fn set_audit_flags(self, i: usize, v: u32) {
+        unsafe { *self.audit_flags_ptr(i) = v }
+    }
+    #[inline(always)]
+    pub fn plt_cache_field(self) -> *mut usize {
+        (self.as_ptr() as *mut u8).wrapping_add(core::mem::offset_of!(LinkMap, plt_cache)) as *mut usize
+    }
+
+    #[inline]
+    pub fn name(self) -> &'static [u8] {
+        unsafe { cstr_opt(self.l_name()) }.unwrap_or(b"")
+    }
+    #[inline]
+    pub fn soname(self) -> Option<&'static [u8]> {
+        unsafe { cstr_opt(self.soname_ptr()) }
+    }
+    #[inline]
+    pub fn rpath(self) -> Option<&'static [u8]> {
+        unsafe { cstr_opt(self.rpath_ptr()) }
+    }
+    #[inline]
+    pub fn runpath(self) -> Option<&'static [u8]> {
+        unsafe { cstr_opt(self.runpath_ptr()) }
+    }
+    #[inline]
+    pub fn origin(self) -> Option<&'static [u8]> {
+        unsafe { cstr_opt(self.origin_ptr()) }
+    }
+    #[inline]
+    pub fn req_name(self) -> Option<&'static [u8]> {
+        unsafe { cstr_opt(self.req_name_ptr()) }
+    }
+    #[inline]
+    pub fn phdrs(self) -> &'static [Phdr] {
+        unsafe { slice(self.phdr(), self.phnum()) }
+    }
+    #[inline]
+    pub fn needed(self) -> &'static [Map] {
+        unsafe { slice(self.needed_ptr() as *const Map, self.nneeded()) }
+    }
+    #[inline]
+    pub fn filtees(self) -> &'static [Map] {
+        unsafe { slice(self.filtees_ptr() as *const Map, self.nfiltees()) }
+    }
+    #[inline]
+    pub fn reldeps(self) -> &'static [Map] {
+        unsafe { slice(self.reldeps_ptr() as *const Map, self.nreldeps()) }
+    }
+    #[inline]
+    pub fn scope(self) -> &'static [Map] {
+        unsafe { slice(self.scope_ptr() as *const Map, self.nscope()) }
+    }
+    #[inline]
+    pub fn xscope(self) -> &'static [Map] {
+        unsafe { slice(self.xscope_ptr() as *const Map, self.nxscope()) }
+    }
+    #[inline]
+    pub fn vers(self) -> &'static [VerInfo] {
+        unsafe { slice(self.vers_ptr() as *const VerInfo, self.nvers()) }
+    }
+    #[inline]
+    pub fn relas(self) -> &'static [Rela] {
+        unsafe { slice(self.rela(), self.relasz() / core::mem::size_of::<Rela>()) }
+    }
+    #[inline]
+    pub fn jmprels(self) -> &'static [Rela] {
+        unsafe { slice(self.jmprel(), self.pltrelsz() / core::mem::size_of::<Rela>()) }
+    }
+    #[inline]
+    pub fn relrs(self) -> &'static [u64] {
+        unsafe { slice(self.relr(), self.relrsz() / 8) }
+    }
+    #[inline]
+    pub fn init_array(self) -> &'static [usize] {
+        unsafe { slice(self.init_array_ptr(), self.init_arraysz() / 8) }
+    }
+    #[inline]
+    pub fn fini_array(self) -> &'static [usize] {
+        unsafe { slice(self.fini_array_ptr(), self.fini_arraysz() / 8) }
+    }
+    #[inline]
+    pub fn preinit_array(self) -> &'static [usize] {
+        unsafe { slice(self.preinit_array_ptr(), self.preinit_arraysz() / 8) }
+    }
+    #[inline]
+    pub fn gnu_bloom_words(self) -> &'static [u64] {
+        unsafe { slice(self.gnu_bloom(), self.gnu_bloom_size() as usize) }
+    }
+    #[inline]
+    pub fn gnu_bucket_words(self) -> &'static [u32] {
+        unsafe { slice(self.gnu_buckets(), self.gnu_nbuckets() as usize) }
+    }
+    #[inline]
+    pub fn hash_bucket_words(self) -> &'static [u32] {
+        unsafe { slice(self.hash_buckets(), self.hash_nbucket() as usize) }
+    }
+    #[inline]
+    pub fn hash_chain_words(self) -> &'static [u32] {
+        unsafe { slice(self.hash_chains(), self.hash_nchain() as usize) }
+    }
+    #[inline]
+    pub fn dynamic(self) -> DynIter {
+        DynIter(self.l_ld())
+    }
+    pub fn dep_names(self) -> impl Iterator<Item = (&'static [u8], u8)> {
+        let kind_of = |t: i64| match t {
+            DT_NEEDED => 0u8,
+            DT_AUXILIARY => 1,
+            DT_FILTER => 2,
+            _ => 3,
+        };
+        let firsts = self.dynamic().filter(move |d| kind_of(d.tag) == 0);
+        let filtees = self.dynamic().filter(move |d| matches!(kind_of(d.tag), 1 | 2));
+        firsts.chain(filtees).map(move |d| (unsafe { self.str_at(d.val as usize) }, kind_of(d.tag)))
+    }
+    pub fn needed_names(self) -> impl Iterator<Item = &'static [u8]> {
+        self.dynamic().filter(|d| d.tag == DT_NEEDED).map(move |d| unsafe { self.str_at(d.val as usize) })
+    }
+    pub fn verdefs(self) -> impl Iterator<Item = (&'static Verdef, CStrRef)> {
+        let mut vd = self.verdef();
+        (0..self.verdefnum()).map(move |_| {
+            let e = unsafe { at(vd) };
+            let da = unsafe { at((vd as *const u8).wrapping_add(e.aux as usize) as *const Verdaux) };
+            let name = unsafe { self.str_ref(da.name as usize) };
+            vd = (vd as *const u8).wrapping_add(e.next as usize) as *const Verdef;
+            (e, name)
+        })
+    }
+    pub fn verneeds(self) -> impl Iterator<Item = (&'static Verneed, CStrRef, VernauxIter)> {
+        let mut vn = self.verneed();
+        (0..self.verneednum()).map(move |_| {
+            let e = unsafe { at(vn) };
+            let file = unsafe { self.str_ref(e.file as usize) };
+            let aux = VernauxIter { map: self, at: (vn as *const u8).wrapping_add(e.aux as usize) as *const Vernaux, left: e.cnt };
+            vn = (vn as *const u8).wrapping_add(e.next as usize) as *const Verneed;
+            (e, file, aux)
+        })
+    }
+
+    #[inline(always)]
+    pub unsafe fn str_at(self, off: usize) -> &'static [u8] {
+        unsafe { cstr(self.strtab().wrapping_add(off)) }
+    }
+
+    #[inline(always)]
+    pub unsafe fn str_ref(self, off: usize) -> CStrRef {
+        unsafe { CStrRef::new(self.strtab().wrapping_add(off)) }
+    }
+
+    #[inline(always)]
+    pub unsafe fn sym(self, idx: usize) -> &'static Sym {
+        unsafe { at(self.symtab().wrapping_add(idx)) }
+    }
+
+    #[inline(always)]
+    pub fn sym_index(self, s: &Sym) -> usize {
+        (s as *const Sym as usize).wrapping_sub(self.symtab() as usize) / core::mem::size_of::<Sym>()
+    }
+
+    #[inline(always)]
+    pub fn sym_name(self, s: &'static Sym) -> CStrRef {
+        unsafe { self.str_ref(s.name as usize) }
+    }
+}
+
+pub struct DynIter(*const Dyn);
+
+impl Iterator for DynIter {
+    type Item = Dyn;
+    #[inline]
+    fn next(&mut self) -> Option<Dyn> {
+        let d = unsafe { *self.0 };
+        if d.tag == DT_NULL {
+            return None;
+        }
+        self.0 = self.0.wrapping_add(1);
+        Some(d)
+    }
+}
+
+pub struct VernauxIter {
+    map: Map,
+    at: *const Vernaux,
+    left: u16,
+}
+
+impl Iterator for VernauxIter {
+    type Item = (&'static Vernaux, CStrRef);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        let a = unsafe { at(self.at) };
+        let name = unsafe { self.map.str_ref(a.name as usize) };
+        self.at = (self.at as *const u8).wrapping_add(a.next as usize) as *const Vernaux;
+        Some((a, name))
+    }
+}
 
 pub const MAX_MAPS: usize = 1024;
 
 pub const DL_NNS: usize = 16;
 
 pub struct Ns {
-    pub head: *mut LinkMap,
-    pub tail: *mut LinkMap,
+    pub head: Option<Map>,
+    pub tail: Option<Map>,
     pub nmaps: usize,
-    pub global: *mut *mut LinkMap,
+    global: *mut Option<Map>,
     pub nglobal: usize,
-    pub libc_map: *mut LinkMap,
+    pub libc_map: Option<Map>,
 }
 
-static mut BASE_GLOBAL: [*mut LinkMap; MAX_MAPS] = [null_mut(); MAX_MAPS];
+static BASE_GLOBAL: SyncCell<[Option<Map>; MAX_MAPS]> = SyncCell::new([None; MAX_MAPS]);
 
 impl Ns {
-    const EMPTY: Ns = Ns { head: null_mut(), tail: null_mut(), nmaps: 0, global: null_mut(), nglobal: 0, libc_map: null_mut() };
+    const EMPTY: Ns = Ns { head: None, tail: None, nmaps: 0, global: null_mut(), nglobal: 0, libc_map: None };
 
-    pub fn scope(&self) -> &'static [*mut LinkMap] {
+    pub fn scope(&self) -> &'static [Map] {
         if self.global.is_null() {
             return &[];
         }
-        unsafe { core::slice::from_raw_parts(self.global, self.nglobal) }
+        unsafe { slice(self.global as *const Map, self.nglobal) }
     }
 
-    pub unsafe fn push_global(&mut self, m: *mut LinkMap) -> bool {
-        unsafe {
-            if self.nglobal >= MAX_MAPS {
-                return false;
-            }
-            if self.global.is_null() {
-                self.global = alloc_perm(MAX_MAPS * core::mem::size_of::<*mut LinkMap>(), 8) as *mut *mut LinkMap;
-            }
-            *self.global.add(self.nglobal) = m;
-            self.nglobal += 1;
-            true
+    pub fn push_global(&mut self, m: Map) -> bool {
+        if self.nglobal >= MAX_MAPS {
+            return false;
         }
+        if self.global.is_null() {
+            self.global = alloc_perm(MAX_MAPS * core::mem::size_of::<Option<Map>>(), 8) as *mut Option<Map>;
+        }
+        unsafe { *self.global.wrapping_add(self.nglobal) = Some(m) };
+        self.nglobal += 1;
+        true
     }
 
-    pub unsafe fn remove_global(&mut self, m: *mut LinkMap) {
-        unsafe {
-            let mut j = 0;
-            for i in 0..self.nglobal {
-                let g = *self.global.add(i);
-                if g != m {
-                    *self.global.add(j) = g;
-                    j += 1;
-                }
-            }
-            self.nglobal = j;
+    pub fn remove_global(&mut self, m: Map) {
+        if self.global.is_null() {
+            return;
         }
+        let g = unsafe { crate::ffi::slice_mut(self.global, self.nglobal) };
+        let mut j = 0;
+        for i in 0..g.len() {
+            if g[i] != Some(m) {
+                g[j] = g[i];
+                j += 1;
+            }
+        }
+        self.nglobal = j;
+    }
+
+    pub fn maps(&self) -> MapIter {
+        MapIter(self.head)
+    }
+}
+
+pub struct MapIter(pub Option<Map>);
+
+impl Iterator for MapIter {
+    type Item = Map;
+    #[inline]
+    fn next(&mut self) -> Option<Map> {
+        let m = self.0?;
+        self.0 = m.next();
+        Some(m)
     }
 }
 
 #[inline(always)]
 pub fn ns(n: usize) -> &'static mut Ns {
-    unsafe { &mut (*(&raw mut STATE)).ns[n] }
+    &mut st().ns[n]
 }
 
 #[inline(always)]
-pub unsafe fn ns_of(m: *mut LinkMap) -> usize {
-    if m.is_null() { 0 } else { unsafe { (*m).l_ns as usize } }
+pub fn ns_of(m: Option<Map>) -> usize {
+    match m {
+        Some(m) => m.l_ns() as usize,
+        None => 0,
+    }
 }
 
 pub struct State {
     pub ns: [Ns; DL_NNS],
     pub nns: usize,
-    pub main_map: *mut LinkMap,
-    pub ldso_map: *mut LinkMap,
+    pub main_map: Option<Map>,
+    pub ldso_map: Option<Map>,
     pub argc: usize,
     pub argv: *mut *mut u8,
     pub envp: *mut *mut u8,
@@ -230,6 +714,9 @@ pub struct State {
     pub error: *mut u8,
     pub error_cap: usize,
     pub error_len: usize,
+    pub error_obj: (usize, usize),
+    pub error_msg: (usize, usize),
+    pub error_code: c_int,
     pub ldso_base: usize,
     pub audit: *const u8,
     pub trace_versions: bool,
@@ -237,15 +724,15 @@ pub struct State {
     pub trace_unused: bool,
 }
 
-pub static mut STATE: State = State {
+pub static STATE: SyncCell<State> = SyncCell::new(State {
     ns: {
         let mut t = [Ns::EMPTY; DL_NNS];
-        t[0].global = (&raw mut BASE_GLOBAL) as *mut *mut LinkMap;
+        t[0].global = BASE_GLOBAL.as_ptr() as *mut Option<Map>;
         t
     },
     nns: 1,
-    main_map: null_mut(),
-    ldso_map: null_mut(),
+    main_map: None,
+    ldso_map: None,
     argc: 0,
     argv: null_mut(),
     envp: null_mut(),
@@ -269,19 +756,38 @@ pub static mut STATE: State = State {
     error: null_mut(),
     error_cap: 512,
     error_len: 0,
+    error_obj: (0, 0),
+    error_msg: (0, 0),
+    error_code: 0,
     ldso_base: 0,
     audit: null(),
     trace_versions: false,
     trace_warn: false,
     trace_unused: false,
-};
+});
 
 #[inline(always)]
 pub fn st() -> &'static mut State {
-    unsafe { &mut *(&raw mut STATE) }
+    unsafe { &mut *STATE.as_ptr() }
 }
 
-static mut ERR0: [u8; 512] = [0; 512];
+#[inline]
+pub fn main_map() -> Map {
+    match st().main_map {
+        Some(m) => m,
+        None => crate::die(format_args!("internal error: no program map")),
+    }
+}
+
+#[inline]
+pub fn ldso_map() -> Map {
+    match st().ldso_map {
+        Some(m) => m,
+        None => crate::die(format_args!("internal error: no loader map")),
+    }
+}
+
+static ERR0: SyncCell<[u8; 512]> = SyncCell::new([0; 512]);
 
 pub struct Count(pub usize);
 impl core::fmt::Write for Count {
@@ -292,11 +798,19 @@ impl core::fmt::Write for Count {
 }
 
 pub fn set_error(args: core::fmt::Arguments) {
+    set_error_at(b"", 0, args)
+}
+
+pub fn set_error_at(obj: &[u8], code: c_int, args: core::fmt::Arguments) {
+    set_error_occ("", obj, code, args)
+}
+
+pub fn set_error_occ(occasion: &str, obj: &[u8], code: c_int, args: core::fmt::Arguments) {
     use core::fmt::Write;
-    struct W(*mut u8, usize);
-    impl Write for W {
+    struct W<'a>(&'a mut [u8], usize);
+    impl Write for W<'_> {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), self.0.add(self.1), s.len()) };
+            self.0[self.1..self.1 + s.len()].copy_from_slice(s.as_bytes());
             self.1 += s.len();
             Ok(())
         }
@@ -304,19 +818,74 @@ pub fn set_error(args: core::fmt::Arguments) {
     let s = st();
     let mut c = Count(0);
     let _ = c.write_fmt(args);
+    let sep = if obj.is_empty() { 0 } else { 2 };
+    let tail = if code != 0 { 2 + errno_text(code).len() } else { 0 };
+    let occ = if occasion.is_empty() { 0 } else { occasion.len() + 2 };
+    let total = occ + obj.len() + sep + c.0 + tail;
     if s.error.is_null() {
-        s.error = (&raw mut ERR0) as *mut u8;
+        s.error = ERR0.as_ptr() as *mut u8;
     }
-    if c.0 + 1 > s.error_cap {
-        let cap = (c.0 + 1).next_power_of_two();
-        s.error = unsafe { alloc_perm(cap, 1) };
+    if total + 1 > s.error_cap {
+        let cap = (total + 1).next_power_of_two();
+        s.error = alloc_perm(cap, 1);
         s.error_cap = cap;
     }
-    let mut w = W(s.error, 0);
+    let buf = unsafe { crate::ffi::slice_mut(s.error, s.error_cap) };
+    let mut w = W(buf, 0);
+    if occ != 0 {
+        let _ = w.write_str(occasion);
+        let _ = w.write_str(": ");
+    }
+    w.0[occ..occ + obj.len()].copy_from_slice(obj);
+    w.1 += obj.len();
+    if sep != 0 {
+        let _ = w.write_str(": ");
+    }
+    let m0 = w.1;
     let _ = w.write_fmt(args);
+    if code != 0 {
+        let _ = w.write_str(": ");
+        let _ = w.write_str(errno_text(code));
+    }
     let n = w.1;
-    unsafe { *s.error.add(n) = 0 };
+    w.0[n] = 0;
+    s.error_obj = (occ, occ + obj.len());
+    s.error_msg = (m0, m0 + c.0);
+    s.error_code = code;
     s.error_len = n;
+}
+
+pub fn set_error_obj(obj: &[u8]) {
+    let s = st();
+    if s.error_obj.1 != s.error_obj.0 || s.error_len == 0 {
+        return;
+    }
+    let msg = error_msg();
+    let code = s.error_code;
+    let mut tmp = [0u8; 512];
+    let held: &[u8] = if msg.len() <= tmp.len() {
+        tmp[..msg.len()].copy_from_slice(msg);
+        &tmp[..msg.len()]
+    } else {
+        let p = alloc_perm(msg.len(), 1);
+        let d = unsafe { crate::ffi::slice_mut(p, msg.len()) };
+        d.copy_from_slice(msg);
+        d
+    };
+    set_error_at(obj, code, format_args!("{}", RawText(held)));
+}
+
+struct RawText<'a>(&'a [u8]);
+impl core::fmt::Display for RawText<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for chunk in self.0.utf8_chunks() {
+            f.write_str(chunk.valid())?;
+            if !chunk.invalid().is_empty() {
+                f.write_str("?")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn error_str() -> &'static [u8] {
@@ -324,283 +893,245 @@ pub fn error_str() -> &'static [u8] {
     if s.error.is_null() {
         return &[];
     }
-    unsafe { core::slice::from_raw_parts(s.error as *const u8, s.error_len) }
+    unsafe { slice(s.error as *const u8, s.error_len) }
 }
 
-pub unsafe fn new_map() -> *mut LinkMap {
-    unsafe {
-        let m = alloc_calloc(core::mem::size_of::<LinkMap>(), 16) as *mut LinkMap;
-        (*m).l_real = m;
-        m
+pub fn error_obj() -> &'static [u8] {
+    let s = st();
+    &error_str()[s.error_obj.0..s.error_obj.1]
+}
+pub fn error_msg() -> &'static [u8] {
+    let s = st();
+    &error_str()[s.error_msg.0..s.error_msg.1]
+}
+pub fn error_code() -> c_int {
+    st().error_code
+}
+
+pub fn new_map() -> Map {
+    let p = alloc_calloc(core::mem::size_of::<LinkMap>(), 16) as *mut LinkMap;
+    let m = unsafe { Map::from_ptr(p) };
+    match m {
+        Some(m) => {
+            m.set_real(Some(m));
+            m
+        }
+        None => crate::die(format_args!("cannot allocate memory")),
     }
 }
 
-pub unsafe fn link_map(m: *mut LinkMap) {
-    unsafe {
-        let s = ns((*m).l_ns as usize);
-        (*m).l_prev = s.tail;
-        (*m).l_next = null_mut();
-        if s.tail.is_null() {
-            s.head = m;
-        } else {
-            (*s.tail).l_next = m;
-        }
-        s.tail = m;
-        s.nmaps += 1;
-        if s.libc_map.is_null() && !(*m).soname.is_null() && cstr((*m).soname) == b"libc.so.6" {
-            s.libc_map = m;
-        }
+pub fn link_map(m: Map) {
+    let s = ns(m.l_ns() as usize);
+    m.set_prev(s.tail);
+    m.set_next(None);
+    match s.tail {
+        None => s.head = Some(m),
+        Some(t) => t.set_next(Some(m)),
+    }
+    s.tail = Some(m);
+    s.nmaps += 1;
+    if s.libc_map.is_none() && m.soname() == Some(b"libc.so.6") {
+        s.libc_map = Some(m);
     }
 }
 
-pub unsafe fn unlink_map(m: *mut LinkMap) {
-    unsafe {
-        let s = ns((*m).l_ns as usize);
-        if (*m).l_prev.is_null() {
-            s.head = (*m).l_next;
-            (*crate::rdebug((*m).l_ns as usize)).map = s.head;
-        } else {
-            (*(*m).l_prev).l_next = (*m).l_next;
+pub fn unlink_map(m: Map) {
+    let s = ns(m.l_ns() as usize);
+    match m.prev() {
+        None => {
+            s.head = m.next();
+            crate::rdebug_set_map(m.l_ns() as usize, s.head);
         }
-        if (*m).l_next.is_null() {
-            s.tail = (*m).l_prev;
-        } else {
-            (*(*m).l_next).l_prev = (*m).l_prev;
-        }
-        s.nmaps -= 1;
-        if s.libc_map == m {
-            s.libc_map = null_mut();
-        }
-        trim_nns();
+        Some(p) => p.set_next(m.next()),
     }
+    match m.next() {
+        None => s.tail = m.prev(),
+        Some(n) => n.set_prev(m.prev()),
+    }
+    s.nmaps -= 1;
+    if s.libc_map == Some(m) {
+        s.libc_map = None;
+    }
+    trim_nns();
 }
 
 pub fn trim_nns() {
     let s = st();
-    while s.nns > 1 && ns(s.nns - 1).head.is_null() {
+    while s.nns > 1 && ns(s.nns - 1).head.is_none() {
         s.nns -= 1;
     }
 }
 
-pub unsafe fn parse_dynamic(m: *mut LinkMap) {
-    unsafe {
-        let a = (*m).l_addr;
-        let mut d = (*m).l_ld;
-        let mut hash = 0usize;
-        let mut gnu = 0usize;
-        let mut versym = 0usize;
-        while (*d).tag != DT_NULL {
-            let v = (*d).val as usize;
-            match (*d).tag {
-                DT_STRTAB => (*m).strtab = (a + v) as *const u8,
-                DT_STRSZ => (*m).strsz = v,
-                DT_SYMTAB => (*m).symtab = (a + v) as *const Sym,
-                DT_HASH => hash = a + v,
-                DT_GNU_HASH => gnu = a + v,
-                DT_RELA => (*m).rela = (a + v) as *const Rela,
-                DT_RELASZ => (*m).relasz = v,
-                DT_JMPREL => (*m).jmprel = (a + v) as *const Rela,
-                DT_PLTRELSZ => (*m).pltrelsz = v,
-                DT_RELR => (*m).relr = (a + v) as *const u64,
-                DT_RELRSZ => (*m).relrsz = v,
-                DT_PLTGOT => (*m).pltgot = (a + v) as *mut usize,
-                DT_INIT => (*m).init = a + v,
-                DT_FINI => (*m).fini = a + v,
-                DT_INIT_ARRAY => (*m).init_array = (a + v) as *const usize,
-                DT_INIT_ARRAYSZ => (*m).init_arraysz = v,
-                DT_FINI_ARRAY => (*m).fini_array = (a + v) as *const usize,
-                DT_FINI_ARRAYSZ => (*m).fini_arraysz = v,
-                DT_PREINIT_ARRAY => (*m).preinit_array = (a + v) as *const usize,
-                DT_PREINIT_ARRAYSZ => (*m).preinit_arraysz = v,
-                DT_VERSYM => versym = a + v,
-                DT_VERDEF => (*m).verdef = (a + v) as *const Verdef,
-                DT_VERDEFNUM => (*m).verdefnum = v,
-                DT_VERNEED => (*m).verneed = (a + v) as *const Verneed,
-                DT_VERNEEDNUM => (*m).verneednum = v,
-                DT_FLAGS => (*m).flags = v as u64,
-                DT_FLAGS_1 => (*m).flags_1 = v as u64,
-                DT_AUDIT => (*m).audit_str = v as u64 + 1,
-                DT_DEPAUDIT => (*m).depaudit_str = v as u64 + 1,
-                DT_BIND_NOW => (*m).bind_now = true,
-                DT_TEXTREL => (*m).textrel = true,
-                DT_SYMBOLIC => (*m).flags |= DF_SYMBOLIC,
-                DT_DEBUG => {}
-                _ => {}
-            }
-            d = d.add(1);
+pub unsafe fn parse_dynamic(m: Map) {
+    let a = m.l_addr();
+    let mut hash = 0usize;
+    let mut gnu = 0usize;
+    let mut versym = 0usize;
+    for d in m.dynamic() {
+        let v = d.val as usize;
+        match d.tag {
+            DT_STRTAB => unsafe { m.set_strtab((a + v) as *const u8) },
+            DT_STRSZ => unsafe { m.set_strsz(v) },
+            DT_SYMTAB => unsafe { m.set_symtab((a + v) as *const Sym) },
+            DT_HASH => hash = a + v,
+            DT_GNU_HASH => gnu = a + v,
+            DT_RELA => unsafe { m.set_rela((a + v) as *const Rela) },
+            DT_RELASZ => unsafe { m.set_relasz(v) },
+            DT_JMPREL => unsafe { m.set_jmprel((a + v) as *const Rela) },
+            DT_PLTRELSZ => unsafe { m.set_pltrelsz(v) },
+            DT_RELR => unsafe { m.set_relr((a + v) as *const u64) },
+            DT_RELRSZ => unsafe { m.set_relrsz(v) },
+            DT_PLTGOT => unsafe { m.set_pltgot((a + v) as *mut usize) },
+            DT_INIT => m.set_init(a + v),
+            DT_FINI => m.set_fini(a + v),
+            DT_INIT_ARRAY => unsafe { m.set_init_array((a + v) as *const usize) },
+            DT_INIT_ARRAYSZ => unsafe { m.set_init_arraysz(v) },
+            DT_FINI_ARRAY => unsafe { m.set_fini_array((a + v) as *const usize) },
+            DT_FINI_ARRAYSZ => unsafe { m.set_fini_arraysz(v) },
+            DT_PREINIT_ARRAY => unsafe { m.set_preinit_array((a + v) as *const usize) },
+            DT_PREINIT_ARRAYSZ => unsafe { m.set_preinit_arraysz(v) },
+            DT_VERSYM => versym = a + v,
+            DT_VERDEF => unsafe { m.set_verdef((a + v) as *const Verdef) },
+            DT_VERDEFNUM => unsafe { m.set_verdefnum(v) },
+            DT_VERNEED => unsafe { m.set_verneed((a + v) as *const Verneed) },
+            DT_VERNEEDNUM => unsafe { m.set_verneednum(v) },
+            DT_FLAGS => m.set_flags(v as u64),
+            DT_FLAGS_1 => m.set_flags_1(v as u64),
+            DT_AUDIT => unsafe { m.set_audit_str(v as u64 + 1) },
+            DT_DEPAUDIT => unsafe { m.set_depaudit_str(v as u64 + 1) },
+            DT_BIND_NOW => m.set_bind_now(true),
+            DT_TEXTREL => m.set_textrel(true),
+            DT_SYMBOLIC => m.set_flags(m.flags() | DF_SYMBOLIC),
+            DT_DEBUG => {}
+            _ => {}
         }
-        if (*m).flags & DF_TEXTREL != 0 {
-            (*m).textrel = true;
+    }
+    if m.flags() & DF_TEXTREL != 0 {
+        m.set_textrel(true);
+    }
+    if m.flags() & DF_BIND_NOW != 0 || m.flags_1() & DF_1_NOW != 0 {
+        m.set_bind_now(true);
+    }
+    if m.flags_1() & DF_1_NODELETE != 0 {
+        m.set_nodelete(true);
+    }
+    let strtab = m.strtab();
+    for d in m.dynamic() {
+        let p = strtab.wrapping_add(d.val as usize);
+        match d.tag {
+            DT_SONAME => unsafe { m.set_soname(p) },
+            DT_RPATH => unsafe { m.set_rpath(p) },
+            DT_RUNPATH => unsafe { m.set_runpath(p) },
+            _ => {}
         }
-        if (*m).flags & DF_BIND_NOW != 0 || (*m).flags_1 & DF_1_NOW != 0 {
-            (*m).bind_now = true;
-        }
-        if (*m).flags_1 & DF_1_NODELETE != 0 {
-            (*m).nodelete = true;
-        }
-        let mut d = (*m).l_ld;
-        while (*d).tag != DT_NULL {
-            let v = (*d).val as usize;
-            match (*d).tag {
-                DT_SONAME => (*m).soname = (*m).strtab.add(v),
-                DT_RPATH => (*m).rpath = (*m).strtab.add(v),
-                DT_RUNPATH => (*m).runpath = (*m).strtab.add(v),
-                _ => {}
-            }
-            d = d.add(1);
-        }
-        if gnu != 0 {
-            let h = gnu as *const u32;
-            (*m).gnu_nbuckets = *h;
-            (*m).gnu_symoffset = *h.add(1);
-            (*m).gnu_bloom_size = *h.add(2);
-            (*m).gnu_bloom_shift = *h.add(3);
-            (*m).gnu_bloom = h.add(4) as *const u64;
-            (*m).gnu_buckets = h.add(4 + 2 * (*m).gnu_bloom_size as usize);
-            (*m).gnu_chain = (*m).gnu_buckets.add((*m).gnu_nbuckets as usize);
-        }
-        if hash != 0 {
-            let h = hash as *const u32;
-            (*m).hash_nbucket = *h;
-            (*m).hash_nchain = *h.add(1);
-            (*m).hash_buckets = h.add(2);
-            (*m).hash_chains = h.add(2 + (*m).hash_nbucket as usize);
-        }
-        (*m).versym = versym as *const u16;
-        build_versions(m);
-        let mut writable = false;
-        for i in 0..(*m).phnum {
-            let p = &*(*m).phdr.add(i);
-            if p.typ == PT_DYNAMIC && p.flags & PF_W != 0 {
-                writable = true;
-            }
-        }
-        if writable && a != 0 && !(*m).dyn_adjusted {
-            (*m).dyn_adjusted = true;
-            let mut d = (*m).l_ld;
-            while (*d).tag != DT_NULL {
-                if matches!((*d).tag, DT_HASH | DT_PLTGOT | DT_STRTAB | DT_SYMTAB | DT_RELA | DT_JMPREL | DT_VERSYM | DT_GNU_HASH | DT_RELR) {
-                    (*d).val = (*d).val.wrapping_add(a as u64);
-                }
-                d = d.add(1);
-            }
-        }
+    }
+    if gnu != 0 {
+        let h = gnu as *const u32;
+        let hdr = unsafe { slice(h, 4) };
+        m.set_gnu_nbuckets(hdr[0]);
+        m.set_gnu_symoffset(hdr[1]);
+        m.set_gnu_bloom_size(hdr[2]);
+        m.set_gnu_bloom_shift(hdr[3]);
+        let bloom = h.wrapping_add(4) as *const u64;
+        let buckets = h.wrapping_add(4 + 2 * hdr[2] as usize);
+        unsafe { m.set_gnu_bloom(bloom) };
+        unsafe { m.set_gnu_buckets(buckets) };
+        unsafe { m.set_gnu_chain(buckets.wrapping_add(hdr[0] as usize)) };
+    }
+    if hash != 0 {
+        let h = hash as *const u32;
+        let hdr = unsafe { slice(h, 2) };
+        m.set_hash_nbucket(hdr[0]);
+        m.set_hash_nchain(hdr[1]);
+        unsafe { m.set_hash_buckets(h.wrapping_add(2)) };
+        unsafe { m.set_hash_chains(h.wrapping_add(2 + hdr[0] as usize)) };
+    }
+    unsafe { m.set_versym(versym as *const u16) };
+    build_versions(m);
+    let writable = m.phdrs().iter().any(|p| p.typ == PT_DYNAMIC && p.flags & PF_W != 0);
+    if writable && a != 0 && !m.dyn_adjusted() {
+        m.set_dyn_adjusted(true);
+        dyn_rebase(m, a as u64, true);
     }
 }
 
-unsafe fn build_versions(m: *mut LinkMap) {
-    unsafe {
-        let mut max = 0usize;
-        let mut vd = (*m).verdef;
-        for _ in 0..(*m).verdefnum {
-            max = max.max((*vd).ndx as usize & 0x7fff);
-            vd = (vd as *const u8).add((*vd).next as usize) as *const Verdef;
+pub fn dyn_rebase(m: Map, a: u64, add: bool) {
+    let mut d = m.l_ld();
+    loop {
+        let e = unsafe { *d };
+        if e.tag == DT_NULL {
+            break;
         }
-        let mut vn = (*m).verneed;
-        for _ in 0..(*m).verneednum {
-            let mut aux = (vn as *const u8).add((*vn).aux as usize) as *const Vernaux;
-            for _ in 0..(*vn).cnt {
-                max = max.max((*aux).other as usize & 0x7fff);
-                aux = (aux as *const u8).add((*aux).next as usize) as *const Vernaux;
-            }
-            vn = (vn as *const u8).add((*vn).next as usize) as *const Verneed;
+        if matches!(e.tag, DT_HASH | DT_PLTGOT | DT_STRTAB | DT_SYMTAB | DT_RELA | DT_JMPREL | DT_VERSYM | DT_GNU_HASH | DT_RELR) {
+            let v = if add { e.val.wrapping_add(a) } else { e.val.wrapping_sub(a) };
+            unsafe { (*d).val = v };
         }
-        if max == 0 {
-            return;
-        }
-        let tbl = alloc_perm((max + 1) * core::mem::size_of::<VerInfo>(), 8) as *mut VerInfo;
-        for i in 0..=max {
-            *tbl.add(i) = VerInfo { name: null(), hash: 0, file: null(), hidden: false };
-        }
-        let mut vd = (*m).verdef;
-        for _ in 0..(*m).verdefnum {
-            let idx = (*vd).ndx as usize & 0x7fff;
-            let aux = (vd as *const u8).add((*vd).aux as usize) as *const Verdaux;
-            if (*vd).flags & 1 == 0 {
-                *tbl.add(idx) = VerInfo { name: (*m).strtab.add((*aux).name as usize), hash: (*vd).hash, file: null(), hidden: false };
-            }
-            vd = (vd as *const u8).add((*vd).next as usize) as *const Verdef;
-        }
-        let mut vn = (*m).verneed;
-        for _ in 0..(*m).verneednum {
-            let file = (*m).strtab.add((*vn).file as usize);
-            let mut aux = (vn as *const u8).add((*vn).aux as usize) as *const Vernaux;
-            for _ in 0..(*vn).cnt {
-                let idx = (*aux).other as usize & 0x7fff;
-                *tbl.add(idx) = VerInfo { name: (*m).strtab.add((*aux).name as usize), hash: (*aux).hash, file, hidden: (*aux).other & 0x8000 != 0 };
-                aux = (aux as *const u8).add((*aux).next as usize) as *const Vernaux;
-            }
-            vn = (vn as *const u8).add((*vn).next as usize) as *const Verneed;
-        }
-        (*m).vers = tbl;
-        (*m).nvers = max + 1;
+        d = d.wrapping_add(1);
     }
 }
 
-pub unsafe fn dep_names(m: *mut LinkMap, mut f: impl FnMut(&'static [u8], u8)) {
-    unsafe {
-        for pass in 0..2 {
-            let mut d = (*m).l_ld;
-            while (*d).tag != DT_NULL {
-                let kind = match (*d).tag {
-                    DT_NEEDED => 0,
-                    DT_AUXILIARY => 1,
-                    DT_FILTER => 2,
-                    _ => 3,
-                };
-                if kind != 3 && (kind == 0) == (pass == 0) {
-                    f(cstr((*m).strtab.add((*d).val as usize)), kind);
-                }
-                d = d.add(1);
-            }
+fn build_versions(m: Map) {
+    let mut max = 0usize;
+    for (vd, _) in m.verdefs() {
+        max = max.max(vd.ndx as usize & 0x7fff);
+    }
+    for (_, _, aux) in m.verneeds() {
+        for (a, _) in aux {
+            max = max.max(a.other as usize & 0x7fff);
         }
     }
-}
-
-pub unsafe fn needed_names(m: *mut LinkMap, mut f: impl FnMut(&'static [u8])) {
-    unsafe {
-        let mut d = (*m).l_ld;
-        while (*d).tag != DT_NULL {
-            if (*d).tag == DT_NEEDED {
-                f(cstr((*m).strtab.add((*d).val as usize)));
-            }
-            d = d.add(1);
+    if max == 0 {
+        return;
+    }
+    let tbl = alloc_perm((max + 1) * core::mem::size_of::<VerInfo>(), 8) as *mut VerInfo;
+    let t = unsafe { crate::ffi::slice_mut(tbl, max + 1) };
+    for e in t.iter_mut() {
+        *e = VerInfo { name: None, hash: 0, file: None, hidden: false };
+    }
+    for (vd, name) in m.verdefs() {
+        let idx = vd.ndx as usize & 0x7fff;
+        if vd.flags & 1 == 0 {
+            t[idx] = VerInfo { name: Some(name), hash: vd.hash, file: None, hidden: false };
         }
     }
+    for (_, file, aux) in m.verneeds() {
+        for (a, name) in aux {
+            let idx = a.other as usize & 0x7fff;
+            t[idx] = VerInfo { name: Some(name), hash: a.hash, file: Some(file), hidden: a.other & 0x8000 != 0 };
+        }
+    }
+    unsafe { m.set_vers(tbl) };
+    unsafe { m.set_nvers(max + 1) };
 }
 
-pub unsafe fn scan_phdrs(m: *mut LinkMap) {
-    unsafe {
-        let a = (*m).l_addr;
-        let (mut lo, mut hi) = (usize::MAX, 0usize);
-        for i in 0..(*m).phnum {
-            let p = &*(*m).phdr.add(i);
-            if p.typ == PT_LOAD {
-                lo = lo.min(page_down(p.vaddr as usize));
-                hi = hi.max(page_up((p.vaddr + p.memsz) as usize));
-            }
+pub unsafe fn scan_phdrs(m: Map) {
+    let a = m.l_addr();
+    let (mut lo, mut hi) = (usize::MAX, 0usize);
+    for p in m.phdrs() {
+        if p.typ == PT_LOAD {
+            lo = lo.min(page_down(p.vaddr as usize));
+            hi = hi.max(page_up((p.vaddr + p.memsz) as usize));
         }
-        if (*m).map_end == 0 && lo != usize::MAX {
-            (*m).map_start = a + lo;
-            (*m).map_end = a + hi;
-        }
-        for i in 0..(*m).phnum {
-            let p = &*(*m).phdr.add(i);
-            match p.typ {
-                PT_DYNAMIC => (*m).l_ld = (a + p.vaddr as usize) as *mut Dyn,
-                PT_TLS => {
-                    (*m).tls_image = a + p.vaddr as usize;
-                    (*m).tls_filesz = p.filesz as usize;
-                    (*m).tls_memsz = p.memsz as usize;
-                    (*m).tls_align = (p.align as usize).max(1);
-                }
-                PT_GNU_RELRO => {
-                    (*m).relro_start = a + p.vaddr as usize;
-                    (*m).relro_len = p.memsz as usize;
-                }
-                PT_GNU_EH_FRAME => (*m).eh_frame_hdr = a + p.vaddr as usize,
-                _ => {}
+    }
+    if m.map_end() == 0 && lo != usize::MAX {
+        m.set_map_start(a + lo);
+        m.set_map_end(a + hi);
+    }
+    for p in m.phdrs() {
+        match p.typ {
+            PT_DYNAMIC => unsafe { m.set_l_ld((a + p.vaddr as usize) as *mut Dyn) },
+            PT_TLS => {
+                unsafe { m.set_tls_image(a + p.vaddr as usize) };
+                unsafe { m.set_tls_filesz(p.filesz as usize) };
+                unsafe { m.set_tls_memsz(p.memsz as usize) };
+                m.set_tls_align((p.align as usize).max(1));
             }
+            PT_GNU_RELRO => {
+                m.set_relro_start(a + p.vaddr as usize);
+                m.set_relro_len(p.memsz as usize);
+            }
+            PT_GNU_EH_FRAME => m.set_eh_frame_hdr(a + p.vaddr as usize),
+            _ => {}
         }
     }
 }
@@ -612,730 +1143,784 @@ fn page_up(x: usize) -> usize {
     (x + sys::PAGE - 1) & !(sys::PAGE - 1)
 }
 
-pub unsafe fn make_stack_executable() -> isize {
-    unsafe {
-        let page = crate::__libc_stack_end & !(sys::PAGE - 1);
-        let r = sys::mprotect(page, sys::PAGE, sys::PROT_READ | sys::PROT_WRITE | sys::PROT_EXEC | 0x0100_0000 );
-        if r == 0 {
-            st().stack_exec = true;
-        }
-        r
+pub fn make_stack_executable() -> isize {
+    let page = crate::__libc_stack_end.load(core::sync::atomic::Ordering::Relaxed) & !(sys::PAGE - 1);
+    let r = unsafe { sys::mprotect(page, sys::PAGE, sys::PROT_READ | sys::PROT_WRITE | sys::PROT_EXEC | 0x0100_0000 ) };
+    if r == 0 {
+        st().stack_exec = true;
     }
+    r
 }
 
-fn errno_text(e: isize) -> &'static str {
-    match -e {
+pub fn errno_text(e: c_int) -> &'static str {
+    match e {
         1 => "Operation not permitted",
-        22 => "Invalid argument",
         2 => "No such file or directory",
-        13 => "Permission denied",
+        5 => "Input/output error",
+        8 => "Exec format error",
         12 => "Cannot allocate memory",
+        13 => "Permission denied",
         20 => "Not a directory",
         21 => "Is a directory",
+        22 => "Invalid argument",
+        23 => "Too many open files in system",
         24 => "Too many open files",
-        8 => "Exec format error",
-        _ => "Input/output error",
+        36 => "File name too long",
+        40 => "Too many levels of symbolic links",
+        _ => "Unknown error",
     }
 }
 
-pub unsafe fn map_file(nsid: usize, path: *const u8, name: *const u8, loader: *mut LinkMap) -> *mut LinkMap {
-    unsafe {
-        let fd = sys::open(path);
-        if fd < 0 {
-            set_error(format_args!("cannot open shared object file: {}", errno_text(fd)));
-            return null_mut();
-        }
-        let r = map_fd(nsid, fd, name, loader);
-        sys::close(fd);
-        r
-    }
+fn neg_errno(r: isize) -> c_int {
+    if r < 0 && r > -4096 { -r as c_int } else { 0 }
 }
 
-unsafe fn map_fd(nsid: usize, fd: isize, name: *const u8, loader: *mut LinkMap) -> *mut LinkMap {
-    unsafe {
-        let (dev, ino) = sys::fstat_id(fd);
-        let mut cur = ns(nsid).head;
-        while !cur.is_null() {
-            if (*cur).dev == dev && (*cur).ino == ino && dev != 0 && !(*cur).unloading {
-                return cur;
-            }
-            cur = (*cur).l_next;
+pub static SKIPPED: AtomicU8 = AtomicU8::new(0);
+
+pub fn map_file(nsid: usize, path: &CStr, name: &'static CStr, loader: Option<Map>) -> Option<Map> {
+    let fd = sys::open(path);
+    if fd < 0 {
+        set_error_at(b"", neg_errno(fd), format_args!("cannot open shared object file"));
+        return None;
+    }
+    let r = map_fd(nsid, fd, name, loader);
+    sys::close(fd);
+    if r.is_none() {
+        match SKIPPED.load(Relaxed) {
+            1 => set_error(format_args!("wrong ELF class: ELFCLASS32")),
+            2 => set_error_at(b"", 2, format_args!("cannot open shared object file")),
+            _ => {}
         }
-        let mut hdr_buf = core::mem::MaybeUninit::<[u64; 128]>::uninit();
-        let hdr = hdr_buf.as_mut_ptr() as *mut u8;
-        let n = sys::pread(fd, hdr, 1024, 0);
-        if n < 0 {
-            set_error(format_args!("cannot read file data: {}", errno_text(n)));
-            return null_mut();
-        }
-        if n < core::mem::size_of::<Ehdr>() as isize {
-            set_error(format_args!("file too short"));
-            return null_mut();
-        }
-        let eh = &*(hdr as *const Ehdr);
-        if &eh.ident[..4] != b"\x7fELF" || eh.ident[5] != 1 || eh.ident[6] != 1 {
-            set_error(format_args!("invalid ELF header"));
-            return null_mut();
-        }
-        if eh.ident[4] != 2 {
+    }
+    r
+}
+
+fn map_fd(nsid: usize, fd: isize, name: &'static CStr, loader: Option<Map>) -> Option<Map> {
+    let (dev, ino) = sys::fstat_id(fd);
+    if let Some(cur) = ns(nsid).maps().find(|c| c.dev() == dev && c.ino() == ino && dev != 0 && !c.unloading()) {
+        return Some(cur);
+    }
+    let mut hdr_buf = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+    let hdr_bytes = unsafe { crate::ffi::slice_mut(hdr_buf.as_mut_ptr() as *mut core::mem::MaybeUninit<u8>, 1024) };
+    SKIPPED.store(0, Relaxed);
+    let file = name.to_bytes();
+    let n = sys::pread(fd, hdr_bytes, 0);
+    if n < core::mem::size_of::<Ehdr>() as isize {
+        let e = neg_errno(n);
+        set_error_at(file, e, format_args!("{}", if e == 0 { "file too short" } else { "cannot read file data" }));
+        return None;
+    }
+    let hdr = hdr_buf.as_ptr() as *const u8;
+    let eh = unsafe { at(hdr as *const Ehdr) };
+    let id = &eh.ident;
+    let osabi_ok = id[7] == 0 || id[7] == 3;
+    let abiver_ok = id[8] == 0 || (id[7] == 3 && id[8] < 4);
+    if &id[..4] != b"\x7fELF" || id[4] != 2 || id[5] != 1 || id[6] != 1 || !osabi_ok || !abiver_ok || id[9..16].iter().any(|&b| b != 0) {
+        let msg = if &id[..4] != b"\x7fELF" {
+            "invalid ELF header"
+        } else if id[4] != 2 {
+            SKIPPED.store(1, Relaxed);
             set_error(format_args!("wrong ELF class: ELFCLASS32"));
-            return null_mut();
-        }
-        if eh.machine != EM_X86_64 || (eh.typ != ET_DYN && eh.typ != ET_EXEC) {
-            set_error(format_args!("cannot open shared object file: not an x86-64 shared object"));
-            return null_mut();
-        }
-        if st().started && eh.typ == ET_EXEC {
-            set_error(format_args!("cannot dynamically load executable"));
-            return null_mut();
-        }
-        let phn = eh.phnum as usize;
-        let phsz = phn * core::mem::size_of::<Phdr>();
-        let mut phbuf: *mut u8 = hdr.add(eh.phoff as usize);
-        if eh.phoff as usize + phsz > n as usize {
-            phbuf = alloc_perm(phsz, 8);
-            if sys::pread(fd, phbuf, phsz, eh.phoff as usize) != phsz as isize {
-                set_error(format_args!("file too short"));
-                return null_mut();
-            }
-        }
-        let ph = core::slice::from_raw_parts(phbuf as *const Phdr, phn);
-        if ph.iter().any(|p| p.typ == PT_LOAD && (p.vaddr.wrapping_sub(p.offset) as usize) & (sys::PAGE - 1) != 0) {
-            set_error(format_args!("ELF load command address/offset not page-aligned"));
-            return null_mut();
-        }
-        if !st().stack_exec && ph.iter().find(|p| p.typ == PT_GNU_STACK).is_none_or(|p| p.flags & PF_X != 0) {
-            let err = if !st().started && st().execstack_mode == 1 { make_stack_executable() } else { -22 };
-            if err != 0 {
-                set_error(format_args!("cannot enable executable stack as shared object requires: {}", errno_text(err)));
-                st().hard_error = true;
-                return null_mut();
-            }
-        }
-        let (mut lo, mut hi) = (usize::MAX, 0usize);
-        for p in ph {
-            if p.typ == PT_LOAD {
-                lo = lo.min(page_down(p.vaddr as usize));
-                hi = hi.max(page_up((p.vaddr + p.memsz) as usize));
-            }
-        }
-        if lo == usize::MAX {
-            set_error(format_args!("object file has no loadable segments"));
-            return null_mut();
-        }
-        let span = hi - lo;
-        let first_load = ph.iter().find(|p| p.typ == PT_LOAD).unwrap();
-        let merged = first_load.flags & PF_W == 0 && first_load.memsz == first_load.filesz && page_down(first_load.vaddr as usize) == lo;
-        let base;
-        if eh.typ == ET_EXEC {
-            let (prot0, flags, fd0, off0) = if merged {
-                let p0 = (if first_load.flags & PF_R != 0 { sys::PROT_READ } else { 0 }) | (if first_load.flags & PF_X != 0 { sys::PROT_EXEC } else { 0 });
-                (p0, sys::MAP_PRIVATE | sys::MAP_FIXED_NOREPLACE, fd, page_down(first_load.offset as usize))
-            } else {
-                (sys::PROT_NONE, sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_FIXED_NOREPLACE, -1, 0)
-            };
-            let r = sys::mmap(lo, span, prot0, flags, fd0, off0);
-            if r < 0 && r > -4096 {
-                set_error(format_args!("cannot map executable at its fixed address"));
-                return null_mut();
-            }
-            base = 0usize;
-        } else if merged {
-            let prot0 = (if first_load.flags & PF_R != 0 { sys::PROT_READ } else { 0 }) | (if first_load.flags & PF_X != 0 { sys::PROT_EXEC } else { 0 });
-            let r = sys::mmap(0, span, prot0, sys::MAP_PRIVATE | map32_flag(ph), fd, page_down(first_load.offset as usize));
-            if r < 0 && r > -4096 {
-                set_error(format_args!("failed to map segment from shared object: {}", errno_text(r)));
-                return null_mut();
-            }
-            base = (r as usize).wrapping_sub(lo);
+            return None;
+        } else if id[5] != 1 {
+            "ELF file data encoding not little-endian"
+        } else if id[6] != 1 {
+            "ELF file version ident does not match current one"
+        } else if !osabi_ok {
+            "ELF file OS ABI invalid"
+        } else if !abiver_ok {
+            "ELF file ABI version invalid"
         } else {
-            let r = sys::mmap(0, span, sys::PROT_NONE, sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | map32_flag(ph), -1, 0);
-            if r < 0 && r > -4096 {
-                set_error(format_args!("failed to map segment from shared object: {}", errno_text(r)));
-                return null_mut();
-            }
-            base = (r as usize).wrapping_sub(lo);
-        }
-        let mut first = true;
-        let mut load0_off = 0usize;
-        let mut load0_vaddr = 0usize;
-        let mut prev_end = 0usize;
-        for p in ph {
-            if p.typ != PT_LOAD {
-                continue;
-            }
-            let was_first = first;
-            if first {
-                load0_off = p.offset as usize;
-                load0_vaddr = p.vaddr as usize;
-                first = false;
-            }
-            let prot = (if p.flags & PF_R != 0 { sys::PROT_READ } else { 0 }) | (if p.flags & PF_W != 0 { sys::PROT_WRITE } else { 0 }) | (if p.flags & PF_X != 0 { sys::PROT_EXEC } else { 0 });
-            let vaddr = p.vaddr as usize;
-            let start = page_down(vaddr);
-            let off = page_down(p.offset as usize);
-            let filend = vaddr + p.filesz as usize;
-            if merged && !was_first && start > prev_end {
-                sys::mprotect(base + prev_end, start - prev_end, sys::PROT_NONE);
-            }
-            if !(merged && was_first) {
-                let r = sys::mmap(base + start, page_up(filend) - start, prot, sys::MAP_PRIVATE | sys::MAP_FIXED, fd, off);
-                if r < 0 && r > -4096 {
-                    set_error(format_args!("failed to map segment from shared object: {}", errno_text(r)));
-                    sys::munmap(base + lo, span);
-                    return null_mut();
-                }
-            }
-            let memend = vaddr + p.memsz as usize;
-            prev_end = page_up(memend);
-            if memend > filend {
-                if p.flags & PF_W != 0 && filend & (sys::PAGE - 1) != 0 {
-                    let z = page_up(filend) - filend;
-                    core::ptr::write_bytes((base + filend) as *mut u8, 0, z.min(memend - filend));
-                }
-                let anon_start = page_up(filend);
-                let anon_end = page_up(memend);
-                if anon_end > anon_start {
-                    let r = sys::mmap(base + anon_start, anon_end - anon_start, prot, sys::MAP_PRIVATE | sys::MAP_FIXED | sys::MAP_ANONYMOUS, -1, 0);
-                    if r < 0 && r > -4096 {
-                        set_error(format_args!("failed to map segment from shared object: {}", errno_text(r)));
-                        return null_mut();
-                    }
-                }
-            }
-        }
-        let m = new_map();
-        (*m).l_ns = nsid as isize;
-        (*m).l_addr = base;
-        (*m).l_name = name;
-        (*m).typ = eh.typ;
-        (*m).map_start = base + lo;
-        (*m).map_end = base + hi;
-        (*m).entry = base + eh.entry as usize;
-        (*m).dev = dev;
-        (*m).ino = ino;
-        (*m).loader = loader;
-        let ph_copy = alloc_perm(phsz, 8) as *mut Phdr;
-        core::ptr::copy_nonoverlapping(ph.as_ptr(), ph_copy, phn);
-        (*m).phdr = (base + load0_vaddr + (eh.phoff as usize - load0_off)) as *const Phdr;
-        let in_map = (eh.phoff as usize) >= load0_off && (eh.phoff as usize + phsz) <= load0_off + 0x100000;
-        if !in_map {
-            (*m).phdr = ph_copy;
-        }
-        (*m).phnum = phn;
-        scan_phdrs(m);
-        if (*m).l_ld.is_null() {
-            set_error(format_args!("object file has no dynamic section"));
-            return null_mut();
-        }
-        parse_dynamic(m);
-        m
+            "nonzero padding in e_ident"
+        };
+        set_error_at(file, 0, format_args!("{}", msg));
+        return None;
     }
+    if eh.version != 1 {
+        set_error_at(file, 0, format_args!("ELF file version does not match current one"));
+        return None;
+    }
+    if eh.machine != EM_X86_64 {
+        SKIPPED.store(2, Relaxed);
+        set_error_at(b"", 2, format_args!("cannot open shared object file"));
+        return None;
+    }
+    if eh.typ != ET_DYN && eh.typ != ET_EXEC {
+        set_error_at(file, 0, format_args!("only ET_DYN and ET_EXEC can be loaded"));
+        return None;
+    }
+    if eh.phentsize as usize != core::mem::size_of::<Phdr>() {
+        set_error_at(file, 0, format_args!("ELF file's phentsize not the expected size"));
+        return None;
+    }
+    let phn = eh.phnum as usize;
+    let phsz = phn * core::mem::size_of::<Phdr>();
+    let ph: &[Phdr] = if eh.phoff as usize + phsz > n as usize {
+        let phbuf = alloc_perm(phsz, 8);
+        let dst = unsafe { crate::ffi::slice_mut(phbuf as *mut core::mem::MaybeUninit<u8>, phsz) };
+        let r = sys::pread(fd, dst, eh.phoff as usize);
+        if r != phsz as isize {
+            set_error_at(file, neg_errno(r), format_args!("cannot read file data"));
+            return None;
+        }
+        unsafe { slice(phbuf as *const Phdr, phn) }
+    } else {
+        unsafe { slice(hdr.wrapping_add(eh.phoff as usize) as *const Phdr, phn) }
+    };
+    if ph.iter().any(|p| p.typ == PT_LOAD && (p.vaddr.wrapping_sub(p.offset) as usize) & (sys::PAGE - 1) != 0) {
+        set_error(format_args!("ELF load command address/offset not page-aligned"));
+        return None;
+    }
+    if !st().stack_exec && ph.iter().find(|p| p.typ == PT_GNU_STACK).is_none_or(|p| p.flags & PF_X != 0) {
+        let err = if !st().started && st().execstack_mode == 1 { make_stack_executable() } else { -22 };
+        if err != 0 {
+            set_error_at(b"", neg_errno(err), format_args!("cannot enable executable stack as shared object requires"));
+            st().hard_error = true;
+            return None;
+        }
+    }
+    let (mut lo, mut hi) = (usize::MAX, 0usize);
+    for p in ph {
+        if p.typ == PT_LOAD {
+            lo = lo.min(page_down(p.vaddr as usize));
+            hi = hi.max(page_up((p.vaddr + p.memsz) as usize));
+        }
+    }
+    if lo == usize::MAX {
+        set_error(format_args!("object file has no loadable segments"));
+        return None;
+    }
+    if st().started && eh.typ == ET_EXEC {
+        set_error(format_args!("cannot dynamically load executable"));
+        return None;
+    }
+    let span = hi - lo;
+    let first_load = ph.iter().find(|p| p.typ == PT_LOAD)?;
+    let merged = first_load.flags & PF_W == 0 && first_load.memsz == first_load.filesz && page_down(first_load.vaddr as usize) == lo;
+    let base = if eh.typ == ET_EXEC {
+        let (prot0, flags, fd0, off0) = if merged {
+            let p0 = (if first_load.flags & PF_R != 0 { sys::PROT_READ } else { 0 }) | (if first_load.flags & PF_X != 0 { sys::PROT_EXEC } else { 0 });
+            (p0, sys::MAP_PRIVATE | sys::MAP_FIXED_NOREPLACE, fd, page_down(first_load.offset as usize))
+        } else {
+            (sys::PROT_NONE, sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_FIXED_NOREPLACE, -1, 0)
+        };
+        let r = sys::mmap_new(lo, span, prot0, flags, fd0, off0);
+        if r < 0 && r > -4096 {
+            set_error(format_args!("cannot map executable at its fixed address"));
+            return None;
+        }
+        0usize
+    } else if merged {
+        let prot0 = (if first_load.flags & PF_R != 0 { sys::PROT_READ } else { 0 }) | (if first_load.flags & PF_X != 0 { sys::PROT_EXEC } else { 0 });
+        let r = sys::mmap_new(0, span, prot0, sys::MAP_PRIVATE | map32_flag(ph), fd, page_down(first_load.offset as usize));
+        if r < 0 && r > -4096 {
+            set_error(format_args!("failed to map segment from shared object"));
+            return None;
+        }
+        (r as usize).wrapping_sub(lo)
+    } else {
+        let r = sys::mmap_new(0, span, sys::PROT_NONE, sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | map32_flag(ph), -1, 0);
+        if r < 0 && r > -4096 {
+            set_error(format_args!("failed to map segment from shared object"));
+            return None;
+        }
+        (r as usize).wrapping_sub(lo)
+    };
+    let mut first = true;
+    let mut load0_off = 0usize;
+    let mut load0_vaddr = 0usize;
+    let mut prev_end = 0usize;
+    for p in ph {
+        if p.typ != PT_LOAD {
+            continue;
+        }
+        let was_first = first;
+        if first {
+            load0_off = p.offset as usize;
+            load0_vaddr = p.vaddr as usize;
+            first = false;
+        }
+        let prot = (if p.flags & PF_R != 0 { sys::PROT_READ } else { 0 }) | (if p.flags & PF_W != 0 { sys::PROT_WRITE } else { 0 }) | (if p.flags & PF_X != 0 { sys::PROT_EXEC } else { 0 });
+        let vaddr = p.vaddr as usize;
+        let start = page_down(vaddr);
+        let off = page_down(p.offset as usize);
+        let filend = vaddr + p.filesz as usize;
+        if merged && !was_first && start > prev_end {
+            unsafe { sys::mprotect(base + prev_end, start - prev_end, sys::PROT_NONE) };
+        }
+        if !(merged && was_first) {
+            let r = unsafe { sys::mmap(base + start, page_up(filend) - start, prot, sys::MAP_PRIVATE | sys::MAP_FIXED, fd, off) };
+            if r < 0 && r > -4096 {
+                set_error(format_args!("failed to map segment from shared object"));
+                unsafe { sys::munmap(base + lo, span) };
+                return None;
+            }
+        }
+        let memend = vaddr + p.memsz as usize;
+        prev_end = page_up(memend);
+        if memend > filend {
+            if p.flags & PF_W != 0 && filend & (sys::PAGE - 1) != 0 {
+                let z = page_up(filend) - filend;
+                unsafe { core::ptr::write_bytes((base + filend) as *mut u8, 0, z.min(memend - filend)) };
+            }
+            let anon_start = page_up(filend);
+            let anon_end = page_up(memend);
+            if anon_end > anon_start {
+                let r = unsafe { sys::mmap(base + anon_start, anon_end - anon_start, prot, sys::MAP_PRIVATE | sys::MAP_FIXED | sys::MAP_ANONYMOUS, -1, 0) };
+                if r < 0 && r > -4096 {
+                    set_error(format_args!("failed to map segment from shared object"));
+                    return None;
+                }
+            }
+        }
+    }
+    let m = new_map();
+    m.set_l_ns(nsid as isize);
+    m.set_l_addr(base);
+    unsafe { m.set_l_name(name.as_ptr() as *const u8) };
+    m.set_typ(eh.typ);
+    m.set_map_start(base + lo);
+    m.set_map_end(base + hi);
+    m.set_entry(base + eh.entry as usize);
+    m.set_dev(dev);
+    m.set_ino(ino);
+    m.set_loader(loader);
+    let ph_copy = alloc_perm(phsz, 8) as *mut Phdr;
+    unsafe { crate::ffi::slice_mut(ph_copy, phn) }.copy_from_slice(ph);
+    let in_map = (eh.phoff as usize) >= load0_off && (eh.phoff as usize + phsz) <= load0_off + 0x100000;
+    let phdr = if in_map { (base + load0_vaddr + (eh.phoff as usize - load0_off)) as *const Phdr } else { ph_copy as *const Phdr };
+    unsafe { m.set_phdr(phdr) };
+    unsafe { m.set_phnum(phn) };
+    unsafe { scan_phdrs(m) };
+    if m.l_ld().is_null() {
+        set_error(format_args!("object file has no dynamic section"));
+        return None;
+    }
+    unsafe { parse_dynamic(m) };
+    Some(m)
 }
 
-pub unsafe fn protect_relro(m: *mut LinkMap) {
-    unsafe {
-        if (*m).relro_len != 0 {
-            let s = page_down((*m).relro_start);
-            let e = page_down((*m).relro_start + (*m).relro_len);
-            if e > s {
-                sys::mprotect(s, e - s, sys::PROT_READ);
-            }
+pub fn protect_relro(m: Map) {
+    if m.relro_len() != 0 {
+        let s = page_down(m.relro_start());
+        let e = page_down(m.relro_start() + m.relro_len());
+        if e > s {
+            unsafe { sys::mprotect(s, e - s, sys::PROT_READ) };
         }
     }
 }
 
 const MAX_PATH: usize = 4096;
 
-pub unsafe fn origin_of(m: *mut LinkMap) -> &'static [u8] {
-    unsafe {
-        if (*m).origin.is_null() {
-            let mut path = PathBuf::new();
-            let mut p: &[u8] = cstr((*m).l_name);
-            if p.is_empty() {
-                path.grow(0, 4096);
-                let n = sys::readlink(c"/proc/self/exe".as_ptr() as *const u8, path.ptr(), path.cap() - 1);
-                if n > 0 {
-                    p = core::slice::from_raw_parts(path.ptr(), n as usize);
-                }
-            }
-            let end = p.iter().rposition(|&c| c == b'/');
-            let dir: &[u8] = match end {
-                Some(0) => b"/",
-                Some(i) => &p[..i],
-                None => b".",
-            };
-            (*m).origin = dup(dir);
-        }
-        cstr((*m).origin)
+pub fn origin_of(m: Map) -> &'static [u8] {
+    if let Some(o) = m.origin() {
+        return o;
     }
+    let mut path = PathBuf::new();
+    let mut p: &[u8] = m.name();
+    if p.is_empty() {
+        path.reserve(4096);
+        if path.readlink(c"/proc/self/exe") > 0 {
+            p = path.bytes();
+        }
+    }
+    let end = p.iter().rposition(|&c| c == b'/');
+    let dir: &[u8] = match end {
+        Some(0) => b"/",
+        Some(i) => &p[..i],
+        None => b".",
+    };
+    let o = dup(dir);
+    unsafe { m.set_origin(o.as_ptr() as *const u8) };
+    o.to_bytes()
 }
 
-pub(crate) unsafe fn expand(elem: &[u8], requester: *mut LinkMap, out: &mut PathBuf) -> usize {
-    unsafe {
-        let mut n = 0usize;
-        let mut i = 0usize;
-        let put = |out: &mut PathBuf, n: &mut usize, s: &[u8]| {
-            for &c in s {
-                if *n < MAX_PATH - 1 {
-                    if *n + 2 > out.cap() {
-                        out.grow(*n, *n + 2);
-                    }
-                    *out.ptr().add(*n) = c;
-                    *n += 1;
+pub(crate) fn expand(elem: &[u8], requester: Option<Map>, out: &mut PathBuf) -> usize {
+    let put = |out: &mut PathBuf, s: &[u8]| {
+        for &c in s {
+            if out.len() < MAX_PATH - 1 {
+                if out.len() + 2 > out.cap() {
+                    out.reserve(out.len() + 2);
                 }
+                out.push(c);
             }
-        };
-        while i < elem.len() {
-            if elem[i] == b'$' {
-                let rest = &elem[i + 1..];
-                let (name, brace) = if rest.first() == Some(&b'{') {
-                    let e = rest.iter().position(|&c| c == b'}').unwrap_or(rest.len());
-                    (&rest[1..e], true)
-                } else {
-                    let e = rest.iter().position(|&c| !(c.is_ascii_alphanumeric() || c == b'_')).unwrap_or(rest.len());
-                    (&rest[..e], false)
-                };
-                let consumed = 1 + name.len() + if brace { 2 } else { 0 };
-                match name {
-                    b"ORIGIN" if !requester.is_null() => {
-                        let o = origin_of(requester);
-                        put(out, &mut n, o);
-                    }
-                    b"LIB" => put(out, &mut n, b"lib64"),
-                    b"PLATFORM" => put(out, &mut n, b"x86_64"),
-                    _ => put(out, &mut n, &elem[i..i + consumed]),
-                }
-                i += consumed;
+        }
+    };
+    let mut i = 0usize;
+    while i < elem.len() {
+        if elem[i] == b'$' {
+            let rest = &elem[i + 1..];
+            let (name, brace) = if rest.first() == Some(&b'{') {
+                let e = rest.iter().position(|&c| c == b'}').unwrap_or(rest.len());
+                (&rest[1..e], true)
             } else {
-                put(out, &mut n, &elem[i..i + 1]);
-                i += 1;
+                let e = rest.iter().position(|&c| !(c.is_ascii_alphanumeric() || c == b'_')).unwrap_or(rest.len());
+                (&rest[..e], false)
+            };
+            let consumed = 1 + name.len() + if brace { 2 } else { 0 };
+            match (name, requester) {
+                (b"ORIGIN", Some(r)) => put(out, origin_of(r)),
+                (b"LIB", _) => put(out, b"lib64"),
+                (b"PLATFORM", _) => put(out, b"x86_64"),
+                _ => put(out, &elem[i..i + consumed]),
             }
+            i += consumed;
+        } else {
+            put(out, &elem[i..i + 1]);
+            i += 1;
         }
-        if n + 1 > out.cap() {
-            out.grow(n, n + 1);
-        }
-        *out.ptr().add(n) = 0;
-        n
     }
+    if out.len() + 1 > out.cap() {
+        out.reserve(out.len() + 1);
+    }
+    out.len()
 }
 
-unsafe fn probe_found(nsid: usize, fd: isize) -> *mut LinkMap {
-    unsafe {
-        if PROBE_IDENT {
-            let (dev, ino) = sys::fstat_id(fd);
-            sys::close(fd);
-            let mut cur = ns(nsid).head;
-            while !cur.is_null() {
-                if (*cur).dev == dev && (*cur).ino == ino && dev != 0 && !(*cur).unloading {
-                    return cur;
-                }
-                cur = (*cur).l_next;
-            }
-            return 1 as *mut LinkMap;
-        }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hit {
+    Map(Map),
+    Exists,
+}
+
+fn probe_found(nsid: usize, fd: isize) -> Hit {
+    if PROBE_IDENT.load(Relaxed) {
+        let (dev, ino) = sys::fstat_id(fd);
         sys::close(fd);
-        1 as *mut LinkMap
+        return match ns(nsid).maps().find(|c| c.dev() == dev && c.ino() == ino && dev != 0 && !c.unloading()) {
+            Some(m) => Hit::Map(m),
+            None => Hit::Exists,
+        };
     }
+    sys::close(fd);
+    Hit::Exists
 }
 
-unsafe fn try_dirs(nsid: usize, list: &[u8], name: &[u8], requester: *mut LinkMap, loader: *mut LinkMap, code: u32, found_err: &mut bool) -> *mut LinkMap {
-    unsafe {
-        let probe = PROBE_ONLY;
-        for elem in list.split(|&c| c == b':') {
-            let mut path = PathBuf::new();
-            let n = if elem.is_empty() {
-                *path.ptr() = b'.';
-                1
-            } else {
-                expand(elem, requester, &mut path)
-            };
-            if n + 1 + name.len() + 1 > MAX_PATH {
-                continue;
-            }
-            path.grow(n, n + 1 + name.len() + 1);
-            *path.ptr().add(n) = b'/';
-            core::ptr::copy_nonoverlapping(name.as_ptr(), path.ptr().add(n + 1), name.len());
-            let plen = n + 1 + name.len();
-            *path.ptr().add(plen) = 0;
-            let mut openp = path.ptr() as *const u8;
-            if !probe && audit::wants_objsearch() {
-                let r = audit::objsearch(openp, loader, code);
-                if r.is_null() {
-                    continue;
-                }
-                if r != openp && cstr(r) != cstr(openp) {
-                    openp = r;
-                }
-            }
-            let fd = sys::open(openp);
-            if fd < 0 {
-                continue;
-            }
-            if probe {
-                return probe_found(nsid, fd);
-            }
-            let m = map_fd(nsid, fd, dup(core::slice::from_raw_parts(path.ptr(), plen)), requester);
-            sys::close(fd);
-            if !m.is_null() {
-                return m;
-            }
-            if st().hard_error {
-                return null_mut();
-            }
-            *found_err = true;
-        }
-        null_mut()
+unsafe fn searched_name(r: *const u8, path: &CStr) -> &CStr {
+    if r == path.as_ptr() as *const u8 {
+        return path;
     }
+    let other = unsafe { cstr_nul(r) };
+    if other.to_bytes() != path.to_bytes() { other } else { path }
+}
+
+fn try_dirs(nsid: usize, list: &[u8], name: &[u8], requester: Option<Map>, loader: Option<Map>, code: u32, found_err: &mut bool) -> Option<Hit> {
+    let probe = PROBE_ONLY.load(Relaxed);
+    for elem in list.split(|&c| c == b':') {
+        let mut path = PathBuf::new();
+        let n = if elem.is_empty() {
+            path.push(b'.');
+            1
+        } else {
+            expand(elem, requester, &mut path)
+        };
+        if n + 1 + name.len() + 1 > MAX_PATH {
+            continue;
+        }
+        path.reserve(n + 1 + name.len() + 1);
+        path.push(b'/');
+        path.extend(name);
+        let candidate = path.as_cstr();
+        let mut openp = candidate;
+        if !probe && audit::wants_objsearch() {
+            let r = audit::objsearch(candidate, loader, code);
+            if r.is_null() {
+                continue;
+            }
+            openp = unsafe { searched_name(r, candidate) };
+        }
+        let fd = sys::open(openp);
+        if fd < 0 {
+            continue;
+        }
+        if SECURE_SEARCH.load(Relaxed) && sys::fstat_mode(fd) & 0o4000 == 0 {
+            sys::close(fd);
+            continue;
+        }
+        if probe {
+            return Some(probe_found(nsid, fd));
+        }
+        let m = map_fd(nsid, fd, dup(candidate.to_bytes()), requester);
+        sys::close(fd);
+        if let Some(m) = m {
+            return Some(Hit::Map(m));
+        }
+        match SKIPPED.load(Relaxed) {
+            1 => *found_err = true,
+            2 => {}
+            _ => {
+                st().hard_error = true;
+                return None;
+            }
+        }
+    }
+    None
 }
 
 const DEFAULT_DIRS: &[u8] = b"/lib64:/usr/lib64:/lib:/usr/lib";
+
+pub static SECURE_SEARCH: AtomicBool = AtomicBool::new(false);
 const PROBE_ONLY_SKIP_CACHE: bool = false;
 
-static mut CACHE_PTR: usize = 0;
-static mut CACHE_LEN: usize = 0;
-static mut CACHE_TRIED: bool = false;
+struct Cache {
+    ptr: usize,
+    len: usize,
+    tried: bool,
+    open_err: isize,
+}
+static CACHE: SyncCell<Cache> = SyncCell::new(Cache { ptr: 0, len: 0, tried: false, open_err: 0 });
 
-unsafe fn cache_load() {
-    unsafe {
-        if CACHE_TRIED {
-            return;
-        }
-        CACHE_TRIED = true;
-        let fd = sys::open(c"/etc/ld.so.cache".as_ptr() as *const u8);
-        if fd < 0 {
-            return;
-        }
-        let len = sys::fstat_size(fd);
-        if len > 16 {
-            let r = sys::mmap(0, len, sys::PROT_READ, sys::MAP_PRIVATE, fd, 0);
-            if !(r < 0 && r > -4096) {
-                CACHE_PTR = r as usize;
-                CACHE_LEN = len;
-            }
-        }
-        sys::close(fd);
-    }
+pub(crate) fn cache_open_error() -> Option<&'static str> {
+    let c = cache_load();
+    if c.open_err < 0 { Some(errno_text(neg_errno(c.open_err))) } else { None }
 }
 
-unsafe fn cache_lookup(name: &[u8]) -> Option<&'static [u8]> {
+fn cache_load() -> Cache {
     unsafe {
-        cache_load();
-        if CACHE_PTR == 0 {
-            return None;
-        }
-        let base = CACHE_PTR as *const u8;
-        let rd32 = |off: usize| -> u32 { core::ptr::read_unaligned(base.add(off) as *const u32) };
-        let mut hdr = 0usize;
-        if core::slice::from_raw_parts(base, 11) == b"ld.so-1.7.0" {
-            let nlibs = rd32(12) as usize;
-            hdr = (16 + nlibs * 12 + 7) & !7;
-        }
-        if hdr + 48 > CACHE_LEN || core::slice::from_raw_parts(base.add(hdr), 20) != b"glibc-ld.so.cache1.1" {
-            return None;
-        }
-        let nlibs = rd32(hdr + 20) as usize;
-        let entries = hdr + 48;
-        if entries + nlibs * 24 > CACHE_LEN {
-            return None;
-        }
-        let key_of = |i: usize| rd32(entries + i * 24 + 4) as usize;
-        let (mut lo, mut hi) = (0usize, nlibs);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let k = key_of(mid);
-            if k >= CACHE_LEN || libcmp(base.add(k), name) > 0 {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        let mut i = lo;
-        while i < nlibs {
-            let e = entries + i * 24;
-            let key = rd32(e + 4) as usize;
-            let val = rd32(e + 8) as usize;
-            if key >= CACHE_LEN || libcmp(base.add(key), name) != 0 {
-                break;
-            }
-            i += 1;
-            let flags = rd32(e);
-            let hwcaps = core::ptr::read_unaligned(base.add(e + 16) as *const u64);
-            if flags & 0xff00 != 0x0300 || (hwcaps >> 62) & 1 != 0 || val >= CACHE_LEN || !cstr_eq(base.add(key), name) {
-                continue;
-            }
-            return Some(cstr(base.add(val)));
-        }
-        None
-    }
-}
-
-unsafe fn libcmp(mut p1: *const u8, name: &[u8]) -> i32 {
-    unsafe {
-        let mut j = 0usize;
-        let at = |j: usize| -> u8 { if j < name.len() { name[j] } else { 0 } };
-        while *p1 != 0 {
-            let c1 = *p1;
-            let c2 = at(j);
-            if c1.is_ascii_digit() {
-                if c2.is_ascii_digit() {
-                    let (mut v1, mut v2) = ((c1 - b'0') as i64, (c2 - b'0') as i64);
-                    p1 = p1.add(1);
-                    j += 1;
-                    while (*p1).is_ascii_digit() {
-                        v1 = v1 * 10 + (*p1 - b'0') as i64;
-                        p1 = p1.add(1);
-                    }
-                    while at(j).is_ascii_digit() {
-                        v2 = v2 * 10 + (at(j) - b'0') as i64;
-                        j += 1;
-                    }
-                    if v1 != v2 {
-                        return if v1 > v2 { 1 } else { -1 };
-                    }
+        CACHE.with_unsync(|c| {
+            if !c.tried {
+                c.tried = true;
+                let fd = sys::open(c"/etc/ld.so.cache");
+                if fd < 0 {
+                    c.open_err = fd;
                 } else {
-                    return 1;
+                    let len = sys::fstat_size(fd);
+                    if len > 16 {
+                        let r = sys::mmap_new(0, len, sys::PROT_READ, sys::MAP_PRIVATE, fd, 0);
+                        if !(r < 0 && r > -4096) {
+                            c.ptr = r as usize;
+                            c.len = len;
+                        }
+                    }
+                    sys::close(fd);
                 }
-            } else if c2.is_ascii_digit() {
-                return -1;
-            } else if c1 != c2 {
-                return c1 as i32 - c2 as i32;
-            } else {
-                p1 = p1.add(1);
+            }
+            Cache { ptr: c.ptr, len: c.len, tried: c.tried, open_err: c.open_err }
+        })
+    }
+}
+
+pub(crate) fn cache_lookup(name: &[u8]) -> Option<&'static [u8]> {
+    let c = cache_load();
+    if c.ptr == 0 {
+        return None;
+    }
+    let file: &'static [u8] = unsafe { slice(c.ptr as *const u8, c.len) };
+    let rd32 = |off: usize| -> u32 { file.get(off..off + 4).map_or(0, |b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]])) };
+    let mut hdr = 0usize;
+    if file.get(..11) == Some(&b"ld.so-1.7.0"[..]) {
+        let nlibs = rd32(12) as usize;
+        hdr = (16 + nlibs * 12 + 7) & !7;
+    }
+    if hdr + 48 > c.len || &file[hdr..hdr + 20] != b"glibc-ld.so.cache1.1" {
+        return None;
+    }
+    let nlibs = rd32(hdr + 20) as usize;
+    let entries = hdr + 48;
+    if entries + nlibs * 24 > c.len {
+        return None;
+    }
+    let key_of = |i: usize| rd32(entries + i * 24 + 4) as usize;
+    let (mut lo, mut hi) = (0usize, nlibs);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let k = key_of(mid);
+        if k >= c.len || libcmp(&file[k..], name) > 0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut i = lo;
+    while i < nlibs {
+        let e = entries + i * 24;
+        let key = rd32(e + 4) as usize;
+        let val = rd32(e + 8) as usize;
+        if key >= c.len || libcmp(&file[key..], name) != 0 {
+            break;
+        }
+        i += 1;
+        let flags = rd32(e);
+        let hwcaps = u64::from(rd32(e + 16)) | u64::from(rd32(e + 20)) << 32;
+        if flags & 0xff00 != 0x0300 || (hwcaps >> 62) & 1 != 0 || val >= c.len || !cache_str_eq(&file[key..], name) {
+            continue;
+        }
+        return Some(cache_str(&file[val..]));
+    }
+    None
+}
+
+fn cache_str(s: &[u8]) -> &[u8] {
+    match s.iter().position(|&c| c == 0) {
+        Some(n) => &s[..n],
+        None => s,
+    }
+}
+
+fn cache_str_eq(s: &[u8], name: &[u8]) -> bool {
+    s.len() > name.len() && &s[..name.len()] == name && s[name.len()] == 0
+}
+
+fn libcmp(s1: &[u8], name: &[u8]) -> i32 {
+    let at1 = |i: usize| -> u8 { if i < s1.len() { s1[i] } else { 0 } };
+    let at = |j: usize| -> u8 { if j < name.len() { name[j] } else { 0 } };
+    let (mut i, mut j) = (0usize, 0usize);
+    while at1(i) != 0 {
+        let c1 = at1(i);
+        let c2 = at(j);
+        if c1.is_ascii_digit() {
+            if c2.is_ascii_digit() {
+                let (mut v1, mut v2) = ((c1 - b'0') as i64, (c2 - b'0') as i64);
+                i += 1;
                 j += 1;
-            }
-        }
-        0 - at(j) as i32
-    }
-}
-
-static mut PROBE_ONLY: bool = false;
-
-static mut PROBE_IDENT: bool = false;
-
-pub unsafe fn find_loaded_by_file(nsid: usize, name: &[u8], requester: *mut LinkMap) -> *mut LinkMap {
-    unsafe {
-        PROBE_ONLY = true;
-        PROBE_IDENT = true;
-        let r = load_library_search(nsid, name, requester);
-        PROBE_IDENT = false;
-        PROBE_ONLY = false;
-        if r as usize == 1 { null_mut() } else { r }
-    }
-}
-
-pub unsafe fn library_exists(nsid: usize, name: &[u8], requester: *mut LinkMap) -> bool {
-    unsafe {
-        PROBE_ONLY = true;
-        let r = load_library_search(nsid, name, requester);
-        PROBE_ONLY = false;
-        !r.is_null()
-    }
-}
-
-pub unsafe fn find_loaded(nsid: usize, name: &[u8]) -> *mut LinkMap {
-    unsafe {
-        let mut cur = ns(nsid).head;
-        while !cur.is_null() {
-            if !(*cur).unloading {
-                if !(*cur).soname.is_null() && cstr((*cur).soname) == name {
-                    return cur;
+                while at1(i).is_ascii_digit() {
+                    v1 = v1 * 10 + (at1(i) - b'0') as i64;
+                    i += 1;
                 }
-                let n = cstr((*cur).l_name);
-                if n == name && !n.is_empty() {
-                    return cur;
+                while at(j).is_ascii_digit() {
+                    v2 = v2 * 10 + (at(j) - b'0') as i64;
+                    j += 1;
                 }
+                if v1 != v2 {
+                    return if v1 > v2 { 1 } else { -1 };
+                }
+            } else {
+                return 1;
             }
-            cur = (*cur).l_next;
+        } else if c2.is_ascii_digit() {
+            return -1;
+        } else if c1 != c2 {
+            return c1 as i32 - c2 as i32;
+        } else {
+            i += 1;
+            j += 1;
         }
-        null_mut()
+    }
+    0 - at(j) as i32
+}
+
+static PROBE_ONLY: AtomicBool = AtomicBool::new(false);
+
+static PROBE_IDENT: AtomicBool = AtomicBool::new(false);
+
+pub fn find_loaded_by_file(nsid: usize, name: &[u8], requester: Option<Map>) -> Option<Map> {
+    PROBE_ONLY.store(true, Relaxed);
+    PROBE_IDENT.store(true, Relaxed);
+    let r = load_library_search(nsid, name, requester);
+    PROBE_IDENT.store(false, Relaxed);
+    PROBE_ONLY.store(false, Relaxed);
+    match r {
+        Some(Hit::Map(m)) => Some(m),
+        _ => None,
     }
 }
 
-unsafe fn names_ldso(name: &[u8]) -> bool {
-    unsafe {
-        let l = st().ldso_map;
-        if l.is_null() {
+pub fn library_exists(nsid: usize, name: &[u8], requester: Option<Map>) -> bool {
+    PROBE_ONLY.store(true, Relaxed);
+    let r = load_library_search(nsid, name, requester);
+    PROBE_ONLY.store(false, Relaxed);
+    r.is_some()
+}
+
+pub fn find_loaded(nsid: usize, name: &[u8]) -> Option<Map> {
+    ns(nsid).maps().find(|c| {
+        if c.unloading() {
             return false;
         }
-        (!(*l).soname.is_null() && cstr((*l).soname) == name) || cstr((*l).l_name) == name
+        if c.soname() == Some(name) {
+            return true;
+        }
+        let n = c.name();
+        n == name && !n.is_empty()
+    })
+}
+
+fn names_ldso(name: &[u8]) -> bool {
+    match st().ldso_map {
+        None => false,
+        Some(l) => l.soname() == Some(name) || l.name() == name,
     }
 }
 
-unsafe fn ldso_mirror(nsid: usize) -> *mut LinkMap {
-    unsafe {
-        let real = st().ldso_map;
-        let m = new_map();
-        core::ptr::copy_nonoverlapping(real as *const u8, m as *mut u8, core::mem::size_of::<LinkMap>());
-        (*m).l_real = real;
-        (*m).l_ns = nsid as isize;
-        (*m).l_prev = null_mut();
-        (*m).l_next = null_mut();
-        (*m).refcount = 0;
-        (*m).nodelete = false;
-        (*m).in_global = false;
-        (*m).scope = null_mut();
-        (*m).nscope = 0;
-        (*m).xscope = null_mut();
-        (*m).nxscope = 0;
-        (*m).reldeps = null_mut();
-        (*m).nreldeps = 0;
-        (*m).creldeps = 0;
-        (*m).opening = false;
-        (*m).dlopened = true;
-        link_map(m);
-        m
+fn ldso_mirror(nsid: usize) -> Map {
+    let real = ldso_map();
+    let m = new_map();
+    unsafe { core::ptr::copy_nonoverlapping(real.as_ptr() as *const u8, m.as_ptr() as *mut u8, core::mem::size_of::<LinkMap>()) };
+    m.set_real(Some(real));
+    m.set_l_ns(nsid as isize);
+    m.set_prev(None);
+    m.set_next(None);
+    m.set_refcount(0);
+    m.set_nodelete(false);
+    m.set_in_global(false);
+    unsafe { m.set_scope(null_mut()) };
+    unsafe { m.set_nscope(0) };
+    unsafe { m.set_xscope(null_mut()) };
+    unsafe { m.set_nxscope(0) };
+    unsafe { m.set_reldeps(null_mut()) };
+    unsafe { m.set_nreldeps(0) };
+    unsafe { m.set_creldeps(0) };
+    m.set_opening(false);
+    m.set_dlopened(true);
+    link_map(m);
+    m
+}
+
+pub fn load_library(nsid: usize, name: &[u8], requester: Option<Map>) -> Option<Map> {
+    if let Some(m) = find_loaded(nsid, name) {
+        return Some(m);
+    }
+    if nsid != 0 && names_ldso(name) {
+        return Some(ldso_mirror(nsid));
+    }
+    if nsid != 0 && name == b"libc.so.6" && !PROBE_ONLY.load(Relaxed)
+        && let Some(base) = ns(0).libc_map
+    {
+        let path = base.name();
+        if !path.is_empty() && path.contains(&b'/')
+            && let Some(Hit::Map(m)) = load_library_search(nsid, path, requester)
+        {
+            return Some(m);
+        }
+    }
+    match load_library_search(nsid, name, requester) {
+        Some(Hit::Map(m)) => Some(m),
+        _ => None,
     }
 }
 
-pub unsafe fn load_library(nsid: usize, name: &[u8], requester: *mut LinkMap) -> *mut LinkMap {
-    unsafe {
-        let m = find_loaded(nsid, name);
-        if !m.is_null() {
-            return m;
+fn load_library_search(nsid: usize, name: &[u8], requester: Option<Map>) -> Option<Hit> {
+    let probe_only = PROBE_ONLY.load(Relaxed);
+    let asked = name;
+    let mut name = name;
+    let mut buf = PathBuf::new();
+    if !probe_only && audit::wants_objsearch() && requester.is_some() {
+        buf.reserve(name.len() + 1);
+        buf.extend(name);
+        let orig = buf.as_cstr();
+        let r = audit::objsearch(orig, requester, audit::LA_SER_ORIG);
+        if r.is_null() {
+            set_error_at(name, 2, format_args!("cannot open shared object file"));
+            return None;
         }
-        if nsid != 0 && names_ldso(name) {
-            return ldso_mirror(nsid);
+        if r != orig.as_ptr() as *const u8 {
+            name = unsafe { cstr(r) };
         }
-        if nsid != 0 && name == b"libc.so.6" && !PROBE_ONLY {
-            let base = ns(0).libc_map;
-            if !base.is_null() && !cstr((*base).l_name).is_empty() && cstr((*base).l_name).contains(&b'/') {
-                let path = cstr((*base).l_name);
-                let m = load_library_search(nsid, path, requester);
-                if !m.is_null() {
-                    return m;
-                }
-            }
-        }
-        load_library_search(nsid, name, requester)
     }
-}
-
-unsafe fn load_library_search(nsid: usize, name: &[u8], requester: *mut LinkMap) -> *mut LinkMap {
-    unsafe {
-        let asked = name;
-        let mut name = name;
-        if !PROBE_ONLY && audit::wants_objsearch() && !requester.is_null() {
-            let mut buf = PathBuf::new();
-            buf.grow(0, name.len() + 1);
-            core::ptr::copy_nonoverlapping(name.as_ptr(), buf.ptr(), name.len());
-            *buf.ptr().add(name.len()) = 0;
-            let orig = buf.ptr() as *const u8;
-            let r = audit::objsearch(orig, requester, audit::LA_SER_ORIG);
-            if r.is_null() {
-                set_error(format_args!("{}: cannot open shared object file: No such file or directory", Bytes(name)));
-                return null_mut();
-            }
-            if r != orig {
-                name = cstr(r);
-            }
+    let mut m: Option<Hit> = None;
+    let mut bad = false;
+    st().hard_error = false;
+    let main_or = |r: Option<Map>| r.or(st().main_map);
+    if name.contains(&b'/') {
+        let mut path = PathBuf::new();
+        if name.len() >= 4095 {
+            set_error_at(name, 36, format_args!("cannot open shared object file"));
+            return None;
         }
-        let mut m: *mut LinkMap = null_mut();
-        let mut bad = false;
-        st().hard_error = false;
-        if name.contains(&b'/') {
-            let mut path = PathBuf::new();
-            if name.len() >= 4095 {
-                set_error(format_args!("{}: cannot open shared object file: File name too long", Bytes(name)));
-                return null_mut();
-            }
-            let n = expand(name, requester, &mut path);
-            m = if PROBE_ONLY {
-                let fd = sys::open(path.ptr());
-                if fd < 0 {
-                    set_error(format_args!("cannot open shared object file: {}", errno_text(fd)));
-                    null_mut()
-                } else {
-                    probe_found(nsid, fd)
-                }
+        expand(name, requester, &mut path);
+        let p = path.as_cstr();
+        m = if probe_only {
+            let fd = sys::open(p);
+            if fd < 0 {
+                set_error_at(b"", neg_errno(fd), format_args!("cannot open shared object file"));
+                None
             } else {
-                map_file(nsid, path.ptr(), dup(core::slice::from_raw_parts(path.ptr(), n)), requester)
-            };
-            if m.is_null() {
-                let e = error_str();
-                let mut tmp = [0u8; 400];
-                let l = e.len().min(399);
-                tmp[..l].copy_from_slice(&e[..l]);
-                set_error(format_args!("{}: {}", Bytes(name), Bytes(&tmp[..l])));
+                Some(probe_found(nsid, fd))
             }
         } else {
-            let mut r = requester;
-            while m.is_null() && !r.is_null() && !st().hard_error {
-                if !(*r).rpath.is_null() && (*r).runpath.is_null() {
-                    m = try_dirs(nsid, cstr((*r).rpath), name, r, requester, audit::LA_SER_RUNPATH, &mut bad);
+            map_file(nsid, p, dup(p.to_bytes()), requester).map(Hit::Map)
+        };
+        if m.is_none() {
+            set_error_obj(name);
+        }
+    } else {
+        let mut r = requester;
+        while m.is_none() && !st().hard_error {
+            let Some(rm) = r else { break };
+            if let (Some(rp), None) = (rm.rpath(), rm.runpath()) {
+                m = try_dirs(nsid, rp, name, Some(rm), requester, audit::LA_SER_RUNPATH, &mut bad);
+            }
+            r = rm.loader();
+        }
+        if m.is_none() && !st().hard_error && !st().library_path.is_null() {
+            let lp = unsafe { cstr(st().library_path) };
+            m = try_dirs(nsid, lp, name, requester, main_or(requester), audit::LA_SER_LIBPATH, &mut bad);
+        }
+        if m.is_none() && !st().hard_error
+            && let Some(rp) = requester.and_then(|r| r.runpath())
+        {
+            m = try_dirs(nsid, rp, name, requester, requester, audit::LA_SER_RUNPATH, &mut bad);
+        }
+        if m.is_none() && !st().hard_error && nsid != 0
+            && let Some(base) = ns(0).libc_map
+        {
+            let p = base.name();
+            if let Some(slash) = p.iter().rposition(|&c| c == b'/') {
+                m = try_dirs(nsid, &p[..slash.max(1)], name, requester, main_or(requester), audit::LA_SER_DEFAULT, &mut bad);
+            }
+        }
+        if m.is_none() && !st().hard_error && !PROBE_ONLY_SKIP_CACHE && !SECURE_SEARCH.load(Relaxed)
+            && let Some(path) = cache_lookup(name)
+        {
+            let mut dir = PathBuf::new();
+            if path.len() < MAX_PATH - 1 {
+                dir.reserve(path.len() + 1);
+                dir.extend(path);
+                let candidate = dir.as_cstr();
+                let mut openp = Some(candidate);
+                if !probe_only && audit::wants_objsearch() {
+                    let r = audit::objsearch(candidate, main_or(requester), audit::LA_SER_CONFIG);
+                    openp = if r.is_null() {
+                        None
+                    } else {
+                        Some(unsafe { searched_name(r, candidate) })
+                    };
                 }
-                r = (*r).loader;
-            }
-            if m.is_null() && !st().hard_error && !st().library_path.is_null() {
-                m = try_dirs(nsid, cstr(st().library_path), name, requester, if requester.is_null() { st().main_map } else { requester }, audit::LA_SER_LIBPATH, &mut bad);
-            }
-            if m.is_null() && !st().hard_error && !requester.is_null() && !(*requester).runpath.is_null() {
-                m = try_dirs(nsid, cstr((*requester).runpath), name, requester, requester, audit::LA_SER_RUNPATH, &mut bad);
-            }
-            if m.is_null() && !st().hard_error && nsid != 0 {
-                let base = ns(0).libc_map;
-                if !base.is_null() {
-                    let p = cstr((*base).l_name);
-                    if let Some(slash) = p.iter().rposition(|&c| c == b'/') {
-                        m = try_dirs(nsid, &p[..slash.max(1)], name, requester, if requester.is_null() { st().main_map } else { requester }, audit::LA_SER_DEFAULT, &mut bad);
+                let fd = match openp {
+                    None => -1,
+                    Some(p) => sys::open(p),
+                };
+                if fd >= 0 {
+                    if probe_only {
+                        sys::close(fd);
+                        return Some(Hit::Exists);
+                    }
+                    m = map_fd(nsid, fd, dup(path), requester).map(Hit::Map);
+                    sys::close(fd);
+                    if m.is_none() {
+                        let sk = SKIPPED.load(Relaxed);
+                        if sk == 1 {
+                            bad = true;
+                        } else if sk == 0 {
+                            st().hard_error = true;
+                        }
                     }
                 }
             }
-            if m.is_null() && !st().hard_error && !PROBE_ONLY_SKIP_CACHE {
-                if let Some(path) = cache_lookup(name) {
-                    let mut dir = PathBuf::new();
-                    if path.len() < MAX_PATH - 1 {
-                        dir.grow(0, path.len() + 1);
-                        core::ptr::copy_nonoverlapping(path.as_ptr(), dir.ptr(), path.len());
-                        *dir.ptr().add(path.len()) = 0;
-                        let mut openp = dir.ptr() as *const u8;
-                        let mut vetoed = false;
-                        if !PROBE_ONLY && audit::wants_objsearch() {
-                            let r = audit::objsearch(openp, if requester.is_null() { st().main_map } else { requester }, audit::LA_SER_CONFIG);
-                            if r.is_null() {
-                                vetoed = true;
-                            } else if r != openp && cstr(r) != cstr(openp) {
-                                openp = r;
-                            }
-                        }
-                        let fd = if vetoed { -1 } else { sys::open(openp) };
-                        if fd >= 0 {
-                            if PROBE_ONLY {
-                                sys::close(fd);
-                                return 1 as *mut LinkMap;
-                            }
-                            m = map_fd(nsid, fd, dup(path), requester);
-                            sys::close(fd);
-                        }
-                    }
-                }
-            }
-            if m.is_null() && !st().hard_error {
-                m = try_dirs(nsid, DEFAULT_DIRS, name, requester, if requester.is_null() { st().main_map } else { requester }, audit::LA_SER_DEFAULT, &mut bad);
-            }
-            if m.is_null() && st().hard_error {
-                let e = error_str();
-                let mut tmp = [0u8; 400];
-                let l = e.len().min(399);
-                tmp[..l].copy_from_slice(&e[..l]);
-                set_error(format_args!("{}: {}", Bytes(name), Bytes(&tmp[..l])));
-            } else if m.is_null() {
-                set_error(format_args!("{}: cannot open shared object file: No such file or directory", Bytes(name)));
-            }
         }
-        if m.is_null() {
-            return null_mut();
+        if m.is_none() && !st().hard_error {
+            m = try_dirs(nsid, DEFAULT_DIRS, name, requester, main_or(requester), audit::LA_SER_DEFAULT, &mut bad);
         }
-        if !PROBE_ONLY && (*m).l_prev.is_null() && ns((*m).l_ns as usize).head != m && (*m).l_next.is_null() && ns((*m).l_ns as usize).tail != m {
-            link_map(m);
+        if m.is_none() && st().hard_error {
+            set_error_obj(name);
+        } else if m.is_none() && bad {
+            set_error_at(name, 0, format_args!("wrong ELF class: ELFCLASS32"));
+        } else if m.is_none() {
+            set_error_at(name, 2, format_args!("cannot open shared object file"));
         }
-        if !PROBE_ONLY && (*m).req_name.is_null() {
-            (*m).req_name = dup(asked);
-        }
-        m
     }
+    let hit = m?;
+    if let Hit::Map(mm) = hit {
+        let n = ns(mm.l_ns() as usize);
+        if !probe_only && mm.prev().is_none() && n.head != Some(mm) && mm.next().is_none() && n.tail != Some(mm) {
+            link_map(mm);
+        }
+        if !probe_only && mm.req_name_ptr().is_null() {
+            unsafe { mm.set_req_name(dup(asked).as_ptr() as *const u8) };
+        }
+    }
+    Some(hit)
 }
 
-unsafe fn map32_flag(ph: &[Phdr]) -> usize {
+fn map32_flag(ph: &[Phdr]) -> usize {
     if st().map32 && ph.iter().any(|p| p.typ == PT_LOAD && p.flags & PF_X != 0) { 0x40 } else { 0 }
 }

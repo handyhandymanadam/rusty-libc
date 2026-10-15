@@ -195,6 +195,7 @@ macro_rules! xproc {
         {
             #[allow(unused_unsafe)]
             let p = $f as *const ();
+            #[allow(unused_unsafe)]
             let f = unsafe { core::mem::transmute::<*const (), $crate::types::XdrFn>(p) };
             Some(f)
         }
@@ -629,3 +630,79 @@ pub const fn some<T>(f: T) -> Option<T> {
     Some(f)
 }
 
+macro_rules! pod_union {
+    ($u:ident { $( $f:ident : $t:ty => $get:ident, $get_mut:ident );* $(;)? }) => {
+        impl $u {
+            $(
+                #[inline(always)]
+                pub fn $get(&self) -> &$t {
+                    unsafe { &self.$f }
+                }
+                #[inline(always)]
+                pub fn $get_mut(&mut self) -> &mut $t {
+                    unsafe { &mut self.$f }
+                }
+            )*
+        }
+    };
+}
+
+pod_union!(des_block { key: des_block_key => key, key_mut; c: [c_char; 8] => chars, chars_mut });
+pod_union!(authdes_verf_time { adv_ctime: rpc_timeval => ctime, ctime_mut; adv_xtime: des_block => xtime, xtime_mut });
+pod_union!(rpc_err_u { RE_errno: c_int => errno, errno_mut; RE_why: c_int => why, why_mut; RE_vers: rpc_vers => vers, vers_mut; RE_lb: rpc_lb => lb, lb_mut });
+pod_union!(accepted_reply_u { AR_versions: rpc_vers => versions, versions_mut; AR_results: ar_results => results, results_mut });
+pod_union!(rejected_reply_u { RJ_versions: rpc_vers => versions, versions_mut; RJ_why: c_int => why, why_mut });
+pod_union!(reply_body_u { RP_ar: accepted_reply => ar, ar_mut; RP_dr: rejected_reply => dr, dr_mut });
+pod_union!(rpc_msg_u { RM_cmb: call_body => cmb, cmb_mut; RM_rmb: reply_body => rmb, rmb_mut });
+pod_union!(cryptkeyres_u { deskey: des_block => deskey, deskey_mut });
+pod_union!(key_netstres_u { knet: key_netstarg => knet, knet_mut });
+
+impl des_block {
+    #[inline(always)]
+    pub fn bytes_mut(&mut self) -> &mut [u8; 8] {
+        let c: &mut [c_char; 8] = self.chars_mut();
+        unsafe { &mut *(c as *mut [c_char; 8]).cast::<[u8; 8]>() }
+    }
+
+    #[inline(always)]
+    pub fn bytes(&self) -> &[u8; 8] {
+        let c: &[c_char; 8] = self.chars();
+        unsafe { &*(c as *const [c_char; 8]).cast::<[u8; 8]>() }
+    }
+}
+
+impl getcredres_u {
+    #[inline(always)]
+    pub fn cred_mut(&mut self) -> &mut unixcred {
+        unsafe { &mut self.cred }
+    }
+}
+
+impl call_body {
+    pub const fn zeroed() -> call_body {
+        call_body { cb_rpcvers: 0, cb_prog: 0, cb_vers: 0, cb_proc: 0, cb_cred: opaque_auth::null(), cb_verf: opaque_auth::null() }
+    }
+}
+
+
+#[inline(always)]
+pub fn chars_as_bytes_mut<const N: usize>(a: &mut [c_char; N]) -> &mut [u8; N] {
+    unsafe { &mut *(a as *mut [c_char; N]).cast::<[u8; N]>() }
+}
+
+#[inline(always)]
+pub fn chars_as_bytes<const N: usize>(a: &[c_char; N]) -> &[u8; N] {
+    unsafe { &*(a as *const [c_char; N]).cast::<[u8; N]>() }
+}
+
+impl cryptkeyres {
+    pub const fn zeroed() -> cryptkeyres {
+        cryptkeyres { status: 0, cryptkeyres_u: cryptkeyres_u { deskey: des_block { key: des_block_key { high: 0, low: 0 } } } }
+    }
+}
+
+impl key_netstres {
+    pub const fn zeroed() -> key_netstres {
+        key_netstres { status: 0, key_netstres_u: key_netstres_u { knet: key_netstarg { st_priv_key: [0; HEXKEYBYTES], st_pub_key: [0; HEXKEYBYTES], st_netname: core::ptr::null_mut() } } }
+    }
+}

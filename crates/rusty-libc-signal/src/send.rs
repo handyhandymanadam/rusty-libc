@@ -1,17 +1,19 @@
-use crate::consts::{EINVAL, SI_QUEUE, SYS_GETPID, SYS_GETTID, SYS_GETUID, SYS_KILL, SYS_RT_SIGQUEUEINFO, SYS_TGKILL};
+use crate::consts::{EINVAL, SI_QUEUE};
 use crate::sigset::is_internal_signal;
 use crate::types::{PidT, Siginfo, Sigval};
-use crate::{fail, finish};
+use crate::{fail, finish, finish_res, sys};
 use core::ffi::c_int;
-use rusty_libc_core::{Errno, syscall};
+use rusty_libc_core::Errno;
+use rusty_libc_core::unistd::{getpid, gettid, getuid};
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn kill(pid: PidT, sig: c_int) -> c_int {
-    finish(unsafe { syscall::syscall2(SYS_KILL, pid as usize, sig as usize) })
+    finish_res(kill_rs(pid, sig))
 }
 
+#[inline]
 pub fn kill_rs(pid: PidT, sig: i32) -> Result<(), Errno> {
-    syscall::check(unsafe { syscall::syscall2(SYS_KILL, pid as usize, sig as usize) }).map(|_| ())
+    rusty_libc_core::signal::kill(pid, sig)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -24,15 +26,7 @@ pub extern "C" fn killpg(pgrp: PidT, sig: c_int) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn tgkill(tgid: PidT, tid: PidT, sig: c_int) -> c_int {
-    finish(unsafe { syscall::syscall3(SYS_TGKILL, tgid as usize, tid as usize, sig as usize) })
-}
-
-fn getpid() -> PidT {
-    unsafe { syscall::syscall0(SYS_GETPID) as PidT }
-}
-
-fn gettid() -> PidT {
-    unsafe { syscall::syscall0(SYS_GETTID) as PidT }
+    finish_res(rusty_libc_core::signal::tgkill(tgid, tid, sig))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -57,7 +51,7 @@ pub extern "C" fn sigqueue(pid: PidT, sig: c_int, val: Sigval) -> c_int {
     let mut info = Siginfo::ZERO;
     info.si_signo = sig;
     info.si_code = SI_QUEUE;
-    info.set_pid_uid(getpid(), unsafe { syscall::syscall0(SYS_GETUID) } as u32);
+    info.set_pid_uid(getpid(), getuid());
     info.set_value(val);
-    finish(unsafe { syscall::syscall3(SYS_RT_SIGQUEUEINFO, pid as usize, sig as usize, &info as *const Siginfo as usize) })
+    finish(sys::rt_sigqueueinfo(pid, sig, &info))
 }

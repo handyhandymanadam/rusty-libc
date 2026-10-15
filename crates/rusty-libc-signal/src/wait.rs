@@ -1,26 +1,44 @@
-use crate::consts::{
-    EINTR, KSIGSET_BYTES, SI_TKILL, SI_USER, SIGCANCEL, SIGSETXID, SYS_RT_SIGPENDING, SYS_RT_SIGTIMEDWAIT, SYS_RT_SIGSUSPEND,
-};
+use crate::consts::{EINTR, SI_TKILL, SI_USER, SIGCANCEL, SIGSETXID};
 use crate::types::{Siginfo, Sigset, Timespec};
-use crate::{fail, finish};
+use crate::{fail, finish, sys};
 use core::ffi::c_int;
-use rusty_libc_core::{Errno, errno, syscall};
+use rusty_libc_core::{Errno, errno, ffi, syscall};
+
+#[inline(always)]
+fn filtered(set: &Sigset) -> Option<Sigset> {
+    if set.has(SIGCANCEL) || set.has(SIGSETXID) {
+        let mut local = *set;
+        local.clear_internal();
+        Some(local)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn errno_of(ret: usize) -> c_int {
+    match syscall::check(ret) {
+        Ok(_) => 0,
+        Err(e) => e.0,
+    }
+}
 
 pub unsafe fn sigmask_errno(how: c_int, set: *const Sigset, old: *mut Sigset) -> c_int {
-    let mut local;
-    let mut set = set;
-    unsafe {
-        if !set.is_null() && ((*set).has(SIGCANCEL) || (*set).has(SIGSETXID)) {
-            local = *set;
-            local.clear_internal();
-            set = &local;
-        }
-        let ret = syscall::syscall4(syscall::SYS_RT_SIGPROCMASK, how as usize, set as usize, old as usize, KSIGSET_BYTES);
-        match syscall::check(ret) {
-            Ok(_) => 0,
-            Err(e) => e.0,
-        }
-    }
+    let local = unsafe { set.as_ref() }.and_then(filtered);
+    let set = local.as_ref().map_or(set, |l| l as *const Sigset);
+    errno_of(unsafe { sys::rt_sigprocmask(how, set, old) })
+}
+
+#[inline]
+pub fn sigmask(how: c_int, set: Option<&Sigset>, old: Option<&mut Sigset>) -> Result<(), Errno> {
+    let local = set.and_then(filtered);
+    let set = local.as_ref().or(set);
+    syscall::check(sys::rt_sigprocmask_ref(how, set, old)).map(|_| ())
+}
+
+#[inline]
+pub(crate) fn sigmask_c(how: c_int, set: Option<&Sigset>, old: Option<&mut Sigset>) -> c_int {
+    crate::finish_res(sigmask(how, set, old))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -35,18 +53,17 @@ pub fn sigprocmask_rs(how: i32, set: Option<u64>) -> Result<u64, Errno> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sigpending(set: *mut Sigset) -> c_int {
-    finish(unsafe { syscall::syscall2(SYS_RT_SIGPENDING, set as usize, KSIGSET_BYTES) })
+    finish(unsafe { sys::rt_sigpending(set) })
 }
 
 pub fn sigpending_rs() -> Result<u64, Errno> {
     let mut m = 0u64;
-    let ret = unsafe { syscall::syscall2(SYS_RT_SIGPENDING, &mut m as *mut u64 as usize, KSIGSET_BYTES) };
-    syscall::check(ret).map(|_| m)
+    syscall::check(sys::rt_sigpending_mask(&mut m)).map(|_| m)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sigsuspend(set: *const Sigset) -> c_int {
-    finish(unsafe { rusty_libc_core::tls::syscall_cp(SYS_RT_SIGSUSPEND, set as usize, KSIGSET_BYTES, 0, 0, 0, 0) })
+    finish(unsafe { sys::rt_sigsuspend_cp(set) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -55,8 +72,7 @@ pub unsafe extern "C" fn __sigsuspend(set: *const Sigset) -> c_int {
 }
 
 pub fn sigsuspend_rs(mask: u64) -> Errno {
-    let ret = unsafe { syscall::syscall2(SYS_RT_SIGSUSPEND, &mask as *const u64 as usize, KSIGSET_BYTES) };
-    match syscall::check(ret) {
+    match syscall::check(sys::rt_sigsuspend_mask(&mask)) {
         Err(e) => e,
         Ok(_) => Errno(0),
     }
@@ -64,16 +80,16 @@ pub fn sigsuspend_rs(mask: u64) -> Errno {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sigtimedwait(set: *const Sigset, info: *mut Siginfo, timeout: *const Timespec) -> c_int {
-    unsafe {
-        let ret = rusty_libc_core::tls::syscall_cp(SYS_RT_SIGTIMEDWAIT, set as usize, info as usize, timeout as usize, KSIGSET_BYTES, 0, 0);
-        match syscall::check(ret) {
-            Err(e) => fail(e.0),
-            Ok(sig) => {
-                if !info.is_null() && (*info).si_code == SI_TKILL {
-                    (*info).si_code = SI_USER;
+    let ret = unsafe { sys::rt_sigtimedwait_cp(set, info, timeout) };
+    match syscall::check(ret) {
+        Err(e) => fail(e.0),
+        Ok(sig) => {
+            if let Some(info) = unsafe { ffi::out(info) } {
+                if info.si_code == SI_TKILL {
+                    info.si_code = SI_USER;
                 }
-                sig as c_int
             }
+            sig as c_int
         }
     }
 }
@@ -85,18 +101,16 @@ pub unsafe extern "C" fn sigwaitinfo(set: *const Sigset, info: *mut Siginfo) -> 
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sigwait(set: *const Sigset, sig: *mut c_int) -> c_int {
-    unsafe {
-        let mut si = Siginfo::ZERO;
-        loop {
-            let ret = sigtimedwait(set, &mut si, core::ptr::null());
-            if ret >= 0 {
-                *sig = si.si_signo;
-                return 0;
-            }
-            let e = errno::get();
-            if e != EINTR {
-                return e;
-            }
+    let mut si = Siginfo::ZERO;
+    loop {
+        let ret = unsafe { sigtimedwait(set, &mut si, core::ptr::null()) };
+        if ret >= 0 {
+            unsafe { sig.write(si.si_signo) };
+            return 0;
+        }
+        let e = errno::get();
+        if e != EINTR {
+            return e;
         }
     }
 }

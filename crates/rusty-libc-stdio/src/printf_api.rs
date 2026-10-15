@@ -5,26 +5,22 @@ use rusty_libc_core::errno;
 pub struct VaArgs<'a, 'f>(pub &'a mut VaList<'f>);
 
 unsafe fn read_long_double(va: &mut VaList) -> [u8; 16] {
-    unsafe {
-        let rec = va as *mut VaList as *mut [usize; 3];
-        let area = (*rec)[1];
-        let aligned = (area + 15) & !15;
-        let mut out = [0u8; 16];
-        core::ptr::copy_nonoverlapping(aligned as *const u8, out.as_mut_ptr(), 16);
-        (*rec)[1] = aligned + 16;
-        out
-    }
+    let rec = va as *mut VaList as *mut [usize; 3];
+    let area = unsafe { (*rec)[1] };
+    let aligned = (area + 15) & !15;
+    let mut out = [0u8; 16];
+    unsafe { core::ptr::copy_nonoverlapping(aligned as *const u8, out.as_mut_ptr(), 16) };
+    unsafe { (*rec)[1] = aligned + 16 };
+    out
 }
 
 unsafe fn take(va: &mut VaList, kind: Kind) -> Val {
-    unsafe {
-        match kind {
-            Kind::Int => Val::I(u64::from(va.next_arg::<c_int>() as u32)),
-            Kind::Long => Val::I(va.next_arg::<c_long>() as u64),
-            Kind::Double => Val::D(va.next_arg::<f64>()),
-            Kind::Ptr => Val::I(va.next_arg::<*const c_void>() as usize as u64),
-            Kind::LongDouble => Val::LD(read_long_double(va)),
-        }
+    match kind {
+        Kind::Int => Val::I(u64::from(unsafe { va.next_arg::<c_int>() } as u32)),
+        Kind::Long => Val::I(unsafe { va.next_arg::<c_long>() } as u64),
+        Kind::Double => Val::D(unsafe { va.next_arg::<f64>() }),
+        Kind::Ptr => Val::I(unsafe { va.next_arg::<*const c_void>() } as usize as u64),
+        Kind::LongDouble => Val::LD(unsafe { read_long_double(va) }),
     }
 }
 
@@ -65,18 +61,16 @@ pub unsafe fn run<S: Sink>(sink: &mut S, fmt_ptr: *const c_char, va: &mut VaList
 }
 
 pub unsafe fn run_fmt<S: Sink, F: fmt::FmtChar>(sink: &mut S, f: *const F, va: &mut VaList) -> c_int {
-    unsafe {
-        let positional = if F::has_dollar(f) { fmt::scan_positional(f) } else { None };
-        match positional {
-            None => fmt::format(sink, f, &mut VaArgs(va)),
-            Some(pk) => {
-                let n = pk.max.min(128);
-                let mut pa = PosArgs { vals: [const { core::mem::MaybeUninit::uninit() }; 128], n, next: 0 };
-                for i in 0..n {
-                    pa.vals[i] = core::mem::MaybeUninit::new(take(va, pk.kinds[i].unwrap_or(Kind::Int)));
-                }
-                fmt::format(sink, f, &mut pa)
+    let positional = if unsafe { F::has_dollar(f) } { unsafe { fmt::scan_positional(f) } } else { None };
+    match positional {
+        None => unsafe { fmt::format(sink, f, &mut VaArgs(va)) },
+        Some(pk) => {
+            let n = pk.max.min(128);
+            let mut pa = PosArgs { vals: [const { core::mem::MaybeUninit::uninit() }; 128], n, next: 0 };
+            for i in 0..n {
+                pa.vals[i] = core::mem::MaybeUninit::new(unsafe { take(va, pk.kinds[i].unwrap_or(Kind::Int)) });
             }
+            unsafe { fmt::format(sink, f, &mut pa) }
         }
     }
 }
@@ -88,20 +82,19 @@ pub struct BufSink {
 }
 
 impl BufSink {
-    pub fn new(buf: *mut u8, cap: usize) -> BufSink {
+    pub unsafe fn new(buf: *mut u8, cap: usize) -> BufSink {
         BufSink { buf, cap, pos: 0 }
     }
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn new_snprintf(buf: *mut u8, cap: usize) -> BufSink {
+    pub unsafe fn new_snprintf(buf: *mut u8, cap: usize) -> BufSink {
         if cap > 0 {
             unsafe { *buf = 0 };
         }
         BufSink { buf, cap, pos: 0 }
     }
-    pub unsafe fn finish(&mut self) {
+    pub fn finish(&mut self) {
         if self.cap > 0 {
             let at = self.pos.min(self.cap - 1);
-            unsafe { *self.buf.add(at) = 0 };
+            unsafe { *self.buf.wrapping_add(at) = 0 };
         }
     }
 }
@@ -110,7 +103,7 @@ impl Sink for BufSink {
     const DIRECT: bool = true;
     fn direct(&mut self, n: usize) -> *mut u8 {
         if self.cap > 0 && n < self.cap - self.pos.min(self.cap - 1) {
-            let p = unsafe { self.buf.add(self.pos) };
+            let p = self.buf.wrapping_add(self.pos);
             self.pos += n;
             p
         } else {
@@ -121,7 +114,7 @@ impl Sink for BufSink {
         if self.cap > 0 && self.pos < self.cap - 1 {
             let room = self.cap - 1 - self.pos;
             let n = bytes.len().min(room);
-            unsafe { crate::fmt::small_copy(self.buf.add(self.pos), bytes.as_ptr(), n) };
+            unsafe { crate::fmt::small_copy(self.buf.wrapping_add(self.pos), bytes.as_ptr(), n) };
         }
         self.pos = self.pos.saturating_add(bytes.len());
         true
@@ -136,28 +129,26 @@ struct AllocSink {
 
 impl Sink for AllocSink {
     fn put(&mut self, bytes: &[u8]) -> bool {
-        unsafe {
-            if self.len + bytes.len() + 1 > self.cap {
-                let mut cap = if self.cap == 0 { 128 } else { self.cap };
-                while cap < self.len + bytes.len() + 1 {
-                    cap = match cap.checked_mul(2) {
-                        Some(c) => c,
-                        None => {
-                            errno::set(12);
-                            return false;
-                        }
-                    };
-                }
-                let nb = rusty_libc_malloc::realloc(self.buf.cast(), cap) as *mut u8;
-                if nb.is_null() {
-                    return false;
-                }
-                self.buf = nb;
-                self.cap = cap;
+        if self.len + bytes.len() + 1 > self.cap {
+            let mut cap = if self.cap == 0 { 128 } else { self.cap };
+            while cap < self.len + bytes.len() + 1 {
+                cap = match cap.checked_mul(2) {
+                    Some(c) => c,
+                    None => {
+                        errno::set(12);
+                        return false;
+                    }
+                };
             }
-            rusty_libc_mem::memcpy(self.buf.add(self.len).cast(), bytes.as_ptr().cast(), bytes.len());
-            self.len += bytes.len();
+            let nb = unsafe { rusty_libc_malloc::realloc(self.buf.cast(), cap) } as *mut u8;
+            if nb.is_null() {
+                return false;
+            }
+            self.buf = nb;
+            self.cap = cap;
         }
+        unsafe { crate::file::copy_raw(self.buf.wrapping_add(self.len), bytes.as_ptr(), bytes.len()) };
+        self.len += bytes.len();
         true
     }
 }
@@ -213,65 +204,53 @@ impl Sink for FdSink {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn vsprintf(s: *mut c_char, format: *const c_char, mut ap: VaList) -> c_int {
-    unsafe {
-        let mut sink = BufSink::new(s.cast(), usize::MAX);
-        let r = run(&mut sink, format, &mut ap);
-        sink.finish();
-        r
-    }
+    let mut sink = unsafe { BufSink::new(s.cast(), usize::MAX) };
+    let r = unsafe { run(&mut sink, format, &mut ap) };
+    sink.finish();
+    r
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn vsnprintf(s: *mut c_char, n: usize, format: *const c_char, mut ap: VaList) -> c_int {
-    unsafe {
-        let mut sink = BufSink::new_snprintf(s.cast(), n);
-        let r = run(&mut sink, format, &mut ap);
-        sink.finish();
-        r
-    }
+    let mut sink = unsafe { BufSink::new_snprintf(s.cast(), n) };
+    let r = unsafe { run(&mut sink, format, &mut ap) };
+    sink.finish();
+    r
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sprintf(s: *mut c_char, format: *const c_char, mut args: ...) -> c_int {
-    unsafe {
-        let mut sink = BufSink::new(s.cast(), usize::MAX);
-        let r = run(&mut sink, format, &mut args);
-        sink.finish();
-        r
-    }
+    let mut sink = unsafe { BufSink::new(s.cast(), usize::MAX) };
+    let r = unsafe { run(&mut sink, format, &mut args) };
+    sink.finish();
+    r
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn snprintf(s: *mut c_char, n: usize, format: *const c_char, mut args: ...) -> c_int {
-    unsafe {
-        let mut sink = BufSink::new_snprintf(s.cast(), n);
-        let r = run(&mut sink, format, &mut args);
-        sink.finish();
-        r
-    }
+    let mut sink = unsafe { BufSink::new_snprintf(s.cast(), n) };
+    let r = unsafe { run(&mut sink, format, &mut args) };
+    sink.finish();
+    r
 }
 
 unsafe fn alloc_printf(strp: *mut *mut c_char, format: *const c_char, va: &mut VaList) -> c_int {
-    unsafe {
-        let mut sink = AllocSink { buf: core::ptr::null_mut(), len: 0, cap: 0 };
-        let r = run(&mut sink, format, va);
-        if r < 0 {
-            rusty_libc_malloc::free(sink.buf.cast());
-            *strp = core::ptr::null_mut();
-            return -1;
-        }
+    let mut sink = AllocSink { buf: core::ptr::null_mut(), len: 0, cap: 0 };
+    let r = unsafe { run(&mut sink, format, va) };
+    let out = if r < 0 {
+        unsafe { crate::file::free(sink.buf) };
+        core::ptr::null_mut()
+    } else {
         if sink.buf.is_null() {
-            let b = rusty_libc_malloc::malloc(1) as *mut u8;
-            if b.is_null() {
-                *strp = core::ptr::null_mut();
-                return -1;
-            }
-            sink.buf = b;
+            sink.buf = crate::file::alloc(1);
         }
-        *sink.buf.add(sink.len) = 0;
-        *strp = sink.buf.cast();
-        r
-    }
+        if !sink.buf.is_null() {
+            unsafe { *sink.buf.wrapping_add(sink.len) = 0 };
+        }
+        sink.buf
+    };
+    unsafe { *strp = out.cast() };
+    if out.is_null() { -1 } else { r }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -290,14 +269,12 @@ pub unsafe extern "C" fn __asprintf(strp: *mut *mut c_char, format: *const c_cha
 }
 
 unsafe fn fd_printf(fd: c_int, format: *const c_char, va: &mut VaList) -> c_int {
-    unsafe {
-        let mut sink = FdSink { fd, buf: [0; 1024], len: 0 };
-        let r = run(&mut sink, format, va);
-        if r >= 0 && !sink.flush() {
-            return -1;
-        }
-        r
+    let mut sink = FdSink { fd, buf: [0; 1024], len: 0 };
+    let r = unsafe { run(&mut sink, format, va) };
+    if r >= 0 && !sink.flush() {
+        return -1;
     }
+    r
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

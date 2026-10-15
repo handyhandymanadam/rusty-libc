@@ -266,11 +266,9 @@ pub(crate) fn force_nofma() -> bool {
 fn detect() -> u8 {
     use core::arch::x86_64::__cpuid;
     let mut f = F_INIT;
-    #[allow(unused_unsafe)]
-    let max = unsafe { __cpuid(0) }.eax;
+    let max = __cpuid(0).eax;
     if max >= 1 {
-        #[allow(unused_unsafe)]
-        let r = unsafe { __cpuid(1) };
+        let r = __cpuid(1);
         if r.ecx & (1 << 19) != 0 {
             f |= F_SSE41;
         }

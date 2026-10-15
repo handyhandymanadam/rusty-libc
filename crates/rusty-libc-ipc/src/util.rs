@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use core::ffi::c_int;
+use core::ffi::{c_int, c_void};
 use rusty_libc_core::errno;
 
 #[inline]
@@ -20,6 +20,30 @@ pub(crate) fn sci(ret: usize) -> c_int {
 #[inline]
 pub(crate) fn res(ret: usize) -> Result<usize, rusty_libc_core::Errno> {
     rusty_libc_core::syscall::check(ret)
+}
+
+#[inline(always)]
+pub(crate) fn malloc(size: usize) -> *mut c_void {
+    unsafe { rusty_libc_malloc::malloc(size) }
+}
+
+pub(crate) fn heap_box<T>(v: T) -> *mut T {
+    const { assert!(core::mem::align_of::<T>() <= 16) };
+    let p = malloc(core::mem::size_of::<T>()).cast::<T>();
+    if !p.is_null() {
+        unsafe { p.write(v) };
+    }
+    p
+}
+
+pub(crate) unsafe fn heap_take<T>(p: *mut T) -> T {
+    let v = unsafe { p.read() };
+    unsafe { rusty_libc_malloc::free(p.cast()) };
+    v
+}
+
+pub(crate) unsafe fn heap_free<T>(p: *mut T) {
+    unsafe { rusty_libc_malloc::free(p.cast()) };
 }
 
 pub(crate) fn fail(e: c_int) -> c_int {

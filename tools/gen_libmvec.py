@@ -20,8 +20,8 @@ syms.sort()
 FEATURE = {"b": "sse2", "c": "avx", "d": "avx2", "e": "avx512f"}
 VT = {("b", "d"): "__m128d", ("b", "s"): "__m128", ("c", "d"): "__m256d", ("c", "s"): "__m256", ("d", "d"): "__m256d", ("d", "s"): "__m256",
       ("e", "d"): "__m512d", ("e", "s"): "__m512"}
-IT = {"b": "__m128i", "c": "__m256i", "d": "__m256i", "e": "__m512i"}
-REGBYTES = {"b": 16, "c": 32, "d": 32, "e": 64}
+IT = {"b": "__m128i", "c": "__m128i", "d": "__m256i", "e": "__m512i"}
+REGBYTES = {"b": 16, "c": 16, "d": 32, "e": 64}
 SIMD = {"_ZGVdN8v_expf", "_ZGVeN16v_expf", "_ZGVdN8v_logf", "_ZGVeN16v_logf", "_ZGVdN8v_sinf", "_ZGVeN16v_sinf",
         "_ZGVdN8v_cosf", "_ZGVeN16v_cosf", "_ZGVdN8vv_powf", "_ZGVeN16vv_powf",
         "_ZGVdN4v_exp", "_ZGVeN8v_exp", "_ZGVdN4v_log", "_ZGVeN8v_log",
@@ -48,10 +48,9 @@ for name, ver in syms:
     elif shape == "vvv":
         it = IT[isa]
         regs = (lanes * 8) // REGBYTES[isa]
-        if regs == 1:
-            body.append('sincos1!(%s, %s, %s, %s, %d, "%s", %s);' % (name, vt, it, elem, lanes, feat, fn))
-        else:
-            body.append('sincos2!(%s, %s, %s, %s, %d, "%s", %s);' % (name, vt, it, elem, lanes, feat, fn))
+        if regs not in (1, 2, 4):
+            sys.exit("sincos registers %d for %s" % (regs, name))
+        body.append('sincos%d!(%s, %s, %s, %s, %d, "%s", %s);' % (regs, name, vt, it, elem, lanes, feat, fn))
     else:
         sys.exit("shape " + shape)
 open(os.path.join(root, "crates/rusty-libc-mvec/src/vecs.rs"), "w").write("\n".join(body) + "\n")

@@ -1,0 +1,15 @@
+[package]
+name = "rusty-libc-rs-core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+rust-version = "1.88"
+keywords = ["libc", "linux", "syscall", "no-std", "posix"]
+categories = ["os::linux-apis", "no-std::no-alloc", "api-bindings"]
+description = "The unsafe layer of rusty-libc's Rust face: raw Linux system calls, Errno, descriptor ownership types and typed structures (no_std, no alloc, stable Rust)"
+
+[dependencies]
+
+[features]
+std = []
+libc-services = ["std"]

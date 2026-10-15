@@ -1,9 +1,12 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::nss;
-use crate::util::{eq_nocase, is_space};
-use core::ffi::{c_char, c_int};
+use crate::util::{HeapVec, eq_nocase, is_space};
+use core::ffi::{CStr, c_char, c_int};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
 use rusty_libc_core::errno;
+use rusty_libc_core::ffi;
+use rusty_libc_core::sync_cell::SyncCell;
 
 const ERANGE: i32 = 34;
 const ENOMEM: i32 = 12;
@@ -18,56 +21,50 @@ enum St {
     Return,
 }
 
-#[repr(C)]
-struct NameList {
-    next: *mut NameList,
-}
+struct Name(HeapVec<u8>);
 
-unsafe fn nl_name(n: *const NameList) -> *const u8 {
-    unsafe { (n as *const u8).add(size_of::<NameList>()) }
-}
-
-unsafe fn nl_new(name: *const u8, len: usize) -> *mut NameList {
-    unsafe {
-        let p = rusty_libc_malloc::malloc(size_of::<NameList>() + len + 1) as *mut NameList;
-        if p.is_null() {
-            return null_mut();
-        }
-        core::ptr::copy_nonoverlapping(name, (p as *mut u8).add(size_of::<NameList>()), len);
-        *(p as *mut u8).add(size_of::<NameList>() + len) = 0;
-        p
+impl Name {
+    fn of(b: &[u8]) -> Option<Name> {
+        let mut v = HeapVec::new();
+        if v.extend_from(b) && v.push(0) { Some(Name(v)) } else { None }
+    }
+    fn cstr(&self) -> &CStr {
+        CStr::from_bytes_until_nul(&self.0).unwrap_or_default()
     }
 }
 
-unsafe fn nl_contains(mut l: *const NameList, name: &[u8]) -> bool {
-    unsafe {
-        while !l.is_null() {
-            if cbytes_u8(nl_name(l)) == name {
-                return true;
-            }
-            l = (*l).next;
-        }
-        false
-    }
+struct Names {
+    bytes: HeapVec<u8>,
+    ranges: HeapVec<(usize, usize)>,
 }
 
-unsafe fn nl_free(mut l: *mut NameList) {
-    unsafe {
-        while !l.is_null() {
-            let n = (*l).next;
-            rusty_libc_malloc::free(l.cast());
-            l = n;
-        }
+impl Names {
+    const fn new() -> Names {
+        Names { bytes: HeapVec::new(), ranges: HeapVec::new() }
     }
-}
-
-unsafe fn cbytes_u8<'a>(p: *const u8) -> &'a [u8] {
-    unsafe {
-        let mut n = 0;
-        while *p.add(n) != 0 {
-            n += 1;
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+    fn push(&mut self, name: &[u8]) -> bool {
+        let s = self.bytes.len();
+        self.bytes.extend_from(name) && self.ranges.push((s, s + name.len()))
+    }
+    fn contains(&self, name: &[u8]) -> bool {
+        self.ranges.iter().any(|&(s, e)| &self.bytes[s..e] == name)
+    }
+    fn pop(&mut self) -> Option<Name> {
+        let &(s, e) = self.ranges.last()?;
+        let n = Name::of(&self.bytes[s..e]);
+        let mut r = HeapVec::new();
+        let k = self.ranges.len() - 1;
+        if !r.extend_from(&self.ranges[..k]) {
+            return None;
         }
-        core::slice::from_raw_parts(p, n)
+        self.ranges = r;
+        n
+    }
+    fn free(&mut self) {
+        *self = Names::new();
     }
 }
 
@@ -81,14 +78,36 @@ struct NetGrent {
     data_size: usize,
     cursor: *mut u8,
     first: c_int,
-    known: *mut NameList,
-    needed: *mut NameList,
+    known: *mut u8,
+    needed: *mut u8,
     nip: usize,
 }
 
-impl NetGrent {
-    const fn new() -> NetGrent {
-        NetGrent { typ: 0, host: core::ptr::null(), user: core::ptr::null(), domain: core::ptr::null(), data: null_mut(), data_size: 0, cursor: null_mut(), first: 0, known: null_mut(), needed: null_mut(), nip: 0 }
+struct Ng {
+    d: NetGrent,
+    text: HeapVec<u8>,
+    cur: Option<usize>,
+    known: Names,
+    needed: Names,
+    got: bool,
+}
+
+impl Ng {
+    const fn new() -> Ng {
+        Ng {
+            d: NetGrent { typ: 0, host: core::ptr::null(), user: core::ptr::null(), domain: core::ptr::null(), data: null_mut(), data_size: 0, cursor: null_mut(), first: 0, known: null_mut(), needed: null_mut(), nip: 0 },
+            text: HeapVec::new(),
+            cur: None,
+            known: Names::new(),
+            needed: Names::new(),
+            got: false,
+        }
+    }
+    fn strs(&self) -> [Option<&[u8]>; 3] {
+        if !self.got {
+            return [None; 3];
+        }
+        [self.d.host, self.d.user, self.d.domain].map(|p| unsafe { ffi::cstr(p) }.map(CStr::to_bytes))
     }
 }
 
@@ -139,45 +158,45 @@ fn st_of(status: i32) -> St {
     }
 }
 
-unsafe fn src_set(src: &nssmod::Source, group: &[u8], group_c: *const u8, d: &mut NetGrent) -> St {
-    unsafe {
-        if nssent::is_files(src) {
-            return files_set(group, d);
-        }
-        let f = ng_module_fn(src, Fn3::Set);
-        if f == 0 {
-            return St::Unavail;
-        }
-        let f: unsafe extern "C" fn(*const u8, *mut NetGrent) -> c_int = core::mem::transmute(f);
-        st_of(f(group_c, d))
+fn src_set(src: &nssmod::Source, group: &CStr, st: &mut Ng) -> St {
+    st.got = false;
+    if nssent::is_files(src) {
+        return files_set(group.to_bytes(), st);
     }
+    let f = ng_module_fn(src, Fn3::Set);
+    if f == 0 {
+        return St::Unavail;
+    }
+    let f: extern "C" fn(*const c_char, *mut NetGrent) -> c_int = unsafe { core::mem::transmute(f) };
+    st_of(f(group.as_ptr(), &mut st.d))
 }
 
-unsafe fn src_get(src: &nssmod::Source, d: &mut NetGrent, buffer: *mut u8, buflen: usize) -> St {
-    unsafe {
-        if nssent::is_files(src) {
-            return parseline(d, buffer, buflen);
-        }
+fn src_get(src: &nssmod::Source, st: &mut Ng, buffer: &mut [u8]) -> St {
+    st.got = false;
+    let r = if nssent::is_files(src) {
+        parseline(st, buffer)
+    } else {
         let f = ng_module_fn(src, Fn3::Get);
         if f == 0 {
             return St::Unavail;
         }
-        let f: unsafe extern "C" fn(*mut NetGrent, *mut u8, usize, *mut c_int) -> c_int = core::mem::transmute(f);
-        st_of(f(d, buffer, buflen, errno::location()))
-    }
+        let f: extern "C" fn(*mut NetGrent, *mut u8, usize, *mut c_int) -> c_int = unsafe { core::mem::transmute(f) };
+        st_of(f(&mut st.d, buffer.as_mut_ptr(), buffer.len(), errno::location()))
+    };
+    st.got = r == St::Success;
+    r
 }
 
-unsafe fn src_end(src: &nssmod::Source, d: &mut NetGrent) {
-    unsafe {
-        if nssent::is_files(src) {
-            files_end(d);
-            return;
-        }
-        let f = ng_module_fn(src, Fn3::End);
-        if f != 0 {
-            let f: unsafe extern "C" fn(*mut NetGrent) -> c_int = core::mem::transmute(f);
-            f(d);
-        }
+fn src_end(src: &nssmod::Source, st: &mut Ng) {
+    st.got = false;
+    if nssent::is_files(src) {
+        files_end(st);
+        return;
+    }
+    let f = ng_module_fn(src, Fn3::End);
+    if f != 0 {
+        let f: extern "C" fn(*mut NetGrent) -> c_int = unsafe { core::mem::transmute(f) };
+        f(&mut st.d);
     }
 }
 
@@ -196,409 +215,359 @@ fn ng_next2(ord: &nssmod::Order, nip: &mut usize, f: Fn3, status: St) -> i32 {
     nssent::next2(ord, nip, f, s, false, &mut NgOps)
 }
 
-fn read_file(path: &crate::util::Buf<320>) -> Result<(*mut u8, usize), i32> {
-    unsafe {
-        let fd = match rusty_libc_core::unistd::open(path.b.as_ptr() as *const c_char, 0o2000000, 0) {
-            Ok(fd) => fd,
-            Err(e) => return Err(e.0),
-        };
-        let mut cap = 4096usize;
-        let mut buf = rusty_libc_malloc::malloc(cap) as *mut u8;
-        let mut len = 0usize;
-        if buf.is_null() {
+fn grow_zeroed(v: &mut HeapVec<u8>, n: usize) -> bool {
+    let zeros = [0u8; 512];
+    let mut left = n;
+    while left > 0 {
+        let k = left.min(zeros.len());
+        if !v.extend_from(&zeros[..k]) {
+            return false;
+        }
+        left -= k;
+    }
+    true
+}
+
+fn read_file(path: &crate::util::Buf<320>) -> Result<(HeapVec<u8>, usize), i32> {
+    let Ok(path) = CStr::from_bytes_until_nul(&path.b) else { return Err(ENOMEM) };
+    let fd = match unsafe { rusty_libc_core::unistd::open(path.as_ptr(), 0o2000000, 0) } {
+        Ok(fd) => fd,
+        Err(e) => return Err(e.0),
+    };
+    let mut buf = HeapVec::new();
+    if !grow_zeroed(&mut buf, 4096) {
+        let _ = rusty_libc_core::unistd::close(fd);
+        return Err(ENOMEM);
+    }
+    let mut len = 0usize;
+    loop {
+        if len == buf.len() && !grow_zeroed(&mut buf, len) {
             let _ = rusty_libc_core::unistd::close(fd);
             return Err(ENOMEM);
         }
-        loop {
-            if len == cap {
-                cap *= 2;
-                let nb = rusty_libc_malloc::realloc(buf.cast(), cap) as *mut u8;
-                if nb.is_null() {
-                    rusty_libc_malloc::free(buf.cast());
-                    let _ = rusty_libc_core::unistd::close(fd);
-                    return Err(ENOMEM);
-                }
-                buf = nb;
-            }
-            match rusty_libc_core::unistd::read(fd, core::slice::from_raw_parts_mut(buf.add(len), cap - len)) {
-                Ok(0) => break,
-                Ok(n) => len += n,
-                Err(e) if e.0 == 4 => {}
-                Err(_) => break,
-            }
+        match rusty_libc_core::unistd::read(fd, &mut buf[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.0 == 4 => {}
+            Err(_) => break,
         }
-        let _ = rusty_libc_core::unistd::close(fd);
-        Ok((buf, len))
     }
+    let _ = rusty_libc_core::unistd::close(fd);
+    Ok((buf, len))
 }
 
-unsafe fn files_end(d: &mut NetGrent) {
-    unsafe {
-        rusty_libc_malloc::free(d.data.cast());
-        d.data = null_mut();
-        d.cursor = null_mut();
-    }
+fn files_end(st: &mut Ng) {
+    st.text = HeapVec::new();
+    st.cur = None;
 }
 
-unsafe fn files_set(group: &[u8], d: &mut NetGrent) -> St {
-    unsafe {
-        if group.is_empty() {
-            return St::Unavail;
-        }
-        let path = nss::etc_path(b"/netgroup");
-        let (file, flen) = match read_file(&path) {
-            Ok(x) => x,
-            Err(e) => return if e == EAGAIN { St::TryAgain } else { St::Unavail },
-        };
-        let bytes = core::slice::from_raw_parts(file, flen);
-        let mut pos = 0usize;
-        let next_line = |pos: &mut usize| -> Option<(usize, usize)> {
-            if *pos >= flen {
-                return None;
-            }
-            let s = *pos;
-            let mut e = s;
-            while e < flen && bytes[e] != b'\n' {
-                e += 1;
-            }
-            let end = if e < flen { e + 1 } else { e };
-            *pos = end;
-            Some((s, end))
-        };
-        let mut status = St::NotFound;
-        let mut out: Vec8 = Vec8::new();
-        while let Some((s, end)) = next_line(&mut pos) {
-            let line = &bytes[s..end];
-            let found = line.len() > group.len() && line[..group.len()] == *group && is_space(line[group.len()]);
-            if found {
-                if !out.extend(&line[group.len() + 1..]) {
-                    rusty_libc_malloc::free(file.cast());
-                    files_end(d);
-                    return St::Unavail;
-                }
-            }
-            let mut cur = (s, end);
-            while cur.1 - cur.0 > 1 && bytes[cur.1 - 1] == b'\n' && bytes[cur.1 - 2] == b'\\' {
-                if found {
-                    out.len -= 2;
-                }
-                match next_line(&mut pos) {
-                    Some((s2, e2)) => {
-                        cur = (s2, e2);
-                        if found {
-                            if !out.push(b' ') || !out.extend(&bytes[s2..e2]) {
-                                rusty_libc_malloc::free(file.cast());
-                                files_end(d);
-                                return St::Unavail;
-                            }
-                        }
-                    }
-                    None => break,
-                }
-            }
-            if found {
-                status = St::Success;
-                break;
-            }
-        }
-        rusty_libc_malloc::free(file.cast());
-        if status == St::Success {
-            if !out.push(0) {
-                return St::Unavail;
-            }
-            d.data = out.p;
-            d.cursor = d.data;
-            d.first = 1;
-        } else {
-            out.free();
-            files_end(d);
-        }
-        status
-    }
-}
-
-struct Vec8 {
-    p: *mut u8,
+struct Text {
+    v: HeapVec<u8>,
     len: usize,
-    cap: usize,
 }
 
-impl Vec8 {
-    const fn new() -> Vec8 {
-        Vec8 { p: null_mut(), len: 0, cap: 0 }
-    }
-    unsafe fn reserve(&mut self, extra: usize) -> bool {
-        unsafe {
-            if self.len + extra > self.cap {
-                let ncap = (self.len + extra).max(self.cap * 2).max(512);
-                let np = rusty_libc_malloc::realloc(self.p.cast(), ncap) as *mut u8;
-                if np.is_null() {
-                    return false;
-                }
-                self.p = np;
-                self.cap = ncap;
-            }
-            true
-        }
-    }
+impl Text {
     fn push(&mut self, b: u8) -> bool {
-        unsafe {
-            if !self.reserve(1) {
-                return false;
-            }
-            *self.p.add(self.len) = b;
-            self.len += 1;
-            true
+        if self.len < self.v.len() {
+            self.v[self.len] = b;
+        } else if !self.v.push(b) {
+            return false;
         }
+        self.len += 1;
+        true
     }
     fn extend(&mut self, s: &[u8]) -> bool {
-        unsafe {
-            if !self.reserve(s.len() + 1) {
-                return false;
-            }
-            core::ptr::copy_nonoverlapping(s.as_ptr(), self.p.add(self.len), s.len());
-            self.len += s.len();
-            true
-        }
-    }
-    fn free(&mut self) {
-        unsafe { rusty_libc_malloc::free(self.p.cast()) };
-        self.p = null_mut();
-        self.len = 0;
-        self.cap = 0;
+        s.iter().all(|&b| self.push(b))
     }
 }
 
-unsafe fn strip_whitespace(str_: *mut u8) -> *const c_char {
-    unsafe {
-        let mut cp = str_;
-        while is_space(*cp) {
-            cp = cp.add(1);
-        }
-        let s = cp;
-        while *cp != 0 && !is_space(*cp) {
-            cp = cp.add(1);
-        }
-        *cp = 0;
-        if *s == 0 { core::ptr::null() } else { s as *const c_char }
+fn files_set(group: &[u8], st: &mut Ng) -> St {
+    if group.is_empty() {
+        return St::Unavail;
     }
-}
-
-unsafe fn parseline(d: &mut NetGrent, buffer: *mut u8, buflen: usize) -> St {
-    unsafe {
-        let mut cp = d.cursor;
-        if cp.is_null() {
-            return St::NotFound;
+    let path = nss::etc_path(b"/netgroup");
+    let (file, flen) = match read_file(&path) {
+        Ok(x) => x,
+        Err(e) => return if e == EAGAIN { St::TryAgain } else { St::Unavail },
+    };
+    let bytes = &file[..flen];
+    let mut pos = 0usize;
+    let next_line = |pos: &mut usize| -> Option<(usize, usize)> {
+        if *pos >= flen {
+            return None;
         }
-        while is_space(*cp) {
-            cp = cp.add(1);
+        let s = *pos;
+        let mut e = s;
+        while e < flen && bytes[e] != b'\n' {
+            e += 1;
         }
-        let not_found = |first: bool| if first { St::NotFound } else { St::Return };
-        if *cp != b'(' {
-            let name = cp;
-            while *cp != 0 && !is_space(*cp) {
-                cp = cp.add(1);
-            }
-            if name != cp {
-                let last = *cp == 0;
-                d.typ = 1;
-                d.host = name as *const c_char;
-                *cp = 0;
-                if !last {
-                    cp = cp.add(1);
-                }
-                d.cursor = cp;
-                d.first = 0;
-                return St::Success;
-            }
-            return not_found(d.first != 0);
-        }
-        cp = cp.add(1);
-        let host = cp;
-        while *cp != b',' {
-            if *cp == 0 {
-                return not_found(d.first != 0);
-            }
-            cp = cp.add(1);
-        }
-        cp = cp.add(1);
-        let user = cp;
-        while *cp != b',' {
-            if *cp == 0 {
-                return not_found(d.first != 0);
-            }
-            cp = cp.add(1);
-        }
-        cp = cp.add(1);
-        let domain = cp;
-        while *cp != b')' {
-            if *cp == 0 {
-                return not_found(d.first != 0);
-            }
-            cp = cp.add(1);
-        }
-        cp = cp.add(1);
-        let n = cp.offset_from(host) as usize;
-        if n > buflen {
-            errno::set(ERANGE);
-            return St::TryAgain;
-        }
-        core::ptr::copy_nonoverlapping(host, buffer, n);
-        d.typ = 0;
-        *buffer.add(user.offset_from(host) as usize - 1) = 0;
-        d.host = strip_whitespace(buffer);
-        *buffer.add(domain.offset_from(host) as usize - 1) = 0;
-        d.user = strip_whitespace(buffer.add(user.offset_from(host) as usize));
-        *buffer.add(n - 1) = 0;
-        d.domain = strip_whitespace(buffer.add(domain.offset_from(host) as usize));
-        d.cursor = cp;
-        d.first = 0;
-        St::Success
-    }
-}
-
-static mut DS_ORD: nssmod::Order = nssmod::Order::EMPTY;
-
-unsafe fn end_hook(d: &mut NetGrent, ord: &nssmod::Order) {
-    unsafe {
-        if d.nip == 0 {
-            return;
-        }
-        let src = ord.e[d.nip - 1];
-        if nssent::is_files(&src) || ng_module_fn(&src, Fn3::End) != 0 {
-            src_end(&src, d);
-        }
-        d.nip = 0;
-    }
-}
-
-unsafe fn set_reuse(group: *const u8, d: &mut NetGrent, ord: &mut nssmod::Order) -> bool {
-    unsafe {
-        end_hook(d, ord);
-        let g = cbytes_u8(group);
-        let mut status = St::Unavail;
-        *ord = ng_order();
-        let mut i = 0usize;
-        let mut no_more = if ord.n == 0 { 1 } else { ng_lookup(ord, &mut i, Fn3::Set) };
-        if ord.n != 0 {
-            d.nip = i + 1;
-        }
-        while no_more == 0 {
-            status = src_set(&ord.e[i], g, group, d);
-            let old = i;
-            no_more = ng_next2(ord, &mut i, Fn3::Set, status);
-            d.nip = i + 1;
-            if status == St::Success && no_more == 0 {
-                let src = ord.e[old];
-                if nssent::is_files(&src) || ng_module_fn(&src, Fn3::End) != 0 {
-                    src_end(&src, d);
-                }
-            }
-        }
-        let n = nl_new(group, g.len());
-        if n.is_null() {
-            errno::set(ENOMEM);
-            status = St::TryAgain;
-        } else {
-            (*n).next = d.known;
-            d.known = n;
-        }
-        status == St::Success
-    }
-}
-
-unsafe fn internal_set(group: *const u8, d: &mut NetGrent, ord: &mut nssmod::Order) -> bool {
-    unsafe {
-        nl_free(d.known);
-        d.known = null_mut();
-        nl_free(d.needed);
-        d.needed = null_mut();
-        set_reuse(group, d, ord)
-    }
-}
-
-unsafe fn internal_end(d: &mut NetGrent, ord: &nssmod::Order) {
-    unsafe {
-        end_hook(d, ord);
-        nl_free(d.known);
-        d.known = null_mut();
-        nl_free(d.needed);
-        d.needed = null_mut();
-    }
-}
-
-unsafe fn internal_get(hostp: *mut *mut c_char, userp: *mut *mut c_char, domainp: *mut *mut c_char, d: &mut NetGrent, ord: &mut nssmod::Order, buffer: *mut u8, buflen: usize) -> c_int {
-    unsafe {
-        let mut status = St::NotFound;
-        if d.nip != 0 && (nssent::is_files(&ord.e[d.nip - 1]) || ng_module_fn(&ord.e[d.nip - 1], Fn3::Get) != 0) {
-            loop {
-                let src = ord.e[d.nip - 1];
-                status = src_get(&src, d, buffer, buflen);
-                if status == St::Return || (status == St::NotFound && !d.needed.is_null()) {
-                    let mut found = false;
-                    while !d.needed.is_null() && !found {
-                        let tmp = d.needed;
-                        d.needed = (*tmp).next;
-                        (*tmp).next = d.known;
-                        d.known = tmp;
-                        found = set_reuse(nl_name(d.known), d, ord);
-                    }
-                    if found && d.nip != 0 {
-                        let s = ord.e[d.nip - 1];
-                        if nssent::is_files(&s) || ng_module_fn(&s, Fn3::Get) != 0 {
-                            continue;
-                        }
-                    }
-                } else if status == St::Success && d.typ == 1 {
-                    let g = cbytes_u8(d.host as *const u8);
-                    if nl_contains(d.known, g) || nl_contains(d.needed, g) {
-                        continue;
-                    }
-                    let n = nl_new(g.as_ptr(), g.len());
-                    if n.is_null() {
-                        status = St::Return;
-                    } else {
-                        (*n).next = d.needed;
-                        d.needed = n;
-                        continue;
-                    }
-                }
+        let end = if e < flen { e + 1 } else { e };
+        *pos = end;
+        Some((s, end))
+    };
+    let mut status = St::NotFound;
+    let mut out = Text { v: HeapVec::new(), len: 0 };
+    let mut oom = false;
+    while let Some((s, end)) = next_line(&mut pos) {
+        let line = &bytes[s..end];
+        let found = line.len() > group.len() && line[..group.len()] == *group && is_space(line[group.len()]);
+        if found {
+            if !out.extend(&line[group.len() + 1..]) {
+                oom = true;
                 break;
             }
         }
-        if status == St::Success {
-            *hostp = d.host as *mut c_char;
-            *userp = d.user as *mut c_char;
-            *domainp = d.domain as *mut c_char;
+        let mut cur = (s, end);
+        while cur.1 - cur.0 > 1 && bytes[cur.1 - 1] == b'\n' && bytes[cur.1 - 2] == b'\\' {
+            if found {
+                out.len -= 2;
+            }
+            match next_line(&mut pos) {
+                Some((s2, e2)) => {
+                    cur = (s2, e2);
+                    if found {
+                        if !out.push(b' ') || !out.extend(&bytes[s2..e2]) {
+                            oom = true;
+                            break;
+                        }
+                    }
+                }
+                None => break,
+            }
         }
-        (status == St::Success) as c_int
+        if oom {
+            break;
+        }
+        if found {
+            status = St::Success;
+            break;
+        }
     }
+    drop(file);
+    if oom {
+        files_end(st);
+        return St::Unavail;
+    }
+    if status == St::Success {
+        if !out.push(0) {
+            return St::Unavail;
+        }
+        st.text = out.v;
+        st.cur = Some(0);
+        st.d.first = 1;
+    } else {
+        files_end(st);
+    }
+    status
+}
+
+fn strip_whitespace(b: &mut [u8], start: usize) -> Option<usize> {
+    let mut c = start;
+    while is_space(b[c]) {
+        c += 1;
+    }
+    let s = c;
+    while b[c] != 0 && !is_space(b[c]) {
+        c += 1;
+    }
+    b[c] = 0;
+    if b[s] == 0 { None } else { Some(s) }
+}
+
+fn parseline(st: &mut Ng, buffer: &mut [u8]) -> St {
+    let Some(start) = st.cur else { return St::NotFound };
+    let d = &mut st.d;
+    let t = &mut st.text[start..];
+    let mut i = 0usize;
+    while is_space(t[i]) {
+        i += 1;
+    }
+    let not_found = |first: bool| if first { St::NotFound } else { St::Return };
+    if t[i] != b'(' {
+        let name = i;
+        while t[i] != 0 && !is_space(t[i]) {
+            i += 1;
+        }
+        if name != i {
+            let last = t[i] == 0;
+            d.typ = 1;
+            t[i] = 0;
+            if !last {
+                i += 1;
+            }
+            d.host = t.as_ptr().wrapping_add(name).cast::<c_char>();
+            st.cur = Some(start + i);
+            d.first = 0;
+            return St::Success;
+        }
+        return not_found(d.first != 0);
+    }
+    let skip_to = |i: &mut usize, stop: u8| -> bool {
+        while t[*i] != stop {
+            if t[*i] == 0 {
+                return false;
+            }
+            *i += 1;
+        }
+        *i += 1;
+        true
+    };
+    i += 1;
+    let host = i;
+    if !skip_to(&mut i, b',') {
+        return not_found(d.first != 0);
+    }
+    let user = i;
+    if !skip_to(&mut i, b',') {
+        return not_found(d.first != 0);
+    }
+    let domain = i;
+    if !skip_to(&mut i, b')') {
+        return not_found(d.first != 0);
+    }
+    let n = i - host;
+    if n > buffer.len() {
+        errno::set(ERANGE);
+        return St::TryAgain;
+    }
+    let b = &mut buffer[..n];
+    b.copy_from_slice(&t[host..i]);
+    d.typ = 0;
+    b[user - host - 1] = 0;
+    let h = strip_whitespace(b, 0);
+    b[domain - host - 1] = 0;
+    let u = strip_whitespace(b, user - host);
+    b[n - 1] = 0;
+    let dm = strip_whitespace(b, domain - host);
+    let bp = buffer.as_ptr();
+    let at = |o: Option<usize>| o.map_or(core::ptr::null(), |o| bp.wrapping_add(o).cast::<c_char>());
+    d.host = at(h);
+    d.user = at(u);
+    d.domain = at(dm);
+    st.cur = Some(start + i);
+    d.first = 0;
+    St::Success
+}
+
+fn end_hook(st: &mut Ng, ord: &nssmod::Order) {
+    if st.d.nip == 0 {
+        return;
+    }
+    let src = ord.e[st.d.nip - 1];
+    if nssent::is_files(&src) || ng_module_fn(&src, Fn3::End) != 0 {
+        src_end(&src, st);
+    }
+    st.d.nip = 0;
+}
+
+fn set_reuse(group: &CStr, st: &mut Ng, ord: &mut nssmod::Order) -> bool {
+    end_hook(st, ord);
+    let mut status = St::Unavail;
+    *ord = ng_order();
+    let mut i = 0usize;
+    let mut no_more = if ord.n == 0 { 1 } else { ng_lookup(ord, &mut i, Fn3::Set) };
+    if ord.n != 0 {
+        st.d.nip = i + 1;
+    }
+    while no_more == 0 {
+        status = src_set(&ord.e[i], group, st);
+        let old = i;
+        no_more = ng_next2(ord, &mut i, Fn3::Set, status);
+        st.d.nip = i + 1;
+        if status == St::Success && no_more == 0 {
+            let src = ord.e[old];
+            if nssent::is_files(&src) || ng_module_fn(&src, Fn3::End) != 0 {
+                src_end(&src, st);
+            }
+        }
+    }
+    if !st.known.push(group.to_bytes()) {
+        errno::set(ENOMEM);
+        status = St::TryAgain;
+    }
+    status == St::Success
+}
+
+fn internal_set(group: &CStr, st: &mut Ng, ord: &mut nssmod::Order) -> bool {
+    st.known.free();
+    st.needed.free();
+    set_reuse(group, st, ord)
+}
+
+fn internal_end(st: &mut Ng, ord: &nssmod::Order) {
+    end_hook(st, ord);
+    st.known.free();
+    st.needed.free();
+}
+
+pub(crate) type Triple = (*mut c_char, *mut c_char, *mut c_char);
+
+fn internal_get(st: &mut Ng, ord: &mut nssmod::Order, buffer: &mut [u8]) -> Option<Triple> {
+    let mut status = St::NotFound;
+    if st.d.nip != 0 && (nssent::is_files(&ord.e[st.d.nip - 1]) || ng_module_fn(&ord.e[st.d.nip - 1], Fn3::Get) != 0) {
+        loop {
+            let src = ord.e[st.d.nip - 1];
+            status = src_get(&src, st, buffer);
+            if status == St::Return || (status == St::NotFound && !st.needed.is_empty()) {
+                let mut found = false;
+                while !found {
+                    let Some(n) = st.needed.pop() else { break };
+                    found = set_reuse(n.cstr(), st, ord);
+                }
+                if found && st.d.nip != 0 {
+                    let s = ord.e[st.d.nip - 1];
+                    if nssent::is_files(&s) || ng_module_fn(&s, Fn3::Get) != 0 {
+                        continue;
+                    }
+                }
+            } else if status == St::Success && st.d.typ == 1 {
+                let [g, _, _] = st.strs();
+                let g = g.unwrap_or(b"");
+                if st.known.contains(g) || st.needed.contains(g) {
+                    continue;
+                }
+                let n = Name::of(g);
+                match n {
+                    Some(n) if st.needed.push(n.cstr().to_bytes()) => continue,
+                    _ => status = St::Return,
+                }
+            }
+            break;
+        }
+    }
+    if status == St::Success { Some((st.d.host as *mut c_char, st.d.user as *mut c_char, st.d.domain as *mut c_char)) } else { None }
 }
 
 pub(crate) struct PrivNetgr {
-    d: NetGrent,
+    st: Ng,
     ord: nssmod::Order,
 }
 
 impl PrivNetgr {
     pub(crate) const fn new() -> PrivNetgr {
-        PrivNetgr { d: NetGrent::new(), ord: nssmod::Order::EMPTY }
+        PrivNetgr { st: Ng::new(), ord: nssmod::Order::EMPTY }
     }
-    pub(crate) unsafe fn set(&mut self, group: *const u8) -> bool {
-        unsafe { internal_set(group, &mut self.d, &mut self.ord) }
+    pub(crate) fn set(&mut self, group: &CStr) -> bool {
+        internal_set(group, &mut self.st, &mut self.ord)
     }
-    pub(crate) unsafe fn get(&mut self, host: *mut *mut c_char, user: *mut *mut c_char, domain: *mut *mut c_char, buffer: *mut u8, buflen: usize) -> c_int {
-        unsafe { internal_get(host, user, domain, &mut self.d, &mut self.ord, buffer, buflen) }
+    pub(crate) fn get(&mut self, buffer: &mut [u8]) -> Option<Triple> {
+        internal_get(&mut self.st, &mut self.ord, buffer)
     }
-    pub(crate) unsafe fn end(&mut self) {
-        unsafe { internal_end(&mut self.d, &self.ord) }
+    pub(crate) fn end(&mut self) {
+        internal_end(&mut self.st, &self.ord)
     }
 }
 
 struct Lock(AtomicBool);
 static LOCK: Lock = Lock(AtomicBool::new(false));
-static mut DATASET: NetGrent = NetGrent::new();
-static mut BUFFER: [u8; 1024] = [0; 1024];
+
+struct Global {
+    st: Ng,
+    ord: nssmod::Order,
+    buffer: [u8; 1024],
+}
+
+static GLOBAL: SyncCell<Global> = SyncCell::new(Global { st: Ng::new(), ord: nssmod::Order::EMPTY, buffer: [0; 1024] });
 
 struct Guard;
 impl Guard {
@@ -615,104 +584,122 @@ impl Drop for Guard {
     }
 }
 
+fn with_global<R>(f: impl FnOnce(&mut Global) -> R) -> R {
+    let _g = Guard::new();
+    unsafe { GLOBAL.with_unsync(f) }
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setnetgrent(group: *const c_char) -> c_int {
-    unsafe {
-        let _g = Guard::new();
-        internal_set(group as *const u8, &mut *(&raw mut DATASET), &mut *(&raw mut DS_ORD)) as c_int
-    }
+    let group = unsafe { ffi::cstr_nonnull(group) };
+    with_global(|g| internal_set(group, &mut g.st, &mut g.ord)) as c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn endnetgrent() {
-    unsafe {
-        let _g = Guard::new();
-        internal_end(&mut *(&raw mut DATASET), &*(&raw const DS_ORD));
-    }
+    with_global(|g| internal_end(&mut g.st, &g.ord))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getnetgrent_r(host: *mut *mut c_char, user: *mut *mut c_char, domain: *mut *mut c_char, buffer: *mut c_char, buflen: usize) -> c_int {
-    unsafe {
-        let _g = Guard::new();
-        internal_get(host, user, domain, &mut *(&raw mut DATASET), &mut *(&raw mut DS_ORD), buffer as *mut u8, buflen)
+    let buffer = unsafe { ffi::bytes_mut(buffer.cast::<u8>(), buflen) };
+    match with_global(|g| internal_get(&mut g.st, &mut g.ord, buffer)) {
+        Some(t) => {
+            let [h, u, d] = [host, user, domain].map(|p| unsafe { &mut *p });
+            (*h, *u, *d) = t;
+            1
+        }
+        None => 0,
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getnetgrent(host: *mut *mut c_char, user: *mut *mut c_char, domain: *mut *mut c_char) -> c_int {
-    unsafe {
-        let _g = Guard::new();
-        internal_get(host, user, domain, &mut *(&raw mut DATASET), &mut *(&raw mut DS_ORD), (&raw mut BUFFER) as *mut u8, 1024)
-    }
+    with_global(|g| match internal_get(&mut g.st, &mut g.ord, &mut g.buffer) {
+        Some(t) => {
+            let [h, u, d] = [host, user, domain].map(|p| unsafe { &mut *p });
+            (*h, *u, *d) = t;
+            1
+        }
+        None => 0,
+    })
 }
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn innetgr(netgroup: *const c_char, host: *const c_char, user: *const c_char, domain: *const c_char) -> c_int {
-    unsafe {
-        let mut entry = NetGrent::new();
-        let mut result = 0;
-        let mut current_group = netgroup as *const u8;
-        let ng = cbytes_u8(netgroup as *const u8);
-        let opt = |p: *const c_char| -> Option<&[u8]> { if p.is_null() { None } else { Some(cbytes_u8(p as *const u8)) } };
-        let (host, user, domain) = (opt(host), opt(user), opt(domain));
-        loop {
-            let ord = ng_order();
-            let mut i = 0usize;
-            let mut no_more = if ord.n == 0 { 1 } else { ng_lookup(&ord, &mut i, Fn3::Set) };
-            while no_more == 0 {
-                entry.nip = i + 1;
-                let src = ord.e[i];
-                let mut status = src_set(&src, cbytes_u8(current_group), current_group, &mut entry);
-                if status == St::Success && (nssent::is_files(&src) || ng_module_fn(&src, Fn3::Get) != 0) {
-                    let mut buffer = [0u8; 1024];
-                    while src_get(&src, &mut entry, buffer.as_mut_ptr(), buffer.len()) == St::Success {
-                        if entry.typ == 1 {
-                            let g = cbytes_u8(entry.host as *const u8);
-                            if !nl_contains(entry.known, g) && !nl_contains(entry.needed, g) && g != ng {
-                                let n = nl_new(g.as_ptr(), g.len());
-                                if n.is_null() {
-                                    result = -1;
-                                    break;
-                                }
-                                (*n).next = entry.needed;
-                                entry.needed = n;
-                            }
-                        } else {
-                            let eh = if entry.host.is_null() { None } else { Some(cbytes_u8(entry.host as *const u8)) };
-                            let eu = if entry.user.is_null() { None } else { Some(cbytes_u8(entry.user as *const u8)) };
-                            let ed = if entry.domain.is_null() { None } else { Some(cbytes_u8(entry.domain as *const u8)) };
-                            let m = |e: Option<&[u8]>, q: Option<&[u8]>, nocase: bool| match (e, q) {
-                                (Some(e), Some(q)) => if nocase { eq_nocase(e, q) } else { e == q },
-                                _ => true,
-                            };
-                            if m(eh, host, true) && m(eu, user, false) && m(ed, domain, true) {
-                                result = 1;
+
+pub fn in_netgroup(netgroup: &CStr, host: Option<&[u8]>, user: Option<&[u8]>, domain: Option<&[u8]>) -> bool {
+    let mut entry = Ng::new();
+    let mut result = 0;
+    let ng = netgroup.to_bytes();
+    let mut cur: Option<Name> = None;
+    loop {
+        let group: &CStr = match &cur {
+            Some(n) => n.cstr(),
+            None => netgroup,
+        };
+        let ord = ng_order();
+        let mut i = 0usize;
+        let mut no_more = if ord.n == 0 { 1 } else { ng_lookup(&ord, &mut i, Fn3::Set) };
+        while no_more == 0 {
+            entry.d.nip = i + 1;
+            let src = ord.e[i];
+            let mut status = src_set(&src, group, &mut entry);
+            if status == St::Success && (nssent::is_files(&src) || ng_module_fn(&src, Fn3::Get) != 0) {
+                let mut buffer = [0u8; 1024];
+                while src_get(&src, &mut entry, &mut buffer) == St::Success {
+                    let [eh, eu, ed] = entry.strs();
+                    if entry.d.typ == 1 {
+                        let g = eh.unwrap_or(b"");
+                        let is_cur = cur.as_ref().is_some_and(|n| n.cstr().to_bytes() == g);
+                        if !entry.known.contains(g) && !is_cur && !entry.needed.contains(g) && g != ng {
+                            let n = Name::of(g);
+                            if !n.is_some_and(|n| entry.needed.push(n.cstr().to_bytes())) {
+                                result = -1;
                                 break;
                             }
                         }
+                    } else {
+                        let m = |e: Option<&[u8]>, q: Option<&[u8]>, nocase: bool| match (e, q) {
+                            (Some(e), Some(q)) => if nocase { eq_nocase(e, q) } else { e == q },
+                            _ => true,
+                        };
+                        if m(eh, host, true) && m(eu, user, false) && m(ed, domain, true) {
+                            result = 1;
+                            break;
+                        }
                     }
-                    status = St::Return;
                 }
-                if nssent::is_files(&src) || ng_module_fn(&src, Fn3::End) != 0 {
-                    src_end(&src, &mut entry);
-                }
-                if result != 0 {
-                    break;
-                }
-                no_more = ng_next2(&ord, &mut i, Fn3::Set, status);
+                status = St::Return;
             }
-            if result == 0 && !entry.needed.is_null() {
-                let tmp = entry.needed;
-                entry.needed = (*tmp).next;
-                (*tmp).next = entry.known;
-                entry.known = tmp;
-                current_group = nl_name(tmp);
-                continue;
+            if nssent::is_files(&src) || ng_module_fn(&src, Fn3::End) != 0 {
+                src_end(&src, &mut entry);
             }
-            break;
+            if result != 0 {
+                break;
+            }
+            no_more = ng_next2(&ord, &mut i, Fn3::Set, status);
         }
-        nl_free(entry.known);
-        nl_free(entry.needed);
-        (result == 1) as c_int
+        if result == 0 && !entry.needed.is_empty() {
+            if let Some(n) = cur.take()
+                && !entry.known.push(n.cstr().to_bytes())
+            {
+                break;
+            }
+            cur = entry.needed.pop();
+            if cur.is_none() {
+                break;
+            }
+            continue;
+        }
+        break;
     }
+    drop(cur);
+    entry.known.free();
+    entry.needed.free();
+    result == 1
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn innetgr(netgroup: *const c_char, host: *const c_char, user: *const c_char, domain: *const c_char) -> c_int {
+    let netgroup = unsafe { ffi::cstr_nonnull(netgroup) };
+    let [host, user, domain] = [host, user, domain].map(|p| unsafe { ffi::cstr(p) }.map(CStr::to_bytes));
+    in_netgroup(netgroup, host, user, domain) as c_int
 }

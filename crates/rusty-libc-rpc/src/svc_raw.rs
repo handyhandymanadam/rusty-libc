@@ -1,13 +1,16 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
+
+use crate::stream::XdrStream;
 use crate::types::*;
 use crate::vars::*;
-use core::ffi::{c_char, c_int};
+use core::ffi::c_int;
 
 #[repr(C)]
 struct SvcRawPrivate {
-    raw_buf: [c_char; UDPMSGSIZE as usize],
+    raw_buf: [u8; UDPMSGSIZE as usize],
     server: SVCXPRT,
     xdr_stream: XDR,
-    verf_body: [c_char; MAX_AUTH_BYTES as usize],
+    verf_body: [u8; MAX_AUTH_BYTES as usize],
 }
 
 static SERVER_OPS: xp_ops = xp_ops {
@@ -20,27 +23,32 @@ static SERVER_OPS: xp_ops = xp_ops {
 };
 
 #[inline]
-unsafe fn srp() -> *mut SvcRawPrivate {
-    (*thread_vars()).svcraw_private as *mut SvcRawPrivate
+unsafe fn private<'a>() -> Option<&'a mut SvcRawPrivate> {
+    unsafe { tv_svcraw_private().cast::<SvcRawPrivate>().as_mut() }
+}
+
+#[inline]
+unsafe fn raw_stream<'a>() -> Option<XdrStream<'a>> {
+    let p = unsafe { private() }?;
+    Some(unsafe { XdrStream::from_ptr(&mut p.xdr_stream) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn svcraw_create() -> *mut SVCXPRT {
-    let tvp = thread_vars();
-    let mut p = (*tvp).svcraw_private as *mut SvcRawPrivate;
-    if p.is_null() {
-        p = calloc(1, core::mem::size_of::<SvcRawPrivate>()) as *mut SvcRawPrivate;
+pub extern "C" fn svcraw_create() -> *mut SVCXPRT {
+    if tv_svcraw_private().is_null() {
+        let p = alloc_zeroed(1, core::mem::size_of::<SvcRawPrivate>());
         if p.is_null() {
             return core::ptr::null_mut();
         }
-        (*tvp).svcraw_private = p.cast();
+        set_tv_svcraw_private(p);
     }
-    (*p).server.xp_sock = 0;
-    (*p).server.xp_port = 0;
-    (*p).server.xp_ops = &SERVER_OPS;
-    (*p).server.xp_verf.oa_base = (*p).verf_body.as_mut_ptr();
-    crate::xdr::xdrmem_create(&mut (*p).xdr_stream, (*p).raw_buf.as_mut_ptr(), UDPMSGSIZE, XDR_FREE);
-    &raw mut (*p).server
+    let Some(p) = (unsafe { private() }) else { return core::ptr::null_mut() };
+    p.server.xp_sock = 0;
+    p.server.xp_port = 0;
+    p.server.xp_ops = &SERVER_OPS;
+    p.server.xp_verf.oa_base = p.verf_body.as_mut_ptr().cast();
+    XdrStream::mem(&mut p.xdr_stream, &mut p.raw_buf, XDR_FREE);
+    &raw mut p.server
 }
 
 unsafe extern "C" fn svcraw_stat(_xprt: *mut SVCXPRT) -> c_int {
@@ -48,50 +56,37 @@ unsafe extern "C" fn svcraw_stat(_xprt: *mut SVCXPRT) -> c_int {
 }
 
 unsafe extern "C" fn svcraw_recv(_xprt: *mut SVCXPRT, msg: *mut rpc_msg) -> bool_t {
-    let p = srp();
-    if p.is_null() {
-        return FALSE;
-    }
-    let xdrs = &raw mut (*p).xdr_stream;
-    (*xdrs).x_op = XDR_DECODE;
-    crate::xdr::x_setpos(xdrs, 0);
-    if crate::msg::xdr_callmsg(xdrs, msg) == 0 {
+    let Some(mut x) = (unsafe { raw_stream() }) else { return FALSE };
+    x.set_op(XDR_DECODE);
+    x.setpos(0);
+    let m = unsafe { &mut *msg };
+    if unsafe { crate::msg::callmsg_in(&mut x, m) } == 0 {
         return FALSE;
     }
     TRUE
 }
 
 unsafe extern "C" fn svcraw_reply(_xprt: *mut SVCXPRT, msg: *mut rpc_msg) -> bool_t {
-    let p = srp();
-    if p.is_null() {
+    let Some(mut x) = (unsafe { raw_stream() }) else { return FALSE };
+    x.set_op(XDR_ENCODE);
+    x.setpos(0);
+    let m = unsafe { &mut *msg };
+    if unsafe { crate::msg::replymsg_in(&mut x, m) } == 0 {
         return FALSE;
     }
-    let xdrs = &raw mut (*p).xdr_stream;
-    (*xdrs).x_op = XDR_ENCODE;
-    crate::xdr::x_setpos(xdrs, 0);
-    if crate::msg::xdr_replymsg(xdrs, msg) == 0 {
-        return FALSE;
-    }
-    crate::xdr::x_getpos(xdrs);
+    x.getpos();
     TRUE
 }
 
 unsafe extern "C" fn svcraw_getargs(_xprt: *mut SVCXPRT, xdr_args: xdrproc_t, args_ptr: caddr_t) -> bool_t {
-    let p = srp();
-    if p.is_null() {
-        return FALSE;
-    }
-    crate::clnt_tcp::call_results(xdr_args, &raw mut (*p).xdr_stream, args_ptr)
+    let Some(mut x) = (unsafe { raw_stream() }) else { return FALSE };
+    unsafe { crate::clnt_stream::call_results(xdr_args, x.as_ptr(), args_ptr) }
 }
 
 unsafe extern "C" fn svcraw_freeargs(_xprt: *mut SVCXPRT, xdr_args: xdrproc_t, args_ptr: caddr_t) -> bool_t {
-    let p = srp();
-    if p.is_null() {
-        return FALSE;
-    }
-    let xdrs = &raw mut (*p).xdr_stream;
-    (*xdrs).x_op = XDR_FREE;
-    crate::clnt_tcp::call_results(xdr_args, xdrs, args_ptr)
+    let Some(mut x) = (unsafe { raw_stream() }) else { return FALSE };
+    x.set_op(XDR_FREE);
+    unsafe { crate::clnt_stream::call_results(xdr_args, x.as_ptr(), args_ptr) }
 }
 
 unsafe extern "C" fn svcraw_destroy(_xprt: *mut SVCXPRT) {}

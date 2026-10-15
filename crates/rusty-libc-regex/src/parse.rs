@@ -104,6 +104,7 @@ struct Tok {
 }
 
 type Res = Result<u32, i32>;
+type Ranges = [(u32, u32)];
 pub type Set = [u64; 4];
 
 pub struct Parsed {
@@ -777,7 +778,7 @@ impl<'a> Parser<'a> {
         self.tree_of_seqs(&seqs)
     }
 
-    fn cased(&mut self) -> (&[(u32, u32)], &[(u32, u32)]) {
+    fn cased(&mut self) -> (&Ranges, &Ranges) {
         if self.cased.is_none() && self.cased_own.is_none() {
             self.cased = mbset::cased_cached();
             if self.cased.is_none() {
@@ -917,7 +918,7 @@ impl<'a> Parser<'a> {
         let mut key: V<u8> = V::new();
         key.extend_from_slice(b"period");
         key.push(mb as u8);
-        key.extend_from_slice(&(rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE) as usize).to_ne_bytes());
+        key.extend_from_slice(&(rusty_libc_core::locale::current_key(rusty_libc_core::locale::LC_CTYPE)).to_ne_bytes());
         let mut build = |seqs: &mut V<Seq>| {
             if mb == Mb::Utf8 {
                 let c = (0x80u8, 0xbfu8);
@@ -951,11 +952,11 @@ impl<'a> Parser<'a> {
                     let seq = coll.seq_wc(wc);
                     hit = acc.ranges.iter().any(|&(s, e)| s <= seq && seq <= e);
                 }
-                if !hit && !acc.equivs.is_empty() {
-                    let pat = [wc, 0u32];
-                    if let Some((rule, w, _)) = unsafe { rusty_libc_locale::primary_wc(pat.as_ptr()) } {
-                        hit = acc.equivs.iter().any(|&(r2, w2)| r2 == rule && w2 == w);
-                    }
+                if !hit
+                    && !acc.equivs.is_empty()
+                    && let Some((rule, w, _)) = rusty_libc_locale::primary_wide(through_nul(&[wc, 0u32]))
+                {
+                    hit = acc.equivs.iter().any(|&(r2, w2)| r2 == rule && w2 == w);
                 }
             } else {
                 hit = acc.ranges.iter().any(|&(s, e)| s <= wc && wc <= e);
@@ -1117,7 +1118,7 @@ impl<'a> Parser<'a> {
             let equiv_hit = !acc.equivs_mb.is_empty() && {
                 let mut buf = [0u8; 8];
                 buf[..elem.len()].copy_from_slice(elem);
-                unsafe { rusty_libc_locale::primary_mb(buf.as_ptr()) }
+                rusty_libc_locale::primary_bytes(until_nul(&buf))
                     .is_some_and(|(r, w, used)| used == elem.len() && acc.equivs_mb.iter().any(|&(r2, w2)| r2 == r && w2 == w))
             };
             let hit = coll_hit || range_hit || equiv_hit;
@@ -1336,7 +1337,7 @@ impl<'a> Parser<'a> {
         k.push(self.mb as u8);
         k.push(acc.non_match as u8);
         k.push(has_complex as u8);
-        let loc = |cat: usize| rusty_libc_core::locale::current(cat) as usize;
+        let loc = rusty_libc_core::locale::current_key;
         k.extend_from_slice(&loc(rusty_libc_core::locale::LC_CTYPE).to_ne_bytes());
         k.extend_from_slice(&loc(rusty_libc_core::locale::LC_COLLATE).to_ne_bytes());
         for w in acc.sb.iter() {
@@ -1614,13 +1615,13 @@ impl<'a> Parser<'a> {
         }
         let mut buf = [0u8; 34];
         buf[..name.len()].copy_from_slice(name);
-        let Some((rule, w1, used)) = (unsafe { rusty_libc_locale::primary_mb(buf.as_ptr()) }) else { return Err(REG_ECOLLATE) };
+        let Some((rule, w1, used)) = rusty_libc_locale::primary_bytes(until_nul(&buf)) else { return Err(REG_ECOLLATE) };
         if used != name.len() {
             return Err(REG_ECOLLATE);
         }
         for ch in 0..=255u32 {
-            let b = [ch as u8, 0];
-            if let Some((r2, w2, _)) = unsafe { rusty_libc_locale::primary_mb(b.as_ptr()) }
+            let b = [ch as u8];
+            if let Some((r2, w2, _)) = rusty_libc_locale::primary_bytes(until_nul(&b))
                 && r2 == rule
                 && w2 == w1
             {
@@ -1637,7 +1638,7 @@ impl<'a> Parser<'a> {
                 n += 1;
                 i += l;
             }
-            if let Some((r, w, _)) = unsafe { rusty_libc_locale::primary_wc(wide.as_ptr()) } {
+            if let Some((r, w, _)) = rusty_libc_locale::primary_wide(through_nul(&wide)) {
                 acc.equivs.push((r, w));
             }
         }
@@ -1811,4 +1812,12 @@ pub fn parse(pattern: &[u8], syntax: u64, trans: Option<&[u8; 256]>) -> Result<P
     let eor = p.mk_raw(NK::End, NONE, NONE)?;
     let root = if tree != NONE { p.mk_raw(NK::Concat, tree, eor)? } else { eor };
     Ok(Parsed { nodes: p.nodes, root, sets: p.sets, nsub: p.nsub, nbackref: p.nbackref, guards: p.guards, mb })
+}
+
+fn until_nul(s: &[u8]) -> &[u8] {
+    s.iter().position(|&b| b == 0).map_or(s, |n| &s[..n])
+}
+
+fn through_nul(s: &[u32]) -> &[u32] {
+    s.iter().position(|&c| c == 0).map_or(s, |n| &s[..=n])
 }

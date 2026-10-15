@@ -1,7 +1,10 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
+use crate::mntent::Stream;
 use core::ffi::{c_char, c_int};
 use core::ptr::null_mut;
+use rusty_libc_core::sync_cell::SyncCell;
 use rusty_libc_stdio::file::File as FILE;
-use rusty_libc_stdio::file_api::{fclose, fgets, fopen, getc, rewind};
+use rusty_libc_stdio::file_api::fopen;
 
 pub const TTY_ON: c_int = 0x01;
 pub const TTY_SECURE: c_int = 0x02;
@@ -18,204 +21,240 @@ pub struct Ttyent {
 
 const MAXLINELENGTH: usize = 100;
 
-static mut ZAPCHAR: c_char = 0;
-static mut TF: *mut FILE = null_mut();
-static mut TTY: Ttyent = Ttyent { ty_name: null_mut(), ty_getty: null_mut(), ty_type: null_mut(), ty_status: 0, ty_window: null_mut(), ty_comment: null_mut() };
-static mut LINE: [c_char; MAXLINELENGTH] = [0; MAXLINELENGTH];
-static mut PATH: *const c_char = c"/etc/ttys".as_ptr();
+struct State {
+    zapchar: u8,
+    tf: *mut FILE,
+    tty: Ttyent,
+    line: [u8; MAXLINELENGTH],
+    path: *const c_char,
+}
+
+static STATE: SyncCell<State> = SyncCell::new(State {
+    zapchar: 0,
+    tf: null_mut(),
+    tty: Ttyent { ty_name: null_mut(), ty_getty: null_mut(), ty_type: null_mut(), ty_status: 0, ty_window: null_mut(), ty_comment: null_mut() },
+    line: [0; MAXLINELENGTH],
+    path: c"/etc/ttys".as_ptr(),
+});
+
+unsafe fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
+    unsafe { STATE.with_unsync(f) }
+}
+
+fn line_ptr(i: usize) -> *mut c_char {
+    STATE.as_ptr().cast::<c_char>().wrapping_add(core::mem::offset_of!(State, line) + i)
+}
+fn tty_ptr() -> *mut Ttyent {
+    STATE.as_ptr().cast::<u8>().wrapping_add(core::mem::offset_of!(State, tty)).cast::<Ttyent>()
+}
 
 pub unsafe fn set_path(path: *const c_char) {
-    unsafe { PATH = if path.is_null() { c"/etc/ttys".as_ptr() } else { path } };
+    unsafe { with_state(|st| st.path = if path.is_null() { c"/etc/ttys".as_ptr() } else { path }) };
 }
 
-fn isspace(c: c_char) -> bool {
-    rusty_libc_ctype::is_space(c as u8 as i32)
+fn isspace(c: u8) -> bool {
+    rusty_libc_ctype::is_space(c as i32)
 }
 
-unsafe fn skip(mut p: *mut c_char) -> *mut c_char {
-    unsafe {
-        let mut q = false;
-        let mut t = p;
-        while *p != 0 {
-            let c = *p as u8;
-            if c == b'"' {
-                q = !q;
-                p = p.add(1);
-                continue;
-            }
-            if q && c == b'\\' && *p.add(1) as u8 == b'"' {
-                p = p.add(1);
-            }
-            *t = *p;
-            t = t.add(1);
-            if q {
-                p = p.add(1);
-                continue;
-            }
-            if c == b'#' {
-                ZAPCHAR = c as c_char;
-                *p = 0;
-                break;
-            }
-            if c == b'\t' || c == b' ' || c == b'\n' {
-                ZAPCHAR = c as c_char;
-                *p = 0;
-                p = p.add(1);
-                while matches!(*p as u8, b'\t' | b' ' | b'\n') {
-                    p = p.add(1);
-                }
-                break;
-            }
-            p = p.add(1);
+fn skip(line: &mut [u8], zapchar: &mut u8, mut p: usize) -> usize {
+    let mut q = false;
+    let mut t = p;
+    while line[p] != 0 {
+        let c = line[p];
+        if c == b'"' {
+            q = !q;
+            p += 1;
+            continue;
         }
-        t = t.sub(1);
-        *t = 0;
-        p
-    }
-}
-
-unsafe fn value(p: *mut c_char) -> *mut c_char {
-    unsafe {
-        let e = rusty_libc_mem::strchr(p, b'=' as c_int);
-        if e.is_null() { null_mut() } else { e.add(1) }
-    }
-}
-
-unsafe fn word_is(p: *const c_char, word: &[u8], next: impl Fn(u8) -> bool) -> bool {
-    unsafe {
-        for (i, &w) in word.iter().enumerate() {
-            if *p.add(i) as u8 != w {
-                return false;
-            }
+        if q && c == b'\\' && line[p + 1] == b'"' {
+            p += 1;
         }
-        next(*p.add(word.len()) as u8)
+        line[t] = line[p];
+        t += 1;
+        if q {
+            p += 1;
+            continue;
+        }
+        if c == b'#' {
+            *zapchar = c;
+            line[p] = 0;
+            break;
+        }
+        if c == b'\t' || c == b' ' || c == b'\n' {
+            *zapchar = c;
+            line[p] = 0;
+            p += 1;
+            while matches!(line[p], b'\t' | b' ' | b'\n') {
+                p += 1;
+            }
+            break;
+        }
+        p += 1;
     }
+    t = t.saturating_sub(1);
+    line[t] = 0;
+    p
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn setttyent() -> c_int {
-    unsafe {
-        if !TF.is_null() {
-            rewind(TF);
+fn value(line: &[u8], p: usize) -> Option<usize> {
+    let end = p + line[p..].iter().position(|&c| c == 0)?;
+    line[p..end].iter().position(|&c| c == b'=').map(|e| p + e + 1)
+}
+
+fn word_is(line: &[u8], p: usize, word: &[u8], next: impl Fn(u8) -> bool) -> bool {
+    for (i, &w) in word.iter().enumerate() {
+        if line[p + i] != w {
+            return false;
+        }
+    }
+    next(line[p + word.len()])
+}
+
+impl State {
+    fn stream(&self) -> Stream {
+        debug_assert!(!self.tf.is_null());
+        unsafe { Stream::new(self.tf) }
+    }
+
+    fn set(&mut self) -> c_int {
+        if !self.tf.is_null() {
+            self.stream().rewind();
             return 1;
         }
-        let mode = c"rce";
-        TF = fopen(PATH, mode.as_ptr());
-        if !TF.is_null() {
-            rusty_libc_stdio::stdio_ext::__fsetlocking(TF, 2);
+        self.tf = unsafe { fopen(self.path, c"rce".as_ptr()) };
+        if !self.tf.is_null() {
+            self.stream().set_locking(2);
             return 1;
         }
         0
     }
-}
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn endttyent() -> c_int {
-    unsafe {
-        if !TF.is_null() {
-            let rval = (fclose(TF) != -1) as c_int;
-            TF = null_mut();
+    fn end(&mut self) -> c_int {
+        if !self.tf.is_null() {
+            let rval = (self.stream().close() != -1) as c_int;
+            self.tf = null_mut();
             return rval;
         }
         1
     }
-}
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn getttyent() -> *mut Ttyent {
-    unsafe {
-        if TF.is_null() && setttyent() == 0 {
+    fn get(&mut self) -> *mut Ttyent {
+        if self.tf.is_null() && self.set() == 0 {
             return null_mut();
         }
-        let line = &raw mut LINE as *mut c_char;
+        let stream = self.stream();
+        let line = &mut self.line;
         let mut p;
         loop {
-            p = line;
-            if fgets(p, MAXLINELENGTH as c_int, TF).is_null() {
+            p = 0;
+            if !stream.fgets(line, MAXLINELENGTH as c_int) {
                 return null_mut();
             }
-            if rusty_libc_mem::strchr(p, b'\n' as c_int).is_null() {
+            let len = line.iter().position(|&c| c == 0).unwrap_or(MAXLINELENGTH);
+            if !line[..len].contains(&b'\n') {
                 loop {
-                    let c = getc(TF);
+                    let c = stream.getc();
                     if c == b'\n' as c_int || c == -1 {
                         break;
                     }
                 }
                 continue;
             }
-            while isspace(*p) {
-                p = p.add(1);
+            while isspace(line[p]) {
+                p += 1;
             }
-            if *p != 0 && *p as u8 != b'#' {
+            if line[p] != 0 && line[p] != b'#' {
                 break;
             }
         }
-        ZAPCHAR = 0;
-        let tty = &mut *(&raw mut TTY);
-        tty.ty_name = p;
-        p = skip(p);
-        tty.ty_getty = p;
-        if *p == 0 {
+        let zap = &mut self.zapchar;
+        *zap = 0;
+        let tty = &mut self.tty;
+        tty.ty_name = line_ptr(p);
+        p = skip(line, zap, p);
+        tty.ty_getty = line_ptr(p);
+        if line[p] == 0 {
             tty.ty_getty = null_mut();
             tty.ty_type = null_mut();
         } else {
-            p = skip(p);
-            tty.ty_type = p;
-            if *p == 0 {
+            p = skip(line, zap, p);
+            tty.ty_type = line_ptr(p);
+            if line[p] == 0 {
                 tty.ty_type = null_mut();
             } else {
-                p = skip(p);
+                p = skip(line, zap, p);
             }
         }
         tty.ty_status = 0;
         tty.ty_window = null_mut();
-        while *p != 0 {
-            if word_is(p, b"off", |c| isspace(c as c_char)) {
+        while line[p] != 0 {
+            if word_is(line, p, b"off", isspace) {
                 tty.ty_status &= !TTY_ON;
-            } else if word_is(p, b"on", |c| isspace(c as c_char)) {
+            } else if word_is(line, p, b"on", isspace) {
                 tty.ty_status |= TTY_ON;
-            } else if word_is(p, b"secure", |c| isspace(c as c_char)) {
+            } else if word_is(line, p, b"secure", isspace) {
                 tty.ty_status |= TTY_SECURE;
-            } else if word_is(p, b"window", |c| c == b'=') {
-                tty.ty_window = value(p);
+            } else if word_is(line, p, b"window", |c| c == b'=') {
+                tty.ty_window = value(line, p).map_or(null_mut(), line_ptr);
             } else {
                 break;
             }
-            p = skip(p);
+            p = skip(line, zap, p);
         }
-        if ZAPCHAR as u8 == b'#' || *p as u8 == b'#' {
+        if *zap == b'#' || line[p] == b'#' {
             loop {
-                p = p.add(1);
-                let c = *p as u8;
+                p += 1;
+                let c = line[p];
                 if !(c == b' ' || c == b'\t') {
                     break;
                 }
             }
         }
-        tty.ty_comment = p;
-        if *p == 0 {
+        tty.ty_comment = line_ptr(p);
+        if line[p] == 0 {
             tty.ty_comment = null_mut();
         }
-        let nl = rusty_libc_mem::strchr(p, b'\n' as c_int);
-        if !nl.is_null() {
-            *nl = 0;
+        if let Some(nl) = line[p..].iter().take_while(|&&c| c != 0).position(|&c| c == b'\n') {
+            line[p + nl] = 0;
         }
-        tty
+        tty_ptr()
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn setttyent() -> c_int {
+    unsafe { with_state(State::set) }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn endttyent() -> c_int {
+    unsafe { with_state(State::end) }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn getttyent() -> *mut Ttyent {
+    unsafe { with_state(State::get) }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getttynam(tty: *const c_char) -> *mut Ttyent {
-    unsafe {
-        setttyent();
+    let name = unsafe { rusty_libc_core::ffi::cstr_bytes(tty) };
+    let find = |st: &mut State| {
+        st.set();
         let mut t;
         loop {
-            t = getttyent();
-            if t.is_null() || rusty_libc_mem::strcmp(tty, (*t).ty_name) == 0 {
+            t = st.get();
+            if t.is_null() {
+                break;
+            }
+            let rest = &st.line[st.tty.ty_name.addr() - line_ptr(0).addr()..];
+            let end = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
+            if rest[..end] == *name {
                 break;
             }
         }
-        endttyent();
+        st.end();
         t
-    }
+    };
+    unsafe { with_state(find) }
 }

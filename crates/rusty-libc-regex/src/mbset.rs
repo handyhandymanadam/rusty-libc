@@ -1,6 +1,6 @@
 use crate::charset::{self, Mb};
-use crate::vec::V;
-use core::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::Spin;
+use crate::vec::{self, V};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Seq {
@@ -117,41 +117,32 @@ pub struct Ch {
 
 struct Cache {
     key: usize,
-    ptr: *mut Ch,
-    len: usize,
+    chars: &'static [Ch],
 }
 
-static LOCK: AtomicBool = AtomicBool::new(false);
-static mut CACHE: Cache = Cache { key: 0, ptr: core::ptr::null_mut(), len: 0 };
+static CACHE: Spin<Cache> = Spin::new(Cache { key: 0, chars: &[] });
 
 pub fn other_chars() -> &'static [Ch] {
-    let key = rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE) as usize;
-    while LOCK.swap(true, Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
-    let c = unsafe { &mut *core::ptr::addr_of_mut!(CACHE) };
-    if c.key != key || c.ptr.is_null() {
-        let mut v: V<Ch> = V::new();
-        rusty_libc_wchar::mbyte::each_other_char(&mut |bytes, wc| {
-            let mut b = [0u8; 4];
-            b[..bytes.len()].copy_from_slice(bytes);
-            v.push(Ch { b, n: bytes.len() as u8, wc });
-        });
-        c.ptr = core::ptr::null_mut();
-        c.len = 0;
-        if !v.oom && !v.is_empty() {
-            let p = unsafe { rusty_libc_malloc::malloc(v.len() * core::mem::size_of::<Ch>()) } as *mut Ch;
-            if !p.is_null() {
-                unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), p, v.len()) };
-                c.ptr = p;
-                c.len = v.len();
+    let key = rusty_libc_core::locale::current_key(rusty_libc_core::locale::LC_CTYPE);
+    CACHE.with(|c| {
+        if c.key != key || c.chars.is_empty() {
+            let mut v: V<Ch> = V::new();
+            rusty_libc_wchar::mbyte::each_other_char(&mut |bytes, wc| {
+                let mut b = [0u8; 4];
+                b[..bytes.len()].copy_from_slice(bytes);
+                v.push(Ch { b, n: bytes.len() as u8, wc });
+            });
+            c.chars = &[];
+            if !v.oom
+                && !v.is_empty()
+                && let Some(kept) = vec::leak_copy(&v)
+            {
+                c.chars = kept;
                 c.key = key;
             }
         }
-    }
-    let r: &'static [Ch] = if c.ptr.is_null() { &[] } else { unsafe { core::slice::from_raw_parts(c.ptr, c.len) } };
-    LOCK.store(false, Ordering::Release);
-    r
+        c.chars
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -162,44 +153,36 @@ pub struct Fold {
 
 struct FoldCache {
     key: usize,
-    ptr: *mut Fold,
-    len: usize,
+    folds: &'static [Fold],
 }
 
-static FOLD_LOCK: AtomicBool = AtomicBool::new(false);
-static mut FOLDS: FoldCache = FoldCache { key: 0, ptr: core::ptr::null_mut(), len: 0 };
+static FOLDS: Spin<FoldCache> = Spin::new(FoldCache { key: 0, folds: &[] });
 
 fn other_folds(k: Mb, chars: &'static [Ch]) -> &'static [Fold] {
-    let key = rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE) as usize;
-    while FOLD_LOCK.swap(true, Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
-    let c = unsafe { &mut *core::ptr::addr_of_mut!(FOLDS) };
-    if c.key != key || c.ptr.is_null() || c.len != chars.len() {
-        c.ptr = core::ptr::null_mut();
-        c.len = 0;
-        if !chars.is_empty() {
-            let p = unsafe { rusty_libc_malloc::malloc(chars.len() * core::mem::size_of::<Fold>()) } as *mut Fold;
-            if !p.is_null() {
-                for (i, ch) in chars.iter().enumerate() {
-                    let up = charset::upper_wc(ch.wc);
-                    let single = if up == ch.wc {
-                        if ch.n == 1 { i16::from(ch.b[0]) } else { -1 }
-                    } else {
-                        let mut b = [0u8; 6];
-                        if let Some(1) = charset::encode(k, up, &mut b) { i16::from(b[0]) } else { -1 }
-                    };
-                    unsafe { p.add(i).write(Fold { up, single }) };
-                }
-                c.ptr = p;
-                c.len = chars.len();
+    let key = rusty_libc_core::locale::current_key(rusty_libc_core::locale::LC_CTYPE);
+    FOLDS.with(|c| {
+        if c.key != key || c.folds.is_empty() || c.folds.len() != chars.len() {
+            c.folds = &[];
+            let made = vec::leak_with(chars.len(), |i| {
+                let ch = chars[i];
+                let up = charset::upper_wc(ch.wc);
+                let single = if up == ch.wc {
+                    if ch.n == 1 { i16::from(ch.b[0]) } else { -1 }
+                } else {
+                    let mut b = [0u8; 6];
+                    if let Some(1) = charset::encode(k, up, &mut b) { i16::from(b[0]) } else { -1 }
+                };
+                Fold { up, single }
+            });
+            if let Some(f) = made
+                && !f.is_empty()
+            {
+                c.folds = f;
                 c.key = key;
             }
         }
-    }
-    let r: &'static [Fold] = if c.ptr.is_null() { &[] } else { unsafe { core::slice::from_raw_parts(c.ptr, c.len) } };
-    FOLD_LOCK.store(false, Ordering::Release);
-    r
+        c.folds
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -225,35 +208,14 @@ struct CasedEntry {
     cased: Cased,
 }
 
-static CASED_LOCK: AtomicBool = AtomicBool::new(false);
-static mut CASED: [Option<CasedEntry>; CASED_SLOTS] = [const { None }; CASED_SLOTS];
+static CASED: Spin<[Option<CasedEntry>; CASED_SLOTS]> = Spin::new([const { None }; CASED_SLOTS]);
 
 fn cased_find(key: (usize, u8)) -> Option<Cased> {
-    while CASED_LOCK.swap(true, Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
-    let slots = unsafe { &*core::ptr::addr_of!(CASED) };
-    let r = slots.iter().flatten().find(|e| e.key == key).map(|e| e.cased);
-    CASED_LOCK.store(false, Ordering::Release);
-    r
-}
-
-fn leak<T: Copy>(v: &[T]) -> Option<&'static [T]> {
-    if v.is_empty() {
-        return Some(&[]);
-    }
-    let p = unsafe { rusty_libc_malloc::malloc(core::mem::size_of_val(v)) } as *mut T;
-    if p.is_null() {
-        return None;
-    }
-    unsafe {
-        core::ptr::copy_nonoverlapping(v.as_ptr(), p, v.len());
-        Some(core::slice::from_raw_parts(p, v.len()))
-    }
+    CASED.with(|slots| slots.iter().flatten().find(|e| e.key == key).map(|e| e.cased))
 }
 
 pub fn cased_cached() -> Option<Cased> {
-    let key = (rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE) as usize, rusty_libc_wchar::charset() as u8);
+    let key = (rusty_libc_core::locale::current_key(rusty_libc_core::locale::LC_CTYPE), rusty_libc_wchar::charset() as u8);
     if let Some(c) = cased_find(key) {
         return Some(c);
     }
@@ -263,20 +225,17 @@ pub fn cased_cached() -> Option<Cased> {
     if pairs.oom || kept.oom {
         return None;
     }
-    let cased = Cased { pairs: leak(&pairs)?, kept: leak(&kept)? };
-    while CASED_LOCK.swap(true, Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
-    let slots = unsafe { &mut *core::ptr::addr_of_mut!(CASED) };
-    let mut r = None;
-    if let Some(e) = slots.iter().flatten().find(|e| e.key == key) {
-        r = Some(e.cased);
-    } else if let Some(slot) = slots.iter_mut().find(|s| s.is_none()) {
-        *slot = Some(CasedEntry { key, cased });
-        r = Some(cased);
-    }
-    CASED_LOCK.store(false, Ordering::Release);
-    r
+    let cased = Cased { pairs: vec::leak_copy(&pairs)?, kept: vec::leak_copy(&kept)? };
+    CASED.with(|slots| {
+        if let Some(e) = slots.iter().flatten().find(|e| e.key == key) {
+            Some(e.cased)
+        } else if let Some(slot) = slots.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(CasedEntry { key, cased });
+            Some(cased)
+        } else {
+            None
+        }
+    })
 }
 
 pub fn collect(k: Mb, singles: bool, limit: u32, pred: &mut dyn FnMut(u32, usize) -> bool, out: &mut V<Seq>) {
@@ -540,25 +499,23 @@ struct Entry {
     canon: Canon,
 }
 
-static CACHE_LOCK: AtomicBool = AtomicBool::new(false);
-static mut ENTRIES: V<Entry> = V::new();
-static mut NEXT_SLOT: usize = 0;
+struct Entries {
+    list: V<Entry>,
+    next: usize,
+}
+
+static ENTRIES: Spin<Entries> = Spin::new(Entries { list: V::new(), next: 0 });
 const CACHE_SLOTS: usize = 64;
 
 pub fn canon_with<R>(key: &[u8], f: impl FnOnce(&Canon) -> R) -> Option<R> {
-    while CACHE_LOCK.swap(true, Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
-    let entries = unsafe { &*core::ptr::addr_of!(ENTRIES) };
-    let mut r = None;
-    for e in entries.iter() {
-        if e.key.len() == key.len() && e.key[..] == *key {
-            r = Some(f(&e.canon));
-            break;
+    ENTRIES.with(|entries| {
+        for e in entries.list.iter() {
+            if e.key.len() == key.len() && e.key[..] == *key {
+                return Some(f(&e.canon));
+            }
         }
-    }
-    CACHE_LOCK.store(false, Ordering::Release);
-    r
+        None
+    })
 }
 
 pub fn canon_put(key: &[u8], canon: Canon) {
@@ -570,20 +527,14 @@ pub fn canon_put(key: &[u8], canon: Canon) {
     if k.oom {
         return;
     }
-    while CACHE_LOCK.swap(true, Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
-    unsafe {
-        let entries = &mut *core::ptr::addr_of_mut!(ENTRIES);
-        let next = &mut *core::ptr::addr_of_mut!(NEXT_SLOT);
-        if entries.len() < CACHE_SLOTS {
-            entries.push(Entry { key: k, canon });
+    ENTRIES.with(|entries| {
+        if entries.list.len() < CACHE_SLOTS {
+            entries.list.push(Entry { key: k, canon });
         } else {
-            entries[*next % CACHE_SLOTS] = Entry { key: k, canon };
-            *next += 1;
+            entries.list[entries.next % CACHE_SLOTS] = Entry { key: k, canon };
+            entries.next += 1;
         }
-    }
-    CACHE_LOCK.store(false, Ordering::Release);
+    });
 }
 
 pub type Ranges = V<(u32, u32)>;

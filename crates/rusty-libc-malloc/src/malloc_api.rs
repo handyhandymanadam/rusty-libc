@@ -33,28 +33,28 @@ pub struct mallinfo2 {
     pub keepcost: usize,
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-#[inline(never)]
-pub unsafe extern "C" fn memalign(alignment: usize, size: usize) -> *mut c_void {
+pub fn memalign_rs(alignment: usize, size: usize) -> *mut u8 {
+    memalign_rule(alignment, size)
+}
+
+pub fn pvalloc_rs(size: usize) -> *mut u8 {
+    pvalloc_rule(size)
+}
+
+#[inline(always)]
+fn memalign_rule(alignment: usize, size: usize) -> *mut u8 {
     let a = if alignment <= 16 { 16 } else { alignment.checked_next_power_of_two().unwrap_or(0) };
     if a == 0 {
         errno::set(22);
         return core::ptr::null_mut();
     }
-    unsafe { heap::memalign(a, size).cast() }
+    heap::memalign(a, size)
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-#[inline(never)]
-pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
-    unsafe { heap::memalign(4096, size).cast() }
-}
-
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-#[inline(never)]
-pub unsafe extern "C" fn pvalloc(size: usize) -> *mut c_void {
+#[inline(always)]
+fn pvalloc_rule(size: usize) -> *mut u8 {
     match size.checked_add(4095) {
-        Some(n) => unsafe { heap::memalign(4096, n & !4095).cast() },
+        Some(n) => heap::memalign(4096, n & !4095),
         None => {
             errno::set(12);
             core::ptr::null_mut()
@@ -63,12 +63,30 @@ pub unsafe extern "C" fn pvalloc(size: usize) -> *mut c_void {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[inline(never)]
+pub unsafe extern "C" fn memalign(alignment: usize, size: usize) -> *mut c_void {
+    memalign_rule(alignment, size).cast()
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[inline(never)]
+pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
+    heap::memalign(4096, size).cast()
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[inline(never)]
+pub unsafe extern "C" fn pvalloc(size: usize) -> *mut c_void {
+    pvalloc_rule(size).cast()
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> usize {
     unsafe { heap::usable_size(ptr.cast()) }
 }
 
-fn fill_info() -> mallinfo2 {
-    let st = unsafe { heap::stats() };
+pub fn fill_info() -> mallinfo2 {
+    let st = heap::stats();
     let avail = st.top + st.free_bytes + st.small_bytes;
     mallinfo2 {
         arena: st.arena,
@@ -85,12 +103,12 @@ fn fill_info() -> mallinfo2 {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn mallinfo2() -> mallinfo2 {
+pub extern "C" fn mallinfo2() -> mallinfo2 {
     fill_info()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn mallinfo() -> mallinfo {
+pub extern "C" fn mallinfo() -> mallinfo {
     let m = fill_info();
     mallinfo {
         arena: m.arena as c_int,
@@ -107,8 +125,8 @@ pub unsafe extern "C" fn mallinfo() -> mallinfo {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn malloc_trim(pad: usize) -> c_int {
-    unsafe { heap::trim(pad) }
+pub extern "C" fn malloc_trim(pad: usize) -> c_int {
+    heap::trim(pad)
 }
 
 pub const M_MXFAST: c_int = 1;
@@ -122,8 +140,8 @@ pub const M_ARENA_TEST: c_int = -7;
 pub const M_ARENA_MAX: c_int = -8;
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn mallopt(param: c_int, value: c_int) -> c_int {
-    unsafe { heap::ensure_init() };
+pub extern "C" fn mallopt(param: c_int, value: c_int) -> c_int {
+    heap::ensure_init();
     let lock = heap::main_lock();
     let taken = lock.lock();
     let p = &heap::P;
@@ -205,7 +223,7 @@ fn put_num(buf: &mut [u8], at: &mut usize, label: &[u8], v: usize) {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn malloc_stats() {
+pub extern "C" fn malloc_stats() {
     let mut buf = [0u8; 160];
     let text = |t: &[u8], buf: &mut [u8; 160], at: &mut usize| {
         for &b in t {
@@ -219,7 +237,7 @@ pub unsafe extern "C" fn malloc_stats() {
     let (mut system, mut in_use) = (0usize, 0usize);
     let mut i = 0;
     heap::arenas(|a| {
-        let st = unsafe { heap::arena_stats(a) };
+        let st = heap::arena_stats(a);
         let avail = st.top + st.free_bytes + st.small_bytes;
         let used = st.arena.saturating_sub(avail);
         let mut at = 0;
@@ -255,41 +273,27 @@ pub unsafe extern "C" fn malloc_stats() {
     out(&buf[..at]);
 }
 
-#[allow(dead_code)]
-fn unused(_: *mut c_void) {}
-
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __libc_memalign(alignment: usize, size: usize) -> *mut c_void {
-    let a = if alignment <= 16 { 16 } else { alignment.checked_next_power_of_two().unwrap_or(0) };
-    if a == 0 {
-        errno::set(22);
-        return core::ptr::null_mut();
-    }
-    unsafe { heap::memalign(a, size).cast() }
+    memalign_rule(alignment, size).cast()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __libc_valloc(size: usize) -> *mut c_void {
-    unsafe { heap::memalign(4096, size).cast() }
+    heap::memalign(4096, size).cast()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __libc_pvalloc(size: usize) -> *mut c_void {
-    match size.checked_add(4095) {
-        Some(n) => unsafe { heap::memalign(4096, n & !4095).cast() },
-        None => {
-            errno::set(12);
-            core::ptr::null_mut()
-        }
-    }
+    pvalloc_rule(size).cast()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn __libc_mallinfo() -> mallinfo {
-    unsafe { mallinfo() }
+pub extern "C" fn __libc_mallinfo() -> mallinfo {
+    mallinfo()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn __libc_mallopt(param: c_int, value: c_int) -> c_int {
-    unsafe { mallopt(param, value) }
+pub extern "C" fn __libc_mallopt(param: c_int, value: c_int) -> c_int {
+    mallopt(param, value)
 }

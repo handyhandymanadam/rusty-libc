@@ -1,14 +1,13 @@
 use crate::consts::{SS_ONSTACK, SIG_BLOCK, SIG_SETMASK};
-use crate::stack::sigaltstack;
-use crate::types::{JmpBufTag, StackT};
-use crate::wait::sigprocmask;
+use crate::stack::sigaltstack_rs;
+use crate::types::JmpBufTag;
+use crate::wait::sigmask_c;
 use core::arch::naked_asm;
 use core::ffi::c_int;
 
 extern "C" fn sigjmp_save(env: *mut JmpBufTag, savemask: c_int) -> c_int {
-    unsafe {
-        (*env).mask_was_saved = (savemask != 0 && sigprocmask(SIG_BLOCK, core::ptr::null(), &mut (*env).saved_mask) == 0) as c_int;
-    }
+    let env = unsafe { &mut *env };
+    env.mask_was_saved = (savemask != 0 && sigmask_c(SIG_BLOCK, None, Some(&mut env.saved_mask)) == 0) as c_int;
     0
 }
 
@@ -75,13 +74,17 @@ unsafe extern "C" fn restore_regs(_jmpbuf: *const i64, _val: c_int) -> ! {
 }
 
 #[inline(always)]
-unsafe fn longjmp_impl(env: *mut JmpBufTag, val: c_int) -> ! {
-    unsafe {
-        if (*env).mask_was_saved != 0 {
-            sigprocmask(SIG_SETMASK, &(*env).saved_mask, core::ptr::null_mut());
-        }
-        restore_regs((*env).jmpbuf.as_ptr(), if val == 0 { 1 } else { val })
+fn restore_mask(env: &JmpBufTag) {
+    if env.mask_was_saved != 0 {
+        sigmask_c(SIG_SETMASK, Some(&env.saved_mask), None);
     }
+}
+
+#[inline(always)]
+unsafe fn longjmp_impl(env: *mut JmpBufTag, val: c_int) -> ! {
+    let env = unsafe { &*env };
+    restore_mask(env);
+    unsafe { restore_regs(env.jmpbuf.as_ptr(), if val == 0 { 1 } else { val }) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -99,37 +102,39 @@ pub unsafe extern "C" fn siglongjmp(env: *mut JmpBufTag, val: c_int) -> ! {
     unsafe { longjmp_impl(env, val) }
 }
 
-unsafe fn saved_sp(env: *const JmpBufTag) -> usize {
-    unsafe {
-        let guard = (*rusty_libc_core::tls::current()).pointer_guard;
-        ((*env).jmpbuf[6] as usize).rotate_right(0x11) ^ guard
+#[inline(always)]
+fn pointer_guard() -> usize {
+    unsafe { (*rusty_libc_core::tls::current()).pointer_guard }
+}
+
+fn saved_sp(env: &JmpBufTag) -> usize {
+    (env.jmpbuf[6] as usize).rotate_right(0x11) ^ pointer_guard()
+}
+
+fn longjmp_target_ok(here: usize, target: usize) -> bool {
+    if here <= target {
+        return true;
+    }
+    match sigaltstack_rs(None) {
+        Err(e) => {
+            rusty_libc_core::errno::set(e.0);
+            true
+        }
+        Ok(ss) if ss.ss_flags & SS_ONSTACK == 0 => false,
+        Ok(ss) => (ss.ss_sp as usize).wrapping_add(ss.ss_size).wrapping_sub(target) >= ss.ss_size,
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __longjmp_chk(env: *mut JmpBufTag, val: c_int) -> ! {
-    unsafe {
-        if (*env).mask_was_saved != 0 {
-            sigprocmask(SIG_SETMASK, &(*env).saved_mask, core::ptr::null_mut());
-        }
-        let target = saved_sp(env);
-        let here: usize;
-        core::arch::asm!("mov {}, rsp", out(reg) here, options(nomem, nostack, preserves_flags));
-        if here > target {
-            let mut ss = StackT::ZERO;
-            let ok = if sigaltstack(core::ptr::null(), &mut ss) != 0 {
-                true
-            } else if ss.ss_flags & SS_ONSTACK == 0 {
-                false
-            } else {
-                (ss.ss_sp as usize).wrapping_add(ss.ss_size).wrapping_sub(target) >= ss.ss_size
-            };
-            if !ok {
-                let msg = b"*** longjmp causes uninitialized stack frame ***: terminated\n";
-                rusty_libc_core::syscall::syscall3(rusty_libc_core::syscall::SYS_WRITE, 2, msg.as_ptr() as usize, msg.len());
-                rusty_libc_core::process::abort();
-            }
-        }
-        restore_regs((*env).jmpbuf.as_ptr(), if val == 0 { 1 } else { val })
+    let env = unsafe { &*env };
+    restore_mask(env);
+    let target = saved_sp(env);
+    let here: usize;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) here, options(nomem, nostack, preserves_flags)) };
+    if !longjmp_target_ok(here, target) {
+        let _ = rusty_libc_core::unistd::write_nocancel(2, b"*** longjmp causes uninitialized stack frame ***: terminated\n");
+        rusty_libc_core::process::abort();
     }
+    unsafe { restore_regs(env.jmpbuf.as_ptr(), if val == 0 { 1 } else { val }) }
 }

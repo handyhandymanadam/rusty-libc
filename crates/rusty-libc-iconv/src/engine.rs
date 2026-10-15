@@ -11,6 +11,7 @@ pub const IGNORE: u32 = 2;
 pub const ILLEGAL_SEEN: usize = 1 << 62;
 pub const SWAP: u32 = 4;
 pub const TRANSLIT: u32 = 8;
+pub const INTERNAL_USE: u32 = 1 << 16;
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Ctx {

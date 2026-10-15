@@ -1,9 +1,11 @@
-use crate::clnt::{auth_destroy, clnt_call, clnt_control, clnt_destroy, clnt_geterr, clnt_sperrno};
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
+
+use crate::clnt::{auth_destroy, clnt_call, clnt_control, clnt_destroy, clnt_geterr, clnt_sperrno, client_auth};
+use crate::stream::XdrStream;
 use crate::types::*;
-use crate::vars::Racy;
-use crate::xdr;
 use core::ffi::{c_char, c_int, c_ulong, c_void};
 use core::marker::PhantomData;
+use rusty_libc_core::lock::Locked;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RpcStatus(pub i32);
@@ -28,69 +30,80 @@ impl<'a> Xdr<'a> {
     }
     fn new(buf: &'a mut [u8], op: c_int) -> Xdr<'a> {
         let mut x = XDR::zeroed();
-        unsafe { xdr::xdrmem_create(&mut x, buf.as_mut_ptr().cast(), buf.len() as u_int, op) };
+        crate::xdr::mem_init(&mut x, buf.as_mut_ptr().cast(), buf.len() as u_int, op);
         Xdr { x, _buf: PhantomData }
     }
-    pub fn stream(&mut self) -> Stream {
-        Stream { x: &mut self.x }
+    fn s(&mut self) -> XdrStream<'_> {
+        unsafe { XdrStream::from_ptr(&mut self.x) }
+    }
+    pub fn stream(&mut self) -> Stream<'_> {
+        Stream { x: &mut self.x, _h: PhantomData }
     }
     pub fn position(&self) -> usize {
-        unsafe { xdr::x_getpos(&self.x) as usize }
+        unsafe { crate::xdr::x_getpos(&self.x) as usize }
     }
     pub fn set_position(&mut self, pos: usize) -> bool {
-        unsafe { xdr::x_setpos(&mut self.x, pos as u_int) != 0 }
+        self.s().setpos(pos as u_int) != 0
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct Stream {
+pub struct Stream<'h> {
     x: *mut XDR,
+    _h: PhantomData<&'h mut XDR>,
 }
 
 macro_rules! prim {
-    ($(#[$m:meta])* $name:ident, $t:ty, $f:path) => {
+    ($(#[$m:meta])* $name:ident, $t:ty, $f:ident) => {
         $(#[$m])*
         pub fn $name(&self, v: &mut $t) -> bool {
-            unsafe { $f(self.x, v) != 0 }
+            self.s().$f(v) != 0
         }
     };
 }
 
-impl Stream {
-    pub unsafe fn from_raw(x: *mut XDR) -> Stream {
-        Stream { x }
+impl<'h> Stream<'h> {
+    pub unsafe fn from_raw(x: *mut XDR) -> Stream<'h> {
+        Stream { x, _h: PhantomData }
     }
     pub fn raw(&self) -> *mut XDR {
         self.x
     }
+    fn s(&self) -> XdrStream<'_> {
+        unsafe { XdrStream::from_ptr(self.x) }
+    }
     pub fn is_encoding(&self) -> bool {
-        unsafe { (*self.x).x_op == XDR_ENCODE }
+        self.s().op() == XDR_ENCODE
     }
     pub fn is_decoding(&self) -> bool {
-        unsafe { (*self.x).x_op == XDR_DECODE }
+        self.s().op() == XDR_DECODE
     }
     prim!(
-        i32, i32, xdr::xdr_int32_t);
-    prim!(u32, u32, xdr::xdr_uint32_t);
-    prim!(i64, i64, xdr::xdr_int64_t);
-    prim!(u64, u64, xdr::xdr_uint64_t);
-    prim!(f32, f32, xdr::xdr_float);
-    prim!(f64, f64, xdr::xdr_double);
+        i32, i32, int32);
+    prim!(u32, u32, uint32);
+    prim!(i64, i64, int64);
+    prim!(u64, u64, uint64);
+    prim!(f32, f32, float);
+    prim!(f64, f64, double);
     pub fn boolean(&self, v: &mut bool) -> bool {
         let mut b: bool_t = *v as bool_t;
-        let r = unsafe { xdr::xdr_bool(self.x, &mut b) != 0 };
+        let r = self.s().bool_(&mut b) != 0;
         if r {
             *v = b != 0;
         }
         r
     }
     pub fn opaque(&self, data: &mut [u8]) -> bool {
-        unsafe { xdr::xdr_opaque(self.x, data.as_mut_ptr().cast(), data.len() as u_int) != 0 }
+        self.s().opaque(data) != 0
     }
     pub fn var_opaque(&self, buf: &mut [u8], len: &mut usize) -> bool {
         let mut n = *len as u_int;
         let mut p = buf.as_mut_ptr().cast::<c_char>();
-        let r = unsafe { xdr::xdr_bytes(self.x, &mut p, &mut n, buf.len() as u_int) != 0 };
+        let mut s = self.s();
+        if s.op() == XDR_FREE {
+            return true;
+        }
+        let r = unsafe { crate::xdr::bytes_in(&mut s, &mut p, &mut n, buf.len() as u_int) } != 0;
         if r {
             *len = n as usize;
         }
@@ -108,7 +121,7 @@ impl Stream {
         true
     }
     pub fn position(&self) -> usize {
-        unsafe { xdr::x_getpos(self.x) as usize }
+        self.s().getpos() as usize
     }
 }
 
@@ -116,7 +129,7 @@ type Coder<'c> = &'c mut dyn FnMut(Stream) -> bool;
 
 unsafe extern "C" fn trampoline(x: *mut XDR, p: *mut c_void) -> bool_t {
     let f = unsafe { &mut *(p as *mut Coder) };
-    f(Stream { x }) as bool_t
+    f(unsafe { Stream::from_raw(x) }) as bool_t
 }
 
 fn tramp() -> xdrproc_t {
@@ -137,7 +150,7 @@ pub struct Client {
 
 impl Client {
     fn check(cl: *mut CLIENT) -> Result<Client, RpcStatus> {
-        if cl.is_null() { Err(RpcStatus(unsafe { (*crate::vars::createerr()).cf_stat })) } else { Ok(Client { cl }) }
+        if cl.is_null() { Err(RpcStatus(crate::vars::get_createerr().cf_stat)) } else { Ok(Client { cl }) }
     }
     pub fn udp(ip: [u8; 4], port: u16, prog: u32, vers: u32, retry_ms: u32) -> Result<Client, RpcStatus> {
         let mut a = sin(ip, port);
@@ -150,7 +163,7 @@ impl Client {
         Self::check(unsafe { crate::clnt_tcp::clnttcp_create(&mut a, prog as c_ulong, vers as c_ulong, &mut sock, 0, 0) })
     }
     pub fn unix(path: &[u8], prog: u32, vers: u32) -> Result<Client, RpcStatus> {
-        let mut un: sockaddr_un = unsafe { core::mem::zeroed() };
+        let mut un: sockaddr_un = crate::sock::zeroed();
         if path.len() >= un.sun_path.len() {
             return Err(RpcStatus(RPC_SYSTEMERROR));
         }
@@ -162,7 +175,7 @@ impl Client {
     pub fn call(&mut self, proc_: u32, timeout_ms: u32, args: Coder, result: Coder) -> Result<(), RpcStatus> {
         let mut a = args;
         let mut r = result;
-        let st = unsafe { clnt_call(self.cl, proc_ as c_ulong, tramp(), (&mut a as *mut Coder).cast(), tramp(), (&mut r as *mut Coder).cast(), tv(timeout_ms)) };
+        let st = unsafe { clnt_call(self.cl, proc_ as c_ulong, tramp(), (&raw mut a).cast(), tramp(), (&raw mut r).cast(), tv(timeout_ms)) };
         if st == RPC_SUCCESS { Ok(()) } else { Err(RpcStatus(st)) }
     }
     pub fn call_void(&mut self, proc_: u32, timeout_ms: u32) -> Result<(), RpcStatus> {
@@ -171,7 +184,8 @@ impl Client {
     pub fn last_error(&self) -> (i32, i64, i64) {
         let mut e = rpc_err::zeroed();
         unsafe { clnt_geterr(self.cl, &mut e) };
-        unsafe { (e.re_status, e.ru.RE_lb.s1, e.ru.RE_lb.s2) }
+        let lb = e.ru.lb();
+        (e.re_status, lb.s1, lb.s2)
     }
     pub fn use_unix_auth(&mut self, machine: &[u8], uid: u32, gid: u32, gids: &mut [u32]) -> bool {
         let mut name = [0 as c_char; 260];
@@ -185,15 +199,14 @@ impl Client {
         if a.is_null() {
             return false;
         }
-        unsafe {
-            auth_destroy((*self.cl).cl_auth);
-            (*self.cl).cl_auth = a;
-        }
+        let old = unsafe { client_auth(self.cl) };
+        unsafe { auth_destroy(old) };
+        unsafe { (*self.cl).cl_auth = a };
         true
     }
     pub fn set_timeout_ms(&mut self, ms: u32) -> bool {
         let mut t = tv(ms);
-        unsafe { clnt_control(self.cl, CLSET_TIMEOUT, (&mut t as *mut timeval).cast()) != 0 }
+        unsafe { clnt_control(self.cl, CLSET_TIMEOUT, (&raw mut t).cast()) != 0 }
     }
     pub fn raw(&self) -> *mut CLIENT {
         self.cl
@@ -219,43 +232,42 @@ pub struct Call {
 pub type Handler = fn(&Call);
 
 const MAX_HANDLERS: usize = 16;
-static HANDLERS: Racy<[(u32, u32, Option<Handler>); MAX_HANDLERS]> = Racy::new([(0, 0, None); MAX_HANDLERS]);
+static HANDLERS: Locked<[(u32, u32, Option<Handler>); MAX_HANDLERS]> = Locked::new([(0, 0, None); MAX_HANDLERS]);
 
 unsafe extern "C" fn dispatcher(req: *mut svc_req, xprt: *mut SVCXPRT) {
-    let (prog, vers) = unsafe { ((*req).rq_prog as u32, (*req).rq_vers as u32) };
-    let table = unsafe { &*HANDLERS.get() };
-    for (p, v, h) in table.iter() {
-        if *p == prog && *v == vers {
-            if let Some(h) = h {
-                h(&Call { req, xprt });
-                return;
-            }
-        }
+    let r = unsafe { &*req };
+    let (prog, vers) = (r.rq_prog as u32, r.rq_vers as u32);
+    let found = HANDLERS.with(|table| table.iter().find(|(p, v, h)| *p == prog && *v == vers && h.is_some()).and_then(|e| e.2));
+    match found {
+        Some(h) => h(&Call { req, xprt }),
+        None => unsafe { crate::svc::svcerr_noproc(xprt) },
     }
-    unsafe { crate::svc::svcerr_noproc(xprt) };
 }
 
 impl Call {
+    fn r(&self) -> &svc_req {
+        unsafe { &*self.req }
+    }
     pub fn procedure(&self) -> u32 {
-        unsafe { (*self.req).rq_proc as u32 }
+        self.r().rq_proc as u32
     }
     pub fn credential_flavor(&self) -> i32 {
-        unsafe { (*self.req).rq_cred.oa_flavor }
+        self.r().rq_cred.oa_flavor
     }
     pub fn unix_credentials(&self) -> Option<(u32, u32, u32)> {
         if self.credential_flavor() != AUTH_UNIX {
             return None;
         }
-        let p = unsafe { &*((*self.req).rq_clntcred as *const authunix_parms) };
+        let p = unsafe { &*(self.r().rq_clntcred as *const authunix_parms) };
         Some((p.aup_uid, p.aup_gid, p.aup_len))
     }
     pub fn args(&self, f: Coder) -> bool {
         let mut f = f;
-        unsafe { crate::svc::svc_getargs(self.xprt, tramp(), (&mut f as *mut Coder).cast()) != 0 }
+        unsafe { crate::svc::svc_getargs(self.xprt, tramp(), (&raw mut f).cast()) != 0 }
     }
     pub fn reply(&self, f: Coder) -> bool {
         let mut f = f;
-        unsafe { crate::svc::svc_sendreply(self.xprt, tramp(), (&mut f as *mut Coder).cast()) != 0 }
+        unsafe { crate::svc::svc_sendreply(self.xprt, tramp(), (&raw mut f).cast()) != 0 }
     }
     pub fn reply_void(&self) -> bool {
         self.reply(&mut |_| true)
@@ -283,12 +295,15 @@ pub struct Server {
 
 impl Server {
     pub fn udp() -> Option<Server> {
-        Self::wrap(unsafe { crate::svc_udp::svcudp_create(RPC_ANYSOCK) })
+        Self::wrap(crate::svc_udp::svcudp_create(RPC_ANYSOCK))
     }
     pub fn tcp() -> Option<Server> {
-        Self::wrap(unsafe { crate::svc_tcp::svctcp_create(RPC_ANYSOCK, 0, 0) })
+        Self::wrap(crate::svc_tcp::svctcp_create(RPC_ANYSOCK, 0, 0))
     }
     pub fn unix(path: &[u8]) -> Option<Server> {
+        if !path.contains(&0) {
+            return None;
+        }
         Self::wrap(unsafe { crate::svc_unix::svcunix_create(RPC_ANYSOCK, 0, 0, path.as_ptr() as *mut c_char) })
     }
     fn wrap(x: *mut SVCXPRT) -> Option<Server> {
@@ -298,17 +313,22 @@ impl Server {
         unsafe { (*self.xprt).xp_port }
     }
     pub fn register(&self, prog: u32, vers: u32, handler: Handler) -> bool {
-        let table = unsafe { &mut *HANDLERS.get() };
-        let slot = table.iter().position(|e| e.2.is_none() || (e.0 == prog && e.1 == vers));
-        let Some(i) = slot else { return false };
-        table[i] = (prog, vers, Some(handler));
+        let placed = HANDLERS.with(|table| {
+            let slot = table.iter().position(|e| e.2.is_none() || (e.0 == prog && e.1 == vers));
+            let Some(i) = slot else { return false };
+            table[i] = (prog, vers, Some(handler));
+            true
+        });
+        if !placed {
+            return false;
+        }
         unsafe { crate::svc::svc_register(self.xprt, prog as c_ulong, vers as c_ulong, Some(dispatcher), 0) != 0 }
     }
     pub fn run(&self) {
-        unsafe { crate::svc::svc_run() }
+        crate::svc::svc_run()
     }
 }
 
 pub fn stop() {
-    unsafe { crate::svc::svc_exit() }
+    crate::svc::svc_exit()
 }

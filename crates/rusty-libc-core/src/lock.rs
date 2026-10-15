@@ -1,3 +1,4 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use crate::syscall::syscall4;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
@@ -8,26 +9,33 @@ const FUTEX_WAKE_PRIVATE: usize = 129;
 
 #[cfg_attr(feature = "export-mem", unsafe(no_mangle))]
 #[allow(non_upper_case_globals)]
-pub static mut __libc_single_threaded: u8 = 1;
+pub static __libc_single_threaded: AtomicU8 = AtomicU8::new(1);
 
 #[cfg_attr(feature = "export-mem", unsafe(no_mangle))]
 pub extern "C" fn __libc_early_init(initial: bool) {
-    unsafe {
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(__libc_single_threaded), initial as u8);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(LIBC_INITIAL), initial as u8);
-    }
+    __libc_single_threaded.store(initial as u8, Ordering::Relaxed);
+    LIBC_INITIAL.store(initial as u8, Ordering::Relaxed);
 }
 
-static mut LIBC_INITIAL: u8 = 1;
+static LIBC_INITIAL: AtomicU8 = AtomicU8::new(1);
 
 pub fn libc_initial() -> bool {
-    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(LIBC_INITIAL)) != 0 }
+    LIBC_INITIAL.load(Ordering::Relaxed) != 0
 }
 
 static AT_SECURE: AtomicU8 = AtomicU8::new(2);
 
 pub fn set_at_secure(v: bool) {
     AT_SECURE.store(v as u8, Ordering::Relaxed);
+}
+
+pub fn secure() -> bool {
+    at_secure().unwrap_or_else(|| {
+        let id = |nr: usize| {
+            unsafe { syscall4(nr, 0, 0, 0, 0) }
+        };
+        id(102) != id(107) || id(104) != id(108)
+    })
 }
 
 pub fn at_secure() -> Option<bool> {
@@ -38,9 +46,10 @@ pub fn at_secure() -> Option<bool> {
 }
 
 pub fn note_multithreaded() {
-    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(__libc_single_threaded), 0) };
+    __libc_single_threaded.store(0, Ordering::Relaxed);
 }
 
+#[cfg(not(miri))]
 #[inline(always)]
 pub fn multithreaded() -> bool {
     let v: i32;
@@ -48,9 +57,20 @@ pub fn multithreaded() -> bool {
     v != 0
 }
 
+#[cfg(miri)]
+pub fn multithreaded() -> bool {
+    true
+}
+
 #[inline]
 pub fn futex_wait(word: &AtomicU32, expected: u32) {
     unsafe { syscall4(SYS_FUTEX, word as *const AtomicU32 as usize, FUTEX_WAIT_PRIVATE, expected as usize, 0) };
+}
+
+#[inline]
+pub fn futex_wait_timeout(word: &AtomicU32, expected: u32, ns: u64) {
+    let ts = [(ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64];
+    unsafe { syscall4(SYS_FUTEX, word as *const AtomicU32 as usize, FUTEX_WAIT_PRIVATE, expected as usize, ts.as_ptr() as usize) };
 }
 
 #[inline]
@@ -74,6 +94,7 @@ pub unsafe fn release_single_thread(w: &AtomicU32) -> u32 {
     s
 }
 
+#[repr(transparent)]
 pub struct RawMutex {
     state: AtomicU32,
 }
@@ -108,6 +129,17 @@ impl RawMutex {
         }
         while self.state.swap(2, Ordering::Acquire) != 0 {
             futex_wait(&self.state, 2);
+        }
+    }
+
+    pub fn wait_held(&self, ns: u64) {
+        let v = self.state.load(Ordering::Relaxed);
+        if v != 0 {
+            let ts = [(ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64];
+            let r = unsafe { syscall4(SYS_FUTEX, &self.state as *const AtomicU32 as usize, FUTEX_WAIT_PRIVATE, v as usize, ts.as_ptr() as usize) };
+            if r == 0 {
+                futex_wake(&self.state, 1);
+            }
         }
     }
 

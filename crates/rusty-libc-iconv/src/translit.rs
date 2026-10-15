@@ -1,5 +1,6 @@
 use crate::engine::{EBody, St, enc_loop};
 use crate::translit_tables::{DEFAULT_MISSING, FROM_IDX, FROM_TBL, TO_IDX, TO_TBL};
+use rusty_libc_core::ffi::slice;
 
 enum Tab {
     C,
@@ -20,15 +21,13 @@ struct Loc {
 
 impl Tab {
     fn current() -> Tab {
-        let ct = rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE);
-        if ct.is_null() {
+        let Some(d) = rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE) else {
+            return Tab::C;
+        };
+        if d.flags() & rusty_libc_core::locale::F_BUILTIN_C != 0 || d.nstrings() < 70 {
             return Tab::C;
         }
-        let d = unsafe { &*ct };
-        if d.flags & rusty_libc_core::locale::F_BUILTIN_C != 0 || d.nstrings < 70 {
-            return Tab::C;
-        }
-        let wp = |i: usize| d.cstr(i) as *const u32;
+        let wp = |i: usize| d.cstr(i).cast::<u32>();
         Tab::Locale(Loc {
             size: d.word(61) as usize,
             src_idx: wp(62),
@@ -52,49 +51,66 @@ impl Tab {
     fn src_idx(&self, i: usize) -> usize {
         match self {
             Tab::C => FROM_IDX[i] as usize,
-            Tab::Locale(l) => unsafe { *l.src_idx.add(i) as usize },
+            Tab::Locale(l) => {
+                let p = l.src_idx.wrapping_add(i);
+                unsafe { *p as usize }
+            }
         }
     }
 
     fn to_idx(&self, i: usize) -> usize {
         match self {
             Tab::C => TO_IDX[i] as usize,
-            Tab::Locale(l) => unsafe { *l.to_idx.add(i) as usize },
+            Tab::Locale(l) => {
+                let p = l.to_idx.wrapping_add(i);
+                unsafe { *p as usize }
+            }
         }
     }
 
     fn src_tbl(&self, i: usize) -> u32 {
         match self {
             Tab::C => FROM_TBL[i],
-            Tab::Locale(l) => unsafe { *l.src_tbl.add(i) },
+            Tab::Locale(l) => {
+                let p = l.src_tbl.wrapping_add(i);
+                unsafe { *p }
+            }
         }
     }
 
     fn to_tbl(&self, i: usize) -> u32 {
         match self {
             Tab::C => TO_TBL[i],
-            Tab::Locale(l) => unsafe { core::ptr::read_volatile(l.to_tbl.add(i)) },
+            Tab::Locale(l) => {
+                let p = l.to_tbl.wrapping_add(i);
+                unsafe { core::ptr::read_volatile(p) }
+            }
         }
     }
 
     fn to_slice(&self, idx: usize, len: usize) -> &[u32] {
         match self {
             Tab::C => &TO_TBL[idx..idx + len],
-            Tab::Locale(l) => unsafe { core::slice::from_raw_parts(l.to_tbl.add(idx), len) },
+            Tab::Locale(l) => {
+                let p = l.to_tbl.wrapping_add(idx);
+                unsafe { slice(p, len) }
+            }
         }
     }
 
     fn default_missing(&self) -> &[u32] {
         match self {
             Tab::C => &DEFAULT_MISSING,
-            Tab::Locale(l) => unsafe { core::slice::from_raw_parts(l.default_missing, l.default_missing_len) },
+            Tab::Locale(l) => {
+                unsafe { slice(l.default_missing, l.default_missing_len) }
+            }
         }
     }
 
     fn ignored(&self, c: u32) -> bool {
         let Tab::Locale(l) = self else { return false };
-        for i in 0..l.ignore_len {
-            let (lo, hi, step) = unsafe { (*l.ignore.add(3 * i), *l.ignore.add(3 * i + 1), *l.ignore.add(3 * i + 2)) };
+        let ignore = unsafe { slice(l.ignore, 3 * l.ignore_len) };
+        for &[lo, hi, step] in ignore.as_chunks::<3>().0 {
             if lo <= c && c <= hi && step != 0 && (c - lo).is_multiple_of(step) {
                 return true;
             } else if c < lo {

@@ -54,23 +54,41 @@ pub(crate) fn dir_f32(hi: f64, lo: f64, rc: u32, eps: f64) -> f32 {
     if neg { -r } else { r }
 }
 
-#[inline(always)]
-pub(crate) fn tiny_mul_dir_f32(x: f32, ch: f64, cl: f64, rc: u32) -> f32 {
-    let xd = f64::from(x);
-    let (h, l0) = two_prod::<false>(xd, ch);
-    let (h, l) = fast_two_sum(h, l0 + xd * cl);
-    dir_f32(h, l, rc, h.abs() * 7.888609052210118e-31 * 1024.0)
+#[cold]
+#[inline(never)]
+fn directed_pair_f32(k: &dyn Fn() -> (f64, f64)) -> (f32, f64) {
+    let rc = crate::trig::dd::rounding_control();
+    let _g = crate::trig::dd::NearestGuard::new();
+    let (h, l) = k();
+    (dir_f32(h, l, rc, h.abs() * 7.888609052210118e-31 * 1024.0), h)
 }
 
-#[inline(always)]
-fn one_minus_tiny(neg: bool) -> f32 {
-    let r = black_box(1.0f32) - black_box(f32::from_bits(0x1e80_0000));
+#[cold]
+#[inline(never)]
+fn dir_range_f32(v: f64, rc: u32) -> f32 {
+    let neg = v.is_sign_negative();
+    let away = rc == if neg { 1 } else { 2 };
+    set_errno(ERANGE);
+    let r = if v.is_infinite() {
+        let o = black_box(black_box(f32::MAX) * black_box(2.0f32));
+        if away { o } else { f32::MAX }
+    } else {
+        let t = black_box(f32::MIN_POSITIVE);
+        let u = black_box(t * t);
+        if away { f32::from_bits(1) } else { u }
+    };
     if neg { -r } else { r }
 }
 
 #[inline(always)]
+fn one_minus_tiny(neg: bool) -> f32 {
+    let t = black_box(f32::from_bits(0x1e80_0000));
+    if neg { black_box(-1.0f32) + t } else { black_box(1.0f32) - t }
+}
+
+#[inline(always)]
 pub(super) fn erff_impl<const F: bool>(x: f32) -> f32 {
-    if crate::trig::dd::directed_if((x.to_bits() & 0x7fff_ffff).wrapping_sub(1) < 0x3880_0000 - 1) {
+    if (x.to_bits() & 0x7fff_ffff).wrapping_sub(1) < 0x40c0_0000 - 1 && !crate::trig::dd::is_nearest() {
         return erff_directed::<F>(x);
     }
     erff_body::<F>(x, 0)
@@ -88,8 +106,8 @@ fn erff_body<const F: bool>(x: f32, rc: u32) -> f32 {
     const LO: u32 = 0x2b8c_bccd;
     const HI: u32 = 0x40c0_0000;
     let ab = x.to_bits() & 0x7fff_ffff;
-    if ab.wrapping_sub(LO) < HI - LO {
-        let e = fastf::erf_lo::<F>(f64::from(f32::from_bits(ab)));
+    if rc == 0 && ab.wrapping_sub(LO) < HI - LO {
+        let e = fastf::erf_lo_unchecked::<F>(f64::from(f32::from_bits(ab))).0;
         if let Some(r) = fastf::round_f32(e, e * 4.0 * REL) {
             return f32::from_bits(r.to_bits() | (x.to_bits() & 0x8000_0000));
         }
@@ -99,11 +117,17 @@ fn erff_body<const F: bool>(x: f32, rc: u32) -> f32 {
     if ax.is_nan() {
         return x + x;
     }
+    if ax == f64::INFINITY {
+        return if x < 0.0 { -1.0 } else { 1.0 };
+    }
     if ax >= 6.0 {
         return one_minus_tiny(x.is_sign_negative());
     }
-    if ax >= 1.0e-12 {
-        let e = fastf::erf_lo::<F>(ax);
+    if ax == 0.0 {
+        return x;
+    }
+    if rc == 0 && ax >= 1.0e-12 {
+        let e = fastf::erf_lo_unchecked::<F>(ax).0;
         if let Some(r) = fastf::round_f32(e, e * 4.0 * REL) {
             return if x.is_sign_negative() { -r } else { r };
         }
@@ -124,6 +148,12 @@ pub(super) fn erfcf_impl<const F: bool>(x: f32) -> f32 {
     if ax.is_nan() {
         return x + x;
     }
+    if ax == 0.0 {
+        return 1.0;
+    }
+    if xd == f64::NEG_INFINITY {
+        return 2.0;
+    }
     if ax < 1.0e-12 {
         let t = black_box(f32::from_bits(0x1e80_0000));
         return if x < 0.0 { black_box(1.0f32) + t } else { black_box(1.0f32) - t };
@@ -132,10 +162,13 @@ pub(super) fn erfcf_impl<const F: bool>(x: f32) -> f32 {
         if ax >= 6.0 {
             return black_box(2.0f32) - black_box(f32::from_bits(0x1e80_0000));
         }
-        let e = fastf::erf_lo::<F>(ax);
+        let e = fastf::erf_lo_unchecked::<F>(ax).0;
         let v = 1.0 + e;
-        if let Some(r) = fastf::round_f32(v, v * 4.0 * REL) {
+        if let Some(r) = fastf::round_f32(v, v * 16.0 * REL) {
             return r;
+        }
+        if !crate::trig::dd::is_nearest() {
+            return erfcf_directed(x);
         }
         let v = add_d(erf_dd::<F>(ax, 2), 1.0);
         return dd_to_f32(v.0, v.1);
@@ -147,14 +180,17 @@ pub(super) fn erfcf_impl<const F: bool>(x: f32) -> f32 {
                 return r;
             }
         }
+        if !crate::trig::dd::is_nearest() {
+            return erfcf_directed(x);
+        }
         let v = erfc_dd::<F>(ax, 2);
         return dd_to_f32(v.0, v.1);
     }
     if ax < 10.1 {
-        let c = fastf::erfc_tail_lo::<F>(ax);
+        let c = fastf::erfc_tail_lo_unchecked::<F>(ax).0;
         if c > 1.0e-46 {
-            if let Some(r) = fastf::round_f32(c, c * (2.0 * REL)) {
-                if r == 0.0 {
+            if let Some(r) = fastf::round_f32(c, c * (8.0 * REL)) {
+                if c < 7.006_492_321_624_085e-46 {
                     set_errno(ERANGE);
                 }
                 return r;
@@ -164,9 +200,33 @@ pub(super) fn erfcf_impl<const F: bool>(x: f32) -> f32 {
     if ax >= 10.2 {
         return if ax == f64::INFINITY { 0.0 } else { uflowf(false) };
     }
+    if !crate::trig::dd::is_nearest() {
+        return erfcf_directed(x);
+    }
     let (v, k) = erfc_tail_dd::<F>(ax, 2);
     let r = dd_to_f32(ldexp(v.0, k), ldexp(v.1, k));
     if r == 0.0 {
+        set_errno(ERANGE);
+    }
+    r
+}
+
+#[cold]
+#[inline(never)]
+fn erfcf_directed(x: f32) -> f32 {
+    let xd = f64::from(x);
+    let ax = xd.abs();
+    let (r, h) = directed_pair_f32(&|| {
+        if xd < 0.0 {
+            add_d(erf_dd::<false>(ax, 2), 1.0)
+        } else if ax < 6.0 {
+            erfc_dd::<false>(ax, 2)
+        } else {
+            let (v, k) = erfc_tail_dd::<false>(ax, 2);
+            (ldexp(v.0, k), ldexp(v.1, k))
+        }
+    });
+    if h < 7.006_492_321_624_085e-46 {
         set_errno(ERANGE);
     }
     r
@@ -221,7 +281,8 @@ fn lgammaf_r_body<const F: bool>(x: f32) -> (f32, i32) {
 
 #[inline(always)]
 pub(super) fn tgammaf_impl<const F: bool>(x: f32) -> f32 {
-    if crate::trig::dd::directed_if((x.to_bits() & 0x7fff_ffff).wrapping_sub(1) < 0x3080_0000 - 1) {
+    let xd = f64::from(x);
+    if x.is_finite() && x != 0.0 && !((xd.abs() >= 8_388_608.0 || fastf::is_int(xd)) && xd <= 14.0) && !crate::trig::dd::is_nearest() {
         return tgammaf_directed::<F>(x);
     }
     tgammaf_body::<F>(x, 0)
@@ -249,8 +310,23 @@ fn tgammaf_body<const F: bool>(x: f32, rc: u32) -> f32 {
             f32::MAX
         };
     }
+    if rc != 0 {
+        let b = x.to_bits() & 0x7fff_ffff;
+        if (0x0040_0000..=0x2180_0000).contains(&b) && (b & 0x007f_ffff == 0 || b.is_power_of_two()) {
+            let p = 1.0 / f64::from(f32::from_bits(b));
+            let p = p as f32;
+            black_box(black_box(1.0f32) + black_box(f32::from_bits(0x1e80_0000)));
+            return if x > 0.0 {
+                if rc == 2 { p } else { f32::from_bits(p.to_bits() - 1) }
+            } else if rc == 1 {
+                -f32::from_bits(p.to_bits() + 1)
+            } else {
+                -p
+            };
+        }
+    }
     let xd = x as f64;
-    if xd > 1.0e-30 && xd < 34.5 && !fastf::is_int(xd) {
+    if rc == 0 && xd > 1.0e-30 && xd < 34.5 && !fastf::is_int(xd) {
         let lg = fastf::lgamma_pos_lo::<F>(xd);
         let v = crate::exp::dexp::exp_impl::<F>(lg);
         if v < 1.0e38 && v > 1.0e-37 {
@@ -258,7 +334,7 @@ fn tgammaf_body<const F: bool>(x: f32, rc: u32) -> f32 {
                 return r;
             }
         }
-    } else if xd < -1.0e-30 && xd > -30.0 && !fastf::is_int(xd) {
+    } else if rc == 0 && xd < -1.0e-30 && xd > -30.0 && !fastf::is_int(xd) {
         let v = fastf::tgamma_neg::<F>(xd);
         let av = v.abs();
         if av < 1.0e38 && av > 1.0e-37 {
@@ -271,10 +347,13 @@ fn tgammaf_body<const F: bool>(x: f32, rc: u32) -> f32 {
         }
     }
     match tgamma_dd::<F>(x as f64) {
+        Err(v) if rc != 0 && x.is_finite() && x != 0.0 && (v.is_infinite() || v == 0.0) => dir_range_f32(v, rc),
         Err(v) => if crate::SVID && v.is_nan() && !x.is_nan() { f32::from_bits(0xffc0_0000) } else { v as f32 },
         Ok(((m, k), neg)) => {
             let (h, l) = if neg { (-ldexp(m.0, k), -ldexp(m.1, k)) } else { (ldexp(m.0, k), ldexp(m.1, k)) };
-            let r = if rc != 0 {
+            let r = if rc != 0 && h == 0.0 {
+                dir_range_f32(if neg { -0.0 } else { 0.0 }, rc)
+            } else if rc != 0 {
                 dir_f32(h, l, rc, h.abs() * 7.888609052210118e-31 * 1024.0)
             } else {
                 dd_to_f32(h, l)
@@ -325,7 +404,7 @@ fn bessel_f32_directed<const K: u8>(ax: f64, flip: bool) -> f32 {
     }
     neg ^= flip;
     let away = rc == if neg { 1 } else { 2 };
-    let r = fastf::round_f32_dir(h, l, h * 8.881784197001252e-16, away).unwrap_or_else(|| dd_to_f32(h, l));
+    let r = fastf::round_f32_dir(h, l, 0.0, away).unwrap_or_else(|| dd_to_f32(h, l));
     if r.is_infinite() {
         set_errno(ERANGE);
     }
@@ -374,13 +453,32 @@ pub(super) fn j1f_impl<const F: bool>(x: f32) -> f32 {
         return x;
     }
     if ax < 6.0e-5 {
-        let r = x * 0.5;
-        if r == 0.0 {
-            return uflowf(x < 0.0);
+        let neg = x < 0.0;
+        let m = ax * 0.5;
+        let rc = crate::trig::dd::rounding_control();
+        let away = rc == if neg { 1 } else { 2 };
+        let toward = rc == 3 || rc == if neg { 2 } else { 1 };
+        let bits = if m >= f64::from(f32::MIN_POSITIVE) {
+            let b = (m as f32).to_bits();
+            if toward { b - 1 } else { b }
+        } else {
+            let k = (m * f64::from_bits((1023 + 150) << 52)) as u32;
+            let u = k >> 1;
+            if k & 1 == 0 {
+                if toward { u - 1 } else { u }
+            } else if away {
+                u + 1
+            } else {
+                u
+            }
+        };
+        if bits == 0 {
+            return uflowf(neg);
         }
+        let r = f32::from_bits(bits);
         force_underflowf(r);
         raise_inexact();
-        return r;
+        return if neg { -r } else { r };
     }
     if !crate::trig::dd::is_nearest() {
         return bessel_f32_directed::<1>(ax, x < 0.0);

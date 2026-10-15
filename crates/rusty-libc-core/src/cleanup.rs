@@ -1,3 +1,4 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use core::cell::Cell;
 use core::ffi::{c_int, c_void};
 
@@ -24,11 +25,9 @@ pub fn set_head(p: *mut CleanupBuf) {
 
 #[inline]
 pub unsafe fn push(buf: *mut CleanupBuf, routine: unsafe extern "C" fn(*mut c_void), arg: *mut c_void) {
-    unsafe {
-        (*buf).routine = routine;
-        (*buf).arg = arg;
-        (*buf).prev = HEAD.get();
-    }
+    unsafe { (*buf).routine = routine };
+    unsafe { (*buf).arg = arg };
+    unsafe { (*buf).prev = HEAD.get() };
     HEAD.set(buf);
 }
 
@@ -38,29 +37,27 @@ pub unsafe fn pop(buf: *mut CleanupBuf) {
 }
 
 pub unsafe fn remove(buf: *mut CleanupBuf) {
-    unsafe {
-        if HEAD.get() == buf {
-            HEAD.set((*buf).prev);
+    let next = unsafe { (*buf).prev };
+    if HEAD.get() == buf {
+        HEAD.set(next);
+        return;
+    }
+    let mut p = HEAD.get();
+    while !p.is_null() {
+        let prev = unsafe { (*p).prev };
+        if prev == buf {
+            unsafe { (*p).prev = next };
             return;
         }
-        let mut p = HEAD.get();
-        while !p.is_null() {
-            if (*p).prev == buf {
-                (*p).prev = (*buf).prev;
-                return;
-            }
-            p = (*p).prev;
-        }
+        p = prev;
     }
 }
 
 #[inline]
 pub unsafe fn with<R>(routine: unsafe extern "C" fn(*mut c_void), arg: *mut c_void, body: impl FnOnce() -> R) -> R {
     let mut buf = core::mem::MaybeUninit::<CleanupBuf>::uninit();
-    unsafe {
-        push(buf.as_mut_ptr(), routine, arg);
-        let r = body();
-        pop(buf.as_mut_ptr());
-        r
-    }
+    unsafe { push(buf.as_mut_ptr(), routine, arg) };
+    let r = body();
+    unsafe { pop(buf.as_mut_ptr()) };
+    r
 }

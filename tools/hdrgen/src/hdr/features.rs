@@ -353,7 +353,7 @@ pub static HDR: Header = Header {
                         Branch { head: "if !defined __OPTIMIZE__ || __OPTIMIZE__ <= 0", items: &[
                             Item::Raw(Reason::Other, "#  warning _FORTIFY_SOURCE requires compiling with optimization (-O)"),
                         ] },
-                        Branch { head: "elif _FORTIFY_SOURCE > 2 && defined __GNUC__ && __GNUC__ >= 12", items: &[
+                        Branch { head: "elif _FORTIFY_SOURCE > 2 && ((defined __clang__ && __clang_major__ >= 9) || (defined __GNUC__ && __GNUC__ >= 12))", items: &[
                             Item::Gate(&[
                                 Branch { head: "if _FORTIFY_SOURCE > 3", items: &[
                                     Item::Raw(Reason::Other, "#   warning _FORTIFY_SOURCE > 3 is treated like 3 on this platform"),

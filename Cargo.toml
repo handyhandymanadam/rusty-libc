@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rusty-libc-mem", "crates/rusty-libc-core", "crates/rusty-libc-malloc", "crates/rusty-libc-stdio", "crates/rusty-libc-ctype", "crates/rusty-libc-stdlib", "crates/rusty-libc-math", "crates/rusty-libc-sys", "crates/rusty-libc-util", "crates/rusty-libc-time", "crates/rusty-libc-wchar", "crates/rusty-libc-regex", "crates/rusty-libc-pthread", "crates/rusty-libc-signal", "crates/rusty-libc-net", "crates/rusty-libc-iconv", "crates/rusty-libc-fortify", "crates/rusty-libc-locale", "crates/rusty-libc-extra", "crates/rusty-libc-ipc", "crates/rusty-libc-rpc", "crates/rusty-libc-cabi"]
+members = ["crates/rusty-libc-mem", "crates/rusty-libc-core", "crates/rusty-libc-malloc", "crates/rusty-libc-stdio", "crates/rusty-libc-ctype", "crates/rusty-libc-stdlib", "crates/rusty-libc-math", "crates/rusty-libc-sys", "crates/rusty-libc-util", "crates/rusty-libc-time", "crates/rusty-libc-wchar", "crates/rusty-libc-regex", "crates/rusty-libc-pthread", "crates/rusty-libc-signal", "crates/rusty-libc-net", "crates/rusty-libc-iconv", "crates/rusty-libc-fortify", "crates/rusty-libc-locale", "crates/rusty-libc-extra", "crates/rusty-libc-ipc", "crates/rusty-libc-rpc", "crates/rusty-libc-cabi", "crates/rusty-libc-rs", "crates/rusty-libc-rs-core"]
 exclude = ["crates/rusty-libc-ldso", "crates/rusty-libc-mvec"]
 
 [workspace.package]

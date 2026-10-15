@@ -9,12 +9,15 @@ __libc_ldso_dlmopen
 __libc_ldso_dlclose
 __libc_ldso_dlsym
 __libc_ldso_dlvsym
-__libc_ldso_dlerror
+__libc_ldso_dlerror_record
+__libc_ldso_dlerror_compose
 __libc_ldso_dladdr
 __libc_ldso_dladdr1
 __libc_ldso_dlinfo
 __libc_ldso_iterate_phdr
 __libc_ldso_find_object
 __libc_ldso_fork_child
+__libc_ldso_tls_dtor_ref
 __libc_ldso_debug_mask
 __libc_ldso_debug_write
+__libc_ldso_tls_dbslots

@@ -1,9 +1,11 @@
 #![no_std]
 #![no_builtins]
 #![allow(clippy::missing_safety_doc)]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 
 mod tables;
 mod wvec;
+pub mod wcstr;
 pub mod wstring;
 pub mod mbyte;
 pub mod wctype;
@@ -45,7 +47,7 @@ pub fn charset() -> Charset {
     if !t.is_null() {
         let d = unsafe { *t };
         if !d.is_null() {
-            let code = unsafe { (*d).flags } >> rusty_libc_core::locale::F_CHARSET_SHIFT & 0xff;
+            let code = unsafe { (*d).flags() } >> rusty_libc_core::locale::F_CHARSET_SHIFT & 0xff;
             return code_charset(code);
         }
     }

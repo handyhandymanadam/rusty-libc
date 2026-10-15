@@ -1,7 +1,7 @@
 #![no_std]
 #![feature(thread_local)]
 #![allow(clippy::missing_safety_doc)]
-#![allow(clippy::deref_addrof)]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 #![allow(clippy::too_many_arguments, clippy::type_complexity, clippy::collapsible_if, clippy::needless_range_loop, clippy::if_same_then_else)]
 #![allow(clippy::needless_late_init, clippy::result_unit_err, clippy::ptr_eq)]
@@ -17,6 +17,7 @@ pub mod dns;
 pub mod nssdns_abi;
 pub mod nssdns;
 pub mod nss;
+pub mod hostid;
 pub mod netdb;
 pub mod gai;
 pub mod idna;

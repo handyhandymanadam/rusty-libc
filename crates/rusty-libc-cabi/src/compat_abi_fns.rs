@@ -15,13 +15,12 @@ fn ver_ok(vers: c_int) -> bool {
 }
 
 unsafe fn call(nr: usize, a: usize, b: usize, c: usize, d: usize) -> c_int {
-    unsafe {
-        let r = syscall::syscall4(nr, a, b, c, d);
-        if r > usize::MAX - 4095 {
-            errno::set((r as isize).wrapping_neg() as i32);
+    let r = unsafe { syscall::syscall4(nr, a, b, c, d) };
+    match syscall::check(r) {
+        Ok(v) => v as c_int,
+        Err(e) => {
+            errno::set(e.0);
             -1
-        } else {
-            r as c_int
         }
     }
 }
@@ -88,7 +87,8 @@ pub unsafe extern "C" fn __xmknod(vers: c_int, path: *const c_char, mode: u32, d
     if vers != 0 {
         return einval();
     }
-    unsafe { call(SYS_MKNOD, path as usize, mode as usize, *dev as usize, 0) }
+    let dev = unsafe { *dev };
+    unsafe { call(SYS_MKNOD, path as usize, mode as usize, dev as usize, 0) }
 }
 
 #[unsafe(no_mangle)]
@@ -96,12 +96,13 @@ pub unsafe extern "C" fn __xmknodat(vers: c_int, dirfd: c_int, path: *const c_ch
     if vers != 0 {
         return einval();
     }
-    unsafe { call(SYS_MKNODAT, dirfd as isize as usize, path as usize, mode as usize, *dev as usize) }
+    let dev = unsafe { *dev };
+    unsafe { call(SYS_MKNODAT, dirfd as isize as usize, path as usize, mode as usize, dev as usize) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __libc_freeres() {
-    unsafe { rusty_libc_stdio::file::freeres() }
+    rusty_libc_stdio::file::freeres()
 }
 
 #[unsafe(no_mangle)]

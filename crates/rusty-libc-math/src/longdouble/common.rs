@@ -83,7 +83,8 @@ impl F80Access for F80 {
     }
     #[inline(always)]
     fn sign_exp_(self) -> u16 {
-        unsafe { core::ptr::read(self.0.as_ptr().add(8) as *const u16) }
+        let p = self.0[8..10].as_ptr();
+        unsafe { core::ptr::read(p as *const u16) }
     }
     #[inline(always)]
     fn is_nan_(self) -> bool {
@@ -112,16 +113,30 @@ pub fn f80_from_bits(mant: u64, sign_exp: u16) -> F80 {
     F80([m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], e[0], e[1], 0, 0, 0, 0, 0, 0])
 }
 
+#[repr(C, align(16))]
+pub struct LdArg {
+    mant: u64,
+    se: u16,
+}
+
+impl LdArg {
+    #[inline(always)]
+    pub fn get(&self) -> F80 {
+        f80_from_bits(self.mant, self.se)
+    }
+}
+
+#[repr(C, align(8))]
+pub struct LdOut([core::mem::MaybeUninit<u64>; 2]);
+
 #[inline(always)]
-pub unsafe fn load_f80(p: *const F80) -> F80 {
-    unsafe { f80_from_bits(core::ptr::read(p as *const u64), core::ptr::read((p as *const u8).add(8) as *const u16)) }
+pub fn put(o: &mut LdOut, r: F80) {
+    o.0[0].write(r.mant_());
+    o.0[1].write(r.sign_exp_() as u64);
 }
 
 #[inline(always)]
-pub unsafe fn put_f80(o: *mut F80, r: F80) {
-    let p = o as *mut u64;
-    unsafe {
-        p.write(r.mant_());
-        p.add(1).write(r.sign_exp_() as u64);
-    }
+pub fn put2(o: &mut [LdOut; 2], re: F80, im: F80) {
+    put(&mut o[0], re);
+    put(&mut o[1], im);
 }

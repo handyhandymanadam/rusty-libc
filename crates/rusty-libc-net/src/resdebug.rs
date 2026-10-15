@@ -1,12 +1,14 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::nsparse::{
     __p_class_syms, __p_type_syms, ns_f_aa, ns_f_ad, ns_f_cd, ns_f_opcode, ns_f_qr, ns_f_ra, ns_f_rcode, ns_f_rd, ns_f_tc, ns_f_z, ns_msg, ns_rr, ns_s_an,
     ns_s_ar, ns_s_ns, ns_s_qd, res_sym,
 };
-use crate::resolv::{ResState, __res_state};
+use crate::resolv::{ResState, msg_dst, msg_slice, offset_in, with_this_state};
 use crate::types::{EINVAL, EMSGSIZE, ENOSPC, sockaddr_in};
-use crate::util::{Buf, cbytes, cstrlen};
+use crate::util::{Buf, Spin};
 use core::ffi::{CStr, c_char, c_int, c_uchar, c_uint, c_ulong, c_void};
-use rusty_libc_core::errno;
+use rusty_libc_core::sync_cell::SyncCell;
+use rusty_libc_core::{errno, ffi};
 
 const MAXDNAME: usize = 1025;
 const PACKETSZ: c_int = 512;
@@ -28,8 +30,13 @@ const RES_PRF_HEADX: c_ulong = 0x800;
 
 unsafe extern "C" {
     fn fwrite(ptr: *const c_void, size: usize, n: usize, f: *mut c_void) -> usize;
-    static mut stdout: *mut c_void;
+    static stdout: SyncCell<*mut c_void>;
     fn strerror(e: c_int) -> *const c_char;
+}
+
+fn strerror_text(e: c_int) -> &'static [u8] {
+    let p = unsafe { strerror(e) };
+    unsafe { ffi::cstr_bytes(p) }
 }
 
 pub trait Sink {
@@ -92,19 +99,17 @@ pub fn opcode_name(opcode: usize) -> &'static str {
     OPCODE_NAMES[opcode & 15].to_str().unwrap_or("")
 }
 
-static mut UNNAME_NTOS: [u8; 20] = [0; 20];
-static mut UNNAME_NTOP: [u8; 20] = [0; 20];
-static mut NBUF_OPTION: [u8; 40] = [0; 40];
-static mut NBUF_TIME: [u8; 40] = [0; 40];
-static mut OUTPUT_DATE: [u8; 15] = [0; 15];
+static UNNAME_NTOS: Spin<[u8; 20]> = Spin::new([0; 20]);
+static UNNAME_NTOP: Spin<[u8; 20]> = Spin::new([0; 20]);
+static NBUF_OPTION: Spin<[u8; 40]> = Spin::new([0; 40]);
+static NBUF_TIME: Spin<[u8; 40]> = Spin::new([0; 40]);
+static OUTPUT_DATE: Spin<[u8; 15]> = Spin::new([0; 15]);
 
-unsafe fn fill(dst: *mut u8, cap: usize, s: &[u8]) -> *const c_char {
-    unsafe {
-        let n = s.len().min(cap - 1);
-        core::ptr::copy_nonoverlapping(s.as_ptr(), dst, n);
-        *dst.add(n) = 0;
-        dst as *const c_char
-    }
+fn fill(dst: &mut [u8], s: &[u8]) -> *const c_char {
+    let n = s.len().min(dst.len() - 1);
+    dst[..n].copy_from_slice(&s[..n]);
+    dst[n] = 0;
+    dst.as_ptr().cast::<c_char>()
 }
 
 fn dec(n: i64) -> Buf<24> {
@@ -148,95 +153,88 @@ fn hex(mut v: u64) -> Buf<24> {
     b
 }
 
-unsafe fn sym_lookup(syms: *const res_sym, number: c_int, human: bool) -> Option<*const c_char> {
-    unsafe {
-        let mut s = syms;
-        while !(*s).name.is_null() {
-            if (*s).number == number {
-                return Some(if human { (*s).humanname } else { (*s).name });
-            }
-            s = s.add(1);
-        }
-        None
+fn sym_lookup(syms: &[res_sym], number: c_int, human: bool) -> Option<*const c_char> {
+    syms.iter().take_while(|s| !s.name.is_null()).find(|s| s.number == number).map(|s| if human { s.humanname } else { s.name })
+}
+
+unsafe fn sym_args<'a>(syms: *const res_sym, success: *mut c_int) -> (&'a [res_sym], Option<&'a mut c_int>) {
+    let mut n = 0usize;
+    while !unsafe { (*syms.wrapping_add(n)).name }.is_null() {
+        n += 1;
     }
+    let table = unsafe { ffi::slice(syms, n + 1) };
+    (table, unsafe { ffi::out(success) })
+}
+
+fn own_name(p: *const c_char) -> &'static [u8] {
+    crate::nsparse::sym_text(p)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __sym_ston(syms: *const res_sym, name: *const c_char, success: *mut c_int) -> c_int {
-    unsafe {
-        let want = cbytes(name);
-        let mut s = syms;
-        while !(*s).name.is_null() {
-            if cbytes((*s).name).eq_ignore_ascii_case(want) {
-                if !success.is_null() {
-                    *success = 1;
-                }
-                return (*s).number;
+    let want = unsafe { ffi::cstr_bytes(name) };
+    let (table, success) = unsafe { sym_args(syms, success) };
+    let (entries, end) = table.split_at(table.len() - 1);
+    for s in entries {
+        if unsafe { ffi::cstr_bytes(s.name) }.eq_ignore_ascii_case(want) {
+            if let Some(ok) = success {
+                *ok = 1;
             }
-            s = s.add(1);
+            return s.number;
         }
-        if !success.is_null() {
-            *success = 0;
-        }
-        (*s).number
     }
+    if let Some(ok) = success {
+        *ok = 0;
+    }
+    end[0].number
+}
+
+fn sym_name_or_number(table: &[res_sym], number: c_int, human: bool, success: Option<&mut c_int>, unname: &Spin<[u8; 20]>) -> *const c_char {
+    if let Some(p) = sym_lookup(table, number, human) {
+        if let Some(ok) = success {
+            *ok = 1;
+        }
+        return p;
+    }
+    if let Some(ok) = success {
+        *ok = 0;
+    }
+    fill(&mut unname.lock()[..], dec(number as i64).as_bytes())
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __sym_ntos(syms: *const res_sym, number: c_int, success: *mut c_int) -> *const c_char {
-    unsafe {
-        if let Some(p) = sym_lookup(syms, number, false) {
-            if !success.is_null() {
-                *success = 1;
-            }
-            return p;
-        }
-        if !success.is_null() {
-            *success = 0;
-        }
-        fill((&raw mut UNNAME_NTOS) as *mut u8, 20, dec(number as i64).as_bytes())
-    }
+    let (table, success) = unsafe { sym_args(syms, success) };
+    sym_name_or_number(table, number, false, success, &UNNAME_NTOS)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __sym_ntop(syms: *const res_sym, number: c_int, success: *mut c_int) -> *const c_char {
-    unsafe {
-        if let Some(p) = sym_lookup(syms, number, true) {
-            if !success.is_null() {
-                *success = 1;
-            }
-            return p;
-        }
-        if !success.is_null() {
-            *success = 0;
-        }
-        fill((&raw mut UNNAME_NTOP) as *mut u8, 20, dec(number as i64).as_bytes())
-    }
+    let (table, success) = unsafe { sym_args(syms, success) };
+    sym_name_or_number(table, number, true, success, &UNNAME_NTOP)
 }
 
-fn sym_ntos_rust(syms: *const res_sym, number: c_int) -> Buf<24> {
-    unsafe {
-        match sym_lookup(syms, number, false) {
-            Some(p) => Buf::from(cbytes(p)).unwrap_or_default(),
-            None => dec(number as i64),
-        }
+fn sym_ntos_rust(syms: &'static [res_sym], number: c_int) -> Buf<24> {
+    match sym_lookup(syms, number, false) {
+        Some(p) => Buf::from(own_name(p)).unwrap_or_default(),
+        None => dec(number as i64),
     }
 }
 
 pub fn type_str(ty: c_int) -> Buf<24> {
-    sym_ntos_rust(__p_type_syms.as_ptr(), ty)
+    sym_ntos_rust(&__p_type_syms, ty)
 }
 
 pub fn class_str(class: c_int) -> Buf<24> {
-    sym_ntos_rust(__p_class_syms.as_ptr(), class)
+    sym_ntos_rust(&__p_class_syms, class)
 }
 
 pub fn rcode_str(rcode: c_int) -> Buf<24> {
-    sym_ntos_rust(P_RCODE_SYMS.as_ptr(), rcode)
+    sym_ntos_rust(&P_RCODE_SYMS, rcode)
 }
 
 fn section_str(section: c_int, opcode: c_int) -> Buf<24> {
-    let t = if opcode == 5 { P_UPDATE_SECTION_SYMS.as_ptr() } else { P_DEFAULT_SECTION_SYMS.as_ptr() };
+    let t: &'static [res_sym] = if opcode == 5 { &P_UPDATE_SECTION_SYMS } else { &P_DEFAULT_SECTION_SYMS };
     sym_ntos_rust(t, section)
 }
 
@@ -273,25 +271,23 @@ pub fn option_str(option: c_ulong) -> Buf<40> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_type(ty: c_int) -> *const c_char {
-    unsafe { __sym_ntos(__p_type_syms.as_ptr(), ty, core::ptr::null_mut()) }
+    sym_name_or_number(&__p_type_syms, ty, false, None, &UNNAME_NTOS)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_class(class: c_int) -> *const c_char {
-    unsafe { __sym_ntos(__p_class_syms.as_ptr(), class, core::ptr::null_mut()) }
+    sym_name_or_number(&__p_class_syms, class, false, None, &UNNAME_NTOS)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_rcode(rcode: c_int) -> *const c_char {
-    unsafe { __sym_ntos(P_RCODE_SYMS.as_ptr(), rcode, core::ptr::null_mut()) }
+    sym_name_or_number(&P_RCODE_SYMS, rcode, false, None, &UNNAME_NTOS)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_option(option: c_ulong) -> *const c_char {
-    unsafe {
-        let s = option_str(option);
-        fill((&raw mut NBUF_OPTION) as *mut u8, 40, s.as_bytes())
-    }
+    let s = option_str(option);
+    fill(&mut NBUF_OPTION.lock()[..], s.as_bytes())
 }
 
 pub fn time_str(value: u32) -> Buf<40> {
@@ -308,7 +304,7 @@ pub fn time_str(value: u32) -> Buf<40> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_time(value: u32) -> *const c_char {
-    unsafe { fill((&raw mut NBUF_TIME) as *mut u8, 40, time_str(value).as_bytes()) }
+    fill(&mut NBUF_TIME.lock()[..], time_str(value).as_bytes())
 }
 
 fn civil(days: i64) -> (i64, u32, u32) {
@@ -349,20 +345,18 @@ pub fn secstodate(secs: c_ulong) -> Result<[u8; 14], ()> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_secstodate(secs: c_ulong) -> *mut c_char {
-    unsafe {
-        let out = (&raw mut OUTPUT_DATE) as *mut u8;
-        match secstodate(secs) {
-            Ok(d) => {
-                core::ptr::copy_nonoverlapping(d.as_ptr(), out, 14);
-                *out.add(14) = 0;
-            }
-            Err(()) => {
-                fill(out, 15, b"<overflow>");
-                errno::set(EOVERFLOW);
-            }
+    let mut out = OUTPUT_DATE.lock();
+    match secstodate(secs) {
+        Ok(d) => {
+            out[..14].copy_from_slice(&d);
+            out[14] = 0;
         }
-        out as *mut c_char
+        Err(()) => {
+            fill(&mut out[..], b"<overflow>");
+            errno::set(EOVERFLOW);
+        }
     }
+    out.as_mut_ptr().cast::<c_char>()
 }
 
 pub fn count_labels(name: &[u8]) -> c_int {
@@ -378,27 +372,29 @@ pub fn count_labels(name: &[u8]) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __dn_count_labels(name: *const c_char) -> c_int {
-    count_labels(unsafe { cbytes(name) })
+    count_labels(unsafe { ffi::cstr_bytes(name) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __putlong(src: u32, dst: *mut c_uchar) {
-    unsafe { core::ptr::copy_nonoverlapping(src.to_be_bytes().as_ptr(), dst, 4) }
+    unsafe { ffi::bytes_mut(dst, 4) }.copy_from_slice(&src.to_be_bytes());
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __putshort(src: u16, dst: *mut c_uchar) {
-    unsafe { core::ptr::copy_nonoverlapping(src.to_be_bytes().as_ptr(), dst, 2) }
+    unsafe { ffi::bytes_mut(dst, 2) }.copy_from_slice(&src.to_be_bytes());
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn _getlong(src: *const c_uchar) -> u32 {
-    unsafe { u32::from_be_bytes([*src, *src.add(1), *src.add(2), *src.add(3)]) }
+    let b = unsafe { ffi::bytes(src, 4) };
+    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn _getshort(src: *const c_uchar) -> u16 {
-    unsafe { u16::from_be_bytes([*src, *src.add(1)]) }
+    let b = unsafe { ffi::bytes(src, 2) };
+    u16::from_be_bytes([b[0], b[1]])
 }
 
 const POWEROFTEN: [u32; 10] = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000];
@@ -599,14 +595,12 @@ pub fn loc_aton(ascii: &[u8]) -> Option<[u8; 16]> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __loc_aton(ascii: *const c_char, binary: *mut c_uchar) -> c_int {
-    unsafe {
-        match loc_aton(cbytes(ascii)) {
-            Some(b) => {
-                core::ptr::copy_nonoverlapping(b.as_ptr(), binary, 16);
-                16
-            }
-            None => 0,
+    match loc_aton(unsafe { ffi::cstr_bytes(ascii) }) {
+        Some(b) => {
+            unsafe { ffi::bytes_mut(binary, 16) }.copy_from_slice(&b);
+            16
         }
+        None => 0,
     }
 }
 
@@ -614,7 +608,7 @@ fn getflag(h: &ns_msg, flag: c_int) -> c_int {
     crate::nsparse::ns_msg_getflag(*h, flag)
 }
 
-fn do_section(pfcode: c_ulong, handle: &mut ns_msg, section: c_int, pflag: c_ulong, out: &mut dyn Sink) {
+fn do_section(pfcode: c_ulong, handle: &mut ns_msg, m: &[u8], section: c_int, pflag: c_ulong, out: &mut dyn Sink) {
     let sflag = pfcode & pflag;
     if pfcode != 0 && sflag == 0 {
         return;
@@ -625,10 +619,10 @@ fn do_section(pfcode: c_ulong, handle: &mut ns_msg, section: c_int, pflag: c_ulo
     let mut buf = [0u8; 2048];
     let mut big: Option<Buf<{ 131072 + 1024 }>> = None;
     loop {
-        if unsafe { crate::nsparse::ns_parserr(handle, section, rrnum, &mut rr) } != 0 {
+        if crate::nsparse::parserr_c(handle, m, section, rrnum, &mut rr) != 0 {
             let e = errno::get();
             if e != ENODEV {
-                msg(out, b";; ns_parserr: ", unsafe { cbytes(strerror(e)) });
+                msg(out, b";; ns_parserr: ", strerror_text(e));
             } else if rrnum > 0 && sflag != 0 && (pfcode & RES_PRF_HEAD1) != 0 {
                 out.put(b"\n");
             }
@@ -641,18 +635,18 @@ fn do_section(pfcode: c_ulong, handle: &mut ns_msg, section: c_int, pflag: c_ulo
         }
         if section == ns_s_qd {
             out.put(b";;\t");
-            out.put(unsafe { cbytes(rr.name.as_ptr()) });
+            out.put(crate::nsparse::name_text(&rr.name));
             out.put(b", type = ");
             out.put(type_str(rr.type_ as c_int).as_bytes());
             out.put(b", class = ");
             out.put(class_str(rr.rr_class as c_int).as_bytes());
             out.put(b"\n");
         } else {
-            let mut n = unsafe { crate::nsparse::ns_sprintrr(handle, &rr, core::ptr::null(), core::ptr::null(), buf.as_mut_ptr() as *mut c_char, buf.len()) };
+            let mut n = crate::nsparse::sprintrr_c(handle, m, &rr, &mut buf);
             let mut text: &[u8] = &buf;
             if n < 0 && errno::get() == ENOSPC {
                 let b = big.get_or_insert_with(Buf::new);
-                n = unsafe { crate::nsparse::ns_sprintrr(handle, &rr, core::ptr::null(), core::ptr::null(), b.b.as_mut_ptr() as *mut c_char, 131072) };
+                n = crate::nsparse::sprintrr_c(handle, m, &rr, &mut b.b[..131072]);
                 if n < 0 && errno::get() == ENOSPC {
                     out.put(b";; memory allocation failure\n");
                     return;
@@ -660,7 +654,7 @@ fn do_section(pfcode: c_ulong, handle: &mut ns_msg, section: c_int, pflag: c_ulo
                 text = &b.b;
             }
             if n < 0 {
-                msg(out, b";; ns_sprintrr: ", unsafe { cbytes(strerror(errno::get())) });
+                msg(out, b";; ns_sprintrr: ", strerror_text(errno::get()));
                 return;
             }
             let len = text.iter().position(|&c| c == 0).unwrap_or(text.len());
@@ -678,13 +672,18 @@ fn msg(out: &mut dyn Sink, prefix: &[u8], err: &[u8]) {
 }
 
 pub fn render_fp_nquery(message: &[u8], pfcode: c_ulong, out: &mut dyn Sink) {
-    unsafe { render_fp_nquery_raw(message.as_ptr(), message.len() as c_int, pfcode, out) }
+    let len = message.len() as c_int;
+    render(&message[..len.max(0) as usize], pfcode, out)
 }
 
 pub unsafe fn render_fp_nquery_raw(m: *const c_uchar, len: c_int, pfcode: c_ulong, out: &mut dyn Sink) {
+    render(unsafe { ffi::bytes(m, len.max(0) as usize) }, pfcode, out)
+}
+
+fn render(m: &[u8], pfcode: c_ulong, out: &mut dyn Sink) {
     let mut handle = ns_msg::zero();
-    if unsafe { crate::nsparse::ns_initparse(m, len, &mut handle) } < 0 {
-        msg(out, b";; ns_initparse: ", unsafe { cbytes(strerror(errno::get())) });
+    if crate::nsparse::initparse_c(&mut handle, m) < 0 {
+        msg(out, b";; ns_initparse: ", strerror_text(errno::get()));
         return;
     }
     let opcode = getflag(&handle, ns_f_opcode);
@@ -724,10 +723,10 @@ pub unsafe fn render_fp_nquery_raw(m: *const c_uchar, len: c_int, pfcode: c_ulon
     if full || (pfcode & (RES_PRF_HEADX | RES_PRF_HEAD2 | RES_PRF_HEAD1)) != 0 {
         out.put(b"\n");
     }
-    do_section(pfcode, &mut handle, ns_s_qd, RES_PRF_QUES, out);
-    do_section(pfcode, &mut handle, ns_s_an, RES_PRF_ANS, out);
-    do_section(pfcode, &mut handle, ns_s_ns, RES_PRF_AUTH, out);
-    do_section(pfcode, &mut handle, ns_s_ar, RES_PRF_ADD, out);
+    do_section(pfcode, &mut handle, m, ns_s_qd, RES_PRF_QUES, out);
+    do_section(pfcode, &mut handle, m, ns_s_an, RES_PRF_ANS, out);
+    do_section(pfcode, &mut handle, m, ns_s_ns, RES_PRF_AUTH, out);
+    do_section(pfcode, &mut handle, m, ns_s_ar, RES_PRF_ADD, out);
     if qd == 0 && an == 0 && ns == 0 && ar == 0 {
         out.put(b"\n");
     }
@@ -748,11 +747,12 @@ pub fn render_resstat(options: c_ulong, out: &mut dyn Sink) {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __fp_resstat(statp: *const ResState, file: *mut c_void) {
-    unsafe { render_resstat((*statp).options, &mut FileSink(file)) }
+    let options = unsafe { (*statp).options };
+    render_resstat(options, &mut FileSink(file))
 }
 
 fn cur_pfcode() -> c_ulong {
-    unsafe { (*__res_state()).pfcode }
+    with_this_state(|st| st.pfcode)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -762,30 +762,34 @@ pub unsafe extern "C" fn __fp_nquery(msg: *const c_uchar, len: c_int, file: *mut
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __fp_query(msg: *const c_uchar, file: *mut c_void) {
-    unsafe { __fp_nquery(msg, PACKETSZ, file) }
+    unsafe { render_fp_nquery_raw(msg, PACKETSZ, cur_pfcode(), &mut FileSink(file)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_query(msg: *const c_uchar) {
-    unsafe { __fp_query(msg, stdout) }
+    let out = unsafe { *stdout.as_ptr() };
+    unsafe { render_fp_nquery_raw(msg, PACKETSZ, cur_pfcode(), &mut FileSink(out)) }
+}
+
+fn text(b: &[u8]) -> &[u8] {
+    &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_cdnname(cp: *const c_uchar, msg: *const c_uchar, len: c_int, file: *mut c_void) -> *const c_uchar {
-    unsafe {
-        let mut name = [0 as c_char; MAXDNAME];
-        let n = crate::resolv::dn_expand(msg, msg.offset(len as isize), cp, name.as_mut_ptr(), MAXDNAME as c_int);
-        if n < 0 {
-            return core::ptr::null();
-        }
-        let mut out = FileSink(file);
-        if name[0] == 0 {
-            out.put(b".");
-        } else {
-            out.put(cbytes(name.as_ptr()));
-        }
-        cp.add(n as usize)
+    let mut name = [0u8; MAXDNAME];
+    let m = unsafe { msg_slice(msg, msg.wrapping_offset(len as isize)) };
+    let n = crate::resolv::expand(m, offset_in(msg, cp), &mut name);
+    if n < 0 {
+        return core::ptr::null();
     }
+    let mut out = FileSink(file);
+    if name[0] == 0 {
+        out.put(b".");
+    } else {
+        out.put(text(&name));
+    }
+    cp.wrapping_add(n as usize)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -793,145 +797,180 @@ pub unsafe extern "C" fn __p_cdname(cp: *const c_uchar, msg: *const c_uchar, fil
     unsafe { __p_cdnname(cp, msg, PACKETSZ, file) }
 }
 
+fn fqnname(m: &[u8], off: Option<usize>, name: &mut [u8], namelen: c_int) -> Option<usize> {
+    let n = crate::resolv::expand(m, off, name);
+    if n < 0 {
+        return None;
+    }
+    let newlen = text(name).len() as c_int;
+    if newlen == 0 || name[newlen as usize - 1] != b'.' {
+        if newlen + 1 >= namelen {
+            return None;
+        }
+        name[newlen as usize] = b'.';
+        name[newlen as usize + 1] = 0;
+    }
+    Some(n as usize)
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_fqnname(cp: *const c_uchar, msg: *const c_uchar, msglen: c_int, name: *mut c_char, namelen: c_int) -> *const c_uchar {
-    unsafe {
-        let n = crate::resolv::dn_expand(msg, cp.offset(msglen as isize), cp, name, namelen);
-        if n < 0 {
-            return core::ptr::null();
-        }
-        let newlen = cstrlen(name) as c_int;
-        if newlen == 0 || *name.offset(newlen as isize - 1) != b'.' as c_char {
-            if newlen + 1 >= namelen {
-                return core::ptr::null();
-            }
-            *name.offset(newlen as isize) = b'.' as c_char;
-            *name.offset(newlen as isize + 1) = 0;
-        }
-        cp.add(n as usize)
+    let (m, nm) = unsafe { msg_dst(msg, cp.wrapping_offset(msglen as isize), name.cast::<u8>(), namelen.max(0) as usize) };
+    match fqnname(m, offset_in(msg, cp), nm, namelen) {
+        Some(n) => cp.wrapping_add(n),
+        None => core::ptr::null(),
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_fqname(cp: *const c_uchar, msg: *const c_uchar, file: *mut c_void) -> *const c_uchar {
-    unsafe {
-        let mut name = [0 as c_char; MAXDNAME];
-        let n = __p_fqnname(cp, msg, MAXCDNAME, name.as_mut_ptr(), MAXDNAME as c_int);
-        if n.is_null() {
-            return core::ptr::null();
+    let mut name = [0u8; MAXDNAME];
+    let m = unsafe { msg_slice(msg, cp.wrapping_offset(MAXCDNAME as isize)) };
+    match fqnname(m, offset_in(msg, cp), &mut name, MAXDNAME as c_int) {
+        Some(n) => {
+            FileSink(file).put(text(&name));
+            cp.wrapping_add(n)
         }
-        FileSink(file).put(cbytes(name.as_ptr()));
-        n
+        None => core::ptr::null(),
     }
+}
+
+unsafe fn header_msg<'a>(buf: *const c_uchar, eom: *const c_uchar) -> ([u8; 6], &'a [u8]) {
+    let b = unsafe { ffi::bytes(buf, 6) };
+    ([b[0], b[1], b[2], b[3], b[4], b[5]], unsafe { msg_slice(buf, eom) })
+}
+
+fn nameinquery(name: &[u8], ty: c_int, class: c_int, m: &[u8], qdcount: c_int) -> c_int {
+    let mut cp = HFIXEDSZ;
+    let mut qdcount = qdcount;
+    while qdcount > 0 {
+        qdcount -= 1;
+        let mut tname = [0u8; MAXDNAME + 1];
+        let n = crate::resolv::expand(m, Some(cp), &mut tname);
+        if n < 0 {
+            return -1;
+        }
+        cp += n as usize;
+        if cp + 4 > m.len() {
+            return -1;
+        }
+        let ttype = u16::from_be_bytes([m[cp], m[cp + 1]]) as c_int;
+        let tclass = u16::from_be_bytes([m[cp + 2], m[cp + 3]]) as c_int;
+        cp += 4;
+        if ttype == ty && tclass == class && crate::nsparse::samename_errno(text(&tname), name) == 1 {
+            return 1;
+        }
+    }
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __res_nameinquery(name: *const c_char, ty: c_int, class: c_int, buf: *const c_uchar, eom: *const c_uchar) -> c_int {
-    unsafe {
-        let mut cp = buf.add(HFIXEDSZ);
-        let mut qdcount = u16::from_be_bytes([*buf.add(4), *buf.add(5)]) as c_int;
-        while qdcount > 0 {
-            qdcount -= 1;
-            let mut tname = [0 as c_char; MAXDNAME + 1];
-            let n = crate::resolv::dn_expand(buf, eom, cp, tname.as_mut_ptr(), (MAXDNAME + 1) as c_int);
-            if n < 0 {
-                return -1;
-            }
-            cp = cp.add(n as usize);
-            if cp.add(4) > eom {
-                return -1;
-            }
-            let ttype = u16::from_be_bytes([*cp, *cp.add(1)]) as c_int;
-            let tclass = u16::from_be_bytes([*cp.add(2), *cp.add(3)]) as c_int;
-            cp = cp.add(4);
-            if ttype == ty && tclass == class && crate::nsparse::ns_samename(tname.as_ptr(), name) == 1 {
-                return 1;
-            }
-        }
-        0
-    }
+    let (h, m) = unsafe { header_msg(buf, eom) };
+    let name = unsafe { ffi::cstr_bytes(name) };
+    nameinquery(name, ty, class, m, u16::from_be_bytes([h[4], h[5]]) as c_int)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __res_queriesmatch(buf1: *const c_uchar, eom1: *const c_uchar, buf2: *const c_uchar, eom2: *const c_uchar) -> c_int {
-    unsafe {
-        if (eom1 as usize).wrapping_sub(buf1 as usize) < HFIXEDSZ || (eom2 as usize).wrapping_sub(buf2 as usize) < HFIXEDSZ {
+    if (eom1 as usize).wrapping_sub(buf1 as usize) < HFIXEDSZ || (eom2 as usize).wrapping_sub(buf2 as usize) < HFIXEDSZ {
+        return -1;
+    }
+    let (h1, m1) = unsafe { header_msg(buf1, eom1) };
+    let (h2, m2) = unsafe { header_msg(buf2, eom2) };
+    queriesmatch(m1, h1, m2, h2)
+}
+
+fn queriesmatch(m1: &[u8], h1: [u8; 6], m2: &[u8], h2: [u8; 6]) -> c_int {
+    let op1 = (h1[2] >> 3) & 0xf;
+    let op2 = (h2[2] >> 3) & 0xf;
+    if op1 == 5 && op2 == 5 {
+        return 1;
+    }
+    let q1 = [h1[4], h1[5]];
+    if q1 != [h2[4], h2[5]] {
+        return 0;
+    }
+    let qd2 = u16::from_be_bytes([h2[4], h2[5]]) as c_int;
+    let mut qdcount = u16::from_be_bytes(q1) as c_int;
+    let mut cp = HFIXEDSZ;
+    while qdcount > 0 {
+        qdcount -= 1;
+        let mut tname = [0u8; MAXDNAME + 1];
+        let n = crate::resolv::expand(m1, Some(cp), &mut tname);
+        if n < 0 {
             return -1;
         }
-        let op1 = (*buf1.add(2) >> 3) & 0xf;
-        let op2 = (*buf2.add(2) >> 3) & 0xf;
-        if op1 == 5 && op2 == 5 {
-            return 1;
+        cp += n as usize;
+        if m1.len().wrapping_sub(cp) < 4 {
+            return -1;
         }
-        let q1 = [*buf1.add(4), *buf1.add(5)];
-        if q1 != [*buf2.add(4), *buf2.add(5)] {
+        let ttype = u16::from_be_bytes([m1[cp], m1[cp + 1]]) as c_int;
+        let tclass = u16::from_be_bytes([m1[cp + 2], m1[cp + 3]]) as c_int;
+        cp += 4;
+        if nameinquery(text(&tname), ttype, tclass, m2, qd2) == 0 {
             return 0;
         }
-        let mut qdcount = u16::from_be_bytes(q1) as c_int;
-        let mut cp = buf1.add(HFIXEDSZ);
-        while qdcount > 0 {
-            qdcount -= 1;
-            let mut tname = [0 as c_char; MAXDNAME + 1];
-            let n = crate::resolv::dn_expand(buf1, eom1, cp, tname.as_mut_ptr(), (MAXDNAME + 1) as c_int);
-            if n < 0 {
-                return -1;
-            }
-            cp = cp.add(n as usize);
-            if (eom1 as usize).wrapping_sub(cp as usize) < 4 {
-                return -1;
-            }
-            let ttype = u16::from_be_bytes([*cp, *cp.add(1)]) as c_int;
-            let tclass = u16::from_be_bytes([*cp.add(2), *cp.add(3)]) as c_int;
-            cp = cp.add(4);
-            if __res_nameinquery(tname.as_ptr(), ttype, tclass, buf2, eom2) == 0 {
-                return 0;
-            }
-        }
-        1
+    }
+    1
+}
+
+fn nsaddr(st: &ResState, n: usize) -> *const u8 {
+    if st.nsaddr_list[n].sin_family == 0 && !st.u.nsaddrs[n].is_null() {
+        st.u.nsaddrs[n] as *const u8
+    } else {
+        (&raw const st.nsaddr_list[n]) as *const u8
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __res_get_nsaddr(st: *const ResState, n: c_uint) -> *const u8 {
-    unsafe {
-        let st = &*st;
-        let n = n as usize;
-        if st.nsaddr_list[n].sin_family == 0 && !st.u.nsaddrs[n].is_null() {
-            st.u.nsaddrs[n] as *const u8
-        } else {
-            (&raw const st.nsaddr_list[n]) as *const u8
-        }
+    nsaddr(unsafe { &*st }, n as usize)
+}
+
+fn server_bytes(st: &ResState, n: usize) -> [u8; 28] {
+    let mut b = [0u8; 28];
+    if let Some(a) = (st.nsaddr_list[n].sin_family == 0).then(|| crate::resolv::ext_addr(st, n)).flatten() {
+        b[0..2].copy_from_slice(&a.sin6_family.to_ne_bytes());
+        b[2..4].copy_from_slice(&a.sin6_port.to_ne_bytes());
+        b[4..8].copy_from_slice(&a.sin6_flowinfo.to_ne_bytes());
+        b[8..24].copy_from_slice(&a.sin6_addr.s6_addr);
+        b[24..28].copy_from_slice(&a.sin6_scope_id.to_ne_bytes());
+    } else {
+        let a = &st.nsaddr_list[n];
+        b[0..2].copy_from_slice(&a.sin_family.to_ne_bytes());
+        b[2..4].copy_from_slice(&a.sin_port.to_ne_bytes());
+        b[4..8].copy_from_slice(&a.sin_addr.s_addr.to_ne_bytes());
+        b[8..16].copy_from_slice(&a.sin_zero);
     }
+    b
 }
 
 pub unsafe fn isourserver(st: &ResState, inp: *const u8) -> bool {
-    unsafe {
-        let rd16 = |p: *const u8, off: usize| u16::from_ne_bytes([*p.add(off), *p.add(off + 1)]);
-        let family = rd16(inp, 0) as c_int;
-        let port = rd16(inp, 2);
-        for ns in 0..st.nscount.max(0) as usize {
-            let srv = __res_get_nsaddr(st, ns as c_uint);
-            if family == AF_INET {
-                let addr = core::slice::from_raw_parts(inp.add(4), 4);
-                let sa = core::slice::from_raw_parts(srv.add(4), 4);
-                if rd16(srv, 0) as c_int == AF_INET && rd16(srv, 2) == port && (sa == [0u8; 4] || sa == addr) {
-                    return true;
-                }
-            } else if family == 10 {
-                let addr = core::slice::from_raw_parts(inp.add(8), 16);
-                let sa = core::slice::from_raw_parts(srv.add(8), 16);
-                if rd16(srv, 0) as c_int == 10 && rd16(srv, 2) == port && (sa == [0u8; 16] || sa == addr) {
-                    return true;
-                }
+    let head = unsafe { ffi::bytes(inp, 4) };
+    let family = u16::from_ne_bytes([head[0], head[1]]) as c_int;
+    let port = [head[2], head[3]];
+    let (aoff, alen) = match family {
+        AF_INET => (4, 4),
+        10 => (8, 16),
+        _ => return false,
+    };
+    let addr = unsafe { ffi::bytes(inp.wrapping_add(aoff), alen) };
+    for ns in 0..st.nscount.max(0) as usize {
+        let srv = server_bytes(st, ns);
+        if u16::from_ne_bytes([srv[0], srv[1]]) as c_int == family && [srv[2], srv[3]] == port {
+            let sa = &srv[aoff..aoff + alen];
+            if sa.iter().all(|&b| b == 0) || sa == addr {
+                return true;
             }
         }
-        false
     }
+    false
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __res_isourserver(inp: *const sockaddr_in) -> c_int {
-    unsafe { isourserver(&*__res_state(), inp as *const u8) as c_int }
+    with_this_state(|st| unsafe { isourserver(st, inp as *const u8) } as c_int)
 }
 
 pub fn host_alias(options: c_ulong, name: &[u8]) -> Option<Buf<MAXDNAME>> {
@@ -941,22 +980,19 @@ pub fn host_alias(options: c_ulong, name: &[u8]) -> Option<Buf<MAXDNAME>> {
     let file = crate::util::getenv(b"HOSTALIASES")?;
     let mut path = Buf::<4097>::from(file)?;
     path.push(0);
-    let fd = unsafe { rusty_libc_core::syscall::syscall4(257, (-100isize) as usize, path.b.as_ptr() as usize, 0o2000000, 0) } as isize;
-    if fd < 0 {
-        return None;
-    }
+    let fd = unsafe { rusty_libc_core::unistd::open(path.b.as_ptr().cast::<c_char>(), 0o2000000, 0) }.ok()?;
     let mut data = Buf::<65536>::new();
     loop {
-        let n = unsafe { rusty_libc_core::syscall::syscall3(0, fd as usize, data.b.as_mut_ptr().add(data.len) as usize, 65536 - data.len) } as isize;
-        if n <= 0 {
-            break;
-        }
-        data.len += n as usize;
+        let n = match rusty_libc_core::unistd::read_nocancel(fd, &mut data.b[data.len..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        data.len += n;
         if data.len == 65536 {
             break;
         }
     }
-    unsafe { rusty_libc_core::syscall::syscall1(3, fd as usize) };
+    let _ = rusty_libc_core::unistd::close(fd);
     let mut rest = data.as_bytes();
     while !rest.is_empty() {
         let end = rest.iter().position(|&c| c == b'\n').map(|i| i + 1).unwrap_or(rest.len());
@@ -976,7 +1012,7 @@ pub fn host_alias(options: c_ulong, name: &[u8]) -> Option<Buf<MAXDNAME>> {
         let mut alias_c = Buf::<MAXDNAME>::new();
         alias_c.push_all(alias);
         alias_c.push(0);
-        let same = unsafe { crate::nsparse::ns_samename(alias_c.b.as_ptr() as *const c_char, name_c.b.as_ptr() as *const c_char) } == 1;
+        let same = crate::nsparse::samename_errno(text(&alias_c.b), text(&name_c.b)) == 1;
         if same {
             i += 1;
             while i < line.len() && is_space(line[i]) {
@@ -997,53 +1033,58 @@ pub fn host_alias(options: c_ulong, name: &[u8]) -> Option<Buf<MAXDNAME>> {
     None
 }
 
-static mut ABUF: [u8; MAXDNAME] = [0; MAXDNAME];
+static ABUF: Spin<[u8; MAXDNAME]> = Spin::new([0; MAXDNAME]);
+
+fn hostalias_into(options: c_ulong, name: &[u8], dst: &mut [u8]) -> bool {
+    match host_alias(options, name) {
+        Some(a) => {
+            let n = a.len.min(dst.len() - 1);
+            dst[..n].copy_from_slice(&a.b[..n]);
+            dst[n] = 0;
+            true
+        }
+        None => false,
+    }
+}
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __res_hostalias(statp: *const ResState, name: *const c_char, dst: *mut c_char, siz: usize) -> *const c_char {
-    unsafe {
-        match host_alias((*statp).options, cbytes(name)) {
-            Some(a) => {
-                let n = a.len.min(siz - 1);
-                core::ptr::copy_nonoverlapping(a.b.as_ptr(), dst as *mut u8, n);
-                *dst.add(n) = 0;
-                dst
-            }
-            None => core::ptr::null(),
-        }
-    }
+    let options = unsafe { (*statp).options };
+    let name = unsafe { ffi::cstr_bytes(name) };
+    let d = unsafe { ffi::bytes_mut(dst.cast::<u8>(), siz) };
+    if hostalias_into(options, name, d) { dst } else { core::ptr::null() }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __hostalias(name: *const c_char) -> *const c_char {
-    unsafe {
-        let st = __res_state();
-        if (*st).options & 1 == 0 {
-            crate::resolv::__res_ninit(st);
+    let options = with_this_state(|st| {
+        if st.options & 1 == 0 {
+            crate::resolv::ninit(st);
         }
-        __res_hostalias(st, name, (&raw mut ABUF) as *mut c_char, MAXDNAME)
-    }
+        st.options
+    });
+    let name = unsafe { ffi::cstr_bytes(name) };
+    let mut buf = ABUF.lock();
+    if hostalias_into(options, name, &mut buf[..]) { buf.as_ptr().cast::<c_char>() } else { core::ptr::null() }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __res_close() {
-    unsafe {
-        let st = __res_state();
-        if (*st).options & 1 == 0 {
-            return;
+    with_this_state(|st| {
+        if st.options & 1 != 0 {
+            crate::resolv::iclose(st, false);
         }
-        crate::resolv::__res_iclose(st, false);
-    }
+    })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __rl_res_send_setqhook(hook: *mut c_void) {
-    unsafe { (*__res_state()).qhook = hook }
+    with_this_state(|st| st.qhook = hook)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __rl_res_send_setrhook(hook: *mut c_void) {
-    unsafe { (*__res_state()).rhook = hook }
+    with_this_state(|st| st.rhook = hook)
 }
 
 pub fn neta(mut src: u32, size: usize) -> Option<Buf<20>> {
@@ -1075,17 +1116,16 @@ pub fn neta(mut src: u32, size: usize) -> Option<Buf<20>> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_neta(src: u32, dst: *mut c_char, size: usize) -> *mut c_char {
-    unsafe {
-        match neta(src, size) {
-            Some(b) => {
-                core::ptr::copy_nonoverlapping(b.b.as_ptr(), dst as *mut u8, b.len);
-                *dst.add(b.len) = 0;
-                dst
-            }
-            None => {
-                errno::set(EMSGSIZE);
-                core::ptr::null_mut()
-            }
+    match neta(src, size) {
+        Some(b) => {
+            let d = unsafe { ffi::bytes_mut(dst.cast::<u8>(), b.len + 1) };
+            d[..b.len].copy_from_slice(b.as_bytes());
+            d[b.len] = 0;
+            dst
+        }
+        None => {
+            errno::set(EMSGSIZE);
+            core::ptr::null_mut()
         }
     }
 }
@@ -1141,22 +1181,22 @@ pub fn net_ntop_ipv4(src: &[u8], bits: c_int, size: usize) -> Result<Buf<24>, c_
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_net_ntop(af: c_int, src: *const c_void, bits: c_int, dst: *mut c_char, size: usize) -> *mut c_char {
-    unsafe {
-        if af != AF_INET {
-            errno::set(EAFNOSUPPORT);
-            return core::ptr::null_mut();
+    if af != AF_INET {
+        errno::set(EAFNOSUPPORT);
+        return core::ptr::null_mut();
+    }
+    let n = if (0..=32).contains(&bits) { (bits as usize).div_ceil(8) } else { 0 };
+    let s = unsafe { ffi::bytes(src.cast::<u8>(), n) };
+    match net_ntop_ipv4(s, bits, size) {
+        Ok(b) => {
+            let d = unsafe { ffi::bytes_mut(dst.cast::<u8>(), b.len + 1) };
+            d[..b.len].copy_from_slice(b.as_bytes());
+            d[b.len] = 0;
+            dst
         }
-        let s = core::slice::from_raw_parts(src as *const u8, 4);
-        match net_ntop_ipv4(s, bits, size) {
-            Ok(b) => {
-                core::ptr::copy_nonoverlapping(b.b.as_ptr(), dst as *mut u8, b.len);
-                *dst.add(b.len) = 0;
-                dst
-            }
-            Err(e) => {
-                errno::set(e);
-                core::ptr::null_mut()
-            }
+        Err(e) => {
+            errno::set(e);
+            core::ptr::null_mut()
         }
     }
 }
@@ -1286,18 +1326,16 @@ pub fn net_pton_ipv4(src: &[u8], dst: &mut [u8]) -> Result<c_int, c_int> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_net_pton(af: c_int, src: *const c_char, dst: *mut c_void, size: usize) -> c_int {
-    unsafe {
-        if af != AF_INET {
-            errno::set(EAFNOSUPPORT);
-            return -1;
-        }
-        let d = core::slice::from_raw_parts_mut(dst as *mut u8, size);
-        match net_pton_ipv4(cbytes(src), d) {
-            Ok(b) => b,
-            Err(e) => {
-                errno::set(e);
-                -1
-            }
+    if af != AF_INET {
+        errno::set(EAFNOSUPPORT);
+        return -1;
+    }
+    let d = unsafe { ffi::bytes_mut(dst.cast::<u8>(), size) };
+    match net_pton_ipv4(unsafe { ffi::cstr_bytes(src) }, d) {
+        Ok(b) => b,
+        Err(e) => {
+            errno::set(e);
+            -1
         }
     }
 }

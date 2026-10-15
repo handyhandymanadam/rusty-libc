@@ -1,9 +1,12 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
+
 use crate::clnt::*;
+use crate::stream::XdrStream;
 use crate::types::*;
 use crate::vars::*;
-use crate::xdr::*;
 use core::ffi::{c_char, c_int, c_ulong};
-use rusty_libc_net::types::{AF_INET, SOCK_DGRAM, SOCK_NONBLOCK, cmsghdr, iovec, msghdr, sockaddr, sockaddr_in};
+use rusty_libc_core::ffi::bytes_mut;
+use rusty_libc_net::types::{AF_INET, SOCK_DGRAM, SOCK_NONBLOCK, sockaddr, sockaddr_in};
 
 #[repr(C)]
 struct CuData {
@@ -17,9 +20,50 @@ struct CuData {
     cu_outxdrs: XDR,
     cu_xdrpos: u_int,
     cu_sendsz: u_int,
-    cu_outbuf: *mut c_char,
+    cu_outbuf: *mut u8,
     cu_recvsz: u_int,
-    cu_inbuf: [c_char; 1],
+    cu_inbuf: *mut u8,
+}
+
+impl CuData {
+    #[inline]
+    fn inbuf(&mut self) -> &mut [u8] {
+        unsafe { bytes_mut(self.cu_inbuf, self.cu_recvsz as usize) }
+    }
+
+    #[inline]
+    fn outbuf(&mut self) -> &mut [u8] {
+        unsafe { bytes_mut(self.cu_outbuf, self.cu_sendsz as usize) }
+    }
+
+    #[inline]
+    fn out_stream(&mut self) -> XdrStream<'_> {
+        unsafe { XdrStream::from_ptr(&mut self.cu_outxdrs) }
+    }
+
+    #[inline]
+    fn bump_xid(&mut self) {
+        let b = self.outbuf();
+        let w = u32::from_ne_bytes([b[0], b[1], b[2], b[3]]).wrapping_add(1);
+        b[..4].copy_from_slice(&w.to_ne_bytes());
+    }
+
+    #[inline]
+    fn out_word(&mut self, off: usize) -> u32 {
+        let b = self.outbuf();
+        u32::from_ne_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    }
+
+    #[inline]
+    fn set_out_word(&mut self, off: usize, w: u32) {
+        self.outbuf()[off..off + 4].copy_from_slice(&w.to_ne_bytes());
+    }
+}
+
+#[inline]
+unsafe fn state<'a>(cl: *mut CLIENT) -> &'a mut CuData {
+    let p = unsafe { (*cl).cl_private };
+    unsafe { &mut *p.cast::<CuData>() }
 }
 
 static UDP_OPS: clnt_ops = clnt_ops {
@@ -37,163 +81,202 @@ const MSG_ERRQUEUE: c_int = 0x2000;
 const MSG_DONTWAIT: c_int = 0x40;
 const EWOULDBLOCK: c_int = 11;
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn __libc_clntudp_bufcreate(raddr: *mut sockaddr_in, program: c_ulong, version: c_ulong, wait: timeval, sockp: *mut c_int, sendsz: u_int, recvsz: u_int, flags: c_int) -> *mut CLIENT {
-    let cl = mem_alloc(core::mem::size_of::<CLIENT>()) as *mut CLIENT;
-    let sendsz = sendsz.wrapping_add(3) / 4 * 4;
-    let recvsz = recvsz.wrapping_add(3) / 4 * 4;
-    let total = core::mem::size_of::<CuData>() + sendsz as usize + recvsz as usize;
-    let cu = mem_alloc(total) as *mut CuData;
-    if cl.is_null() || cu.is_null() {
-        oom("clntudp_create");
-        set_createerr(RPC_SYSTEMERROR, ENOMEM);
-        return fooy(cl, cu);
-    }
-    (*cu).cu_outbuf = (*cu).cu_inbuf.as_mut_ptr().add(recvsz as usize);
-    if (*raddr).sin_port == 0 {
-        let port = crate::pmap::pmap_getport(raddr, program, version, IPPROTO_UDP as u_int);
-        if port == 0 {
-            return fooy(cl, cu);
-        }
-        (*raddr).sin_port = htons(port);
-    }
-    (*cl).cl_ops = &UDP_OPS;
-    (*cl).cl_private = cu as caddr_t;
-    (*cu).cu_raddr = *raddr;
-    (*cu).cu_rlen = core::mem::size_of::<sockaddr_in>() as c_int;
-    (*cu).cu_wait = wait;
-    (*cu).cu_total.tv_sec = -1;
-    (*cu).cu_total.tv_usec = -1;
-    (*cu).cu_sendsz = sendsz;
-    (*cu).cu_recvsz = recvsz;
-    let mut call_msg = rpc_msg::zeroed();
-    call_msg.rm_xid = _create_xid();
-    call_msg.rm_direction = CALL;
-    call_msg.ru.RM_cmb.cb_rpcvers = RPC_MSG_VERSION;
-    call_msg.ru.RM_cmb.cb_prog = program;
-    call_msg.ru.RM_cmb.cb_vers = version;
-    xdrmem_create(&mut (*cu).cu_outxdrs, (*cu).cu_outbuf, sendsz, XDR_ENCODE);
-    if crate::msg::xdr_callhdr(&mut (*cu).cu_outxdrs, &mut call_msg) == 0 {
-        return fooy(cl, cu);
-    }
-    (*cu).cu_xdrpos = x_getpos(&(*cu).cu_outxdrs);
-    if *sockp < 0 {
-        *sockp = rusty_libc_net::sock::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | flags, IPPROTO_UDP);
-        if *sockp < 0 {
-            set_createerr(RPC_SYSTEMERROR, get_errno());
-            return fooy(cl, cu);
-        }
-        rusty_libc_net::misc::bindresvport(*sockp, core::ptr::null_mut());
-        let on: c_int = 1;
-        rusty_libc_net::sock::setsockopt(*sockp, SOL_IP, IP_RECVERR, (&on as *const c_int).cast(), 4);
-        (*cu).cu_closeit = TRUE;
-    } else {
-        (*cu).cu_closeit = FALSE;
-    }
-    (*cu).cu_sock = *sockp;
-    (*cl).cl_auth = crate::auth::authnone_create();
-    cl
-}
-
 unsafe fn fooy(cl: *mut CLIENT, cu: *mut CuData) -> *mut CLIENT {
     if !cu.is_null() {
-        mem_free(cu.cast());
+        unsafe { mem_free(cu.cast()) };
     }
     if !cl.is_null() {
-        mem_free(cl.cast());
+        unsafe { mem_free(cl.cast()) };
     }
     core::ptr::null_mut()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __libc_clntudp_bufcreate(raddr: *mut sockaddr_in, program: c_ulong, version: c_ulong, wait: timeval, sockp: *mut c_int, sendsz: u_int, recvsz: u_int, flags: c_int) -> *mut CLIENT {
+    let cl = alloc(core::mem::size_of::<CLIENT>()) as *mut CLIENT;
+    let sendsz = sendsz.wrapping_add(3) / 4 * 4;
+    let recvsz = recvsz.wrapping_add(3) / 4 * 4;
+    let total = core::mem::size_of::<CuData>() + sendsz as usize + recvsz as usize;
+    let cu = alloc(total) as *mut CuData;
+    if cl.is_null() || cu.is_null() {
+        oom("clntudp_create");
+        set_createerr(RPC_SYSTEMERROR, ENOMEM);
+        return unsafe { fooy(cl, cu) };
+    }
+    let inbuf = cu.cast::<u8>().wrapping_add(core::mem::size_of::<CuData>());
+    let outbuf = inbuf.wrapping_add(recvsz as usize);
+    if unsafe { (*raddr).sin_port } == 0 {
+        let port = unsafe { crate::pmap::pmap_getport(raddr, program, version, IPPROTO_UDP as u_int) };
+        if port == 0 {
+            return unsafe { fooy(cl, cu) };
+        }
+        unsafe { (*raddr).sin_port = htons(port) };
+    }
+    let addr = unsafe { *raddr };
+    unsafe {
+        cu.write(CuData {
+            cu_sock: -1,
+            cu_closeit: FALSE,
+            cu_raddr: addr,
+            cu_rlen: core::mem::size_of::<sockaddr_in>() as c_int,
+            cu_wait: wait,
+            cu_total: timeval { tv_sec: -1, tv_usec: -1 },
+            cu_error: rpc_err::zeroed(),
+            cu_outxdrs: XDR::zeroed(),
+            cu_xdrpos: 0,
+            cu_sendsz: sendsz,
+            cu_outbuf: outbuf,
+            cu_recvsz: recvsz,
+            cu_inbuf: inbuf,
+        })
+    };
+    let st = unsafe { &mut *cu };
+    let mut call_msg = rpc_msg::zeroed();
+    call_msg.rm_xid = _create_xid();
+    call_msg.rm_direction = CALL;
+    let cb = call_msg.ru.cmb_mut();
+    cb.cb_rpcvers = RPC_MSG_VERSION;
+    cb.cb_prog = program;
+    cb.cb_vers = version;
+    crate::xdr::mem_init(&mut st.cu_outxdrs, outbuf.cast(), sendsz, XDR_ENCODE);
+    if crate::msg::callhdr_in(&mut st.out_stream(), &mut call_msg) == 0 {
+        return unsafe { fooy(cl, cu) };
+    }
+    st.cu_xdrpos = st.out_stream().getpos();
+    let sock = unsafe { &mut *sockp };
+    if *sock < 0 {
+        *sock = crate::sock::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | flags, IPPROTO_UDP);
+        if *sock < 0 {
+            set_createerr(RPC_SYSTEMERROR, get_errno());
+            return unsafe { fooy(cl, cu) };
+        }
+        crate::sock::bindresvport_any(*sock);
+        crate::sock::setsockopt_int(*sock, SOL_IP, IP_RECVERR, 1);
+        st.cu_closeit = TRUE;
+    } else {
+        st.cu_closeit = FALSE;
+    }
+    st.cu_sock = *sock;
+    unsafe { cl.write(CLIENT { cl_auth: crate::auth::authnone_create(), cl_ops: &UDP_OPS, cl_private: cu.cast() }) };
+    cl
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn clntudp_bufcreate(raddr: *mut sockaddr_in, program: c_ulong, version: c_ulong, wait: timeval, sockp: *mut c_int, sendsz: u_int, recvsz: u_int) -> *mut CLIENT {
-    __libc_clntudp_bufcreate(raddr, program, version, wait, sockp, sendsz, recvsz, 0)
+    unsafe { __libc_clntudp_bufcreate(raddr, program, version, wait, sockp, sendsz, recvsz, 0) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn clntudp_create(raddr: *mut sockaddr_in, program: c_ulong, version: c_ulong, wait: timeval, sockp: *mut c_int) -> *mut CLIENT {
-    __libc_clntudp_bufcreate(raddr, program, version, wait, sockp, UDPMSGSIZE, UDPMSGSIZE, 0)
+    unsafe { __libc_clntudp_bufcreate(raddr, program, version, wait, sockp, UDPMSGSIZE, UDPMSGSIZE, 0) }
 }
 
-unsafe fn is_network_up() -> bool {
+fn is_network_up() -> bool {
     let mut ifa: *mut rusty_libc_net::types::ifaddrs = core::ptr::null_mut();
-    if rusty_libc_net::ifaddrs::getifaddrs(&mut ifa) != 0 {
+    if unsafe { rusty_libc_net::ifaddrs::getifaddrs(&mut ifa) } != 0 {
         return false;
     }
     let mut run = ifa;
-    while !run.is_null() {
-        if (*run).ifa_flags & 1 != 0 && !(*run).ifa_addr.is_null() && (*(*run).ifa_addr).sa_family == AF_INET as u16 {
+    let mut found = false;
+    while let Some(node) = unsafe { run.as_ref() } {
+        if node.ifa_flags & 1 != 0 && unsafe { node.ifa_addr.as_ref() }.is_some_and(|a| a.sa_family == AF_INET as u16) {
+            found = true;
             break;
         }
-        run = (*run).ifa_next;
+        run = node.ifa_next;
     }
-    rusty_libc_net::ifaddrs::freeifaddrs(ifa);
-    !run.is_null()
+    unsafe { rusty_libc_net::ifaddrs::freeifaddrs(ifa) };
+    found
 }
 
-#[inline]
-fn cmsg_align(n: usize) -> usize {
-    (n + 7) & !7
+fn error_queue_errno(cu: &mut CuData, outlen: c_int) -> Result<Option<c_int>, ()> {
+    let n = outlen as usize + 256;
+    let cbuf = alloc(n) as *mut u8;
+    if cbuf.is_null() {
+        return Err(());
+    }
+    let buf = unsafe { bytes_mut(cbuf, n) };
+    let (control, data) = buf.split_at_mut(256);
+    let mut err_addr: sockaddr_in = crate::sock::zeroed();
+    let r = crate::sock::recvmsg(cu.cu_sock, Some(&mut err_addr), data, control, MSG_ERRQUEUE);
+    let ret = r.len;
+    let mut found = None;
+    let (raddr_s, raddr_p) = (cu.cu_raddr.sin_addr.s_addr, cu.cu_raddr.sin_port);
+    if ret >= 0
+        && data.get(..ret as usize).is_some_and(|d| cu.outbuf().get(..ret as usize) == Some(d))
+        && (r.flags & MSG_ERRQUEUE) != 0
+        && ((r.namelen == 0 && ret >= 12)
+            || (r.namelen as usize == core::mem::size_of::<sockaddr_in>() && err_addr.sin_family == AF_INET as u16 && err_addr.sin_addr.s_addr == raddr_s && err_addr.sin_port == raddr_p))
+    {
+        if let Some(off) = crate::sock::find_cmsg(control, r.controllen, SOL_IP, IP_RECVERR) {
+            let e = control.get(off..off + 4).map_or(0, |b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]));
+            found = Some(e as c_int);
+        }
+    }
+    unsafe { mem_free(cbuf.cast()) };
+    Ok(found)
 }
 
 unsafe extern "C" fn clntudp_call(cl: *mut CLIENT, proc_: c_ulong, xargs: xdrproc_t, argsp: caddr_t, xresults: xdrproc_t, resultsp: caddr_t, utimeout: timeval) -> c_int {
-    let cu = (*cl).cl_private as *mut CuData;
+    let cu = unsafe { state(cl) };
     let mut outlen: c_int = 0;
     let mut nrefreshes = 2;
     let mut current_time = deadline_current_time();
     let mut total_deadline = INFINITE_DEADLINE;
     if xargs.is_some() {
-        let tv = if (*cu).cu_total.tv_usec == -1 { utimeout } else { (*cu).cu_total };
+        let tv = if cu.cu_total.tv_usec == -1 { utimeout } else { cu.cu_total };
         if !is_timeval_valid_timeout(&tv) {
-            (*cu).cu_error.re_status = RPC_TIMEDOUT;
+            cu.cu_error.re_status = RPC_TIMEDOUT;
             return RPC_TIMEDOUT;
         }
         total_deadline = deadline_from_timeval(current_time, &tv);
     }
-    if !is_timeval_valid_timeout(&(*cu).cu_wait) {
-        (*cu).cu_error.re_status = RPC_TIMEDOUT;
+    if !is_timeval_valid_timeout(&cu.cu_wait) {
+        cu.cu_error.re_status = RPC_TIMEDOUT;
         return RPC_TIMEDOUT;
     }
     macro_rules! ret {
         ($st:expr) => {{
-            (*cu).cu_error.re_status = $st;
+            cu.cu_error.re_status = $st;
             return $st;
         }};
     }
-    let xdrs = &raw mut (*cu).cu_outxdrs;
+    macro_rules! fail {
+        ($st:expr) => {{
+            *cu.cu_error.ru.errno_mut() = get_errno();
+            ret!($st);
+        }};
+    }
     'call_again: loop {
         if xargs.is_some() {
-            (*xdrs).x_op = XDR_ENCODE;
-            x_setpos(xdrs, (*cu).cu_xdrpos);
-            let idp = (*cu).cu_outbuf as *mut u32;
-            core::ptr::write_unaligned(idp, core::ptr::read_unaligned(idp).wrapping_add(1));
-            let proc_l = proc_ as i64;
-            if x_putlong(xdrs, &proc_l) == 0 || auth_marshall((*cl).cl_auth, xdrs) == 0 || crate::clnt_tcp::call_results(xargs, xdrs, argsp) == 0 {
+            let pos = cu.cu_xdrpos;
+            cu.bump_xid();
+            let mut x = cu.out_stream();
+            x.set_op(XDR_ENCODE);
+            x.setpos(pos);
+            let auth = unsafe { client_auth(cl) };
+            if x.put_long(proc_ as i64) == 0 || unsafe { auth_marshall(auth, x.as_ptr()) } == 0
+                || unsafe { crate::clnt_stream::call_results(xargs, x.as_ptr(), argsp) } == 0
+            {
                 ret!(RPC_CANTENCODEARGS);
             }
-            outlen = x_getpos(xdrs) as c_int;
+            outlen = x.getpos() as c_int;
         }
         'send_again: loop {
             if xargs.is_some() {
-                let r = rusty_libc_net::sock::sendto(
-                    (*cu).cu_sock,
-                    (*cu).cu_outbuf.cast(),
-                    outlen as usize,
-                    0,
-                    (&raw const (*cu).cu_raddr).cast::<sockaddr>(),
-                    (*cu).cu_rlen as u32,
-                );
+                let (sock, raddr, rlen) = (cu.cu_sock, cu.cu_raddr, cu.cu_rlen);
+                let r = crate::sock::sendto(sock, &cu.outbuf()[..outlen as usize], 0, &raddr, rlen as u32);
                 if r != outlen as isize {
-                    (*cu).cu_error.ru.RE_errno = get_errno();
-                    ret!(RPC_CANTSEND);
+                    fail!(RPC_CANTSEND);
                 }
                 current_time = deadline_current_time();
             }
-            let response_deadline = deadline_from_timeval(current_time, &(*cu).cu_wait);
+            let response_deadline = deadline_from_timeval(current_time, &cu.cu_wait);
             let mut reply_msg = rpc_msg::zeroed();
-            reply_msg.ru.RM_rmb.ru.RP_ar.ar_verf = *(&raw const _null_auth);
-            reply_msg.ru.RM_rmb.ru.RP_ar.ru.AR_results = ar_results { where_: resultsp, proc_: xresults };
-            let mut fd = pollfd { fd: (*cu).cu_sock, events: POLLIN, revents: 0 };
+            let ar = reply_msg.ru.rmb_mut().ru.ar_mut();
+            ar.ar_verf = null_auth();
+            ar.ru.AR_results = ar_results { where_: resultsp, proc_: xresults };
+            let mut fd = [pollfd { fd: cu.cu_sock, events: POLLIN, revents: 0 }];
             let mut anyup = false;
             let mut inlen: isize;
             loop {
@@ -212,7 +295,7 @@ unsafe extern "C" fn clntudp_call(cl: *mut CLIENT, proc_: c_ulong, xargs: xdrpro
                         ret!(RPC_CANTSEND);
                     }
                 }
-                let pr = sys_poll(&mut fd, 1, milliseconds);
+                let pr = poll_fds(&mut fd, milliseconds);
                 if pr == 0 {
                     if !anyup {
                         anyup = is_network_up();
@@ -227,52 +310,23 @@ unsafe extern "C" fn clntudp_call(cl: *mut CLIENT, proc_: c_ulong, xargs: xdrpro
                         current_time = deadline_current_time();
                         continue;
                     }
-                    (*cu).cu_error.ru.RE_errno = get_errno();
-                    ret!(RPC_CANTRECV);
+                    fail!(RPC_CANTRECV);
                 }
-                if fd.revents & POLLERR != 0 {
-                    let cbuf = mem_alloc(outlen as usize + 256) as *mut u8;
-                    if cbuf.is_null() {
-                        (*cu).cu_error.ru.RE_errno = get_errno();
-                        ret!(RPC_CANTRECV);
-                    }
-                    let mut err_addr: sockaddr_in = core::mem::zeroed();
-                    let mut iov = iovec { iov_base: cbuf.add(256).cast(), iov_len: outlen as usize };
-                    let mut msg: msghdr = core::mem::zeroed();
-                    msg.msg_name = (&mut err_addr as *mut sockaddr_in).cast();
-                    msg.msg_namelen = core::mem::size_of::<sockaddr_in>() as u32;
-                    msg.msg_iov = &mut iov;
-                    msg.msg_iovlen = 1;
-                    msg.msg_flags = 0;
-                    msg.msg_control = cbuf.cast();
-                    msg.msg_controllen = 256;
-                    let ret = rusty_libc_net::sock::recvmsg((*cu).cu_sock, &mut msg, MSG_ERRQUEUE);
-                    if ret >= 0
-                        && core::slice::from_raw_parts(cbuf.add(256), ret as usize) == core::slice::from_raw_parts((*cu).cu_outbuf as *const u8, ret as usize)
-                        && (msg.msg_flags & MSG_ERRQUEUE) != 0
-                        && ((msg.msg_namelen == 0 && ret >= 12)
-                            || (msg.msg_namelen as usize == core::mem::size_of::<sockaddr_in>()
-                                && err_addr.sin_family == AF_INET as u16
-                                && err_addr.sin_addr.s_addr == (*cu).cu_raddr.sin_addr.s_addr
-                                && err_addr.sin_port == (*cu).cu_raddr.sin_port))
-                    {
-                        let mut cmsg: *mut cmsghdr = if msg.msg_controllen >= core::mem::size_of::<cmsghdr>() { msg.msg_control.cast() } else { core::ptr::null_mut() };
-                        while !cmsg.is_null() {
-                            if (*cmsg).cmsg_level == SOL_IP && (*cmsg).cmsg_type == IP_RECVERR {
-                                let e = (cmsg as *mut u8).add(cmsg_align(core::mem::size_of::<cmsghdr>())) as *const u32;
-                                (*cu).cu_error.ru.RE_errno = *e as c_int;
-                                mem_free(cbuf.cast());
-                                ret!(RPC_CANTRECV);
-                            }
-                            cmsg = rusty_libc_net::sock::__cmsg_nxthdr(&mut msg, cmsg);
+                if fd[0].revents & POLLERR != 0 {
+                    match error_queue_errno(cu, outlen) {
+                        Err(()) => fail!(RPC_CANTRECV),
+                        Ok(Some(e)) => {
+                            *cu.cu_error.ru.errno_mut() = e;
+                            ret!(RPC_CANTRECV);
                         }
+                        Ok(None) => {}
                     }
-                    mem_free(cbuf.cast());
                 }
+                let sock = cu.cu_sock;
                 loop {
-                    let mut from: sockaddr_in = core::mem::zeroed();
+                    let mut from: sockaddr_in = crate::sock::zeroed();
                     let mut fromlen = core::mem::size_of::<sockaddr>() as u32;
-                    inlen = rusty_libc_net::sock::recvfrom((*cu).cu_sock, (*cu).cu_inbuf.as_mut_ptr().cast(), (*cu).cu_recvsz as usize, MSG_DONTWAIT, (&mut from as *mut sockaddr_in).cast(), &mut fromlen);
+                    inlen = crate::sock::recvfrom(sock, cu.inbuf(), MSG_DONTWAIT, &mut from, &mut fromlen);
                     if !(inlen < 0 && get_errno() == EINTR) {
                         break;
                     }
@@ -282,92 +336,100 @@ unsafe extern "C" fn clntudp_call(cl: *mut CLIENT, proc_: c_ulong, xargs: xdrpro
                         current_time = deadline_current_time();
                         continue;
                     }
-                    (*cu).cu_error.ru.RE_errno = get_errno();
-                    ret!(RPC_CANTRECV);
+                    fail!(RPC_CANTRECV);
                 }
-                if inlen >= 4 && (xargs.is_none() || core::slice::from_raw_parts((*cu).cu_inbuf.as_ptr() as *const u8, 4) == core::slice::from_raw_parts((*cu).cu_outbuf as *const u8, 4)) {
+                let xid = cu.out_word(0).to_ne_bytes();
+                if inlen >= 4 && (xargs.is_none() || cu.inbuf()[..4] == xid) {
                     break;
                 }
                 current_time = deadline_current_time();
             }
             let mut reply_xdrs = XDR::zeroed();
-            xdrmem_create(&mut reply_xdrs, (*cu).cu_inbuf.as_mut_ptr(), inlen as u_int, XDR_DECODE);
-            let ok = crate::msg::xdr_replymsg(&mut reply_xdrs, &mut reply_msg);
+            let ok = {
+                let mut rx = XdrStream::mem(&mut reply_xdrs, &mut cu.inbuf()[..inlen as usize], XDR_DECODE);
+                unsafe { crate::msg::replymsg_in(&mut rx, &mut reply_msg) }
+            };
             if ok != 0 {
-                crate::msg::_seterr_reply(&mut reply_msg, &mut (*cu).cu_error);
-                if (*cu).cu_error.re_status == RPC_SUCCESS {
-                    if auth_validate((*cl).cl_auth, &mut reply_msg.ru.RM_rmb.ru.RP_ar.ar_verf) == 0 {
-                        (*cu).cu_error.re_status = RPC_AUTHERROR;
-                        (*cu).cu_error.ru.RE_why = AUTH_INVALIDRESP;
+                crate::msg::seterr_reply(&reply_msg, &mut cu.cu_error);
+                if cu.cu_error.re_status == RPC_SUCCESS {
+                    let verf = &mut reply_msg.ru.rmb_mut().ru.ar_mut().ar_verf;
+                    let auth = unsafe { client_auth(cl) };
+                    if unsafe { auth_validate(auth, verf) } == 0 {
+                        cu.cu_error.re_status = RPC_AUTHERROR;
+                        *cu.cu_error.ru.why_mut() = AUTH_INVALIDRESP;
                     }
-                    if !reply_msg.ru.RM_rmb.ru.RP_ar.ar_verf.oa_base.is_null() {
-                        (*xdrs).x_op = XDR_FREE;
-                        crate::msg::xdr_opaque_auth(xdrs, &mut reply_msg.ru.RM_rmb.ru.RP_ar.ar_verf);
+                    if !verf.oa_base.is_null() {
+                        let mut x = cu.out_stream();
+                        x.set_op(XDR_FREE);
+                        unsafe { crate::msg::opaque_auth_in(&mut x, verf) };
                     }
-                } else if nrefreshes > 0 && auth_refresh((*cl).cl_auth) != 0 {
+                } else if nrefreshes > 0 && {
+                    let auth = unsafe { client_auth(cl) };
+                    unsafe { auth_refresh(auth) }
+                } != 0
+                {
                     nrefreshes -= 1;
                     continue 'call_again;
                 }
             } else {
-                (*cu).cu_error.re_status = RPC_CANTDECODERES;
+                cu.cu_error.re_status = RPC_CANTDECODERES;
             }
-            return (*cu).cu_error.re_status;
+            return cu.cu_error.re_status;
         }
     }
 }
 
 unsafe extern "C" fn clntudp_geterr(cl: *mut CLIENT, errp: *mut rpc_err) {
-    let cu = (*cl).cl_private as *mut CuData;
-    *errp = (*cu).cu_error;
+    let e = unsafe { state(cl) }.cu_error;
+    unsafe { *errp = e };
 }
 
 unsafe extern "C" fn clntudp_freeres(cl: *mut CLIENT, xdr_res: xdrproc_t, res_ptr: caddr_t) -> bool_t {
-    let cu = (*cl).cl_private as *mut CuData;
-    let xdrs = &raw mut (*cu).cu_outxdrs;
-    (*xdrs).x_op = XDR_FREE;
+    let mut x = unsafe { state(cl) }.out_stream();
+    x.set_op(XDR_FREE);
     match xdr_res {
-        Some(f) => f(xdrs, res_ptr.cast()),
+        Some(f) => unsafe { f(x.as_ptr(), res_ptr.cast()) },
         None => FALSE,
     }
 }
 
 unsafe extern "C" fn clntudp_abort() {}
 
+#[inline]
+unsafe fn info_get<T>(info: *mut c_char) -> T {
+    unsafe { info.cast::<T>().read_unaligned() }
+}
+
+#[inline]
+unsafe fn info_put<T>(info: *mut c_char, v: T) {
+    unsafe { info.cast::<T>().write_unaligned(v) }
+}
+
 unsafe extern "C" fn clntudp_control(cl: *mut CLIENT, request: c_int, info: *mut c_char) -> bool_t {
-    let cu = (*cl).cl_private as *mut CuData;
-    let rd = |p: *const u8| core::ptr::read_unaligned(p as *const u32);
+    let cu = unsafe { state(cl) };
     match request {
-        CLSET_FD_CLOSE => (*cu).cu_closeit = TRUE,
-        CLSET_FD_NCLOSE => (*cu).cu_closeit = FALSE,
-        CLSET_TIMEOUT => (*cu).cu_total = *(info as *mut timeval),
-        CLGET_TIMEOUT => *(info as *mut timeval) = (*cu).cu_total,
-        CLSET_RETRY_TIMEOUT => (*cu).cu_wait = *(info as *mut timeval),
-        CLGET_RETRY_TIMEOUT => *(info as *mut timeval) = (*cu).cu_wait,
-        CLGET_SERVER_ADDR => *(info as *mut sockaddr_in) = (*cu).cu_raddr,
-        CLGET_FD => *(info as *mut c_int) = (*cu).cu_sock,
-        CLGET_XID => {
-            let ul = u32::from_be(rd((*cu).cu_outbuf as *const u8)) as c_ulong;
-            core::ptr::write_unaligned(info as *mut c_ulong, ul);
-        }
+        CLSET_FD_CLOSE => cu.cu_closeit = TRUE,
+        CLSET_FD_NCLOSE => cu.cu_closeit = FALSE,
+        CLSET_TIMEOUT => cu.cu_total = unsafe { info_get(info) },
+        CLGET_TIMEOUT => unsafe { info_put(info, cu.cu_total) },
+        CLSET_RETRY_TIMEOUT => cu.cu_wait = unsafe { info_get(info) },
+        CLGET_RETRY_TIMEOUT => unsafe { info_put(info, cu.cu_wait) },
+        CLGET_SERVER_ADDR => unsafe { info_put(info, cu.cu_raddr) },
+        CLGET_FD => unsafe { info_put(info, cu.cu_sock) },
+        CLGET_XID => unsafe { info_put(info, u32::from_be(cu.out_word(0)) as c_ulong) },
         CLSET_XID => {
-            let ul = core::ptr::read_unaligned(info as *const c_ulong);
-            core::ptr::write_unaligned((*cu).cu_outbuf as *mut u32, ((ul.wrapping_sub(1)) as u32).to_be());
+            let ul: c_ulong = unsafe { info_get(info) };
+            cu.set_out_word(0, (ul.wrapping_sub(1) as u32).to_be());
         }
-        CLGET_VERS => {
-            let ul = u32::from_be(rd(((*cu).cu_outbuf as *const u8).add(4 * 4))) as c_ulong;
-            core::ptr::write_unaligned(info as *mut c_ulong, ul);
-        }
+        CLGET_VERS => unsafe { info_put(info, u32::from_be(cu.out_word(16)) as c_ulong) },
         CLSET_VERS => {
-            let ul = core::ptr::read_unaligned(info as *const c_ulong);
-            core::ptr::write_unaligned(((*cu).cu_outbuf as *mut u8).add(4 * 4) as *mut u32, (ul as u32).to_be());
+            let ul: c_ulong = unsafe { info_get(info) };
+            cu.set_out_word(16, (ul as u32).to_be());
         }
-        CLGET_PROG => {
-            let ul = u32::from_be(rd(((*cu).cu_outbuf as *const u8).add(3 * 4))) as c_ulong;
-            core::ptr::write_unaligned(info as *mut c_ulong, ul);
-        }
+        CLGET_PROG => unsafe { info_put(info, u32::from_be(cu.out_word(12)) as c_ulong) },
         CLSET_PROG => {
-            let ul = core::ptr::read_unaligned(info as *const c_ulong);
-            core::ptr::write_unaligned(((*cu).cu_outbuf as *mut u8).add(3 * 4) as *mut u32, (ul as u32).to_be());
+            let ul: c_ulong = unsafe { info_get(info) };
+            cu.set_out_word(12, (ul as u32).to_be());
         }
         _ => return FALSE,
     }
@@ -375,11 +437,12 @@ unsafe extern "C" fn clntudp_control(cl: *mut CLIENT, request: c_int, info: *mut
 }
 
 unsafe extern "C" fn clntudp_destroy(cl: *mut CLIENT) {
-    let cu = (*cl).cl_private as *mut CuData;
-    if (*cu).cu_closeit != 0 {
-        sys_close((*cu).cu_sock);
+    let cu = unsafe { state(cl) };
+    if cu.cu_closeit != 0 {
+        sys_close(cu.cu_sock);
     }
-    x_destroy(&mut (*cu).cu_outxdrs);
-    mem_free(cu.cast());
-    mem_free(cl.cast());
+    cu.out_stream().destroy();
+    let block = core::ptr::from_mut(cu);
+    unsafe { mem_free(block.cast()) };
+    unsafe { mem_free(cl.cast()) };
 }

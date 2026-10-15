@@ -103,30 +103,29 @@ pub const REGS_REALLOCATE: u32 = 1;
 pub const REGS_FIXED: u32 = 2;
 pub const RE_NREGS: usize = 30;
 
-pub static ERROR_MSGS: [&[u8]; 17] = [
-    b"Success\0",
-    b"No match\0",
-    b"Invalid regular expression\0",
-    b"Invalid collation character\0",
-    b"Invalid character class name\0",
-    b"Trailing backslash\0",
-    b"Invalid back reference\0",
-    b"Unmatched [, [^, [:, [., or [=\0",
-    b"Unmatched ( or \\(\0",
-    b"Unmatched \\{\0",
-    b"Invalid content of \\{\\}\0",
-    b"Invalid range end\0",
-    b"Memory exhausted\0",
-    b"Invalid preceding regular expression\0",
-    b"Premature end of regular expression\0",
-    b"Regular expression too big\0",
-    b"Unmatched ) or \\)\0",
+pub static ERROR_MSGS: [&core::ffi::CStr; 17] = [
+    c"Success",
+    c"No match",
+    c"Invalid regular expression",
+    c"Invalid collation character",
+    c"Invalid character class name",
+    c"Trailing backslash",
+    c"Invalid back reference",
+    c"Unmatched [, [^, [:, [., or [=",
+    c"Unmatched ( or \\(",
+    c"Unmatched \\{",
+    c"Invalid content of \\{\\}",
+    c"Invalid range end",
+    c"Memory exhausted",
+    c"Invalid preceding regular expression",
+    c"Premature end of regular expression",
+    c"Regular expression too big",
+    c"Unmatched ) or \\)",
 ];
 
 pub fn error_message(code: i32) -> Option<&'static [u8]> {
     if code < 0 || code as usize >= ERROR_MSGS.len() {
         return None;
     }
-    let m = ERROR_MSGS[code as usize];
-    Some(&m[..m.len() - 1])
+    Some(ERROR_MSGS[code as usize].to_bytes())
 }

@@ -4,39 +4,46 @@ use crate::fmt::FmtChar;
 use crate::scan::{self, MODE_C23_BIN, MODE_LEGACY_A, PtrArgs, Src, StrSrc};
 use core::ffi::{VaList, c_char, c_int, c_void};
 
-pub struct FileSrc(pub *mut FILE);
+pub struct FileSrc(*mut FILE);
+
+impl FileSrc {
+    pub unsafe fn new(f: *mut FILE) -> FileSrc {
+        FileSrc(f)
+    }
+
+    #[inline(always)]
+    fn stream(&mut self) -> &mut FILE {
+        unsafe { file::stream(self.0) }
+    }
+}
 
 impl Src for FileSrc {
-    unsafe fn get(&mut self) -> c_int {
-        unsafe { file::getc(self.0) }
+    fn get(&mut self) -> c_int {
+        file::getc(self.stream())
     }
-    unsafe fn unget(&mut self, c: c_int) {
-        unsafe {
-            file::ungetc(c, self.0);
+    fn unget(&mut self, c: c_int) {
+        file::ungetc(c, self.stream());
+    }
+    fn peek(&mut self) -> (*const u8, usize) {
+        let f = self.stream();
+        if f.nunget() > 0 {
+            return (core::ptr::null(), 0);
         }
+        file::fill_buf(f).map_or((core::ptr::null(), 0), |w| (w.as_ptr(), w.len()))
     }
-    unsafe fn peek(&mut self) -> (*const u8, usize) {
-        unsafe {
-            if (*self.0).nunget() > 0 {
-                return (core::ptr::null(), 0);
-            }
-            file::fill_buf(self.0).unwrap_or((core::ptr::null(), 0))
+    fn advance(&mut self, n: usize) {
+        file::consume(self.stream(), n);
+    }
+    fn orient_ok(&mut self) -> bool {
+        let f = self.stream();
+        if !file::narrow_ok(f) {
+            return false;
         }
-    }
-    unsafe fn advance(&mut self, n: usize) {
-        unsafe { file::consume(self.0, n) };
-    }
-    unsafe fn orient_ok(&mut self) -> bool {
-        unsafe {
-            if !file::narrow_ok(self.0) {
-                return false;
-            }
-            if (*self.0).flags & file::F_READ == 0 {
-                rusty_libc_core::errno::set(9);
-                return false;
-            }
-            true
+        if f.flags & file::F_READ == 0 {
+            rusty_libc_core::errno::set(9);
+            return false;
         }
+        true
     }
 }
 
@@ -69,32 +76,30 @@ impl PtrArgs for PosPtrs {
 }
 
 pub(crate) unsafe fn max_position<F: FmtChar>(fmt: *const F) -> usize {
-    unsafe {
-        let mut f = fmt;
-        let mut max = 0usize;
-        while F::at(f, 0) != 0 {
-            if F::at(f, 0) == b'%' {
-                f = f.add(1);
-                if F::at(f, 0) == b'%' {
-                    f = f.add(1);
-                    continue;
-                }
-                let mut n = 0usize;
-                let mut digits = false;
-                while F::at(f, 0).is_ascii_digit() {
-                    n = n.saturating_mul(10).saturating_add(usize::from(F::at(f, 0) - b'0'));
-                    digits = true;
-                    f = f.add(1);
-                }
-                if digits && F::at(f, 0) == b'$' && n > max {
-                    max = n;
-                }
-            } else {
-                f = f.add(1);
+    let mut f = 0usize;
+    let mut max = 0usize;
+    while fmt_at!(fmt, f) != 0 {
+        if fmt_at!(fmt, f) == b'%' {
+            f += 1;
+            if fmt_at!(fmt, f) == b'%' {
+                f += 1;
+                continue;
             }
+            let mut n = 0usize;
+            let mut digits = false;
+            while fmt_at!(fmt, f).is_ascii_digit() {
+                n = n.saturating_mul(10).saturating_add(usize::from(fmt_at!(fmt, f) - b'0'));
+                digits = true;
+                f += 1;
+            }
+            if digits && fmt_at!(fmt, f) == b'$' && n > max {
+                max = n;
+            }
+        } else {
+            f += 1;
         }
-        max
     }
+    max
 }
 
 pub unsafe fn scan_run<S: Src>(src: &mut S, fmt: *const c_char, va: &mut VaList, mode: u32) -> c_int {
@@ -102,47 +107,61 @@ pub unsafe fn scan_run<S: Src>(src: &mut S, fmt: *const c_char, va: &mut VaList,
 }
 
 pub unsafe fn scan_run_fmt<S: Src, F: FmtChar>(src: &mut S, f: *const F, va: &mut VaList, mode: u32) -> c_int {
-    unsafe {
-        if !src.orient_ok() {
-            return -1;
-        }
-        let maxpos = if F::has_dollar(f) { max_position(f) } else { 0 };
-        if maxpos == 0 {
-            return scan::scan(src, f, &mut VaPtrs { va }, mode);
-        }
-        let mut args = PosPtrs { pos: [core::ptr::null_mut(); 128], seq: 0 };
-        for slot in args.pos.iter_mut().take(maxpos) {
-            *slot = va.next_arg::<*mut c_void>();
-        }
-        scan::scan(src, f, &mut args, mode)
+    if !src.orient_ok() {
+        return -1;
     }
+    let maxpos = if unsafe { F::has_dollar(f) } { unsafe { max_position(f) } } else { 0 };
+    if maxpos == 0 {
+        return unsafe { scan::scan(src, f, &mut VaPtrs { va }, mode) };
+    }
+    let mut args = PosPtrs { pos: [core::ptr::null_mut(); 128], seq: 0 };
+    for slot in args.pos.iter_mut().take(maxpos) {
+        *slot = unsafe { va.next_arg::<*mut c_void>() };
+    }
+    unsafe { scan::scan(src, f, &mut args, mode) }
 }
 
 macro_rules! scanf_family {
     ($mode:expr, $fscanf:ident, $scanf:ident, $sscanf:ident, $vfscanf:ident, $vscanf:ident, $vsscanf:ident) => {
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $vfscanf(f: *mut FILE, format: *const c_char, mut ap: VaList) -> c_int {
-            unsafe { locked!(f, move || scan_run(&mut FileSrc(f), format, &mut ap, $mode)) }
+            locked!(f, |_s| {
+                let mut src = unsafe { FileSrc::new(f) };
+                unsafe { scan_run(&mut src, format, &mut ap, $mode) }
+            })
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $vscanf(format: *const c_char, mut ap: VaList) -> c_int {
-            unsafe { let f = file::stdin_ptr(); locked!(f, move || scan_run(&mut FileSrc(f), format, &mut ap, $mode)) }
+            let f = file::stdin_ptr();
+            locked!(f, |_s| {
+                let mut src = unsafe { FileSrc::new(f) };
+                unsafe { scan_run(&mut src, format, &mut ap, $mode) }
+            })
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $vsscanf(s: *const c_char, format: *const c_char, mut ap: VaList) -> c_int {
-            unsafe { scan_run(&mut StrSrc::new(s as *const u8), format, &mut ap, $mode) }
+            let mut src = unsafe { StrSrc::new(s as *const u8) };
+            unsafe { scan_run(&mut src, format, &mut ap, $mode) }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $fscanf(f: *mut FILE, format: *const c_char, mut args: ...) -> c_int {
-            unsafe { locked!(f, move || scan_run(&mut FileSrc(f), format, &mut args, $mode)) }
+            locked!(f, |_s| {
+                let mut src = unsafe { FileSrc::new(f) };
+                unsafe { scan_run(&mut src, format, &mut args, $mode) }
+            })
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $scanf(format: *const c_char, mut args: ...) -> c_int {
-            unsafe { let f = file::stdin_ptr(); locked!(f, move || scan_run(&mut FileSrc(f), format, &mut args, $mode)) }
+            let f = file::stdin_ptr();
+            locked!(f, |_s| {
+                let mut src = unsafe { FileSrc::new(f) };
+                unsafe { scan_run(&mut src, format, &mut args, $mode) }
+            })
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $sscanf(s: *const c_char, format: *const c_char, mut args: ...) -> c_int {
-            unsafe { scan_run(&mut StrSrc::new(s as *const u8), format, &mut args, $mode) }
+            let mut src = unsafe { StrSrc::new(s as *const u8) };
+            unsafe { scan_run(&mut src, format, &mut args, $mode) }
         }
     };
 }

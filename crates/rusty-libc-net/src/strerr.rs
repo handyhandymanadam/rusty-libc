@@ -1,3 +1,4 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::types::*;
 use core::cell::Cell;
 use core::ffi::{c_char, c_int};
@@ -29,7 +30,11 @@ pub fn gai_message(code: c_int) -> &'static [u8] {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn gai_strerror(code: c_int) -> *const c_char {
-    gai_message(code).as_ptr() as *const c_char
+    tr(gai_message(code))
+}
+
+fn tr(m: &'static [u8]) -> *const c_char {
+    unsafe { rusty_libc_core::i18n::tr_ptr(m.as_ptr() as *const c_char) }
 }
 
 pub fn h_message(err: c_int) -> &'static [u8] {
@@ -62,7 +67,7 @@ pub static h_nerr: c_int = 5;
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn hstrerror(err: c_int) -> *const c_char {
-    h_message(err).as_ptr() as *const c_char
+    tr(h_message(err))
 }
 
 #[allow(non_upper_case_globals)]
@@ -85,11 +90,15 @@ pub extern "C" fn __h_errno_location() -> *mut c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn herror(s: *const c_char) {
-    let msg = h_message(h_errno());
-    let msg = &msg[..msg.len() - 1];
+    let prefix = unsafe { rusty_libc_core::ffi::cstr(s) }.map(core::ffi::CStr::to_bytes);
+    herror_bytes(prefix);
+}
+
+pub fn herror_bytes(prefix: Option<&[u8]>) {
+    let hp = hstrerror(h_errno());
+    let msg = unsafe { crate::util::cbytes(hp) };
     let mut out = crate::util::Buf::<512>::new();
-    if !s.is_null() {
-        let p = unsafe { crate::util::cbytes(s) };
+    if let Some(p) = prefix {
         if !p.is_empty() {
             out.push_all(&p[..p.len().min(400)]);
             out.push_all(b": ");

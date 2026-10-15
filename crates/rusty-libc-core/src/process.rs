@@ -1,3 +1,5 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
+use crate::SyncCell;
 use crate::syscall;
 
 pub fn exit_now(status: i32) -> ! {
@@ -7,18 +9,16 @@ pub fn exit_now(status: i32) -> ! {
 }
 
 pub fn abort() -> ! {
-    const SIGABRT: usize = 6;
-    unsafe {
-        let pid = syscall::syscall1(syscall::SYS_GETPID, 0);
-        let tid = syscall::syscall1(syscall::SYS_GETTID, 0);
-        syscall::syscall3(syscall::SYS_TGKILL, pid, tid, SIGABRT);
-        let act = [0usize, 0, 0, !0usize];
-        syscall::syscall4(syscall::SYS_RT_SIGACTION, SIGABRT, act.as_ptr() as usize, 0, 8);
-        syscall::syscall3(syscall::SYS_TGKILL, pid, tid, SIGABRT);
-        let set: u64 = 1 << (SIGABRT - 1);
-        syscall::syscall4(syscall::SYS_RT_SIGPROCMASK, 1 , &set as *const u64 as usize, 0, 8);
-        core::arch::asm!("hlt", options(noreturn, nostack));
-    }
+    const SIGABRT: i32 = 6;
+    let pid = crate::unistd::getpid();
+    let tid = crate::unistd::gettid();
+    let _ = crate::signal::tgkill(pid, tid, SIGABRT);
+    let act = [0usize, 0, 0, !0usize];
+    unsafe { syscall::syscall4(syscall::SYS_RT_SIGACTION, SIGABRT as usize, act.as_ptr() as usize, 0, 8) };
+    let _ = crate::signal::tgkill(pid, tid, SIGABRT);
+    let set: u64 = 1 << (SIGABRT - 1);
+    unsafe { syscall::syscall4(syscall::SYS_RT_SIGPROCMASK, 1 , &set as *const u64 as usize, 0, 8) };
+    unsafe { core::arch::asm!("hlt", options(noreturn, nostack)) }
 }
 
 
@@ -28,99 +28,143 @@ pub fn exit_func_is_null() -> ! {
     abort()
 }
 
-const MAX_ATEXIT: usize = 1024;
+const INLINE_ATEXIT: usize = 1024;
 
 #[derive(Clone, Copy)]
 pub enum ExitFn {
     Plain(extern "C" fn()),
     Cxa(unsafe extern "C" fn(*mut core::ffi::c_void), *mut core::ffi::c_void, usize),
     OnExit(unsafe extern "C" fn(i32, *mut core::ffi::c_void), *mut core::ffi::c_void),
-    Quick(extern "C" fn()),
+    Quick(extern "C" fn(), usize),
+}
+
+struct ExitTable {
+    inline: [Option<ExitFn>; INLINE_ATEXIT],
+    more: crate::pages::PageVec<Option<ExitFn>>,
+    n: usize,
+}
+
+impl ExitTable {
+    fn slot(&mut self, i: usize) -> &mut Option<ExitFn> {
+        match i.checked_sub(INLINE_ATEXIT) {
+            None => &mut self.inline[i],
+            Some(j) => &mut self.more.as_mut_slice()[j],
+        }
+    }
+
+    fn push(&mut self, f: ExitFn) -> bool {
+        let n = self.n;
+        if n >= INLINE_ATEXIT && !self.more.grow(n - INLINE_ATEXIT + 1, None) {
+            return false;
+        }
+        *self.slot(n) = Some(f);
+        self.n = n + 1;
+        true
+    }
+
+    fn take_next(&mut self, pass: Pass) -> Option<ExitFn> {
+        let mut found = None;
+        for i in (0..self.n).rev() {
+            let take = match (*self.slot(i), pass) {
+                (None, _) => false,
+                (Some(ExitFn::Quick(..)), p) => p == Pass::Quick,
+                (Some(_), Pass::Exit) => true,
+                (Some(ExitFn::Plain(_) | ExitFn::Cxa(..)), Pass::AllCxa) => true,
+                (Some(ExitFn::Cxa(_, _, d)), Pass::Dso(dso)) => d == dso,
+                (Some(_), _) => false,
+            };
+            if take {
+                found = self.slot(i).take();
+                break;
+            }
+        }
+        if found.is_none() {
+            let dso = match pass {
+                Pass::AllCxa => Some(0),
+                Pass::Dso(d) => Some(d),
+                _ => None,
+            };
+            if let Some(dso) = dso {
+                for i in 0..self.n {
+                    let s = self.slot(i);
+                    if matches!(*s, Some(ExitFn::Quick(_, d)) if dso == 0 || d == dso) {
+                        *s = None;
+                    }
+                }
+            }
+        }
+        while self.n > 0 && self.slot(self.n - 1).is_none() {
+            self.n -= 1;
+        }
+        found
+    }
 }
 
 static ATEXIT_LOCK: crate::lock::RawMutex = crate::lock::RawMutex::new();
-static mut ATEXIT: [Option<ExitFn>; MAX_ATEXIT] = [None; MAX_ATEXIT];
-static mut ATEXIT_N: usize = 0;
+static ATEXIT: SyncCell<ExitTable> = SyncCell::new(ExitTable { inline: [None; INLINE_ATEXIT], more: crate::pages::PageVec::new(), n: 0 });
 static EXIT_STATUS: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 pub static FORK_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-pub static ATFORK_UNREGISTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub static ATFORK_UNREGISTER: crate::lock::Locked<Option<extern "C" fn(usize)>> = crate::lock::Locked::new(None);
 
-static STDIO_FLUSH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static STDIO_FLUSH: crate::lock::Locked<Option<extern "C" fn()>> = crate::lock::Locked::new(None);
 
 pub fn register(f: ExitFn) -> bool {
     let g = ATEXIT_LOCK.guard();
     let _ = &g;
-    unsafe {
-        let n = ATEXIT_N;
-        if n >= MAX_ATEXIT {
-            return false;
-        }
-        (core::ptr::addr_of_mut!(ATEXIT) as *mut Option<ExitFn>).add(n).write(Some(f));
-        ATEXIT_N = n + 1;
-        true
-    }
+    unsafe { ATEXIT.with_unsync(|t| t.push(f)) }
 }
 
 pub fn atexit(f: extern "C" fn()) -> bool {
     register(ExitFn::Plain(f))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Exit,
+    AllCxa,
+    Dso(usize),
+    Quick,
+}
+
 pub fn finalize(dso: usize) {
-    run_handlers(dso, false);
-    if dso != 0 {
-        let h = ATFORK_UNREGISTER.load(core::sync::atomic::Ordering::Relaxed);
-        if h != 0 {
-            let f: unsafe extern "C" fn(usize) = unsafe { core::mem::transmute(h) };
-            unsafe { f(dso) };
-        }
+    run_handlers(if dso == 0 { Pass::AllCxa } else { Pass::Dso(dso) }, 0);
+    if dso != 0
+        && let Some(f) = ATFORK_UNREGISTER.with(|h| *h)
+    {
+        f(dso);
     }
 }
 
-pub fn finalize_quick() {
-    run_handlers(0, true);
+pub fn finalize_exit() {
+    run_handlers(Pass::Exit, exit_status());
 }
 
-fn run_handlers(dso: usize, quick: bool) {
+pub fn finalize_quick() {
+    run_handlers(Pass::Quick, exit_status());
+}
+
+fn run_handlers(pass: Pass, status: i32) {
     loop {
         let taken = {
             let g = ATEXIT_LOCK.guard();
             let _ = &g;
-            unsafe {
-                let mut i = ATEXIT_N;
-                let tbl = core::ptr::addr_of_mut!(ATEXIT) as *mut Option<ExitFn>;
-                let mut found = None;
-                while i > 0 {
-                    i -= 1;
-                    let slot = tbl.add(i);
-                    let take = match *slot {
-                        Some(ExitFn::Quick(_)) => quick,
-                        Some(ExitFn::Cxa(_, _, d)) => !quick && (dso == 0 || d == dso),
-                        Some(_) => !quick && dso == 0,
-                        None => false,
-                    };
-                    if take {
-                        found = (*slot).take();
-                        while ATEXIT_N > 0 && (*tbl.add(ATEXIT_N - 1)).is_none() {
-                            ATEXIT_N -= 1;
-                        }
-                        break;
-                    }
-                }
-                found
-            }
+            unsafe { ATEXIT.with_unsync(|t| t.take_next(pass)) }
         };
         match taken {
             None => return,
             Some(ExitFn::Plain(f)) => f(),
-            Some(ExitFn::Cxa(f, arg, _)) => unsafe { f(arg) },
+            Some(ExitFn::Cxa(f, arg, _)) => {
+                let f = unsafe { core::mem::transmute::<unsafe extern "C" fn(*mut core::ffi::c_void), unsafe extern "C" fn(*mut core::ffi::c_void, i32)>(f) };
+                unsafe { f(arg, status) }
+            }
             Some(ExitFn::OnExit(f, arg)) => unsafe { f(exit_status(), arg) },
-            Some(ExitFn::Quick(f)) => f(),
+            Some(ExitFn::Quick(f, _)) => f(),
         }
     }
 }
 
 pub fn set_stdio_flush(f: extern "C" fn()) {
-    STDIO_FLUSH.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+    STDIO_FLUSH.with(|h| *h = Some(f));
 }
 
 pub type ForkHandler = unsafe extern "C" fn();
@@ -217,10 +261,9 @@ pub fn exit(status: i32) -> ! {
     exit_lock();
     EXIT_STATUS.store(status, core::sync::atomic::Ordering::Relaxed);
     crate::tls::run_thread_dtors();
-    finalize(0);
-    let hook = STDIO_FLUSH.load(core::sync::atomic::Ordering::Relaxed);
-    if hook != 0 {
-        let f: extern "C" fn() = unsafe { core::mem::transmute(hook) };
+    finalize_exit();
+    let flush = STDIO_FLUSH.with(|h| *h);
+    if let Some(f) = flush {
         f();
     }
     exit_now(status)

@@ -1,4 +1,6 @@
 #![cfg_attr(not(feature = "shared"), allow(dead_code, unused_imports))]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
+use crate::SyncCell;
 use crate::lock::RawMutex;
 use core::ffi::{c_char, c_int, c_void};
 
@@ -187,33 +189,38 @@ static CONF_PATH: LockedPath = LockedPath::new();
 
 struct LockedPath {
     lock: RawMutex,
-    buf: core::cell::UnsafeCell<[u8; 200]>,
+    buf: SyncCell<[u8; 200]>,
 }
-unsafe impl Sync for LockedPath {}
 impl LockedPath {
     const fn new() -> LockedPath {
-        LockedPath { lock: RawMutex::new(), buf: core::cell::UnsafeCell::new([0; 200]) }
+        LockedPath { lock: RawMutex::new(), buf: SyncCell::new([0; 200]) }
     }
 }
 
 pub fn set_conf_path(path: &[u8]) {
     CONF_PATH.lock.lock_always();
-    let b = unsafe { &mut *CONF_PATH.buf.get() };
-    let n = path.len().min(199);
-    b[..n].copy_from_slice(&path[..n]);
-    b[n] = 0;
+    unsafe {
+        CONF_PATH.buf.with_unsync(|b| {
+            let n = path.len().min(199);
+            b[..n].copy_from_slice(&path[..n]);
+            b[n] = 0;
+        })
+    };
     CONF_PATH.lock.unlock_always();
 }
 
 fn conf_path(out: &mut [u8; 200]) {
     CONF_PATH.lock.lock_always();
-    let b = unsafe { &*CONF_PATH.buf.get() };
-    if b[0] == 0 {
-        let d = b"/etc/nsswitch.conf\0";
-        out[..d.len()].copy_from_slice(d);
-    } else {
-        *out = *b;
-    }
+    unsafe {
+        CONF_PATH.buf.with_unsync(|b| {
+            if b[0] == 0 {
+                let d = b"/etc/nsswitch.conf\0";
+                out[..d.len()].copy_from_slice(d);
+            } else {
+                *out = *b;
+            }
+        })
+    };
     CONF_PATH.lock.unlock_always();
 }
 
@@ -229,18 +236,17 @@ struct Cached {
 
 struct Cache {
     lock: RawMutex,
-    e: core::cell::UnsafeCell<[Cached; CACHE_DBS]>,
+    e: SyncCell<[Cached; CACHE_DBS]>,
 }
-unsafe impl Sync for Cache {}
 
 static CACHE: Cache = Cache {
     lock: RawMutex::new(),
-    e: core::cell::UnsafeCell::new([const { Cached { db: [0; 12], dlen: 0, sig: [0; 3], order: Order::EMPTY, valid: false } }; CACHE_DBS]),
+    e: SyncCell::new([const { Cached { db: [0; 12], dlen: 0, sig: [0; 3], order: Order::EMPTY, valid: false } }; CACHE_DBS]),
 };
 
 fn file_sig(path: &[u8; 200]) -> [u64; 3] {
     let mut st = [0u64; 18];
-    let r = unsafe { crate::syscall::syscall2(crate::syscall::SYS_STAT, path.as_ptr() as usize, st.as_mut_ptr() as usize) };
+    let r = unsafe { crate::syscall::sys_stat(path.as_ptr() as usize, st.as_mut_ptr() as usize) };
     if let Err(e) = crate::syscall::check(r) {
         crate::errno::set(e.0);
         return [u64::MAX; 3];
@@ -308,7 +314,12 @@ pub fn order(db: &[u8]) -> Order {
     conf_path(&mut path);
     let sig = file_sig(&path);
     CACHE.lock.lock_always();
-    let tab = unsafe { &mut *CACHE.e.get() };
+    let o = unsafe { CACHE.e.with_unsync(|tab| order_locked(tab, db, &path, sig)) };
+    CACHE.lock.unlock_always();
+    o
+}
+
+fn order_locked(tab: &mut [Cached; CACHE_DBS], db: &[u8], path: &[u8; 200], sig: [u64; 3]) -> Order {
     let mut slot = None;
     for (i, c) in tab.iter().enumerate() {
         if c.valid && &c.db[..c.dlen as usize] == db {
@@ -322,7 +333,7 @@ pub fn order(db: &[u8]) -> Order {
     };
     let c = &mut tab[i];
     if !(c.valid && &c.db[..c.dlen as usize] == db && c.sig == sig) {
-        let o = read_conf(&path, db);
+        let o = read_conf(path, db);
         c.order = o;
         c.sig = sig;
         let n = db.len().min(12);
@@ -330,9 +341,7 @@ pub fn order(db: &[u8]) -> Order {
         c.dlen = n as u8;
         c.valid = true;
     }
-    let o = c.order;
-    CACHE.lock.unlock_always();
-    o
+    c.order
 }
 
 struct Mod {
@@ -343,12 +352,10 @@ struct Mod {
 
 struct Mods {
     lock: RawMutex,
-    n: core::cell::UnsafeCell<usize>,
-    e: core::cell::UnsafeCell<[Mod; 16]>,
+    tab: SyncCell<(usize, [Mod; 16])>,
 }
-unsafe impl Sync for Mods {}
 
-static MODS: Mods = Mods { lock: RawMutex::new(), n: core::cell::UnsafeCell::new(0), e: core::cell::UnsafeCell::new([const { Mod { name: [0; NAME_MAX], len: 0, handle: 0 } }; 16]) };
+static MODS: Mods = Mods { lock: RawMutex::new(), tab: SyncCell::new((0, [const { Mod { name: [0; NAME_MAX], len: 0, handle: 0 } }; 16])) };
 
 pub const fn supported() -> bool {
     cfg!(feature = "shared")
@@ -356,38 +363,12 @@ pub const fn supported() -> bool {
 
 pub fn module(name: &[u8]) -> usize {
     #[cfg(feature = "shared")]
-    unsafe {
+    {
         if name.is_empty() || name.len() > NAME_MAX {
             return 0;
         }
         MODS.lock.lock_always();
-        let n = &mut *MODS.n.get();
-        let tab = &mut *MODS.e.get();
-        for m in &tab[..*n] {
-            if &m.name[..m.len as usize] == name {
-                let h = m.handle;
-                MODS.lock.unlock_always();
-                return h;
-            }
-        }
-        let mut file = [0u8; 64];
-        let pre = b"libnss_";
-        let suf = b".so.2\0";
-        if pre.len() + name.len() + suf.len() > file.len() {
-            MODS.lock.unlock_always();
-            return 0;
-        }
-        file[..pre.len()].copy_from_slice(pre);
-        file[pre.len()..pre.len() + name.len()].copy_from_slice(name);
-        file[pre.len() + name.len()..pre.len() + name.len() + suf.len()].copy_from_slice(suf);
-        let saved = crate::errno::get();
-        let h = dlopen(file.as_ptr() as *const c_char, 1) as usize;
-        crate::errno::set(saved);
-        if *n < tab.len() {
-            tab[*n] = Mod { name: [0; NAME_MAX], len: name.len() as u8, handle: h };
-            tab[*n].name[..name.len()].copy_from_slice(name);
-            *n += 1;
-        }
+        let h = unsafe { MODS.tab.with_unsync(|(n, tab)| module_locked(n, tab, name)) };
         MODS.lock.unlock_always();
         h
     }
@@ -398,9 +379,36 @@ pub fn module(name: &[u8]) -> usize {
     }
 }
 
+#[cfg(feature = "shared")]
+fn module_locked(n: &mut usize, tab: &mut [Mod; 16], name: &[u8]) -> usize {
+    for m in &tab[..*n] {
+        if &m.name[..m.len as usize] == name {
+            return m.handle;
+        }
+    }
+    let mut file = [0u8; 64];
+    let pre = b"libnss_";
+    let suf = b".so.2\0";
+    if pre.len() + name.len() + suf.len() > file.len() {
+        return 0;
+    }
+    file[..pre.len()].copy_from_slice(pre);
+    file[pre.len()..pre.len() + name.len()].copy_from_slice(name);
+    file[pre.len() + name.len()..pre.len() + name.len() + suf.len()].copy_from_slice(suf);
+    let saved = crate::errno::get();
+    let h = unsafe { dlopen(file.as_ptr() as *const c_char, 1) } as usize;
+    crate::errno::set(saved);
+    if *n < tab.len() {
+        tab[*n] = Mod { name: [0; NAME_MAX], len: name.len() as u8, handle: h };
+        tab[*n].name[..name.len()].copy_from_slice(name);
+        *n += 1;
+    }
+    h
+}
+
 pub fn function(modname: &[u8], func: &[u8]) -> usize {
     #[cfg(feature = "shared")]
-    unsafe {
+    {
         let h = module(modname);
         if h == 0 {
             return 0;
@@ -417,7 +425,7 @@ pub fn function(modname: &[u8], func: &[u8]) -> usize {
             o += part.len();
         }
         let saved = crate::errno::get();
-        let f = dlsym(h as *mut c_void, sym.as_ptr() as *const c_char) as usize;
+        let f = unsafe { dlsym(h as *mut c_void, sym.as_ptr() as *const c_char) } as usize;
         crate::errno::set(saved);
         f
     }

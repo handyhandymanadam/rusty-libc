@@ -7,7 +7,7 @@ const EINVAL: i32 = 22;
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[inline(never)]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
-    unsafe { heap::malloc(size).cast() }
+    heap::malloc(size).cast()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -25,7 +25,7 @@ pub unsafe extern "C" fn cfree(ptr: *mut c_void) {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[inline(never)]
 pub unsafe extern "C" fn calloc(nmemb: usize, size: usize) -> *mut c_void {
-    unsafe { heap::calloc(nmemb, size).cast() }
+    heap::calloc(nmemb, size).cast()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -53,7 +53,7 @@ pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_
         errno::set(EINVAL);
         return core::ptr::null_mut();
     }
-    unsafe { heap::memalign(alignment, size).cast() }
+    heap::memalign(alignment, size).cast()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -63,7 +63,7 @@ pub unsafe extern "C" fn posix_memalign(memptr: *mut *mut c_void, alignment: usi
         return EINVAL;
     }
     let saved = errno::get();
-    let p = unsafe { heap::memalign(alignment, size) };
+    let p = heap::memalign(alignment, size);
     if p.is_null() {
         errno::set(12);
         return 12;
@@ -75,7 +75,7 @@ pub unsafe extern "C" fn posix_memalign(memptr: *mut *mut c_void, alignment: usi
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __libc_malloc(size: usize) -> *mut c_void {
-    unsafe { heap::malloc(size).cast() }
+    heap::malloc(size).cast()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -85,7 +85,7 @@ pub unsafe extern "C" fn __libc_free(ptr: *mut c_void) {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __libc_calloc(nmemb: usize, size: usize) -> *mut c_void {
-    unsafe { heap::calloc(nmemb, size).cast() }
+    heap::calloc(nmemb, size).cast()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

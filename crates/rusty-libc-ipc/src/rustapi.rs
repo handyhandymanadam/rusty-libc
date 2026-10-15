@@ -1,8 +1,9 @@
+use crate::kernel;
 use crate::sysv::*;
 use crate::util::res;
 use core::ffi::{c_int, c_long};
 use rusty_libc_core::Errno;
-use rusty_libc_core::syscall::{syscall1, syscall2, syscall3, syscall4};
+use rusty_libc_core::syscall::{syscall1, syscall3, syscall4};
 use rusty_libc_core::tls::syscall_cp;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,7 +13,7 @@ pub struct MsgQueue {
 
 impl MsgQueue {
     pub fn get(key: key_t, flags: c_int) -> Result<MsgQueue, Errno> {
-        res(unsafe { syscall2(SYS_MSGGET, key as usize, flags as usize) }).map(|id| MsgQueue { id: id as c_int })
+        res(kernel::msgget(key as usize, flags as usize)).map(|id| MsgQueue { id: id as c_int })
     }
     pub fn private(mode: c_int) -> Result<MsgQueue, Errno> {
         Self::get(IPC_PRIVATE, IPC_CREAT | IPC_EXCL | (mode & 0o777))
@@ -43,14 +44,14 @@ impl MsgQueue {
     }
     pub fn stat(&self) -> Result<MsqidDs, Errno> {
         let mut ds = MsqidDs::default();
-        res(unsafe { syscall3(SYS_MSGCTL, self.id as usize, IPC_STAT as usize, &mut ds as *mut MsqidDs as usize) })?;
+        res(unsafe { syscall3(SYS_MSGCTL, self.id as usize, IPC_STAT as usize, &raw mut ds as usize) })?;
         Ok(ds)
     }
     pub fn set(&self, ds: &MsqidDs) -> Result<(), Errno> {
         res(unsafe { syscall3(SYS_MSGCTL, self.id as usize, IPC_SET as usize, ds as *const MsqidDs as usize) }).map(|_| ())
     }
     pub fn remove(&self) -> Result<(), Errno> {
-        res(unsafe { syscall3(SYS_MSGCTL, self.id as usize, IPC_RMID as usize, 0) }).map(|_| ())
+        res(kernel::msgctl_rmid(self.id as usize)).map(|_| ())
     }
 }
 
@@ -61,7 +62,7 @@ pub struct SemSet {
 
 impl SemSet {
     pub fn get(key: key_t, nsems: c_int, flags: c_int) -> Result<SemSet, Errno> {
-        res(unsafe { syscall3(SYS_SEMGET, key as usize, nsems as usize, flags as usize) }).map(|id| SemSet { id: id as c_int })
+        res(kernel::semget(key as usize, nsems as usize, flags as usize)).map(|id| SemSet { id: id as c_int })
     }
     pub fn private(nsems: c_int, mode: c_int) -> Result<SemSet, Errno> {
         Self::get(IPC_PRIVATE, nsems, IPC_CREAT | IPC_EXCL | (mode & 0o777))
@@ -73,15 +74,19 @@ impl SemSet {
         self.id
     }
     pub fn op(&self, ops: &mut [Sembuf]) -> Result<(), Errno> {
-        res(unsafe { syscall3(SYS_SEMOP, self.id as usize, ops.as_mut_ptr() as usize, ops.len()) }).map(|_| ())
+        self.semtimedop(ops, None)
     }
     pub fn timed_op(&self, ops: &mut [Sembuf], timeout: &Timespec) -> Result<(), Errno> {
-        res(unsafe { syscall4(SYS_SEMTIMEDOP, self.id as usize, ops.as_mut_ptr() as usize, ops.len(), timeout as *const Timespec as usize) })
-            .map(|_| ())
+        self.semtimedop(ops, Some(timeout))
+    }
+    fn semtimedop(&self, ops: &mut [Sembuf], timeout: Option<&Timespec>) -> Result<(), Errno> {
+        let tp = timeout.map_or(0, |t| t as *const Timespec as usize);
+        res(unsafe { syscall4(SYS_SEMTIMEDOP, self.id as usize, ops.as_mut_ptr() as usize, ops.len(), tp) }).map(|_| ())
     }
     fn ctl(&self, num: c_int, cmd: c_int, arg: usize) -> Result<usize, Errno> {
-        res(unsafe { syscall4(SYS_SEMCTL, self.id as usize, num as usize, cmd as usize, arg) })
+        res(kernel::semctl_val(self.id as usize, num as usize, cmd, arg))
     }
+
     pub fn value(&self, num: c_int) -> Result<c_int, Errno> {
         self.ctl(num, GETVAL, 0).map(|v| v as c_int)
     }
@@ -98,14 +103,14 @@ impl SemSet {
         self.ctl(num, GETZCNT, 0).map(|v| v as c_int)
     }
     pub fn values(&self, out: &mut [u16]) -> Result<(), Errno> {
-        self.ctl(0, GETALL, out.as_mut_ptr() as usize).map(|_| ())
+        res(unsafe { syscall4(SYS_SEMCTL, self.id as usize, 0, GETALL as usize, out.as_mut_ptr() as usize) }).map(|_| ())
     }
     pub fn set_values(&self, vals: &[u16]) -> Result<(), Errno> {
-        self.ctl(0, SETALL, vals.as_ptr() as usize).map(|_| ())
+        res(unsafe { syscall4(SYS_SEMCTL, self.id as usize, 0, SETALL as usize, vals.as_ptr() as usize) }).map(|_| ())
     }
     pub fn stat(&self) -> Result<SemidDs, Errno> {
         let mut ds = SemidDs::default();
-        self.ctl(0, IPC_STAT, &mut ds as *mut SemidDs as usize)?;
+        res(unsafe { syscall4(SYS_SEMCTL, self.id as usize, 0, IPC_STAT as usize, &raw mut ds as usize) })?;
         Ok(ds)
     }
     pub fn remove(&self) -> Result<(), Errno> {
@@ -120,7 +125,7 @@ pub struct Shm {
 
 impl Shm {
     pub fn get(key: key_t, size: usize, flags: c_int) -> Result<Shm, Errno> {
-        res(unsafe { syscall3(SYS_SHMGET, key as usize, size, flags as usize) }).map(|id| Shm { id: id as c_int })
+        res(kernel::shmget(key as usize, size, flags as usize)).map(|id| Shm { id: id as c_int })
     }
     pub fn private(size: usize, mode: c_int) -> Result<Shm, Errno> {
         Self::get(IPC_PRIVATE, size, IPC_CREAT | IPC_EXCL | (mode & 0o777))
@@ -138,11 +143,11 @@ impl Shm {
     }
     pub fn stat(&self) -> Result<ShmidDs, Errno> {
         let mut ds = ShmidDs::default();
-        res(unsafe { syscall3(SYS_SHMCTL, self.id as usize, IPC_STAT as usize, &mut ds as *mut ShmidDs as usize) })?;
+        res(unsafe { syscall3(SYS_SHMCTL, self.id as usize, IPC_STAT as usize, &raw mut ds as usize) })?;
         Ok(ds)
     }
     pub fn remove(&self) -> Result<(), Errno> {
-        res(unsafe { syscall3(SYS_SHMCTL, self.id as usize, IPC_RMID as usize, 0) }).map(|_| ())
+        res(kernel::shmctl_rmid(self.id as usize)).map(|_| ())
     }
 }
 

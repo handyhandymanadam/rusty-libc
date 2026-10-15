@@ -1,5 +1,7 @@
 use crate::sys::*;
 use crate::*;
+#[allow(unused_imports)]
+use crate::{cond, key, rwlock};
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::ops::{Deref, DerefMut};
@@ -60,19 +62,16 @@ impl<T> Drop for MutexGuard<'_, T> {
 }
 
 pub struct Condvar {
-    raw: UnsafeCell<pthread_cond_t>,
+    raw: pthread_cond_t,
 }
-
-unsafe impl Send for Condvar {}
-unsafe impl Sync for Condvar {}
 
 impl Condvar {
     pub const fn new() -> Condvar {
-        Condvar { raw: UnsafeCell::new(unsafe { core::mem::zeroed() }) }
+        Condvar { raw: cond::Cond::with_attr(0) }
     }
 
     pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
-        unsafe { pthread_cond_wait(self.raw.get(), guard.m.raw.get()) };
+        unsafe { cond::wait_common(&self.raw, guard.m.raw.get(), 0, None) };
         guard
     }
 
@@ -80,16 +79,16 @@ impl Condvar {
         let mut abs = Timespec::default();
         clock_gettime(CLOCK_REALTIME, &mut abs);
         timespec_add_ns(&mut abs, ns);
-        let r = unsafe { pthread_cond_timedwait(self.raw.get(), guard.m.raw.get(), &abs) };
+        let r = unsafe { cond::wait_common(&self.raw, guard.m.raw.get(), CLOCK_REALTIME, Some(&abs)) };
         (guard, r == ETIMEDOUT)
     }
 
     pub fn notify_one(&self) {
-        unsafe { pthread_cond_signal(self.raw.get()) };
+        cond::signal(&self.raw);
     }
 
     pub fn notify_all(&self) {
-        unsafe { pthread_cond_broadcast(self.raw.get()) };
+        cond::broadcast(&self.raw);
     }
 }
 
@@ -100,7 +99,7 @@ impl Default for Condvar {
 }
 
 pub struct RwLock<T> {
-    raw: UnsafeCell<pthread_rwlock_t>,
+    raw: pthread_rwlock_t,
     data: UnsafeCell<T>,
 }
 
@@ -116,27 +115,27 @@ pub struct WriteGuard<'a, T> {
 
 impl<T> RwLock<T> {
     pub const fn new(value: T) -> RwLock<T> {
-        RwLock { raw: UnsafeCell::new(unsafe { core::mem::zeroed() }), data: UnsafeCell::new(value) }
+        RwLock { raw: rwlock::RwLock::with_kind(0, false), data: UnsafeCell::new(value) }
     }
 
     pub fn read(&self) -> ReadGuard<'_, T> {
-        let r = unsafe { pthread_rwlock_rdlock(self.raw.get()) };
+        let r = rwlock::rdlock_full(&self.raw, 0, None);
         assert!(r == 0, "rwlock read lock failed");
         ReadGuard { l: self }
     }
 
     pub fn write(&self) -> WriteGuard<'_, T> {
-        let r = unsafe { pthread_rwlock_wrlock(self.raw.get()) };
+        let r = rwlock::wrlock_full(&self.raw, 0, None);
         assert!(r == 0, "rwlock write lock failed");
         WriteGuard { l: self }
     }
 
     pub fn try_read(&self) -> Option<ReadGuard<'_, T>> {
-        if unsafe { pthread_rwlock_tryrdlock(self.raw.get()) } == 0 { Some(ReadGuard { l: self }) } else { None }
+        if rwlock::tryrdlock(&self.raw) == 0 { Some(ReadGuard { l: self }) } else { None }
     }
 
     pub fn try_write(&self) -> Option<WriteGuard<'_, T>> {
-        if unsafe { pthread_rwlock_trywrlock(self.raw.get()) } == 0 { Some(WriteGuard { l: self }) } else { None }
+        if rwlock::trywrlock(&self.raw) == 0 { Some(WriteGuard { l: self }) } else { None }
     }
 }
 
@@ -159,12 +158,12 @@ impl<T> DerefMut for WriteGuard<'_, T> {
 }
 impl<T> Drop for ReadGuard<'_, T> {
     fn drop(&mut self) {
-        unsafe { pthread_rwlock_unlock(self.l.raw.get()) };
+        rwlock::unlock(&self.l.raw);
     }
 }
 impl<T> Drop for WriteGuard<'_, T> {
     fn drop(&mut self) {
-        unsafe { pthread_rwlock_unlock(self.l.raw.get()) };
+        rwlock::unlock(&self.l.raw);
     }
 }
 
@@ -216,20 +215,19 @@ impl Key {
 
     fn id(&self) -> u32 {
         self.once.call_once(|| {
-            let mut k = 0u32;
-            let r = unsafe { pthread_key_create(&mut k, self.dtor) };
-            assert!(r == 0, "no thread-specific data keys left");
-            self.key.store(k, Ordering::Relaxed);
+            let k = key::key_create(self.dtor);
+            assert!(k.is_ok(), "no thread-specific data keys left");
+            self.key.store(k.unwrap_or(0), Ordering::Relaxed);
         });
         self.key.load(Ordering::Relaxed)
     }
 
     pub fn get(&self) -> *mut c_void {
-        unsafe { pthread_getspecific(self.id()) }
+        key::getspecific(self.id())
     }
 
     pub fn set(&self, value: *mut c_void) {
-        unsafe { pthread_setspecific(self.id(), value) };
+        key::setspecific(self.id(), value);
     }
 }
 
@@ -266,21 +264,19 @@ mod spawn {
     }
 
     unsafe fn release<F, T>(p: *mut Packet<F, T>) {
-        unsafe {
-            if (*p).refs.fetch_sub(1, Ordering::AcqRel) == 1 {
-                drop(Box::from_raw(p));
-            }
+        if unsafe { &(*p).refs }.fetch_sub(1, Ordering::AcqRel) == 1 {
+            drop(unsafe { Box::from_raw(p) });
         }
     }
 
     unsafe extern "C" fn tramp<F: FnOnce() -> T, T>(arg: *mut c_void) -> *mut c_void {
-        unsafe {
-            let p = arg as *mut Packet<F, T>;
-            let f = (*(*p).f.get()).take().unwrap();
-            *(*p).result.get() = Some(f());
-            release(p);
-            core::ptr::null_mut()
-        }
+        let p = arg as *mut Packet<F, T>;
+        let packet = unsafe { &*p };
+        let f = unsafe { (*packet.f.get()).take() }.unwrap();
+        let r = f();
+        unsafe { *packet.result.get() = Some(r) };
+        unsafe { release(p) };
+        core::ptr::null_mut()
     }
 
     pub struct JoinHandle<T> {
@@ -293,12 +289,11 @@ mod spawn {
     unsafe impl<T: Send> Send for JoinHandle<T> {}
 
     unsafe fn take_result<F, T>(p: *mut c_void) -> Option<T> {
-        unsafe {
-            let p = p as *mut Packet<F, T>;
-            let r = (*(*p).result.get()).take();
-            release(p);
-            r
-        }
+        let p = p as *mut Packet<F, T>;
+        let packet = unsafe { &*p };
+        let r = unsafe { (*packet.result.get()).take() };
+        unsafe { release(p) };
+        r
     }
 
     unsafe fn free_packet<F, T>(p: *mut c_void) {
@@ -307,18 +302,14 @@ mod spawn {
 
     impl<T> JoinHandle<T> {
         pub fn join(self) -> T {
-            unsafe {
-                let r = pthread_join(self.th, core::ptr::null_mut());
-                assert!(r == 0, "pthread_join failed");
-                (self.take)(self.packet).expect("thread produced no result")
-            }
+            let r = unsafe { crate::thread::join_common(self.th, None, CLOCK_REALTIME, None, true) };
+            assert!(r == 0, "pthread_join failed");
+            unsafe { (self.take)(self.packet) }.expect("thread produced no result")
         }
 
         pub fn detach(self) {
-            unsafe {
-                pthread_detach(self.th);
-                (self.free)(self.packet);
-            }
+            unsafe { crate::thread::detach(self.th) };
+            unsafe { (self.free)(self.packet) };
         }
 
         pub fn thread_id(&self) -> pthread_t {
@@ -331,19 +322,20 @@ mod spawn {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        spawn_with(core::ptr::null(), f)
+        unsafe { spawn_with(None, f) }
     }
 
-    pub fn spawn_with<F, T>(attr: *const pthread_attr_t, f: F) -> Result<JoinHandle<T>, i32>
+    pub unsafe fn spawn_with<F, T>(attr: Option<&pthread_attr_t>, f: F) -> Result<JoinHandle<T>, i32>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
         let p = Box::into_raw(Box::new(Packet::<F, T> { refs: AtomicU32::new(2), f: UnsafeCell::new(Some(f)), result: UnsafeCell::new(None) }));
         let mut th: pthread_t = 0;
+        let attr = attr.map_or(core::ptr::null(), |a| a as *const pthread_attr_t);
         let r = unsafe { pthread_create(&mut th, attr, tramp::<F, T>, p as *mut c_void) };
         if r != 0 {
-            unsafe { drop(Box::from_raw(p)) };
+            drop(unsafe { Box::from_raw(p) });
             return Err(r);
         }
         Ok(JoinHandle { th, packet: p as *mut c_void, take: take_result::<F, T>, free: free_packet::<F, T> })

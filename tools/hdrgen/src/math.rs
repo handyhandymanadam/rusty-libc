@@ -311,6 +311,13 @@ fn emit_groups(out: &mut Vec<String>, groups: BTreeMap<Vec<&'static str>, Vec<St
     }
 }
 
+fn cplx(suffix: &str, ty: &str) -> String {
+    match suffix {
+        "f32" | "f64" | "f32x" | "f64x" | "f128" => format!("__CFLOAT{}", suffix[1..].to_uppercase()),
+        _ => format!("{ty} _Complex"),
+    }
+}
+
 pub fn complex_header() -> String {
     let real_ret = ["cabs", "carg", "cimag", "creal"];
     let unary = words("cabs carg cimag creal conj cproj cexp clog clog10 csqrt csin ccos ctan casin cacos catan csinh ccosh ctanh casinh cacosh catanh");
@@ -341,7 +348,7 @@ pub fn complex_header() -> String {
             if *name == "clog10" {
                 out.push("#ifdef _GNU_SOURCE".into());
             }
-            let arg = format!("{ty} _Complex");
+            let arg = cplx(suffix, ty);
             let ret = if real_ret.contains(name) { ty.to_string() } else { arg.clone() };
             out.push(format!("extern {ret} {func} ({arg});"));
             if *name == "clog10" && suffix == "l" {
@@ -351,7 +358,8 @@ pub fn complex_header() -> String {
                 out.push("#endif".into());
             }
         }
-        out.push(format!("extern {ty} _Complex cpow{suffix} ({ty} _Complex, {ty} _Complex);"));
+        let c = cplx(suffix, ty);
+        out.push(format!("extern {c} cpow{suffix} ({c}, {c});"));
         if guard {
             out.push("#endif".into());
         }
@@ -537,9 +545,11 @@ impl Math {
                 narrow.push((format!("{res}{op}f128"), rt.into(), vec!["Q"; n].join(" ")));
             }
             let d = vec!["D"; n].join(" ");
-            narrow.push((format!("f32{op}f64"), "F32".into(), d.clone()));
-            narrow.push((format!("f32{op}f32x"), "F32".into(), d.clone()));
-            narrow.push((format!("f32x{op}f64"), "F32X".into(), d.clone()));
+            let f64a = vec!["F64"; n].join(" ");
+            let f32xa = vec!["F32X"; n].join(" ");
+            narrow.push((format!("f32{op}f64"), "F32".into(), f64a.clone()));
+            narrow.push((format!("f32{op}f32x"), "F32".into(), f32xa));
+            narrow.push((format!("f32x{op}f64"), "F32X".into(), f64a));
             let short = match op { "add" => "fadd", "sub" => "fsub", "mul" => "fmul", "div" => "fdiv", "fma" => "ffma", _ => "fsqrt" };
             narrow.push((short.into(), "F".into(), d));
         }

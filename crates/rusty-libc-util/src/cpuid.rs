@@ -1,4 +1,5 @@
 use crate::auxv;
+use rusty_libc_core::sync_cell::SyncCell;
 use rusty_libc_core::tunables;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -176,18 +177,14 @@ fn apply_tunables(active: &mut Masks, t: &[CpuidFeature; LEAVES]) {
     if p.is_null() || auxv::get(auxv::AT_SECURE).unwrap_or(0) != 0 {
         return;
     }
-    let mut n = 0;
-    while unsafe { *p.add(n) } != 0 {
-        n += 1;
-    }
-    let v = unsafe { core::slice::from_raw_parts(p, n) };
+    let v = unsafe { rusty_libc_core::ffi::cstr_bytes_scalar(p) };
     let tun = tunables::parse(v, &mut |_| {});
     if tun.enable_secure {
         return;
     }
     if let Some(list) = tun.hwcaps {
         tunables::hwcaps_items(list, |name, disable| {
-            if let Some(&(_, leaf, reg, bit, both)) = tunables::HWCAP_FEATURES.iter().find(|f| f.0 == name) {
+            if let Some((leaf, reg, bit, both)) = tunables::hwcap_feature(name) {
                 let m = 1u32 << bit;
                 if disable {
                     active[leaf][reg] &= !m;
@@ -200,7 +197,7 @@ fn apply_tunables(active: &mut Masks, t: &[CpuidFeature; LEAVES]) {
 }
 
 static STATE: AtomicU8 = AtomicU8::new(0);
-static mut TABLE: [CpuidFeature; LEAVES] = [ZERO; LEAVES];
+static TABLE: SyncCell<[CpuidFeature; LEAVES]> = SyncCell::new([ZERO; LEAVES]);
 
 fn table() -> &'static [CpuidFeature; LEAVES] {
     loop {
@@ -208,7 +205,7 @@ fn table() -> &'static [CpuidFeature; LEAVES] {
             2 => break,
             0 => {
                 if STATE.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-                    unsafe { *core::ptr::addr_of_mut!(TABLE) = compute() };
+                    unsafe { TABLE.write(compute()) };
                     STATE.store(2, Ordering::Release);
                     break;
                 }
@@ -216,7 +213,7 @@ fn table() -> &'static [CpuidFeature; LEAVES] {
             _ => core::hint::spin_loop(),
         }
     }
-    unsafe { &*core::ptr::addr_of!(TABLE) }
+    unsafe { &*TABLE.as_ptr() }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

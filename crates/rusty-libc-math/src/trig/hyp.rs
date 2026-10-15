@@ -322,7 +322,7 @@ pub fn tanh_directed(x: f64) -> f64 {
 }
 
 #[inline(always)]
-fn tanh_parts<const F: bool>(ax: f64) -> (f64, f64) {
+pub(crate) fn tanh_parts<const F: bool>(ax: f64) -> (f64, f64) {
     if ax < TANH_POLY_MAX {
         let z = ax * ax;
         let c = &TANH_C;

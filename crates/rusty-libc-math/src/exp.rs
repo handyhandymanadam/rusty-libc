@@ -5,7 +5,7 @@ mod data;
 pub(crate) mod dexp;
 pub(crate) mod dlog;
 mod dpow;
-mod fexp;
+pub(crate) mod fexp;
 pub(crate) mod ffast;
 pub(crate) mod flog;
 

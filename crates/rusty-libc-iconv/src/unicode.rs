@@ -388,7 +388,7 @@ pub fn unicode_dec_prepare(ctx: &mut Ctx, inp: &[u8], ip: &mut usize) -> Option<
 }
 
 pub fn unicode_enc_prepare(ctx: &mut Ctx, out: &mut [u8], op: &mut usize) -> Option<St> {
-    if ctx.inv == 0 {
+    if ctx.inv == 0 && ctx.flags & INTERNAL_USE == 0 {
         if *op + 2 > out.len() {
             return Some(St::Full);
         }
@@ -422,6 +422,9 @@ pub fn utf16_dec_prepare(var: Var, ctx: &mut Ctx, inp: &[u8], ip: &mut usize) ->
 pub fn utf16_enc_prepare(var: Var, ctx: &mut Ctx, out: &mut [u8], op: &mut usize) -> Option<St> {
     if ctx.inv == 0 {
         if var == Var::Plain {
+            if ctx.flags & INTERNAL_USE != 0 {
+                return None;
+            }
             if *op + 2 > out.len() {
                 return Some(St::Full);
             }
@@ -512,7 +515,7 @@ pub fn utf32_dec_prepare(var: Var, ctx: &mut Ctx, inp: &[u8], ip: &mut usize) ->
 
 pub fn utf32_enc_prepare(var: Var, ctx: &mut Ctx, out: &mut [u8], op: &mut usize) -> Option<St> {
     if var == Var::Plain {
-        if ctx.inv == 0 {
+        if ctx.inv == 0 && ctx.flags & INTERNAL_USE == 0 {
             if *op + 4 > out.len() {
                 return Some(St::Full);
             }
@@ -585,7 +588,7 @@ pub struct Sb {
 
 impl Sb {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new(name_off: u32, name_len: u16, dec_off: u32, hi_off: u32, blocks_off: u32, nblocks: u16, zero_off: u32, nzero: u16, ident: u16, dec_ident: u16) -> Sb {
+    pub(crate) const fn new(name_off: u32, name_len: u16, dec_off: u32, hi_off: u32, blocks_off: u32, nblocks: u16, zero_off: u32, nzero: u16, ident: u16, dec_ident: u16) -> Sb {
         Sb { name_off, name_len, dec_off, hi_off, blocks_off, nblocks, zero_off, nzero, ident, dec_ident }
     }
 

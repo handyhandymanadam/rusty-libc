@@ -1,4 +1,4 @@
-#![allow(clippy::needless_late_init)]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use super::*;
 
 #[repr(C)]
@@ -15,138 +15,108 @@ impl Sgrp {
     }
 }
 
-unsafe fn parse_list_term(linep: &mut *mut u8, eol: *mut u8, buf_end: *mut u8, terminator: u8) -> *mut *mut c_char {
-    unsafe {
-        let mut line = *linep;
-        let mut e = eol as usize;
-        e += 7;
-        e -= e % 8;
-        let list = e as *mut *mut c_char;
-        let mut p = list;
-        'outer: loop {
-            if (p.add(2) as usize) > buf_end as usize {
-                errno::set(ERANGE);
-                return null_mut();
-            }
-            if *line == 0 {
-                break;
-            }
-            if *line == terminator {
-                line = line.add(1);
-                break;
-            }
-            while isspace(*line) {
-                line = line.add(1);
-            }
-            let elt = line;
-            loop {
-                if *line == 0 || *line == terminator || *line == b',' {
-                    if line > elt {
-                        *p = elt.cast();
-                        p = p.add(1);
-                    }
-                    if *line != 0 {
-                        let endc = *line;
-                        *line = 0;
-                        line = line.add(1);
-                        if endc == terminator {
-                            break 'outer;
-                        }
-                    }
-                    break;
-                }
-                line = line.add(1);
-            }
+fn parse_list_term(c: &mut Cur, mut v: Vec8, terminator: u8) -> Option<(*mut *mut c_char, usize)> {
+    'outer: loop {
+        if !v.room() {
+            errno::set(ERANGE);
+            return None;
         }
-        *p = null_mut();
-        *linep = line;
-        list
+        if c.at_end() {
+            break;
+        }
+        if c.peek() == terminator {
+            c.i += 1;
+            break;
+        }
+        c.skip_space();
+        let elt = c.i;
+        loop {
+            let ch = c.peek();
+            if ch == 0 || ch == terminator || ch == b',' {
+                if c.i > elt {
+                    let p = c.ptr(elt);
+                    v.push(p);
+                }
+                if ch != 0 {
+                    c.line[c.i] = 0;
+                    c.i += 1;
+                    if ch == terminator {
+                        break 'outer;
+                    }
+                }
+                break;
+            }
+            c.i += 1;
+        }
     }
+    Some(v.finish())
 }
 
 impl Entry for Sgrp {
-    const PATH: &'static [u8] = b"/etc/gshadow\0";
-    unsafe fn parse(line: *mut u8, res: *mut Sgrp, data: *mut u8, datalen: usize) -> i32 {
-        unsafe {
-            let buf_end = data.add(datalen);
-            let mut buf_start: *mut u8 = if line >= data && line < buf_end { line.add(rusty_libc_mem::strlen(line.cast()) + 1) } else { data };
-            let mut line = line;
-            chop_newline(line);
-            let r = &mut *res;
-            r.sg_namp = string_field(&mut line).cast();
-            if *line == 0 && matches!(*r.sg_namp as u8, b'+' | b'-') {
-                r.sg_passwd = null_mut();
-                r.sg_adm = null_mut();
-                r.sg_mem = null_mut();
-            } else {
-                r.sg_passwd = string_field(&mut line).cast();
-                let list = parse_list_term(&mut line, buf_start, buf_end, b':');
-                if list.is_null() {
-                    return -1;
-                }
-                r.sg_adm = list;
-                let mut l = list;
-                while !(*l).is_null() {
-                    l = l.add(1);
-                }
-                buf_start = l.add(1).cast();
-            }
-            let list = parse_list_term(&mut line, buf_start, buf_end, 0);
-            if list.is_null() {
-                return -1;
-            }
-            r.sg_mem = list;
-            1
+    const PATH: &'static CStr = c"/etc/gshadow";
+    fn parse(line: &mut [u8], area: &mut [u8], r: &mut Sgrp) -> i32 {
+        let mut c = Cur { line, i: 0 };
+        c.chop_newline();
+        r.sg_namp = c.string_field();
+        let mut mem_from = 0;
+        if c.at_end() && c.first_is_nis() {
+            r.sg_passwd = null_mut();
+            r.sg_adm = null_mut();
+            r.sg_mem = null_mut();
+        } else {
+            r.sg_passwd = c.string_field();
+            let Some((list, end)) = parse_list_term(&mut c, Vec8::new(area, 0), b':') else { return -1 };
+            r.sg_adm = list;
+            mem_from = end;
         }
+        let Some((list, _)) = parse_list_term(&mut c, Vec8::new(area, mem_from), 0) else { return -1 };
+        r.sg_mem = list;
+        1
     }
 }
 
-static mut SGNAM: StaticBuf<Sgrp> = StaticBuf { buf: null_mut(), size: 0, res: Sgrp::zero() };
-static mut SGENT: StaticBuf<Sgrp> = StaticBuf { buf: null_mut(), size: 0, res: Sgrp::zero() };
-static mut FGETSG: StaticBuf<Sgrp> = StaticBuf { buf: null_mut(), size: 0, res: Sgrp::zero() };
-static mut SGETSG: StaticBuf<Sgrp> = StaticBuf { buf: null_mut(), size: 0, res: Sgrp::zero() };
-static mut SG_DB: EntDb = EntDb::new();
+static SGNAM: Locked<StaticBuf<Sgrp>> = Locked::new(StaticBuf::new(Sgrp::zero()));
+static SGENT: Locked<StaticBuf<Sgrp>> = Locked::new(StaticBuf::new(Sgrp::zero()));
+static FGETSG: Locked<StaticBuf<Sgrp>> = Locked::new(StaticBuf::new(Sgrp::zero()));
+static SGETSG: Locked<StaticBuf<Sgrp>> = Locked::new(StaticBuf::new(Sgrp::zero()));
+static SG_DB: EntDb = EntDb::new();
 const SG_NAMES: EntNames = EntNames { db: b"gshadow", set: b"setsgent", get: b"getsgent_r", end: b"endsgent" };
+
+fn sgnam_r(k: Key, out: &mut Out<Sgrp>) -> c_int {
+    lookup(b"gshadow", b"getsgnam_r", out, |r: &Sgrp| !k.nis() && name_is(k.b, r.sg_namp), |f, r, b, l, en| call_by_name(f, k.p, r, b, l, en))
+}
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getsgnam_r(name: *const c_char, resbuf: *mut Sgrp, buffer: *mut c_char, buflen: usize, result: *mut *mut Sgrp) -> c_int {
-    unsafe {
-        let status = nss_dispatch(
-            b"gshadow",
-            b"getsgnam_r",
-            &|| db_lookup::<Sgrp>(resbuf, buffer.cast(), buflen, &|r| !is_nis(name) && cstr_eq(name, r.sg_namp)),
-            &|f, en| {
-                let f: unsafe extern "C" fn(*const c_char, *mut Sgrp, *mut c_char, usize, *mut c_int) -> c_int = core::mem::transmute(f);
-                f(name, resbuf, buffer, buflen, en)
-            },
-        );
-        finish_r(status, resbuf, result)
-    }
+    let (k, mut out) = unsafe { r_args(name, resbuf, buffer, buflen, result) };
+    sgnam_r(k, &mut out)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getsgnam(name: *const c_char) -> *mut Sgrp {
-    unsafe { by_key(&mut *(&raw mut SGNAM), |r, b, n, res| getsgnam_r(name, r, b.cast(), n, res)) }
+    let k = unsafe { Key::new(name) };
+    by_buf(&SGNAM, false, false, |out| sgnam_r(k, out))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setsgent() {
-    unsafe { db_setent::<Sgrp>(&raw mut SG_DB, &SG_NAMES) }
+    db_setent::<Sgrp>(&SG_DB, &SG_NAMES)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn endsgent() {
-    unsafe { db_endent::<Sgrp>(&raw mut SG_DB, &SG_NAMES) }
+    db_endent::<Sgrp>(&SG_DB, &SG_NAMES)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getsgent_r(resbuf: *mut Sgrp, buffer: *mut c_char, buflen: usize, result: *mut *mut Sgrp) -> c_int {
-    unsafe { db_getent_r::<Sgrp>(&raw mut SG_DB, &SG_NAMES, resbuf, buffer.cast(), buflen, result) }
+    let mut out = unsafe { Out::from_c(resbuf, buffer, buflen, result) };
+    db_getent::<Sgrp>(&SG_DB, &SG_NAMES, &mut out)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getsgent() -> *mut Sgrp {
-    unsafe { by_stream(&mut *(&raw mut SGENT), false, |r, b, n, res| getsgent_r(r, b.cast(), n, res)) }
+    by_buf(&SGENT, false, true, |out| db_getent::<Sgrp>(&SG_DB, &SG_NAMES, out))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -156,79 +126,79 @@ pub unsafe extern "C" fn fgetsgent_r(stream: *mut File, resbuf: *mut Sgrp, buffe
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fgetsgent(stream: *mut File) -> *mut Sgrp {
-    unsafe { fget::<Sgrp>(stream, &mut *(&raw mut FGETSG)) }
+    unsafe { fget::<Sgrp>(stream, &FGETSG) }
+}
+
+fn sgetsg_r(s: SrcStr, out: &mut Out<Sgrp>) -> c_int {
+    let buflen = out.buf.len();
+    if buflen == 0 {
+        errno::set(ERANGE);
+        return ERANGE;
+    }
+    let base = out.buf.as_ptr() as usize;
+    let pr = if s.addr < base || s.addr >= base + buflen {
+        if !strncpy_fits(s, out.buf) {
+            errno::set(ERANGE);
+            return ERANGE;
+        }
+        let (line, area) = split_line(out.buf);
+        Sgrp::parse(line, area, out.res)
+    } else {
+        let (_, rest) = out.buf.split_at_mut(s.addr - base);
+        let (line, area) = split_line(rest);
+        Sgrp::parse(line, area, out.res)
+    };
+    out.finish(pr > 0);
+    if pr > 0 { 0 } else { errno::get() }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sgetsgent_r(string: *const c_char, resbuf: *mut Sgrp, buffer: *mut c_char, buflen: usize, result: *mut *mut Sgrp) -> c_int {
-    unsafe {
-        let sp: *mut u8;
-        if (string as usize) < (buffer as usize) || (string as usize) >= (buffer as usize) + buflen {
-            *buffer.add(buflen - 1) = 0;
-            let mut i = 0;
-            while i < buflen {
-                let c = *string.add(i);
-                *buffer.add(i) = c;
-                if c == 0 {
-                    for j in i + 1..buflen {
-                        *buffer.add(j) = 0;
-                    }
-                    break;
-                }
-                i += 1;
-            }
-            if *buffer.add(buflen - 1) != 0 {
-                errno::set(ERANGE);
-                return ERANGE;
-            }
-            sp = buffer.cast();
-        } else {
-            sp = string as *mut u8;
-        }
-        let pr = Sgrp::parse(sp, resbuf, buffer.cast(), buflen);
-        *result = if pr > 0 { resbuf } else { null_mut() };
-        if (*result).is_null() { errno::get() } else { 0 }
-    }
+    let (s, mut out) = unsafe { sget_args(string, resbuf, buffer, buflen, result) };
+    sgetsg_r(s, &mut out)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sgetsgent(string: *const c_char) -> *mut Sgrp {
-    unsafe { by_stream(&mut *(&raw mut SGETSG), true, |r, b, n, res| sgetsgent_r(string, r, b.cast(), n, res)) }
+    let s = unsafe { SrcStr::new(string) };
+    by_buf(&SGETSG, true, true, |out| sgetsg_r(s, out))
+}
+
+fn sgrp_line(name: Option<&[u8]>, passwd: Option<&[u8]>, adm: CList, mem: CList) -> Option<Line> {
+    if name.is_none() || !valid_field(name) || !valid_field(passwd) || !valid_list_field(adm) || !valid_list_field(mem) {
+        return None;
+    }
+    let mut l = Line::new();
+    l.put(name.unwrap_or(b""));
+    l.put(b":");
+    l.put(passwd.unwrap_or(b""));
+    l.put(b":");
+    for (k, list) in [adm, mem].into_iter().enumerate() {
+        if k == 1 {
+            l.put(b":");
+        }
+        for (i, m) in list.iter().enumerate() {
+            if i > 0 {
+                l.put(b",");
+            }
+            l.put(m);
+        }
+    }
+    l.put(b"\n");
+    Some(l)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn putsgent(g: *const Sgrp, stream: *mut File) -> c_int {
-    unsafe {
-        if g.is_null() || stream.is_null() {
-            errno::set(EINVAL);
-            return -1;
-        }
-        let g = &*g;
-        if g.sg_namp.is_null() || !valid_field(g.sg_namp) || !valid_field(g.sg_passwd) || !valid_list_field(g.sg_adm) || !valid_list_field(g.sg_mem) {
-            errno::set(EINVAL);
-            return -1;
-        }
-        let mut l = Line::new();
-        l.put(bytes(g.sg_namp));
-        l.put(b":");
-        l.put(bytes(g.sg_passwd));
-        l.put(b":");
-        for (k, list) in [g.sg_adm, g.sg_mem].into_iter().enumerate() {
-            if k == 1 {
-                l.put(b":");
-            }
-            if !list.is_null() {
-                let mut i = 0;
-                while !(*list.add(i)).is_null() {
-                    if i > 0 {
-                        l.put(b",");
-                    }
-                    l.put(bytes(*list.add(i)));
-                    i += 1;
-                }
-            }
-        }
-        l.put(b"\n");
-        if l.write_to(stream) { 0 } else { -1 }
-    }
+    let (Some(g), Some(mut f)) = (unsafe { put_args(g, stream) }) else {
+        errno::set(EINVAL);
+        return -1;
+    };
+    let s = |q: *mut c_char| unsafe { opt(q) };
+    let l = |q: *mut *mut c_char| unsafe { CList::new(q) };
+    let Some(line) = sgrp_line(s(g.sg_namp), s(g.sg_passwd), l(g.sg_adm), l(g.sg_mem)) else {
+        errno::set(EINVAL);
+        return -1;
+    };
+    if line.write_to(&mut f) { 0 } else { -1 }
 }

@@ -74,26 +74,35 @@ struct Parts {
 }
 
 unsafe fn decode(p: *const u8, ty: u32) -> Parts {
-    unsafe {
-        match ty {
-            0 => {
-                let b = (p as *const u64).read_unaligned();
-                Parts { neg: b >> 63 != 0, zero: (b << 1) == 0, exponent: ((b >> 52) & 0x7ff) as i32 - 0x3ff, ix: ((b & ((1 << 52) - 1)) | (1 << 52)) as u128, mant_dig: 53 }
-            }
-            1 => {
-                let b = (p as *const u32).read_unaligned();
-                Parts { neg: b >> 31 != 0, zero: (b << 1) == 0, exponent: ((b >> 23) & 0xff) as i32 - 0x7f, ix: ((b & ((1 << 23) - 1)) | (1 << 23)) as u128, mant_dig: 24 }
-            }
-            2 => {
-                let m = (p as *const u64).read_unaligned();
-                let se = (p.add(8) as *const u16).read_unaligned();
-                Parts { neg: se & 0x8000 != 0, zero: m == 0, exponent: (se & 0x7fff) as i32 - 0x3fff, ix: m as u128, mant_dig: 64 }
-            }
-            _ => {
-                let b = (p as *const u128).read_unaligned();
-                let hi = b & !(1u128 << 127);
-                Parts { neg: b >> 127 != 0, zero: hi == 0, exponent: ((hi >> 112) & 0x7fff) as i32 - 0x3fff, ix: (b & ((1u128 << 112) - 1)) | (1u128 << 112), mant_dig: 113 }
-            }
+    let n = match ty {
+        0 => 8,
+        1 => 4,
+        2 => 10,
+        _ => 16,
+    };
+    decode_bytes(unsafe { rusty_libc_core::ffi::bytes(p, n) }, ty)
+}
+
+fn decode_bytes(b: &[u8], ty: u32) -> Parts {
+    let word = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+    match ty {
+        0 => {
+            let b = word(0);
+            Parts { neg: b >> 63 != 0, zero: (b << 1) == 0, exponent: ((b >> 52) & 0x7ff) as i32 - 0x3ff, ix: ((b & ((1 << 52) - 1)) | (1 << 52)) as u128, mant_dig: 53 }
+        }
+        1 => {
+            let b = u32::from_le_bytes(b[..4].try_into().unwrap());
+            Parts { neg: b >> 31 != 0, zero: (b << 1) == 0, exponent: ((b >> 23) & 0xff) as i32 - 0x7f, ix: ((b & ((1 << 23) - 1)) | (1 << 23)) as u128, mant_dig: 24 }
+        }
+        2 => {
+            let m = word(0);
+            let se = u16::from_le_bytes([b[8], b[9]]);
+            Parts { neg: se & 0x8000 != 0, zero: m == 0, exponent: (se & 0x7fff) as i32 - 0x3fff, ix: m as u128, mant_dig: 64 }
+        }
+        _ => {
+            let b = u128::from(word(0)) | u128::from(word(8)) << 64;
+            let hi = b & !(1u128 << 127);
+            Parts { neg: b >> 127 != 0, zero: hi == 0, exponent: ((hi >> 112) & 0x7fff) as i32 - 0x3fff, ix: (b & ((1u128 << 112) - 1)) | (1u128 << 112), mant_dig: 113 }
         }
     }
 }

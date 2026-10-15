@@ -6,17 +6,26 @@ use crate::wfile;
 use core::ffi::{VaList, c_int};
 use rusty_libc_wchar::wchar_t;
 
-pub struct WFileSrc(pub *mut FILE);
+pub struct WFileSrc(*mut FILE);
+
+impl WFileSrc {
+    pub unsafe fn new(f: *mut FILE) -> WFileSrc {
+        WFileSrc(f)
+    }
+
+    #[inline(always)]
+    fn stream(&mut self) -> &mut FILE {
+        unsafe { file::stream(self.0) }
+    }
+}
 
 impl Src for WFileSrc {
     const WIDE: bool = true;
-    unsafe fn get(&mut self) -> c_int {
-        unsafe { wfile::getwc_raw(self.0) as c_int }
+    fn get(&mut self) -> c_int {
+        wfile::getwc_raw(self.stream()) as c_int
     }
-    unsafe fn unget(&mut self, c: c_int) {
-        unsafe {
-            wfile::ungetwc_raw(c as u32, self.0);
-        }
+    fn unget(&mut self, c: c_int) {
+        wfile::ungetwc_raw(c as u32, self.stream());
     }
 }
 
@@ -25,44 +34,39 @@ pub struct WStrSrc {
 }
 
 impl WStrSrc {
-    pub fn new(p: *const u32) -> WStrSrc {
+    pub unsafe fn new(p: *const u32) -> WStrSrc {
         WStrSrc { p }
     }
 }
 
 impl Src for WStrSrc {
     const WIDE: bool = true;
-    unsafe fn get(&mut self) -> c_int {
-        unsafe {
-            let c = *self.p;
-            if c == 0 {
-                scan::EOF
-            } else {
-                self.p = self.p.add(1);
-                c as c_int
-            }
+    fn get(&mut self) -> c_int {
+        let c = unsafe { *self.p };
+        if c == 0 {
+            scan::EOF
+        } else {
+            self.p = self.p.wrapping_add(1);
+            c as c_int
         }
     }
-    unsafe fn unget(&mut self, _c: c_int) {
-        unsafe { self.p = self.p.sub(1) };
+    fn unget(&mut self, _c: c_int) {
+        self.p = self.p.wrapping_sub(1);
     }
 }
 
 unsafe fn stream_scan(f: *mut FILE, format: *const wchar_t, va: &mut VaList, mode: u32) -> c_int {
-    unsafe { locked!(f, move || stream_scan_u(f, format, va, mode)) }
-}
-
-unsafe fn stream_scan_u(f: *mut FILE, format: *const wchar_t, va: &mut VaList, mode: u32) -> c_int {
-    unsafe {
-        if !wfile::wide_ok(f) {
+    locked!(f, |s| {
+        if !wfile::wide_ok(s) {
             return scan::EOF;
         }
-        if (*f).flags & crate::file::F_READ == 0 {
+        if s.flags & crate::file::F_READ == 0 {
             rusty_libc_core::errno::set(9);
             return scan::EOF;
         }
-        scan_run_fmt::<WFileSrc, u32>(&mut WFileSrc(f), format as *const u32, va, mode)
-    }
+        let mut src = unsafe { WFileSrc::new(f) };
+        unsafe { scan_run_fmt::<WFileSrc, u32>(&mut src, format as *const u32, va, mode) }
+    })
 }
 
 macro_rules! wscanf_family {
@@ -77,7 +81,8 @@ macro_rules! wscanf_family {
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $vswscanf(s: *const wchar_t, format: *const wchar_t, mut ap: VaList) -> c_int {
-            unsafe { scan_run_fmt::<WStrSrc, u32>(&mut WStrSrc::new(s as *const u32), format as *const u32, &mut ap, $mode) }
+            let mut src = unsafe { WStrSrc::new(s as *const u32) };
+            unsafe { scan_run_fmt::<WStrSrc, u32>(&mut src, format as *const u32, &mut ap, $mode) }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $fwscanf(f: *mut FILE, format: *const wchar_t, mut args: ...) -> c_int {
@@ -89,7 +94,8 @@ macro_rules! wscanf_family {
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $swscanf(s: *const wchar_t, format: *const wchar_t, mut args: ...) -> c_int {
-            unsafe { scan_run_fmt::<WStrSrc, u32>(&mut WStrSrc::new(s as *const u32), format as *const u32, &mut args, $mode) }
+            let mut src = unsafe { WStrSrc::new(s as *const u32) };
+            unsafe { scan_run_fmt::<WStrSrc, u32>(&mut src, format as *const u32, &mut args, $mode) }
         }
     };
 }

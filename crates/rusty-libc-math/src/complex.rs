@@ -50,8 +50,11 @@ fn set_mxcsr(v: u32) {
 #[inline(never)]
 fn in_nearest_directed<F: CF>(f: impl Fn() -> (W<F>, W<F>)) -> (W<F>, W<F>) {
     let c0 = mxcsr();
+    let w0 = crate::fenv::cw_get();
+    crate::fenv::cw_set(w0 & !0xC00);
     set_mxcsr(c0 & !(RC | OE_UE));
     let (re, im) = f();
+    crate::fenv::cw_set(w0);
     let c1 = mxcsr();
     set_mxcsr((c1 & !RC) | (c0 & (RC | OE_UE)));
     let edge = |v: W<F>| v.is_inf() || v == 0.0;

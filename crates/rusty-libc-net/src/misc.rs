@@ -1,6 +1,7 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::types::*;
 use core::ffi::{c_int, c_void};
-use rusty_libc_core::errno;
+use rusty_libc_core::{errno, ffi};
 
 const HBH: usize = 2;
 const IP6OPT_PAD1: u8 = 0;
@@ -18,20 +19,19 @@ pub unsafe extern "C" fn inet6_opt_init(extbuf: *mut c_void, extlen: socklen_t) 
         if extlen == 0 || !a8(extlen) || extlen > 256 * 8 {
             return -1;
         }
-        unsafe { *(extbuf as *mut u8).add(1) = (extlen / 8 - 1) as u8 };
+        let b = unsafe { ffi::bytes_mut(extbuf.cast::<u8>(), extlen as usize) };
+        b[1] = (extlen / 8 - 1) as u8;
     }
     HBH as c_int
 }
 
-unsafe fn add_padding(extbuf: *mut u8, offset: usize, npad: usize) {
-    unsafe {
-        if npad == 1 {
-            *extbuf.add(offset) = IP6OPT_PAD1;
-        } else if npad > 0 {
-            *extbuf.add(offset) = IP6OPT_PADN;
-            *extbuf.add(offset + 1) = (npad - 2) as u8;
-            core::ptr::write_bytes(extbuf.add(offset + 2), 0, npad - 2);
-        }
+fn add_padding(b: &mut [u8], offset: usize, npad: usize) {
+    if npad == 1 {
+        b[offset] = IP6OPT_PAD1;
+    } else if npad > 0 {
+        b[offset] = IP6OPT_PADN;
+        b[offset + 1] = (npad - 2) as u8;
+        b[offset + 2..offset + npad].fill(0);
     }
 }
 
@@ -53,14 +53,13 @@ pub unsafe extern "C" fn inet6_opt_append(extbuf: *mut c_void, extlen: socklen_t
         if data_offset + npad + len as usize > extlen as usize {
             return -1;
         }
-        let b = extbuf as *mut u8;
-        unsafe {
-            add_padding(b, offset, npad);
-            offset += npad;
-            *b.add(offset) = ty;
-            *b.add(offset + 1) = len as u8;
-            *databufp = b.add(offset + HBH) as *mut c_void;
-        }
+        let b = unsafe { ffi::bytes_mut(extbuf.cast::<u8>(), extlen as usize) };
+        add_padding(b, offset, npad);
+        offset += npad;
+        b[offset] = ty;
+        b[offset + 1] = len as u8;
+        let data = b[offset + HBH..].as_mut_ptr().cast::<c_void>();
+        unsafe { databufp.write(data) };
     } else {
         offset += npad;
     }
@@ -77,90 +76,90 @@ pub unsafe extern "C" fn inet6_opt_finish(extbuf: *mut c_void, extlen: socklen_t
         if offset as usize + npad > extlen as usize {
             return -1;
         }
-        unsafe { add_padding(extbuf as *mut u8, offset as usize, npad) };
+        add_padding(unsafe { ffi::bytes_mut(extbuf.cast::<u8>(), extlen as usize) }, offset as usize, npad);
     }
     (offset as usize + npad) as c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet6_opt_set_val(databuf: *mut c_void, offset: c_int, val: *mut c_void, vallen: socklen_t) -> c_int {
-    unsafe { core::ptr::copy_nonoverlapping(val as *const u8, (databuf as *mut u8).offset(offset as isize), vallen as usize) };
+    let src = unsafe { ffi::bytes(val.cast::<u8>(), vallen as usize) };
+    let dst = unsafe { ffi::bytes_mut(databuf.cast::<u8>().wrapping_offset(offset as isize), vallen as usize) };
+    dst.copy_from_slice(src);
     offset + vallen as c_int
+}
+
+fn opt_walk(b: &[u8], offset: c_int, want: Option<u8>) -> Option<(usize, u8, usize, u8)> {
+    let mut offset = offset as i64;
+    if offset == 0 {
+        offset = HBH as i64;
+    } else if offset < HBH as i64 {
+        return None;
+    }
+    let extlen = b.len() as i64;
+    let mut off = offset as usize;
+    while (off as i64) < extlen {
+        let t = b[off];
+        if t == IP6OPT_PAD1 {
+            off += 1;
+            if want == Some(IP6OPT_PAD1) {
+                return Some((off, t, off, 0));
+            }
+        } else {
+            let l = *b.get(off + 1)?;
+            let start = off;
+            off += HBH + l as usize;
+            let skip = match want {
+                None => t == IP6OPT_PADN,
+                Some(w) => w != t,
+            };
+            if skip {
+                continue;
+            }
+            if off as i64 > extlen {
+                return None;
+            }
+            return Some((off, t, start + HBH, l));
+        }
+    }
+    None
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet6_opt_next(extbuf: *mut c_void, extlen: socklen_t, offset: c_int, typep: *mut u8, lenp: *mut socklen_t, databufp: *mut *mut c_void) -> c_int {
-    let mut offset = offset as i64;
-    if offset == 0 {
-        offset = HBH as i64;
-    } else if offset < HBH as i64 {
-        return -1;
-    }
-    let b = extbuf as *mut u8;
-    while offset < extlen as i64 {
-        unsafe {
-            let ty = *b.offset(offset as isize);
-            if ty == IP6OPT_PAD1 {
-                offset += 1;
-            } else if ty == IP6OPT_PADN {
-                offset += HBH as i64 + *b.offset(offset as isize + 1) as i64;
-            } else {
-                let l = *b.offset(offset as isize + 1);
-                let start = offset;
-                offset += HBH as i64 + l as i64;
-                if offset > extlen as i64 {
-                    return -1;
-                }
-                *typep = ty;
-                *lenp = l as socklen_t;
-                *databufp = b.offset(start as isize + HBH as isize) as *mut c_void;
-                return offset as c_int;
-            }
+    let b = unsafe { ffi::bytes_mut(extbuf.cast::<u8>(), extlen as usize) };
+    match opt_walk(b, offset, None) {
+        Some((next, ty, data, l)) => {
+            unsafe { typep.write(ty) };
+            unsafe { opt_found(lenp, databufp, l, b[data..].as_mut_ptr()) };
+            next as c_int
         }
+        None => -1,
     }
-    -1
+}
+
+unsafe fn opt_found(lenp: *mut socklen_t, databufp: *mut *mut c_void, l: u8, data: *mut u8) {
+    unsafe { lenp.write(l as socklen_t) };
+    unsafe { databufp.write(data.cast::<c_void>()) };
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet6_opt_find(extbuf: *mut c_void, extlen: socklen_t, offset: c_int, ty: u8, lenp: *mut socklen_t, databufp: *mut *mut c_void) -> c_int {
-    let mut offset = offset as i64;
-    if offset == 0 {
-        offset = HBH as i64;
-    } else if offset < HBH as i64 {
-        return -1;
-    }
-    let b = extbuf as *mut u8;
-    while offset < extlen as i64 {
-        unsafe {
-            let t = *b.offset(offset as isize);
-            if t == IP6OPT_PAD1 {
-                offset += 1;
-                if ty == IP6OPT_PAD1 {
-                    *lenp = 0;
-                    *databufp = b.offset(offset as isize) as *mut c_void;
-                    return offset as c_int;
-                }
-            } else if t != ty {
-                offset += HBH as i64 + *b.offset(offset as isize + 1) as i64;
-            } else {
-                let l = *b.offset(offset as isize + 1);
-                let start = offset;
-                offset += HBH as i64 + l as i64;
-                if offset > extlen as i64 {
-                    return -1;
-                }
-                *lenp = l as socklen_t;
-                *databufp = b.offset(start as isize + HBH as isize) as *mut c_void;
-                return offset as c_int;
-            }
+    let b = unsafe { ffi::bytes_mut(extbuf.cast::<u8>(), extlen as usize) };
+    match opt_walk(b, offset, Some(ty)) {
+        Some((next, _, data, l)) => {
+            unsafe { opt_found(lenp, databufp, l, b[data..].as_mut_ptr()) };
+            next as c_int
         }
+        None => -1,
     }
-    -1
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet6_opt_get_val(databuf: *mut c_void, offset: c_int, val: *mut c_void, vallen: socklen_t) -> c_int {
-    unsafe { core::ptr::copy_nonoverlapping((databuf as *const u8).offset(offset as isize), val as *mut u8, vallen as usize) };
+    let src = unsafe { ffi::bytes(databuf.cast::<u8>().wrapping_offset(offset as isize), vallen as usize) };
+    let dst = unsafe { ffi::bytes_mut(val.cast::<u8>(), vallen as usize) };
+    dst.copy_from_slice(src);
     offset + vallen as c_int
 }
 
@@ -176,117 +175,124 @@ pub unsafe extern "C" fn inet6_rth_init(bp: *mut c_void, bp_len: socklen_t, ty: 
         if len > bp_len as usize {
             return core::ptr::null_mut();
         }
-        unsafe {
-            core::ptr::write_bytes(bp as *mut u8, 0, len);
-            *(bp as *mut u8).add(1) = (segments as usize * 16 / 8) as u8;
-            *(bp as *mut u8).add(2) = IPV6_RTHDR_TYPE_0 as u8;
-        }
+        let b = unsafe { ffi::bytes_mut(bp.cast::<u8>(), len) };
+        b.fill(0);
+        b[1] = (segments as usize * 16 / 8) as u8;
+        b[2] = IPV6_RTHDR_TYPE_0 as u8;
         return bp;
     }
     core::ptr::null_mut()
 }
 
+unsafe fn rth_fixed(bp: *const c_void) -> (u8, u8, u8) {
+    let h = unsafe { ffi::bytes(bp.cast::<u8>(), 4) };
+    (h[1], h[2], h[3])
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet6_rth_add(bp: *mut c_void, addr: *const in6_addr) -> c_int {
-    unsafe {
-        let b = bp as *mut u8;
-        if *b.add(2) as c_int != IPV6_RTHDR_TYPE_0 {
-            return -1;
-        }
-        let len = *b.add(1) as i32;
-        let segleft = *b.add(3);
-        if len * 8 / 16 - (segleft as i32) < 1 {
-            return -1;
-        }
-        core::ptr::copy_nonoverlapping(addr as *const u8, b.add(8 + segleft as usize * 16), 16);
-        *b.add(3) = segleft + 1;
-        0
+    let (len, ty, segleft) = unsafe { rth_fixed(bp) };
+    if ty as c_int != IPV6_RTHDR_TYPE_0 {
+        return -1;
     }
+    if len as i32 * 8 / 16 - (segleft as i32) < 1 {
+        return -1;
+    }
+    let b = unsafe { ffi::bytes_mut(bp.cast::<u8>(), 8 + len as usize * 8) };
+    let a = unsafe { &(*addr).s6_addr };
+    let at = 8 + segleft as usize * 16;
+    b[at..at + 16].copy_from_slice(a);
+    b[3] = segleft + 1;
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet6_rth_reverse(in_: *const c_void, out: *mut c_void) -> c_int {
-    unsafe {
-        let i = in_ as *const u8;
-        let o = out as *mut u8;
-        if *i.add(2) as c_int != IPV6_RTHDR_TYPE_0 {
-            return -1;
-        }
-        core::ptr::copy(i, o, 8);
-        let total = (*i.add(1) as usize) * 8 / 16;
-        for k in 0..total / 2 {
-            let mut tmp = [0u8; 16];
-            core::ptr::copy_nonoverlapping(i.add(8 + k * 16), tmp.as_mut_ptr(), 16);
-            core::ptr::copy(i.add(8 + (total - 1 - k) * 16), o.add(8 + k * 16), 16);
-            core::ptr::copy_nonoverlapping(tmp.as_ptr(), o.add(8 + (total - 1 - k) * 16), 16);
-        }
-        if !total.is_multiple_of(2) && !core::ptr::eq(in_, out as *const c_void) {
-            core::ptr::copy_nonoverlapping(i.add(8 + (total / 2) * 16), o.add(8 + (total / 2) * 16), 16);
-        }
-        *o.add(3) = total as u8;
-        0
+    let (len, ty, _) = unsafe { rth_fixed(in_) };
+    if ty as c_int != IPV6_RTHDR_TYPE_0 {
+        return -1;
     }
+    let total = (len as usize) * 8 / 16;
+    let size = 8 + total * 16;
+    let mut copy = [0u8; 8 + 127 * 16];
+    copy[..size].copy_from_slice(unsafe { ffi::bytes(in_.cast::<u8>(), size) });
+    let o = unsafe { ffi::bytes_mut(out.cast::<u8>(), size) };
+    o[..8].copy_from_slice(&copy[..8]);
+    for k in 0..total {
+        o[8 + k * 16..8 + (k + 1) * 16].copy_from_slice(&copy[8 + (total - 1 - k) * 16..8 + (total - k) * 16]);
+    }
+    o[3] = total as u8;
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet6_rth_segments(bp: *const c_void) -> c_int {
-    unsafe {
-        let b = bp as *const u8;
-        if *b.add(2) as c_int == IPV6_RTHDR_TYPE_0 { (*b.add(1) as c_int) * 8 / 16 } else { -1 }
-    }
+    let (len, ty, _) = unsafe { rth_fixed(bp) };
+    if ty as c_int == IPV6_RTHDR_TYPE_0 { (len as c_int) * 8 / 16 } else { -1 }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet6_rth_getaddr(bp: *const c_void, index: c_int) -> *mut in6_addr {
-    unsafe {
-        let b = bp as *mut u8;
-        if *b.add(2) as c_int == IPV6_RTHDR_TYPE_0 && index < (*b.add(1) as c_int) * 8 / 16 {
-            return b.offset(8 + index as isize * 16) as *mut in6_addr;
-        }
-        core::ptr::null_mut()
+    let (len, ty, _) = unsafe { rth_fixed(bp) };
+    if ty as c_int == IPV6_RTHDR_TYPE_0 && index < (len as c_int) * 8 / 16 {
+        return bp.cast::<u8>().cast_mut().wrapping_offset(8 + index as isize * 16).cast::<in6_addr>();
     }
+    core::ptr::null_mut()
 }
 
 static LAST_PORT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static START_PORT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(600);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn bindresvport(fd: c_int, sin: *mut sockaddr_in) -> c_int {
     use core::sync::atomic::Ordering;
+    const LOW: u32 = 512;
     const START: u32 = 600;
     const END: u32 = 1023;
     let mut local = sockaddr_in { sin_family: AF_INET as u16, sin_port: 0, sin_addr: in_addr { s_addr: 0 }, sin_zero: [0; 8] };
-    let sin = if sin.is_null() { &mut local as *mut sockaddr_in } else { sin };
-    let fam = unsafe { (*sin).sin_family } as c_int;
-    if fam != AF_INET && fam != AF_INET6 && fam != AF_UNSPEC {
-        errno::set(EPFNOSUPPORT);
-        return -1;
+    let sin = if sin.is_null() {
+        &mut local as *mut sockaddr_in
+    } else {
+        if unsafe { (*sin).sin_family } as c_int != AF_INET {
+            errno::set(EAFNOSUPPORT);
+            return -1;
+        }
+        sin
+    };
+    let mut port = LAST_PORT.load(Ordering::Relaxed);
+    if port == 0 {
+        port = (rusty_libc_core::unistd::getpid() as u32) % (END - START + 1) + START;
     }
-    let len: socklen_t = if fam == AF_INET6 { 28 } else { 16 };
-    unsafe { (*sin).sin_family = if fam == AF_UNSPEC { AF_INET as u16 } else { fam as u16 } };
-    let mut p = LAST_PORT.load(Ordering::Relaxed);
-    if !(START..=END).contains(&p) {
-        let mut b = [0u8; 2];
-        unsafe { rusty_libc_core::syscall::syscall3(318, b.as_mut_ptr() as usize, 2, 0) };
-        p = START + (u16::from_ne_bytes(b) as u32) % (END - START + 1);
-    }
-    let mut tries = 0;
+    let mut startport = START_PORT.load(Ordering::Relaxed);
+    let mut endport = END;
+    let mut nports = END - startport + 1;
+    let mut res;
     loop {
-        unsafe { (*sin).sin_port = (p as u16).to_be() };
-        if unsafe { crate::sock::bind(fd, sin as *const sockaddr, len) } == 0 {
-            LAST_PORT.store(p + 1, Ordering::Relaxed);
-            return 0;
+        let mut i = 0;
+        res = -1;
+        while i < nports {
+            unsafe { (*sin).sin_port = (port as u16).to_be() };
+            port += 1;
+            if port > endport {
+                port = startport;
+            }
+            res = unsafe { crate::sock::bind(fd, sin as *const sockaddr, 16) };
+            if res >= 0 || errno::get() != EADDRINUSE {
+                break;
+            }
+            i += 1;
         }
-        let e = errno::get();
-        if e != EADDRINUSE {
-            return -1;
+        if i == nports && startport != LOW {
+            startport = LOW;
+            endport = START - 1;
+            nports = START - LOW;
+            port = LOW + port % (START - LOW);
+            START_PORT.store(LOW, Ordering::Relaxed);
+            continue;
         }
-        p = if p >= END { START } else { p + 1 };
-        tries += 1;
-        if tries > (END - START + 1) {
-            errno::set(EADDRINUSE);
-            return -1;
-        }
+        break;
     }
+    LAST_PORT.store(port, Ordering::Relaxed);
+    res
 }
 
-const EPFNOSUPPORT: i32 = 96;

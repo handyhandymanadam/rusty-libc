@@ -1,7 +1,8 @@
 use crate::misc::sc;
 use core::ffi::{c_int, c_uint, c_ulong, c_void};
-use rusty_libc_core::syscall::{check, syscall3, syscall4, syscall6};
+use rusty_libc_core::syscall::{check, syscall4, syscall6};
 use rusty_libc_core::Errno;
+use crate::kernel::{plain, plain_cp};
 
 const SYS_PREAD64: usize = 17;
 const SYS_PWRITE64: usize = 18;
@@ -35,11 +36,11 @@ pub fn pwrite_r(fd: i32, buf: &[u8], off: i64) -> Result<usize, Errno> {
     unsafe { check(rusty_libc_core::tls::syscall_cp(SYS_PWRITE64, fd as usize, buf.as_ptr() as usize, buf.len(), off as usize, 0, 0)) }
 }
 
-pub fn readv_r(fd: i32, bufs: &mut [iovec]) -> Result<usize, Errno> {
+pub unsafe fn readv_r(fd: i32, bufs: &mut [iovec]) -> Result<usize, Errno> {
     unsafe { check(rusty_libc_core::tls::syscall_cp(SYS_READV, fd as usize, bufs.as_mut_ptr() as usize, bufs.len(), 0, 0, 0)) }
 }
 
-pub fn writev_r(fd: i32, bufs: &[iovec]) -> Result<usize, Errno> {
+pub unsafe fn writev_r(fd: i32, bufs: &[iovec]) -> Result<usize, Errno> {
     unsafe { check(rusty_libc_core::tls::syscall_cp(SYS_WRITEV, fd as usize, bufs.as_ptr() as usize, bufs.len(), 0, 0, 0)) }
 }
 
@@ -63,15 +64,13 @@ pub unsafe extern "C" fn pwritev(fd: c_int, iov: *const iovec, n: c_int, off: i6
     unsafe { sc(rusty_libc_core::tls::syscall_cp(SYS_PWRITEV, fd as usize, iov as usize, n as isize as usize, off as usize, 0, 0)) }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn preadv64(fd: c_int, iov: *const iovec, n: c_int, off: i64) -> isize {
-    unsafe { preadv(fd, iov, n, off) }
-}
+crate::unistd::alias!(
+    preadv64 => preadv(fd: c_int, iov: *const iovec, n: c_int, off: i64) -> isize
+);
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pwritev64(fd: c_int, iov: *const iovec, n: c_int, off: i64) -> isize {
-    unsafe { pwritev(fd, iov, n, off) }
-}
+crate::unistd::alias!(
+    pwritev64 => pwritev(fd: c_int, iov: *const iovec, n: c_int, off: i64) -> isize
+);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn preadv2(fd: c_int, iov: *const iovec, n: c_int, off: i64, flags: c_int) -> isize {
@@ -83,15 +82,13 @@ pub unsafe extern "C" fn pwritev2(fd: c_int, iov: *const iovec, n: c_int, off: i
     unsafe { sc(rusty_libc_core::tls::syscall_cp(SYS_PWRITEV2, fd as usize, iov as usize, n as isize as usize, off as usize, 0, flags as isize as usize)) }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn preadv64v2(fd: c_int, iov: *const iovec, n: c_int, off: i64, flags: c_int) -> isize {
-    unsafe { preadv2(fd, iov, n, off, flags) }
-}
+crate::unistd::alias!(
+    preadv64v2 => preadv2(fd: c_int, iov: *const iovec, n: c_int, off: i64, flags: c_int) -> isize
+);
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pwritev64v2(fd: c_int, iov: *const iovec, n: c_int, off: i64, flags: c_int) -> isize {
-    unsafe { pwritev2(fd, iov, n, off, flags) }
-}
+crate::unistd::alias!(
+    pwritev64v2 => pwritev2(fd: c_int, iov: *const iovec, n: c_int, off: i64, flags: c_int) -> isize
+);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn process_vm_readv(
@@ -131,25 +128,22 @@ pub unsafe extern "C" fn pwrite(fd: c_int, buf: *const c_void, n: usize, off: i6
     unsafe { sc(rusty_libc_core::tls::syscall_cp(SYS_PWRITE64, fd as usize, buf as usize, n, off as usize, 0, 0)) }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pread64(fd: c_int, buf: *mut c_void, n: usize, off: i64) -> isize {
-    unsafe { pread(fd, buf, n, off) }
-}
+crate::unistd::alias!(
+    pread64 => pread(fd: c_int, buf: *mut c_void, n: usize, off: i64) -> isize
+);
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pwrite64(fd: c_int, buf: *const c_void, n: usize, off: i64) -> isize {
-    unsafe { pwrite(fd, buf, n, off) }
-}
+crate::unistd::alias!(
+    pwrite64 => pwrite(fd: c_int, buf: *const c_void, n: usize, off: i64) -> isize
+);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sendfile(out_fd: c_int, in_fd: c_int, offset: *mut i64, count: usize) -> isize {
     unsafe { sc(syscall4(SYS_SENDFILE, out_fd as usize, in_fd as usize, offset as usize, count)) }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn sendfile64(out_fd: c_int, in_fd: c_int, offset: *mut i64, count: usize) -> isize {
-    unsafe { sendfile(out_fd, in_fd, offset, count) }
-}
+crate::unistd::alias!(
+    sendfile64 => sendfile(out_fd: c_int, in_fd: c_int, offset: *mut i64, count: usize) -> isize
+);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn splice(fd_in: c_int, off_in: *mut i64, fd_out: c_int, off_out: *mut i64, len: usize, flags: c_uint) -> isize {
@@ -158,7 +152,7 @@ pub unsafe extern "C" fn splice(fd_in: c_int, off_in: *mut i64, fd_out: c_int, o
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn tee(fd_in: c_int, fd_out: c_int, len: usize, flags: c_uint) -> isize {
-    unsafe { sc(rusty_libc_core::tls::syscall_cp(SYS_TEE, fd_in as usize, fd_out as usize, len, flags as usize, 0, 0)) }
+    sc(plain_cp!(SYS_TEE, fd_in as usize, fd_out as usize, len, flags as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -173,6 +167,6 @@ pub unsafe extern "C" fn copy_file_range(fd_in: c_int, off_in: *mut i64, fd_out:
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn readahead(fd: c_int, off: i64, count: usize) -> isize {
-    unsafe { sc(syscall3(SYS_READAHEAD, fd as usize, off as usize, count)) }
+    sc(plain!(SYS_READAHEAD, fd as usize, off as usize, count))
 }
 

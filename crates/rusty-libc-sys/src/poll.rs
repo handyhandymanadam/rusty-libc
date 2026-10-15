@@ -1,7 +1,8 @@
 use crate::misc::{sc, sci};
 use core::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
-use rusty_libc_core::syscall::{check, syscall1, syscall2, syscall3, syscall4, syscall5};
+use rusty_libc_core::syscall::{check, syscall2, syscall3, syscall4, syscall5};
 use rusty_libc_core::{Errno, errno};
+use crate::kernel::plain;
 
 const SYS_POLL: usize = 7;
 const SYS_SELECT_PSELECT6: usize = 270;
@@ -87,11 +88,11 @@ pub fn poll_r(fds: &mut [pollfd], timeout_ms: i32) -> Result<usize, Errno> {
 }
 
 pub fn eventfd_r(initval: u32, flags: i32) -> Result<i32, Errno> {
-    unsafe { check(syscall2(SYS_EVENTFD2, initval as usize, flags as usize)).map(|v| v as i32) }
+    check(plain!(SYS_EVENTFD2, initval as usize, flags as usize)).map(|v| v as i32)
 }
 
 pub fn epoll_create1_r(flags: i32) -> Result<i32, Errno> {
-    unsafe { check(syscall1(SYS_EPOLL_CREATE1, flags as usize)).map(|v| v as i32) }
+    check(plain!(SYS_EPOLL_CREATE1, flags as usize)).map(|v| v as i32)
 }
 
 pub fn epoll_ctl_r(epfd: i32, op: i32, fd: i32, ev: Option<&mut epoll_event>) -> Result<(), Errno> {
@@ -112,40 +113,44 @@ pub unsafe extern "C" fn poll(fds: *mut pollfd, nfds: c_ulong, timeout: c_int) -
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ppoll(fds: *mut pollfd, nfds: c_ulong, timeout: *const timespec, sigmask: *const c_void) -> c_int {
-    unsafe {
-        let mut tv = if timeout.is_null() { timespec::default() } else { *timeout };
-        let tp = if timeout.is_null() { 0 } else { &mut tv as *mut timespec as usize };
-        sci(rusty_libc_core::tls::syscall_cp(SYS_PPOLL, fds as usize, nfds as usize, tp, sigmask as usize, KERNEL_SIGSET, 0))
-    }
+    let mut tv = if timeout.is_null() {
+        timespec::default()
+    } else {
+        unsafe { timeout.read() }
+    };
+    let tp = if timeout.is_null() { 0 } else { &mut tv as *mut timespec as usize };
+    sci(unsafe { rusty_libc_core::tls::syscall_cp(SYS_PPOLL, fds as usize, nfds as usize, tp, sigmask as usize, KERNEL_SIGSET, 0) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn select(nfds: c_int, r: *mut fd_set, w: *mut fd_set, e: *mut fd_set, timeout: *mut timeval) -> c_int {
-    unsafe {
-        let mut s: i64 = if timeout.is_null() { 0 } else { (*timeout).tv_sec };
-        let mut us: i32 = if timeout.is_null() { 0 } else { (*timeout).tv_usec as i32 };
-        if s < 0 || us < 0 {
-            errno::set(EINVAL);
-            return -1;
-        }
-        let ns: i64;
-        if (us as i64) / USEC_PER_SEC > i64::MAX - s {
-            s = i64::MAX;
-            ns = NSEC_PER_SEC - 1;
-        } else {
-            s += (us as i64) / USEC_PER_SEC;
-            us %= USEC_PER_SEC as i32;
-            ns = us as i64 * 1000;
-        }
-        let mut ts = timespec { tv_sec: s, tv_nsec: ns };
-        let tp = if timeout.is_null() { 0 } else { &mut ts as *mut timespec as usize };
-        let ret = sci(rusty_libc_core::tls::syscall_cp(SYS_SELECT_PSELECT6, nfds as usize, r as usize, w as usize, e as usize, tp, 0));
-        if !timeout.is_null() {
-            (*timeout).tv_sec = ts.tv_sec;
-            (*timeout).tv_usec = ts.tv_nsec / 1000;
-        }
-        ret
+    let tv = if timeout.is_null() {
+        timeval::default()
+    } else {
+        unsafe { timeout.read() }
+    };
+    let mut s: i64 = tv.tv_sec;
+    let mut us: i32 = tv.tv_usec as i32;
+    if s < 0 || us < 0 {
+        errno::set(EINVAL);
+        return -1;
     }
+    let ns: i64;
+    if (us as i64) / USEC_PER_SEC > i64::MAX - s {
+        s = i64::MAX;
+        ns = NSEC_PER_SEC - 1;
+    } else {
+        s += (us as i64) / USEC_PER_SEC;
+        us %= USEC_PER_SEC as i32;
+        ns = us as i64 * 1000;
+    }
+    let mut ts = timespec { tv_sec: s, tv_nsec: ns };
+    let tp = if timeout.is_null() { 0 } else { &mut ts as *mut timespec as usize };
+    let ret = sci(unsafe { rusty_libc_core::tls::syscall_cp(SYS_SELECT_PSELECT6, nfds as usize, r as usize, w as usize, e as usize, tp, 0) });
+    if !timeout.is_null() {
+        unsafe { timeout.write(timeval { tv_sec: ts.tv_sec, tv_usec: ts.tv_nsec / 1000 }) };
+    }
+    ret
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -157,12 +162,14 @@ pub unsafe extern "C" fn pselect(
     timeout: *const timespec,
     sigmask: *const c_void,
 ) -> c_int {
-    unsafe {
-        let mut tv = if timeout.is_null() { timespec::default() } else { *timeout };
-        let tp = if timeout.is_null() { 0 } else { &mut tv as *mut timespec as usize };
-        let data: [usize; 2] = [sigmask as usize, KERNEL_SIGSET];
-        sci(rusty_libc_core::tls::syscall_cp(SYS_SELECT_PSELECT6, nfds as usize, r as usize, w as usize, e as usize, tp, data.as_ptr() as usize))
-    }
+    let mut tv = if timeout.is_null() {
+        timespec::default()
+    } else {
+        unsafe { timeout.read() }
+    };
+    let tp = if timeout.is_null() { 0 } else { &mut tv as *mut timespec as usize };
+    let data: [usize; 2] = [sigmask as usize, KERNEL_SIGSET];
+    sci(unsafe { rusty_libc_core::tls::syscall_cp(SYS_SELECT_PSELECT6, nfds as usize, r as usize, w as usize, e as usize, tp, data.as_ptr() as usize) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -171,12 +178,12 @@ pub extern "C" fn epoll_create(size: c_int) -> c_int {
         errno::set(EINVAL);
         return -1;
     }
-    unsafe { sci(syscall1(SYS_EPOLL_CREATE, size as usize)) }
+    sci(plain!(SYS_EPOLL_CREATE, size as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn epoll_create1(flags: c_int) -> c_int {
-    unsafe { sci(syscall1(SYS_EPOLL_CREATE1, flags as usize)) }
+    sci(plain!(SYS_EPOLL_CREATE1, flags as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -211,21 +218,17 @@ pub unsafe extern "C" fn epoll_pwait2(
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn eventfd(count: c_uint, flags: c_int) -> c_int {
-    unsafe { sci(syscall2(SYS_EVENTFD2, count as usize, flags as usize)) }
+    sci(plain!(SYS_EVENTFD2, count as usize, flags as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn eventfd_read(fd: c_int, value: *mut u64) -> c_int {
-    unsafe {
-        if sc(rusty_libc_core::tls::syscall_cp(SYS_READ, fd as usize, value as usize, 8, 0, 0, 0)) == 8 { 0 } else { -1 }
-    }
+    if sc(unsafe { rusty_libc_core::tls::syscall_cp(SYS_READ, fd as usize, value as usize, 8, 0, 0, 0) }) == 8 { 0 } else { -1 }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn eventfd_write(fd: c_int, value: u64) -> c_int {
-    unsafe {
-        if sc(rusty_libc_core::tls::syscall_cp(SYS_WRITE, fd as usize, &value as *const u64 as usize, 8, 0, 0, 0)) == 8 { 0 } else { -1 }
-    }
+    if sc(unsafe { rusty_libc_core::tls::syscall_cp(SYS_WRITE, fd as usize, &value as *const u64 as usize, 8, 0, 0, 0) }) == 8 { 0 } else { -1 }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -235,7 +238,7 @@ pub unsafe extern "C" fn signalfd(fd: c_int, mask: *const c_void, flags: c_int) 
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn timerfd_create(clock: c_int, flags: c_int) -> c_int {
-    unsafe { sci(syscall2(SYS_TIMERFD_CREATE, clock as usize, flags as usize)) }
+    sci(plain!(SYS_TIMERFD_CREATE, clock as usize, flags as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -250,12 +253,12 @@ pub unsafe extern "C" fn timerfd_gettime(fd: c_int, cur: *mut itimerspec) -> c_i
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn inotify_init() -> c_int {
-    unsafe { sci(rusty_libc_core::syscall::syscall0(SYS_INOTIFY_INIT)) }
+    sci(plain!(SYS_INOTIFY_INIT))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn inotify_init1(flags: c_int) -> c_int {
-    unsafe { sci(syscall1(SYS_INOTIFY_INIT1, flags as usize)) }
+    sci(plain!(SYS_INOTIFY_INIT1, flags as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -265,12 +268,12 @@ pub unsafe extern "C" fn inotify_add_watch(fd: c_int, path: *const c_char, mask:
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn inotify_rm_watch(fd: c_int, wd: c_int) -> c_int {
-    unsafe { sci(syscall2(SYS_INOTIFY_RM_WATCH, fd as usize, wd as usize)) }
+    sci(plain!(SYS_INOTIFY_RM_WATCH, fd as usize, wd as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn fanotify_init(flags: c_uint, event_f_flags: c_uint) -> c_int {
-    unsafe { sci(syscall2(SYS_FANOTIFY_INIT, flags as usize, event_f_flags as usize)) }
+    sci(plain!(SYS_FANOTIFY_INIT, flags as usize, event_f_flags as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 rusty-libc-core = { path = "../rusty-libc-core" }
 rusty-libc-mem = { path = "../rusty-libc-mem" }
+rusty-libc-rs-core = { path = "../rusty-libc-rs-core" }
 
 [features]
 export = []

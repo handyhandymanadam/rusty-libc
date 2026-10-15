@@ -1,26 +1,27 @@
 use crate::wchar_t;
 use crate::wctype::{to_lower, to_upper};
 use crate::wstring::locale_t;
+use rusty_libc_core::locale::Loc;
 use rusty_libc_time::calendar::Tm;
 use rusty_libc_time::strftime::{Wc, wcsftime_with};
 
-fn up(c: u32, loc: usize) -> u32 {
-    if loc == 0 {
+fn up(c: u32, loc: Loc) -> u32 {
+    if loc == Loc::CURRENT {
         to_upper(c)
     } else {
-        unsafe { crate::wctype::towupper_l(c, loc as locale_t) }
+        unsafe { crate::wctype::towupper_l(c, loc.raw() as locale_t) }
     }
 }
 
-fn low(c: u32, loc: usize) -> u32 {
-    if loc == 0 {
+fn low(c: u32, loc: Loc) -> u32 {
+    if loc == Loc::CURRENT {
         to_lower(c)
     } else {
-        unsafe { crate::wctype::towlower_l(c, loc as locale_t) }
+        unsafe { crate::wctype::towlower_l(c, loc.raw() as locale_t) }
     }
 }
 
-const WC: Wc = Wc { up, low, loc: 0 };
+const WC: Wc = Wc { up, low, loc: Loc::CURRENT };
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wcsftime(s: *mut wchar_t, maxsize: usize, format: *const wchar_t, tp: *const Tm) -> usize {

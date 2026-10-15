@@ -1,74 +1,21 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::dns::{self, Addr, HostData};
 use crate::inet;
 use crate::nssdns::{self, Outcome};
 use crate::wire;
-use crate::nss::{self, Action, Db, Entry, LineReader, Source, Status};
+use crate::nss::{self, Action, Db, Entry, LineReader, Source, Status, ZBuf};
 use crate::strerr::set_h_errno;
 use crate::types::*;
-use crate::util::{Buf, Spin, align_up, cbytes, eq_nocase};
-use core::ffi::{c_char, c_int, c_void};
+use crate::util::{Buf, Carve, HeapVec, Spin, eq_nocase};
+use core::cell::{Cell, RefCell};
+use core::ffi::{CStr, c_char, c_int, c_void};
 use rusty_libc_core::errno;
+use rusty_libc_core::ffi;
 
-struct Fill {
-    base: *mut u8,
-    len: usize,
-    off: usize,
-}
-
-impl Fill {
-    unsafe fn new(buf: *mut c_char, buflen: usize) -> Fill {
-        let pad = (buf as usize).wrapping_neg() & 7;
-        if buflen < pad {
-            return Fill { base: buf as *mut u8, len: 0, off: 0 };
-        }
-        Fill { base: unsafe { (buf as *mut u8).add(pad) }, len: buflen - pad, off: 0 }
-    }
-    fn ptr_array(&mut self, n: usize) -> Option<*mut *mut c_char> {
-        self.off = align_up(self.off, 8);
-        let need = n * 8;
-        if self.off + need > self.len {
-            return None;
-        }
-        let p = unsafe { self.base.add(self.off) } as *mut *mut c_char;
-        self.off += need;
-        Some(p)
-    }
-    fn bytes(&mut self, b: &[u8]) -> Option<*mut u8> {
-        if self.off + b.len() > self.len {
-            return None;
-        }
-        let p = unsafe { self.base.add(self.off) };
-        unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len()) };
-        self.off += b.len();
-        Some(p)
-    }
-    fn string(&mut self, s: &[u8]) -> Option<*mut c_char> {
-        if self.off + s.len() + 1 > self.len {
-            return None;
-        }
-        let p = unsafe { self.base.add(self.off) };
-        unsafe {
-            core::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
-            *p.add(s.len()) = 0;
-        }
-        self.off += s.len() + 1;
-        Some(p as *mut c_char)
-    }
-    fn word_list(&mut self, rest: &[u8]) -> Option<*mut *mut c_char> {
-        let n = nss::words(rest).count();
-        let arr = self.ptr_array(n + 1)?;
-        for (i, w) in nss::words(rest).enumerate() {
-            unsafe { *arr.add(i) = self.string(w)? };
-        }
-        unsafe { *arr.add(n) = core::ptr::null_mut() };
-        Some(arr)
-    }
-}
-
-fn fill_servent(res: &mut servent, buf: *mut c_char, buflen: usize, l: &nss::ServLine) -> Result<(), i32> {
-    let mut f = unsafe { Fill::new(buf, buflen) };
+fn fill_servent(res: &mut servent, buf: &mut [u8], l: &nss::ServLine) -> Result<(), i32> {
+    let mut f = Carve::new(buf);
     let r = (|| {
-        res.s_aliases = f.word_list(l.rest)?;
+        res.s_aliases = f.string_list(nss::words(l.rest))?;
         res.s_name = f.string(l.name)?;
         res.s_proto = f.string(l.proto)?;
         res.s_port = l.port.to_be() as c_int;
@@ -77,10 +24,10 @@ fn fill_servent(res: &mut servent, buf: *mut c_char, buflen: usize, l: &nss::Ser
     r.ok_or(ERANGE)
 }
 
-fn fill_protoent(res: &mut protoent, buf: *mut c_char, buflen: usize, l: &nss::NumLine) -> Result<(), i32> {
-    let mut f = unsafe { Fill::new(buf, buflen) };
+fn fill_protoent(res: &mut protoent, buf: &mut [u8], l: &nss::NumLine) -> Result<(), i32> {
+    let mut f = Carve::new(buf);
     let r = (|| {
-        res.p_aliases = f.word_list(l.rest)?;
+        res.p_aliases = f.string_list(nss::words(l.rest))?;
         res.p_name = f.string(l.name)?;
         res.p_proto = l.num;
         Some(())
@@ -88,10 +35,10 @@ fn fill_protoent(res: &mut protoent, buf: *mut c_char, buflen: usize, l: &nss::N
     r.ok_or(ERANGE)
 }
 
-fn fill_rpcent(res: &mut rpcent, buf: *mut c_char, buflen: usize, l: &nss::NumLine) -> Result<(), i32> {
-    let mut f = unsafe { Fill::new(buf, buflen) };
+fn fill_rpcent(res: &mut rpcent, buf: &mut [u8], l: &nss::NumLine) -> Result<(), i32> {
+    let mut f = Carve::new(buf);
     let r = (|| {
-        res.r_aliases = f.word_list(l.rest)?;
+        res.r_aliases = f.string_list(nss::words(l.rest))?;
         res.r_name = f.string(l.name)?;
         res.r_number = l.num;
         Some(())
@@ -99,10 +46,10 @@ fn fill_rpcent(res: &mut rpcent, buf: *mut c_char, buflen: usize, l: &nss::NumLi
     r.ok_or(ERANGE)
 }
 
-fn fill_netent(res: &mut netent, buf: *mut c_char, buflen: usize, l: &nss::NetLine) -> Result<(), i32> {
-    let mut f = unsafe { Fill::new(buf, buflen) };
+fn fill_netent(res: &mut netent, buf: &mut [u8], l: &nss::NetLine) -> Result<(), i32> {
+    let mut f = Carve::new(buf);
     let r = (|| {
-        res.n_aliases = f.word_list(l.rest)?;
+        res.n_aliases = f.string_list(nss::words(l.rest))?;
         res.n_name = f.string(l.name)?;
         res.n_addrtype = AF_INET;
         res.n_net = l.net;
@@ -111,25 +58,23 @@ fn fill_netent(res: &mut netent, buf: *mut c_char, buflen: usize, l: &nss::NetLi
     r.ok_or(ERANGE)
 }
 
-fn fill_hostent(res: &mut hostent, buf: *mut c_char, buflen: usize, name: &[u8], aliases: &[u8], family: c_int, addrs: &[Addr]) -> Result<(), i32> {
-    let mut f = unsafe { Fill::new(buf, buflen) };
+fn fill_hostent(res: &mut hostent, buf: &mut [u8], name: &[u8], aliases: &[u8], family: c_int, addrs: &[Addr]) -> Result<(), i32> {
+    let mut f = Carve::new(buf);
     let alen = if family == AF_INET { 4 } else { 16 };
+    let words = || aliases.split(|&c| c == 0 || c == b' ').filter(|w| !w.is_empty());
     let r = (|| {
-        let na = aliases.split(|&c| c == 0 || c == b' ').filter(|w| !w.is_empty()).count();
+        let na = words().count();
         let alist = f.ptr_array(na + 1)?;
         let addr_list = f.ptr_array(addrs.len() + 1)?;
-        for (i, a) in addrs.iter().enumerate() {
-            let p = f.bytes(&a.bytes[..alen])?;
-            unsafe { *addr_list.add(i) = p as *mut c_char };
+        for (slot, a) in addr_list.iter_mut().zip(addrs) {
+            *slot = f.bytes(&a.bytes[..alen])? as *mut c_char;
         }
-        unsafe { *addr_list.add(addrs.len()) = core::ptr::null_mut() };
         res.h_name = f.string(name)?;
-        for (i, w) in aliases.split(|&c| c == 0 || c == b' ').filter(|w| !w.is_empty()).enumerate() {
-            unsafe { *alist.add(i) = f.string(w)? };
+        for (slot, w) in alist.iter_mut().zip(words()) {
+            *slot = f.string(w)?;
         }
-        unsafe { *alist.add(na) = core::ptr::null_mut() };
-        res.h_aliases = alist;
-        res.h_addr_list = addr_list;
+        res.h_aliases = alist.as_mut_ptr();
+        res.h_addr_list = addr_list.as_mut_ptr();
         res.h_addrtype = family;
         res.h_length = alen as c_int;
         Some(())
@@ -145,8 +90,8 @@ struct Fit {
 }
 
 impl Fit {
-    fn new(base: usize, buf: *mut c_char, len: usize) -> Fit {
-        Fit { base, addr: buf as usize, len }
+    fn new(base: usize, buf: &[u8]) -> Fit {
+        Fit { base, addr: buf.as_ptr() as usize, len: buf.len() }
     }
     fn pre_ok(&self) -> bool {
         self.len >= self.base + 3
@@ -175,7 +120,6 @@ fn scan(db: Db, fit: Fit, mut f: impl FnMut(&[u8], &mut usize) -> Option<Result<
         return Scan::Hit(Err(ERANGE));
     }
     while let Some((line, rawlen)) = r.next_raw() {
-        let line = unsafe { core::slice::from_raw_parts(line.as_ptr(), line.len()) };
         if !fit.read_ok(rawlen) {
             return Scan::Hit(Err(ERANGE));
         }
@@ -197,73 +141,192 @@ const NSS_UNAVAIL: i32 = -1;
 const NSS_NOTFOUND: i32 = 0;
 const NSS_SUCCESS: i32 = 1;
 
-fn scan_status(h: *mut c_int, r: Scan) -> i32 {
+fn scan_status(h: Option<&Cell<c_int>>, r: Scan) -> i32 {
     match r {
         Scan::Unavail(e) => {
             errno::set(e);
             if e == EAGAIN { NSS_TRYAGAIN } else { NSS_UNAVAIL }
         }
         Scan::NotFound => {
-            if !h.is_null() {
-                unsafe { *h = HOST_NOT_FOUND };
+            if let Some(h) = h {
+                h.set(HOST_NOT_FOUND);
             }
             NSS_NOTFOUND
         }
         Scan::Hit(Ok(())) => NSS_SUCCESS,
         Scan::Hit(Err(e)) => {
             errno::set(e);
-            if !h.is_null() {
-                unsafe { *h = NETDB_INTERNAL };
+            if let Some(h) = h {
+                h.set(NETDB_INTERNAL);
             }
             if e == ERANGE { NSS_TRYAGAIN } else { NSS_UNAVAIL }
         }
     }
 }
 
-unsafe fn by_key<T>(db: &[u8], func: &[u8], res: *mut T, result: *mut *mut T, h_errnop: *mut c_int, files: &dyn Fn() -> i32, call: &dyn Fn(usize, *mut c_int) -> i32) -> c_int {
-    unsafe { by_key_dns(db, func, res, result, h_errnop, files, call, None) }
+trait ModArgs {
+    unsafe fn call(self, f: usize) -> c_int;
 }
 
-unsafe fn by_key_dns<T>(db: &[u8], func: &[u8], res: *mut T, result: *mut *mut T, h_errnop: *mut c_int, files: &dyn Fn() -> i32, call: &dyn Fn(usize, *mut c_int) -> i32, dns: Option<&dyn Fn(*mut c_int) -> i32>) -> c_int {
-    unsafe {
-        let any = core::cell::Cell::new(false);
-        let dns_any = |e: *mut c_int| {
-            any.set(true);
-            match dns {
-                Some(d) => d(e),
-                None => NSS_UNAVAIL,
+macro_rules! mod_args {
+    ($($t:ident $v:ident),*) => {
+        impl<$($t),*> ModArgs for ($($t,)*) {
+            unsafe fn call(self, f: usize) -> c_int {
+                let g = unsafe { core::mem::transmute_copy::<usize, unsafe extern "C" fn($($t),*) -> c_int>(&f) };
+                let ($($v,)*) = self;
+                unsafe { g($($v),*) }
             }
-        };
-        let status = rusty_libc_core::nssent::dispatch_dns(
-            db,
-            func,
-            &|| {
-                any.set(true);
-                files()
-            },
-            &|f, en| {
-                any.set(true);
-                call(f, en)
-            },
-            None,
-            if dns.is_some() { Some(&dns_any) } else { None },
-        );
-        *result = if status == NSS_SUCCESS { res } else { core::ptr::null_mut() };
-        if !h_errnop.is_null() && status != NSS_SUCCESS && !any.get() {
-            *h_errnop = if status == NSS_UNAVAIL && errno::get() != ENOENT { NETDB_INTERNAL } else { NO_RECOVERY };
         }
-        let rc = if status == NSS_SUCCESS || status == NSS_NOTFOUND {
-            0
-        } else if errno::get() == ERANGE && status != NSS_TRYAGAIN {
-            EINVAL
-        } else if !h_errnop.is_null() && status == NSS_TRYAGAIN && *h_errnop != NETDB_INTERNAL {
-            EAGAIN
-        } else {
-            return errno::get();
-        };
-        errno::set(rc);
-        rc
+    };
+}
+mod_args!();
+mod_args!(A a);
+mod_args!(A a, B b, C c, D d, E e);
+mod_args!(A a, B b, C c, D d, E e, G g);
+mod_args!(A a, B b, C c, D d, E e, G g, H h);
+mod_args!(A a, B b, C c, D d, E e, G g, H h, I i);
+mod_args!(A a, B b, C c, D d, E e, G g, H h, I i, J j);
+
+pub(crate) trait CIn<'a> {
+    type Out;
+    unsafe fn conv(self) -> Self::Out;
+}
+
+pub(crate) struct Str(pub(crate) *const c_char);
+pub(crate) struct OptStr(pub(crate) *const c_char);
+pub(crate) struct Out<T>(pub(crate) *mut T);
+pub(crate) struct OptOut<T>(pub(crate) *mut T);
+pub(crate) struct OptCell(pub(crate) *mut c_int);
+pub(crate) struct Bytes(pub(crate) *const u8, pub(crate) usize);
+
+impl<'a> CIn<'a> for Str {
+    type Out = &'a CStr;
+    unsafe fn conv(self) -> &'a CStr {
+        unsafe { ffi::cstr_nonnull(self.0) }
     }
+}
+impl<'a> CIn<'a> for OptStr {
+    type Out = Option<&'a CStr>;
+    unsafe fn conv(self) -> Option<&'a CStr> {
+        unsafe { ffi::cstr(self.0) }
+    }
+}
+impl<'a, T: 'a> CIn<'a> for Out<T> {
+    type Out = &'a mut T;
+    unsafe fn conv(self) -> &'a mut T {
+        unsafe { &mut *self.0 }
+    }
+}
+impl<'a, T: 'a> CIn<'a> for OptOut<T> {
+    type Out = Option<&'a mut T>;
+    unsafe fn conv(self) -> Option<&'a mut T> {
+        unsafe { ffi::out(self.0) }
+    }
+}
+impl<'a> CIn<'a> for OptCell {
+    type Out = Option<&'a Cell<c_int>>;
+    unsafe fn conv(self) -> Option<&'a Cell<c_int>> {
+        unsafe { ffi::out(self.0) }.map(|r| Cell::from_mut(r) as &Cell<c_int>)
+    }
+}
+impl<'a> CIn<'a> for Bytes {
+    type Out = &'a [u8];
+    unsafe fn conv(self) -> &'a [u8] {
+        unsafe { ffi::bytes(self.0, self.1) }
+    }
+}
+pub(crate) struct OptRef<T>(pub(crate) *const T);
+pub(crate) struct Slice<T>(pub(crate) *const T, pub(crate) usize);
+pub(crate) struct OptBytesMut(pub(crate) *mut u8, pub(crate) usize);
+
+impl<'a, T: 'a> CIn<'a> for OptRef<T> {
+    type Out = Option<&'a T>;
+    unsafe fn conv(self) -> Option<&'a T> {
+        unsafe { self.0.as_ref() }
+    }
+}
+impl<'a, T: 'a> CIn<'a> for Slice<T> {
+    type Out = &'a [T];
+    unsafe fn conv(self) -> &'a [T] {
+        unsafe { ffi::slice(self.0, self.1) }
+    }
+}
+impl<'a> CIn<'a> for OptBytesMut {
+    type Out = Option<&'a mut [u8]>;
+    unsafe fn conv(self) -> Option<&'a mut [u8]> {
+        if self.0.is_null() || self.1 == 0 {
+            return None;
+        }
+        Some(unsafe { ffi::bytes_mut(self.0, self.1) })
+    }
+}
+impl CIn<'_> for () {
+    type Out = ();
+    unsafe fn conv(self) {}
+}
+impl<'a, X: CIn<'a>, Y: CIn<'a>> CIn<'a> for (X, Y) {
+    type Out = (X::Out, Y::Out);
+    unsafe fn conv(self) -> Self::Out {
+        let x = unsafe { self.0.conv() };
+        (x, unsafe { self.1.conv() })
+    }
+}
+
+struct OutBufs<'a, T> {
+    res: &'a mut T,
+    buf: &'a mut [u8],
+}
+
+impl<T> OutBufs<'_, T> {
+    fn raw(&mut self) -> (*mut T, *mut c_char, usize) {
+        (self.res as *mut T, self.buf.as_mut_ptr().cast::<c_char>(), self.buf.len())
+    }
+}
+
+fn by_key<A: ModArgs>(db: &[u8], func: &[u8], h_errnop: Option<&Cell<c_int>>, files: &dyn Fn() -> i32, args: &dyn Fn(*mut c_int) -> A) -> (c_int, bool) {
+    by_key_dns(db, func, h_errnop, files, args, None)
+}
+
+fn by_key_dns<A: ModArgs>(db: &[u8], func: &[u8], h_errnop: Option<&Cell<c_int>>, files: &dyn Fn() -> i32, args: &dyn Fn(*mut c_int) -> A, dns: Option<&dyn Fn(*mut c_int) -> i32>) -> (c_int, bool) {
+    let any = Cell::new(false);
+    let dns_any = |e: *mut c_int| {
+        any.set(true);
+        match dns {
+            Some(d) => d(e),
+            None => NSS_UNAVAIL,
+        }
+    };
+    let status = rusty_libc_core::nssent::dispatch_dns(
+        db,
+        func,
+        &|| {
+            any.set(true);
+            files()
+        },
+        &|f, en| {
+            any.set(true);
+            unsafe { args(en).call(f) }
+        },
+        None,
+        if dns.is_some() { Some(&dns_any) } else { None },
+    );
+    let ok = status == NSS_SUCCESS;
+    if let Some(h) = h_errnop {
+        if status != NSS_SUCCESS && !any.get() {
+            h.set(if status == NSS_UNAVAIL && errno::get() != ENOENT { NETDB_INTERNAL } else { NO_RECOVERY });
+        }
+    }
+    let rc = if status == NSS_SUCCESS || status == NSS_NOTFOUND {
+        0
+    } else if errno::get() == ERANGE && status != NSS_TRYAGAIN {
+        EINVAL
+    } else if h_errnop.is_some_and(|h| status == NSS_TRYAGAIN && h.get() != NETDB_INTERNAL) {
+        EAGAIN
+    } else {
+        return (errno::get(), ok);
+    };
+    errno::set(rc);
+    (rc, ok)
 }
 
 type SrcResult = (Status, c_int);
@@ -314,7 +377,6 @@ fn files_hosts(name: &[u8], af: c_int, v4mapped: bool, out: &mut HostData) -> Sr
     let mut ob = OutBuf { cur: 0, end: 0, ok: true };
     let (mut naddr, mut nalias) = (0usize, 0usize);
     while let Some((line, rawlen)) = r.next_raw() {
-        let line = unsafe { core::slice::from_raw_parts(line.as_ptr(), line.len()) };
         if !found {
             if let Some(f) = fit {
                 if !f.read_ok(rawlen) {
@@ -531,223 +593,218 @@ struct AddrTuple {
     scopeid: u32,
 }
 
-unsafe fn with_scratch<R>(mut f: impl FnMut(*mut c_char, usize) -> (R, bool)) -> R {
-    unsafe {
-        let mut stack = [0u8; 2048];
-        let (r, retry) = f(stack.as_mut_ptr() as *mut c_char, stack.len());
-        if !retry {
+fn with_scratch<R>(mut f: impl FnMut(*mut c_char, usize) -> (R, bool)) -> R {
+    let mut stack = [0u8; 2048];
+    let (r, retry) = f(stack.as_mut_ptr() as *mut c_char, stack.len());
+    if !retry {
+        return r;
+    }
+    let mut size = 8192usize;
+    loop {
+        let heap = unsafe { rusty_libc_malloc::malloc(size) } as *mut c_char;
+        if heap.is_null() {
             return r;
         }
-        let mut size = 8192usize;
-        loop {
-            let heap = rusty_libc_malloc::malloc(size) as *mut c_char;
-            if heap.is_null() {
-                return r;
-            }
-            let (r, retry) = f(heap, size);
-            rusty_libc_malloc::free(heap.cast());
-            if !retry || size >= (1 << 20) {
-                return r;
-            }
-            size *= 2;
+        let (r, retry) = f(heap, size);
+        unsafe { rusty_libc_malloc::free(heap.cast()) };
+        if !retry || size >= (1 << 20) {
+            return r;
         }
+        size *= 2;
     }
 }
 
+unsafe fn c_list<'a>(list: *const *mut c_char, len: Option<usize>) -> impl Iterator<Item = &'a [u8]> {
+    let mut i = 0usize;
+    core::iter::from_fn(move || {
+        if list.is_null() {
+            return None;
+        }
+        let p = unsafe { *list.wrapping_add(i) };
+        if p.is_null() {
+            return None;
+        }
+        i += 1;
+        let n = match len {
+            Some(n) => n,
+            None => unsafe { ffi::cstr_len(p) },
+        };
+        Some(unsafe { ffi::bytes(p as *const u8, n) })
+    })
+}
+
 unsafe fn hostent_into(h: &hostent, out: &mut HostData, canon: *const c_char) {
-    unsafe {
-        if !h.h_name.is_null() && !out.have_canon {
-            out.canon = Buf::from(cbytes(h.h_name)).unwrap_or_default();
+    let (name, canon) = unsafe { (OptStr(h.h_name), OptStr(canon)).conv() };
+    if let Some(n) = name {
+        if !out.have_canon {
+            out.canon = Buf::from(n.to_bytes()).unwrap_or_default();
             out.have_canon = true;
         }
-        if !canon.is_null() {
-            out.canon = Buf::from(cbytes(canon)).unwrap_or_default();
-            out.have_canon = true;
-        }
-        if !h.h_aliases.is_null() {
-            let mut i = 0;
-            while !(*h.h_aliases.add(i)).is_null() {
-                out.add_alias(cbytes(*h.h_aliases.add(i)));
-                i += 1;
-            }
-        }
-        if !h.h_addr_list.is_null() {
-            let len = (h.h_length.max(0) as usize).min(16);
-            let mut i = 0;
-            while !(*h.h_addr_list.add(i)).is_null() {
-                let mut a = Addr { family: h.h_addrtype, bytes: [0; 16], scope: 0 };
-                core::ptr::copy_nonoverlapping(*h.h_addr_list.add(i) as *const u8, a.bytes.as_mut_ptr(), len);
-                out.push(a);
-                i += 1;
-            }
-        }
+    }
+    if let Some(c) = canon {
+        out.canon = Buf::from(c.to_bytes()).unwrap_or_default();
+        out.have_canon = true;
+    }
+    for a in unsafe { c_list(h.h_aliases, None) } {
+        out.add_alias(a);
+    }
+    let len = (h.h_length.max(0) as usize).min(16);
+    for b in unsafe { c_list(h.h_addr_list, Some(len)) } {
+        let mut a = Addr { family: h.h_addrtype, bytes: [0; 16], scope: 0 };
+        a.bytes[..len].copy_from_slice(b);
+        out.push(a);
     }
 }
 
 fn module_hosts(module: &[u8], name: &[u8], af: c_int, out: &mut HostData) -> SrcResult {
     use rusty_libc_core::nssmod;
-    unsafe {
-        let Some(cname) = Buf::<256>::from(name).filter(|b| b.len < 255) else { return (Status::Unavail, NO_DATA) };
-        let mut cname = cname;
-        cname.push(0);
-        let cname_ptr = cname.b.as_ptr() as *const c_char;
-        if af == AF_UNSPEC {
-            let f4 = nssmod::function(module, b"gethostbyname4_r");
-            if f4 != 0 {
-                type F4 = unsafe extern "C" fn(*const c_char, *mut *mut AddrTuple, *mut c_char, usize, *mut c_int, *mut c_int, *mut i32) -> c_int;
-                let f: F4 = core::mem::transmute(f4);
-                let mut result: (c_int, c_int) = (-1, NO_DATA);
-                let mut tmp = HostData::new();
-                with_scratch(|buf, len| {
-                    let mut pat: *mut AddrTuple = core::ptr::null_mut();
-                    let (mut en, mut he, mut ttl): (c_int, c_int, i32) = (0, NETDB_SUCCESS, 0);
-                    tmp = HostData::new();
-                    let st = f(cname_ptr, &mut pat, buf, len, &mut en, &mut he, &mut ttl);
-                    let retry = st == -2 && en == ERANGE;
-                    if st == 1 {
-                        let mut first = true;
-                        let mut p = pat;
-                        while !p.is_null() {
-                            let t = &*p;
-                            if first && !t.name.is_null() {
-                                tmp.canon = Buf::from(cbytes(t.name)).unwrap_or_default();
-                                tmp.have_canon = true;
-                            }
-                            first = false;
-                            let mut a = Addr { family: t.family, bytes: [0; 16], scope: if t.family == AF_INET6 { t.scopeid } else { 0 } };
-                            let n = if t.family == AF_INET { 4 } else { 16 };
-                            core::ptr::copy_nonoverlapping(t.addr.as_ptr() as *const u8, a.bytes.as_mut_ptr(), n);
-                            tmp.push(a);
-                            p = t.next;
-                        }
-                    }
-                    result = (st, he);
-                    ((), retry)
-                });
-                let st = module_status(result.0);
-                if st == Status::Success {
-                    *out = tmp;
-                    return (Status::Success, NETDB_SUCCESS);
-                }
-                return (st, if result.1 == NETDB_SUCCESS { HOST_NOT_FOUND } else { result.1 });
-            }
-        }
-        let fams: &[c_int] = match af {
-            AF_UNSPEC => &[AF_INET6, AF_INET],
-            AF_INET => &[AF_INET],
-            _ => &[AF_INET6],
-        };
-        let mut best = (Status::Unavail, HOST_NOT_FOUND);
-        let mut any = false;
-        let (f3, f2, f1) = match out.func {
-            1 => (0, 0, nssmod::function(module, b"gethostbyname_r")),
-            2 => (0, nssmod::function(module, b"gethostbyname2_r"), 0),
-            _ => (nssmod::function(module, b"gethostbyname3_r"), nssmod::function(module, b"gethostbyname2_r"), 0),
-        };
-        if f3 == 0 && f2 == 0 && f1 == 0 {
-            return (Status::Unavail, NO_DATA);
-        }
-        out.called = true;
-        let h_in = out.h;
-        for &fam in fams {
-            let mut hd = HostData::new();
-            let mut r: (c_int, c_int) = (-1, NO_DATA);
+    let Some(cname) = Buf::<256>::from(name).filter(|b| b.len < 255) else { return (Status::Unavail, NO_DATA) };
+    let mut cname = cname;
+    cname.push(0);
+    let cname_ptr = cname.b.as_ptr() as *const c_char;
+    if af == AF_UNSPEC {
+        let f4 = nssmod::function(module, b"gethostbyname4_r");
+        if f4 != 0 {
+            let mut result: (c_int, c_int) = (-1, NO_DATA);
+            let mut tmp = HostData::new();
             with_scratch(|buf, len| {
-                let mut host = HOSTENT0;
-                let (mut en, mut he, mut ttl): (c_int, c_int, i32) = (0, h_in, 0);
-                let mut canon: *mut c_char = core::ptr::null_mut();
-                hd = HostData::new();
-                let st = if f1 != 0 {
-                    type F1 = unsafe extern "C" fn(*const c_char, *mut hostent, *mut c_char, usize, *mut c_int, *mut c_int) -> c_int;
-                    let f: F1 = core::mem::transmute(f1);
-                    f(cname_ptr, &mut host, buf, len, &mut en, &mut he)
-                } else if f3 != 0 {
-                    type F3 = unsafe extern "C" fn(*const c_char, c_int, *mut hostent, *mut c_char, usize, *mut c_int, *mut c_int, *mut i32, *mut *mut c_char) -> c_int;
-                    let f: F3 = core::mem::transmute(f3);
-                    f(cname_ptr, fam, &mut host, buf, len, &mut en, &mut he, &mut ttl, &mut canon)
-                } else {
-                    type F2 = unsafe extern "C" fn(*const c_char, c_int, *mut hostent, *mut c_char, usize, *mut c_int, *mut c_int) -> c_int;
-                    let f: F2 = core::mem::transmute(f2);
-                    f(cname_ptr, fam, &mut host, buf, len, &mut en, &mut he)
-                };
+                let mut pat: *mut AddrTuple = core::ptr::null_mut();
+                let (mut en, mut he, mut ttl): (c_int, c_int, i32) = (0, NETDB_SUCCESS, 0);
+                tmp = HostData::new();
+                let st = unsafe { (cname_ptr, &raw mut pat, buf, len, &raw mut en, &raw mut he, &raw mut ttl).call(f4) };
                 let retry = st == -2 && en == ERANGE;
                 if st == 1 {
-                    hostent_into(&host, &mut hd, canon);
+                    let mut first = true;
+                    let mut p = pat;
+                    while !p.is_null() {
+                        let t = unsafe { &*p };
+                        if first {
+                            if let Some(n) = unsafe { ffi::cstr(t.name) } {
+                                tmp.canon = Buf::from(n.to_bytes()).unwrap_or_default();
+                                tmp.have_canon = true;
+                            }
+                        }
+                        first = false;
+                        let mut a = Addr { family: t.family, bytes: [0; 16], scope: if t.family == AF_INET6 { t.scopeid } else { 0 } };
+                        let n = if t.family == AF_INET { 4 } else { 16 };
+                        let words = t.addr.map(u32::to_ne_bytes);
+                        a.bytes[..n].copy_from_slice(&words.as_flattened()[..n]);
+                        tmp.push(a);
+                        p = t.next;
+                    }
                 }
-                r = (st, he);
+                result = (st, he);
                 ((), retry)
             });
-            let st = module_status(r.0);
-            out.h = r.1;
+            let st = module_status(result.0);
             if st == Status::Success {
-                any = true;
-                if !out.have_canon && hd.have_canon {
-                    out.canon = hd.canon;
-                    out.have_canon = true;
-                }
-                for a in &hd.addrs[..hd.n] {
-                    out.push(*a);
-                }
-                for w in hd.aliases.as_bytes().split(|&c| c == 0).filter(|w| !w.is_empty()) {
-                    out.add_alias(w);
-                }
-            } else if best.0 == Status::Unavail || (st == Status::TryAgain) {
-                best = (st, if r.1 == NETDB_SUCCESS { HOST_NOT_FOUND } else { r.1 });
+                *out = tmp;
+                return (Status::Success, NETDB_SUCCESS);
             }
+            return (st, if result.1 == NETDB_SUCCESS { HOST_NOT_FOUND } else { result.1 });
         }
-        if any { (Status::Success, NETDB_SUCCESS) } else { best }
     }
-}
-
-fn module_addr(module: &[u8], af: c_int, addr: &[u8], h_in: c_int, name: &mut Option<Buf<256>>, aliases: &mut Buf<1024>) -> (Status, c_int, bool) {
-    use rusty_libc_core::nssmod;
-    unsafe {
-        let f2 = nssmod::function(module, b"gethostbyaddr2_r");
-        let f1 = nssmod::function(module, b"gethostbyaddr_r");
-        if f2 == 0 && f1 == 0 {
-            return (Status::Unavail, h_in, false);
-        }
-        let mut r: (c_int, c_int) = (-1, h_in);
-        let mut got: Option<(Buf<256>, Buf<1024>)> = None;
+    let fams: &[c_int] = match af {
+        AF_UNSPEC => &[AF_INET6, AF_INET],
+        AF_INET => &[AF_INET],
+        _ => &[AF_INET6],
+    };
+    let mut best = (Status::Unavail, HOST_NOT_FOUND);
+    let mut any = false;
+    let (f3, f2, f1) = match out.func {
+        1 => (0, 0, nssmod::function(module, b"gethostbyname_r")),
+        2 => (0, nssmod::function(module, b"gethostbyname2_r"), 0),
+        _ => (nssmod::function(module, b"gethostbyname3_r"), nssmod::function(module, b"gethostbyname2_r"), 0),
+    };
+    if f3 == 0 && f2 == 0 && f1 == 0 {
+        return (Status::Unavail, NO_DATA);
+    }
+    out.called = true;
+    let h_in = out.h;
+    for &fam in fams {
+        let mut hd = HostData::new();
+        let mut r: (c_int, c_int) = (-1, NO_DATA);
         with_scratch(|buf, len| {
             let mut host = HOSTENT0;
             let (mut en, mut he, mut ttl): (c_int, c_int, i32) = (0, h_in, 0);
-            let st = if f2 != 0 {
-                type F = unsafe extern "C" fn(*const c_void, u32, c_int, *mut hostent, *mut c_char, usize, *mut c_int, *mut c_int, *mut i32) -> c_int;
-                let f: F = core::mem::transmute(f2);
-                f(addr.as_ptr() as *const c_void, addr.len() as u32, af, &mut host, buf, len, &mut en, &mut he, &mut ttl)
+            let mut canon: *mut c_char = core::ptr::null_mut();
+            hd = HostData::new();
+            let st = if f1 != 0 {
+                unsafe { (cname_ptr, &raw mut host, buf, len, &raw mut en, &raw mut he).call(f1) }
+            } else if f3 != 0 {
+                unsafe { (cname_ptr, fam, &raw mut host, buf, len, &raw mut en, &raw mut he, &raw mut ttl, &raw mut canon).call(f3) }
             } else {
-                type F = unsafe extern "C" fn(*const c_void, u32, c_int, *mut hostent, *mut c_char, usize, *mut c_int, *mut c_int) -> c_int;
-                let f: F = core::mem::transmute(f1);
-                f(addr.as_ptr() as *const c_void, addr.len() as u32, af, &mut host, buf, len, &mut en, &mut he)
+                unsafe { (cname_ptr, fam, &raw mut host, buf, len, &raw mut en, &raw mut he).call(f2) }
             };
             let retry = st == -2 && en == ERANGE;
-            if st == 1 && !host.h_name.is_null() {
-                let mut al = Buf::<1024>::new();
-                if !host.h_aliases.is_null() {
-                    let mut i = 0;
-                    while !(*host.h_aliases.add(i)).is_null() {
-                        al.push_all(cbytes(*host.h_aliases.add(i)));
-                        al.push(0);
-                        i += 1;
-                    }
-                }
-                got = Some((Buf::from(cbytes(host.h_name)).unwrap_or_default(), al));
+            if st == 1 {
+                unsafe { hostent_into(&host, &mut hd, canon) };
             }
             r = (st, he);
             ((), retry)
         });
         let st = module_status(r.0);
+        out.h = r.1;
         if st == Status::Success {
-            if let Some((n, al)) = got {
-                *name = Some(n);
-                *aliases = al;
-                return (Status::Success, r.1, true);
+            any = true;
+            if !out.have_canon && hd.have_canon {
+                out.canon = hd.canon;
+                out.have_canon = true;
             }
-            return (Status::NotFound, r.1, true);
+            for a in &hd.addrs[..hd.n] {
+                out.push(*a);
+            }
+            for w in hd.aliases.as_bytes().split(|&c| c == 0).filter(|w| !w.is_empty()) {
+                out.add_alias(w);
+            }
+        } else if best.0 == Status::Unavail || (st == Status::TryAgain) {
+            best = (st, if r.1 == NETDB_SUCCESS { HOST_NOT_FOUND } else { r.1 });
         }
-        (st, r.1, true)
     }
+    if any { (Status::Success, NETDB_SUCCESS) } else { best }
+}
+
+fn module_addr(module: &[u8], af: c_int, addr: &[u8], h_in: c_int, name: &mut Option<Buf<256>>, aliases: &mut Buf<1024>) -> (Status, c_int, bool) {
+    use rusty_libc_core::nssmod;
+    let f2 = nssmod::function(module, b"gethostbyaddr2_r");
+    let f1 = nssmod::function(module, b"gethostbyaddr_r");
+    if f2 == 0 && f1 == 0 {
+        return (Status::Unavail, h_in, false);
+    }
+    let mut r: (c_int, c_int) = (-1, h_in);
+    let mut got: Option<(Buf<256>, Buf<1024>)> = None;
+    with_scratch(|buf, len| {
+        let mut host = HOSTENT0;
+        let (mut en, mut he, mut ttl): (c_int, c_int, i32) = (0, h_in, 0);
+        let st = if f2 != 0 {
+            unsafe { (addr.as_ptr() as *const c_void, addr.len() as u32, af, &raw mut host, buf, len, &raw mut en, &raw mut he, &raw mut ttl).call(f2) }
+        } else {
+            unsafe { (addr.as_ptr() as *const c_void, addr.len() as u32, af, &raw mut host, buf, len, &raw mut en, &raw mut he).call(f1) }
+        };
+        let retry = st == -2 && en == ERANGE;
+        if st == 1 {
+            if let Some(hn) = unsafe { ffi::cstr(host.h_name) } {
+                let mut al = Buf::<1024>::new();
+                for a in unsafe { c_list(host.h_aliases, None) } {
+                    al.push_all(a);
+                    al.push(0);
+                }
+                got = Some((Buf::from(hn.to_bytes()).unwrap_or_default(), al));
+            }
+        }
+        r = (st, he);
+        ((), retry)
+    });
+    let st = module_status(r.0);
+    if st == Status::Success {
+        if let Some((n, al)) = got {
+            *name = Some(n);
+            *aliases = al;
+            return (Status::Success, r.1, true);
+        }
+        return (Status::NotFound, r.1, true);
+    }
+    (st, r.1, true)
 }
 
 pub fn lookup_name(name: &[u8], af: c_int, v4mapped: bool, out: &mut HostData) -> Result<(), c_int> {
@@ -789,6 +846,7 @@ pub fn lookup_name(name: &[u8], af: c_int, v4mapped: bool, out: &mut HostData) -
     }
     out.any = any;
     out.unavail = any && status == Status::Unavail;
+    out.tryagain = any && status == Status::TryAgain;
     if out.einval {
         Err(out.h)
     } else if status == Status::Success {
@@ -880,87 +938,82 @@ pub unsafe extern "C" fn __nss_hostname_digits_dots(
     const NSS_TRYAGAIN: c_int = -2;
     const NSS_NOTFOUND: c_int = 0;
     const NSS_SUCCESS: c_int = 1;
-    unsafe {
-        nss::hconf_init();
-        let nm = cbytes(name);
-        let fixed = buffer_size.is_null();
-        let fail = |h: c_int| {
-            if !h_errnop.is_null() {
-                *h_errnop = h;
-            }
-            if fixed {
-                *status = NSS_NOTFOUND;
-            } else {
-                *result = core::ptr::null_mut();
-            }
-        };
-        let c0 = nm.first().copied().unwrap_or(0);
-        if !(c0.is_ascii_hexdigit() || c0 == b':') {
-            return 0;
+    nss::hconf_init();
+    let fixed = buffer_size.is_null();
+    let ((nm, mut herr), (bufp, r)) = unsafe { ((Str(name), OptOut(h_errnop)), (Out(buffer), Out(resbuf))).conv() };
+    let nm = nm.to_bytes();
+    let mut mode = if fixed {
+        Ok(unsafe { Out(status).conv() })
+    } else {
+        Err(unsafe { (Out(result), Out(buffer_size)).conv() })
+    };
+    let mut set_h = |h: c_int| {
+        if let Some(e) = herr.as_deref_mut() {
+            *e = h;
         }
-        let need = 16 + 16 + 8 + nm.len() + 1;
-        if fixed {
+    };
+    let done = |mode: &mut Result<&mut c_int, (&mut *mut hostent, &mut usize)>, st: c_int, res: *mut hostent| match mode {
+        Ok(status) => **status = st,
+        Err((result, _)) => **result = res,
+    };
+    let c0 = nm.first().copied().unwrap_or(0);
+    if !(c0.is_ascii_hexdigit() || c0 == b':') {
+        return 0;
+    }
+    let need = 16 + 16 + 8 + nm.len() + 1;
+    match &mut mode {
+        Ok(status) => {
             if buflen < need {
-                *status = NSS_TRYAGAIN;
-                if !h_errnop.is_null() {
-                    *h_errnop = NETDB_INTERNAL;
-                }
+                **status = NSS_TRYAGAIN;
+                set_h(NETDB_INTERNAL);
                 errno::set(ERANGE);
                 return 1;
             }
-        } else if *buffer_size < need {
-            *buffer_size = need;
-            let nb = rusty_libc_malloc::realloc((*buffer).cast(), need) as *mut c_char;
-            if nb.is_null() {
-                let save = errno::get();
-                rusty_libc_malloc::free((*buffer).cast());
-                *buffer = core::ptr::null_mut();
-                *buffer_size = 0;
-                errno::set(save);
-                if !h_errnop.is_null() {
-                    *h_errnop = NETDB_INTERNAL;
+        }
+        Err((result, size)) => {
+            if **size < need {
+                **size = need;
+                let nb = unsafe { rusty_libc_malloc::realloc((*bufp).cast(), need) } as *mut c_char;
+                if nb.is_null() {
+                    let save = errno::get();
+                    unsafe { rusty_libc_malloc::free((*bufp).cast()) };
+                    *bufp = core::ptr::null_mut();
+                    **size = 0;
+                    errno::set(save);
+                    set_h(NETDB_INTERNAL);
+                    **result = core::ptr::null_mut();
+                    return 1;
                 }
-                *result = core::ptr::null_mut();
-                return 1;
+                *bufp = nb;
             }
-            *buffer = nb;
         }
-        let base = *buffer as *mut u8;
-        core::ptr::write_bytes(base, 0, need);
-        let found = match digits_dots(nm, af, use_inet6()) {
-            Ok(None) => return 0,
-            Err(h) => {
-                fail(h);
-                return 1;
-            }
-            Ok(Some(a)) => a,
-        };
-        let (a, fam) = found;
-        let len = if fam == AF_INET6 { 16 } else { 4 };
-        core::ptr::copy_nonoverlapping(a.bytes.as_ptr(), base, len);
-        let addrs = base.add(16) as *mut *mut c_char;
-        let aliases = base.add(32) as *mut *mut c_char;
-        let hname = base.add(40);
-        core::ptr::copy_nonoverlapping(nm.as_ptr(), hname, nm.len());
-        *addrs = base.cast();
-        *addrs.add(1) = core::ptr::null_mut();
-        *aliases = core::ptr::null_mut();
-        let r = &mut *resbuf;
-        r.h_name = hname.cast();
-        r.h_aliases = aliases;
-        r.h_addr_list = addrs;
-        r.h_addrtype = fam;
-        r.h_length = len as c_int;
-        if !h_errnop.is_null() {
-            *h_errnop = NETDB_SUCCESS;
-        }
-        if fixed {
-            *status = NSS_SUCCESS;
-        } else {
-            *result = resbuf;
-        }
-        1
     }
+    let base = *bufp as *mut u8;
+    let b = unsafe { ffi::bytes_mut(base, need) };
+    b.fill(0);
+    let found = match digits_dots(nm, af, use_inet6()) {
+        Ok(None) => return 0,
+        Err(h) => {
+            set_h(h);
+            done(&mut mode, NSS_NOTFOUND, core::ptr::null_mut());
+            return 1;
+        }
+        Ok(Some(a)) => a,
+    };
+    let (a, fam) = found;
+    let len = if fam == AF_INET6 { 16 } else { 4 };
+    b[..len].copy_from_slice(&a.bytes[..len]);
+    b[16..24].copy_from_slice(&base.expose_provenance().to_ne_bytes());
+    b[40..40 + nm.len()].copy_from_slice(nm);
+    let base = b.as_mut_ptr();
+    r.h_name = base.wrapping_add(40).cast();
+    r.h_aliases = base.wrapping_add(32).cast();
+    r.h_addr_list = base.wrapping_add(16).cast();
+    r.h_addrtype = fam;
+    r.h_length = len as c_int;
+    set_h(NETDB_SUCCESS);
+    done(&mut mode, NSS_SUCCESS, resbuf);
+    1
 }
 
 fn dns_addr(cfg: &dns::Config, af: c_int, a: &[u8]) -> (Status, Option<c_int>, Option<Buf<256>>) {
@@ -985,91 +1038,85 @@ fn dns_addr(cfg: &dns::Config, af: c_int, a: &[u8]) -> (Status, Option<c_int>, O
     (o.status, o.h_errno, name)
 }
 
-fn use_inet6() -> bool {
-    crate::resolv::current_config().options & dns::RES_USE_INET6 != 0
+pub(crate) fn use_inet6() -> bool {
+    false
 }
 
-unsafe fn no_sources(h_errnop: *mut c_int) -> c_int {
-    unsafe {
-        let e = errno::get();
-        *h_errnop = if e != ENOENT { NETDB_INTERNAL } else { NO_RECOVERY };
-        if e == ERANGE {
-            errno::set(EINVAL);
-            return EINVAL;
-        }
-        e
+fn no_sources(h_errnop: &mut c_int) -> c_int {
+    let e = errno::get();
+    *h_errnop = if e != ENOENT { NETDB_INTERNAL } else { NO_RECOVERY };
+    if e == ERANGE {
+        errno::set(EINVAL);
+        return EINVAL;
     }
+    e
 }
 
-unsafe fn hostbyname_r(func: u8, name: *const c_char, af: c_int, res: *mut hostent, buf: *mut c_char, buflen: usize, result: *mut *mut hostent, h_errnop: *mut c_int) -> c_int {
-    unsafe {
-        let rc = hostbyname_r_body(func, name, af, res, buf, buflen, result, h_errnop);
-        errno::set(rc);
-        rc
-    }
+pub fn hostbyname_r(func: u8, name: Option<&[u8]>, af: c_int, res: &mut hostent, buf: &mut [u8], h_errnop: &mut c_int) -> (c_int, bool) {
+    let r = hostbyname_r_body(func, name, af, res, buf, h_errnop);
+    errno::set(r.0);
+    r
 }
 
-unsafe fn hostbyname_r_body(func: u8, name: *const c_char, af: c_int, res: *mut hostent, buf: *mut c_char, buflen: usize, result: *mut *mut hostent, h_errnop: *mut c_int) -> c_int {
-    unsafe {
+fn hostbyname_r_body(func: u8, name: Option<&[u8]>, af: c_int, res: &mut hostent, buf: &mut [u8], h_errnop: &mut c_int) -> (c_int, bool) {
+    {
         nss::hconf_init();
-        *result = core::ptr::null_mut();
-        if name.is_null() {
+        let Some(nm) = name else {
             *h_errnop = HOST_NOT_FOUND;
-            return EINVAL;
-        }
-        let nm = cbytes(name);
+            return (EINVAL, false);
+        };
+        let buflen = buf.len();
         let (mut name_buf, mut data) = (Buf::<1025>::from(nm).unwrap_or_default(), HostData::new());
         let _ = &mut name_buf;
         match digits_dots(nm, af, use_inet6()) {
             Err(h) => {
                 *h_errnop = h;
-                return 0;
+                return (0, false);
             }
             Ok(Some((a, fam))) => {
                 if buflen < 16 + 16 + 8 + nm.len() + 1 {
                     *h_errnop = NETDB_INTERNAL;
                     errno::set(ERANGE);
-                    return ERANGE;
+                    return (ERANGE, false);
                 }
-                let r = fill_hostent(&mut *res, buf, buflen, nm, b"", fam, &[a]);
+                let r = fill_hostent(res, buf, nm, b"", fam, &[a]);
                 return match r {
                     Ok(()) => {
                         *h_errnop = NETDB_SUCCESS;
-                        *result = res;
-                        0
+                        (0, true)
                     }
                     Err(e) => {
                         *h_errnop = NETDB_INTERNAL;
                         errno::set(e);
-                        e
+                        (e, false)
                     }
                 };
             }
             Ok(None) => {}
         }
         if nss::hosts_order().n == 0 {
-            return no_sources(h_errnop);
+            return (no_sources(h_errnop), false);
         }
         let want_af = if af == AF_INET || af == AF_INET6 { af } else { AF_INET };
         let v4m = want_af == AF_INET6 && use_inet6();
-        data.fit = Some((buf as usize, buflen));
+        data.fit = Some((buf.as_ptr() as usize, buflen));
         data.func = func;
         data.h = *h_errnop;
         match lookup_name(nm, want_af, v4m, &mut data) {
             Ok(()) => {
                 let fam = if want_af == AF_INET6 { AF_INET6 } else { AF_INET };
                 let addrs = &data.addrs[..data.n];
-                let r = fill_hostent(&mut *res, buf, buflen, data.canon.as_bytes(), data.aliases.as_bytes(), fam, addrs);
+                let r = fill_hostent(res, buf, data.canon.as_bytes(), data.aliases.as_bytes(), fam, addrs);
                 match r {
                     Ok(()) => {
                         *h_errnop = data.h;
-                        *result = res;
-                        0
+                        unsafe { nss::reorder_addrs(res) };
+                        (0, true)
                     }
                     Err(e) => {
                         *h_errnop = NETDB_INTERNAL;
                         errno::set(e);
-                        e
+                        (e, false)
                     }
                 }
             }
@@ -1077,23 +1124,24 @@ unsafe fn hostbyname_r_body(func: u8, name: *const c_char, af: c_int, res: *mut 
                 if data.erange {
                     *h_errnop = NETDB_INTERNAL;
                     errno::set(ERANGE);
-                    return ERANGE;
+                    return (ERANGE, false);
                 }
                 if data.einval {
                     *h_errnop = data.h;
-                    return EINVAL;
+                    return (EINVAL, false);
                 }
                 if !data.any {
-                    return no_sources(h_errnop);
+                    return (no_sources(h_errnop), false);
                 }
                 *h_errnop = h;
-                if h == TRY_AGAIN {
+                let rc = if data.tryagain && h != NETDB_INTERNAL {
                     EAGAIN
-                } else if data.unavail {
+                } else if data.unavail || data.tryagain {
                     errno::get()
                 } else {
                     0
-                }
+                };
+                (rc, false)
             }
         }
     }
@@ -1101,35 +1149,50 @@ unsafe fn hostbyname_r_body(func: u8, name: *const c_char, af: c_int, res: *mut 
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn gethostbyname_r(name: *const c_char, res: *mut hostent, buf: *mut c_char, buflen: usize, result: *mut *mut hostent, h_errnop: *mut c_int) -> c_int {
-    unsafe { hostbyname_r(1, name, if use_inet6() { AF_INET6 } else { AF_INET }, res, buf, buflen, result, h_errnop) }
+    let af = if use_inet6() { AF_INET6 } else { AF_INET };
+    unsafe { r_shell(res, buf, buflen, result, (OptStr(name), Out(h_errnop)), |r, b, (nm, h)| hostbyname_r(1, nm.map(CStr::to_bytes), af, r, b, h)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn gethostbyname2_r(name: *const c_char, af: c_int, res: *mut hostent, buf: *mut c_char, buflen: usize, result: *mut *mut hostent, h_errnop: *mut c_int) -> c_int {
-    unsafe { hostbyname_r(2, name, af, res, buf, buflen, result, h_errnop) }
+    unsafe { r_shell(res, buf, buflen, result, (OptStr(name), Out(h_errnop)), |r, b, (nm, h)| hostbyname_r(2, nm.map(CStr::to_bytes), af, r, b, h)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn gethostbyaddr_r(addr: *const c_void, len: u32, af: c_int, res: *mut hostent, buf: *mut c_char, buflen: usize, result: *mut *mut hostent, h_errnop: *mut c_int) -> c_int {
-    unsafe {
-        let rc = hostbyaddr_r_body(addr, len, af, res, buf, buflen, result, h_errnop);
-        errno::set(rc);
-        rc
-    }
+    unsafe { r_shell(res, buf, buflen, result, (Bytes(addr.cast(), (len as usize).min(16)), Out(h_errnop)), |r, b, (a, h)| hostbyaddr_r(a, len, af, r, b, h)) }
 }
 
-unsafe fn hostbyaddr_r_body(addr: *const c_void, len: u32, af: c_int, res: *mut hostent, buf: *mut c_char, buflen: usize, result: *mut *mut hostent, h_errnop: *mut c_int) -> c_int {
-    unsafe {
+fn in6addr_any_skip(a: &[u8], len: u32) -> bool {
+    len == 16 && a.len() == 16 && a.iter().all(|&b| b == 0)
+}
+
+pub fn hostbyaddr_r(a: &[u8], len: u32, af: c_int, res: &mut hostent, buf: &mut [u8], h_errnop: &mut c_int) -> (c_int, bool) {
+    if in6addr_any_skip(a, len) {
+        crate::resolv::init_this_state();
+        *h_errnop = HOST_NOT_FOUND;
+        return (ENOENT, false);
+    }
+    let (rc, ok) = hostbyaddr_r_body(a, len, af, res, buf, h_errnop);
+    if rc == 0 && ok {
+        unsafe { nss::reorder_addrs(res) };
+        unsafe { nss::trim_domains(res) };
+    }
+    errno::set(rc);
+    (rc, ok)
+}
+
+fn hostbyaddr_r_body(addr: &[u8], len: u32, af: c_int, res: &mut hostent, buf: &mut [u8], h_errnop: &mut c_int) -> (c_int, bool) {
+    {
         nss::hconf_init();
-        *result = core::ptr::null_mut();
         let af = if af == AF_UNSPEC { AF_INET } else { af };
         if !((af == AF_INET6 && len >= 16) || (af == AF_INET && len >= 4)) {
             *h_errnop = NETDB_INTERNAL;
             errno::set(EAFNOSUPPORT);
-            return EAFNOSUPPORT;
+            return (EAFNOSUPPORT, false);
         }
         let len = if af == AF_INET { 4 } else { 16 };
-        let a = core::slice::from_raw_parts(addr as *const u8, len as usize);
+        let a = &addr[..len];
         let (mut af, mut a) = (af, a);
         if af == AF_INET6 && a[..10] == [0; 10] && ((a[10] == 0xff && a[11] == 0xff) || (a[10] == 0 && a[11] == 0 && (a[12] != 0 || a[13] != 0 || a[14] != 0 || a[15] > 1))) {
             a = &a[12..];
@@ -1137,7 +1200,7 @@ unsafe fn hostbyaddr_r_body(addr: *const c_void, len: u32, af: c_int, res: *mut 
         }
         let order = nss::hosts_order();
         if order.n == 0 {
-            return no_sources(h_errnop);
+            return (no_sources(h_errnop), false);
         }
         let mut name: Option<Buf<256>> = None;
         let mut aliases = Buf::<1024>::new();
@@ -1154,7 +1217,7 @@ unsafe fn hostbyaddr_r_body(addr: *const c_void, len: u32, af: c_int, res: *mut 
             let st = match e.src {
                 Source::Files => {
                     let mut found = Status::NotFound;
-                    let fit = Fit::new(32, buf, buflen);
+                    let fit = Fit::new(32, buf);
                     let opened = nss::open_db(Db::Hosts);
                     if let Err(e) = &opened {
                         errno::set(*e);
@@ -1166,7 +1229,6 @@ unsafe fn hostbyaddr_r_body(addr: *const c_void, len: u32, af: c_int, res: *mut 
                         let mut matched = false;
                         while !range_err {
                             let Some((line, rawlen)) = r.next_raw() else { break };
-                            let line = core::slice::from_raw_parts(line.as_ptr(), line.len());
                             if !fit.read_ok(rawlen) {
                                 range_err = true;
                                 break;
@@ -1227,46 +1289,44 @@ unsafe fn hostbyaddr_r_body(addr: *const c_void, len: u32, af: c_int, res: *mut 
             if range_err {
                 *h_errnop = NETDB_INTERNAL;
                 errno::set(ERANGE);
-                return ERANGE;
+                return (ERANGE, false);
             }
             status = st;
             if st == Status::Success && e.action(Status::Success) == Action::Merge {
                 errno::set(EINVAL);
                 *h_errnop = h_out;
-                return EINVAL;
+                return (EINVAL, false);
             }
             if e.action(st) == Action::Return {
                 break;
             }
         }
         if !any {
-            return no_sources(h_errnop);
+            return (no_sources(h_errnop), false);
         }
         match name {
             Some(n) if status == Status::Success => {
                 *h_errnop = h_out;
                 let ad = Addr { family: af, bytes: { let mut b = [0u8; 16]; b[..a.len()].copy_from_slice(a); b }, scope: 0 };
-                match fill_hostent(&mut *res, buf, buflen, n.as_bytes(), aliases.as_bytes(), af, &[ad]) {
-                    Ok(()) => {
-                        *result = res;
-                        0
-                    }
+                match fill_hostent(res, buf, n.as_bytes(), aliases.as_bytes(), af, &[ad]) {
+                    Ok(()) => (0, true),
                     Err(e) => {
                         *h_errnop = NETDB_INTERNAL;
                         errno::set(e);
-                        e
+                        (e, false)
                     }
                 }
             }
             _ => {
                 *h_errnop = h_out;
-                if status == Status::TryAgain && h_out != NETDB_INTERNAL {
+                let rc = if status == Status::TryAgain && h_out != NETDB_INTERNAL {
                     EAGAIN
                 } else if status == Status::Unavail {
                     errno::get()
                 } else {
                     0
-                }
+                };
+                (rc, false)
             }
         }
     }
@@ -1274,17 +1334,31 @@ unsafe fn hostbyaddr_r_body(addr: *const c_void, len: u32, af: c_int, res: *mut 
 
 struct Static<T> {
     res: T,
-    buf: *mut c_char,
-    cap: usize,
+    buf: ZBuf,
 }
 
 unsafe impl<T> Send for Static<T> {}
+
+impl<T> Static<T> {
+    fn grow(&mut self) -> bool {
+        let ncap = if self.buf.is_empty() { BUF0 } else { self.buf.cap() * 2 };
+        if !self.buf.grow(ncap) {
+            errno::set(ENOMEM);
+            return false;
+        }
+        true
+    }
+
+    fn parts(&mut self) -> (&mut T, &mut [u8]) {
+        (&mut self.res, self.buf.as_mut_slice())
+    }
+}
 
 const BUF0: usize = 1024;
 
 macro_rules! statics {
     ($name:ident, $ty:ty, $zero:expr) => {
-        static $name: Spin<Static<$ty>> = Spin::new(Static { res: $zero, buf: core::ptr::null_mut(), cap: 0 });
+        static $name: Spin<Static<$ty>> = Spin::new(Static { res: $zero, buf: ZBuf::new() });
     };
 }
 
@@ -1302,43 +1376,35 @@ statics!(NETENT_S, netent, NETENT0);
 statics!(RPCENT_S, rpcent, RPCENT0);
 statics!(ALIASENT_S, aliasent, ALIASENT0);
 
-fn with_static<T: Copy>(s: &Spin<Static<T>>, mut f: impl FnMut(*mut T, *mut c_char, usize, *mut *mut T) -> c_int) -> *mut T {
+fn with_static<T>(s: &Spin<Static<T>>, ent: bool, mut f: impl FnMut(&mut T, &mut [u8]) -> (c_int, bool)) -> *mut T {
     let mut g = s.lock();
-    if g.buf.is_null() {
-        g.buf = unsafe { rusty_libc_malloc::malloc(BUF0) } as *mut c_char;
-        if g.buf.is_null() {
-            errno::set(ENOMEM);
-            return core::ptr::null_mut();
-        }
-        g.cap = BUF0;
+    if g.buf.is_empty() && !g.grow() {
+        return core::ptr::null_mut();
     }
     loop {
-        let (res, buf, cap) = (&mut g.res as *mut T, g.buf, g.cap);
-        let mut out: *mut T = core::ptr::null_mut();
-        let r = f(res, buf, cap, &mut out);
+        let (res, buf) = g.parts();
+        let (r, ok) = f(res, buf);
         if r == ERANGE {
-            let ncap = g.cap * 2;
-            let nb = unsafe { rusty_libc_malloc::realloc(g.buf as *mut c_void, ncap) } as *mut c_char;
-            if nb.is_null() {
-                errno::set(ENOMEM);
+            if !g.grow() {
                 return core::ptr::null_mut();
             }
-            g.buf = nb;
-            g.cap = ncap;
             continue;
         }
         if r == 0 {
-            return out;
+            return if ok { &mut g.res as *mut T } else { core::ptr::null_mut() };
         }
-        errno::set(r);
+        if !ent {
+            errno::set(r);
+        }
         return core::ptr::null_mut();
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn gethostbyname(name: *const c_char) -> *mut hostent {
+    let nm = unsafe { ffi::cstr(name) }.map(CStr::to_bytes);
     let mut h = 0;
-    let r = with_static(&HOSTENT_S, |res, buf, cap, out| unsafe { gethostbyname_r(name, res, buf, cap, out, &mut h) });
+    let r = with_static(&HOSTENT_S, false, |res, buf| hostbyname_r(1, nm, if use_inet6() { AF_INET6 } else { AF_INET }, res, buf, &mut h));
     if r.is_null() {
         set_h_errno(h);
     }
@@ -1347,8 +1413,9 @@ pub unsafe extern "C" fn gethostbyname(name: *const c_char) -> *mut hostent {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn gethostbyname2(name: *const c_char, af: c_int) -> *mut hostent {
+    let nm = unsafe { ffi::cstr(name) }.map(CStr::to_bytes);
     let mut h = 0;
-    let r = with_static(&HOSTENT_S, |res, buf, cap, out| unsafe { gethostbyname2_r(name, af, res, buf, cap, out, &mut h) });
+    let r = with_static(&HOSTENT_S, false, |res, buf| hostbyname_r(2, nm, af, res, buf, &mut h));
     if r.is_null() {
         set_h_errno(h);
     }
@@ -1357,291 +1424,347 @@ pub unsafe extern "C" fn gethostbyname2(name: *const c_char, af: c_int) -> *mut 
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn gethostbyaddr(addr: *const c_void, len: u32, af: c_int) -> *mut hostent {
+    let a = unsafe { ffi::bytes(addr.cast(), (len as usize).min(16)) };
     let mut h = 0;
-    let r = with_static(&HOSTENT_S, |res, buf, cap, out| unsafe { gethostbyaddr_r(addr, len, af, res, buf, cap, out, &mut h) });
+    let olderr = errno::get();
+    let r = with_static(&HOSTENT_S, false, |res, buf| hostbyaddr_r(a, len, af, res, buf, &mut h));
     if r.is_null() {
         set_h_errno(h);
+        if in6addr_any_skip(a, len) {
+            errno::set(olderr);
+        }
     }
     r
+}
+
+unsafe fn r_shell<'a, T: 'a, S: CIn<'a>>(res: *mut T, buf: *mut c_char, buflen: usize, result: *mut *mut T, extra: S, f: impl FnOnce(&mut T, &mut [u8], S::Out) -> (c_int, bool)) -> c_int {
+    let r = unsafe { &mut *res };
+    let b = unsafe { ffi::bytes_mut(buf.cast(), buflen) };
+    let x = unsafe { extra.conv() };
+    let (rc, ok) = f(r, b, x);
+    if let Some(rp) = unsafe { ffi::out(result) } {
+        *rp = if ok { res } else { core::ptr::null_mut() };
+    }
+    rc
+}
+
+pub fn servbyname_r(name: &CStr, proto: Option<&CStr>, res: &mut servent, buf: &mut [u8]) -> (c_int, bool) {
+    let nm = name.to_bytes();
+    let pr = proto.map(CStr::to_bytes);
+    let out = RefCell::new(OutBufs { res, buf });
+    by_key(
+        b"services",
+        b"getservbyname_r",
+        None,
+        &|| {
+            let mut o = out.borrow_mut();
+            let o = &mut *o;
+            scan_status(None, scan(Db::Services, Fit::new(0, o.buf), |line, k| {
+                let l = nss::parse_serv_line(line)?;
+                *k = nss::words(l.rest).count();
+                if let Some(p) = pr {
+                    if l.proto != p {
+                        return None;
+                    }
+                }
+                if l.name == nm || nss::words(l.rest).any(|w| w == nm) {
+                    return Some(fill_servent(o.res, o.buf, &l));
+                }
+                None
+            }))
+        },
+        &|en| {
+            let (r, b, n) = out.borrow_mut().raw();
+            (name.as_ptr(), proto.map_or(core::ptr::null(), CStr::as_ptr), r, b, n, en)
+        },
+    )
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getservbyname_r(name: *const c_char, proto: *const c_char, res: *mut servent, buf: *mut c_char, buflen: usize, result: *mut *mut servent) -> c_int {
-    unsafe {
-        let nm = cbytes(name);
-        let pr = if proto.is_null() { None } else { Some(cbytes(proto)) };
-        by_key(
-            b"services",
-            b"getservbyname_r",
-            res,
-            result,
-            core::ptr::null_mut(),
-            &|| {
-                scan_status(core::ptr::null_mut(), scan(Db::Services, Fit::new(0, buf, buflen), |line, k| {
-                    let l = nss::parse_serv_line(line)?;
-                    *k = nss::words(l.rest).count();
-                    if let Some(p) = pr {
-                        if l.proto != p {
-                            return None;
-                        }
+    unsafe { r_shell(res, buf, buflen, result, (Str(name), OptStr(proto)), |r, b, (nm, pr)| servbyname_r(nm, pr, r, b)) }
+}
+
+pub fn servbyport_r(port: c_int, proto: Option<&CStr>, res: &mut servent, buf: &mut [u8]) -> (c_int, bool) {
+    let pr = proto.map(CStr::to_bytes);
+    let out = RefCell::new(OutBufs { res, buf });
+    by_key(
+        b"services",
+        b"getservbyport_r",
+        None,
+        &|| {
+            let mut o = out.borrow_mut();
+            let o = &mut *o;
+            scan_status(None, scan(Db::Services, Fit::new(0, o.buf), |line, k| {
+                let l = nss::parse_serv_line(line)?;
+                *k = nss::words(l.rest).count();
+                if (l.port.to_be() as c_int) != port {
+                    return None;
+                }
+                if let Some(p) = pr {
+                    if l.proto != p {
+                        return None;
                     }
-                    if l.name == nm || nss::words(l.rest).any(|w| w == nm) {
-                        return Some(fill_servent(&mut *res, buf, buflen, &l));
-                    }
-                    None
-                }))
-            },
-            &|f, en| {
-                let f: unsafe extern "C" fn(*const c_char, *const c_char, *mut servent, *mut c_char, usize, *mut c_int) -> c_int = core::mem::transmute(f);
-                f(name, proto, res, buf, buflen, en)
-            },
-        )
-    }
+                }
+                Some(fill_servent(o.res, o.buf, &l))
+            }))
+        },
+        &|en| {
+            let (r, b, n) = out.borrow_mut().raw();
+            (port, proto.map_or(core::ptr::null(), CStr::as_ptr), r, b, n, en)
+        },
+    )
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getservbyport_r(port: c_int, proto: *const c_char, res: *mut servent, buf: *mut c_char, buflen: usize, result: *mut *mut servent) -> c_int {
-    unsafe {
-        let pr = if proto.is_null() { None } else { Some(cbytes(proto)) };
-        by_key(
-            b"services",
-            b"getservbyport_r",
-            res,
-            result,
-            core::ptr::null_mut(),
-            &|| {
-                scan_status(core::ptr::null_mut(), scan(Db::Services, Fit::new(0, buf, buflen), |line, k| {
-                    let l = nss::parse_serv_line(line)?;
-                    *k = nss::words(l.rest).count();
-                    if (l.port.to_be() as c_int) != port {
-                        return None;
-                    }
-                    if let Some(p) = pr {
-                        if l.proto != p {
-                            return None;
-                        }
-                    }
-                    Some(fill_servent(&mut *res, buf, buflen, &l))
-                }))
-            },
-            &|f, en| {
-                let f: unsafe extern "C" fn(c_int, *const c_char, *mut servent, *mut c_char, usize, *mut c_int) -> c_int = core::mem::transmute(f);
-                f(port, proto, res, buf, buflen, en)
-            },
-        )
-    }
+    unsafe { r_shell(res, buf, buflen, result, OptStr(proto), |r, b, pr| servbyport_r(port, pr, r, b)) }
+}
+
+pub fn protobyname_r(name: &CStr, res: &mut protoent, buf: &mut [u8]) -> (c_int, bool) {
+    let nm = name.to_bytes();
+    let out = RefCell::new(OutBufs { res, buf });
+    by_key(
+        b"protocols",
+        b"getprotobyname_r",
+        None,
+        &|| {
+            let mut o = out.borrow_mut();
+            let o = &mut *o;
+            scan_status(None, scan(Db::Protocols, Fit::new(0, o.buf), |line, k| {
+                let l = nss::parse_num_line(line)?;
+                *k = nss::words(l.rest).count();
+                if l.name == nm || nss::words(l.rest).any(|w| w == nm) {
+                    return Some(fill_protoent(o.res, o.buf, &l));
+                }
+                None
+            }))
+        },
+        &|en| {
+            let (r, b, n) = out.borrow_mut().raw();
+            (name.as_ptr(), r, b, n, en)
+        },
+    )
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getprotobyname_r(name: *const c_char, res: *mut protoent, buf: *mut c_char, buflen: usize, result: *mut *mut protoent) -> c_int {
-    unsafe {
-        let nm = cbytes(name);
-        by_key(
-            b"protocols",
-            b"getprotobyname_r",
-            res,
-            result,
-            core::ptr::null_mut(),
-            &|| {
-                scan_status(core::ptr::null_mut(), scan(Db::Protocols, Fit::new(0, buf, buflen), |line, k| {
-                    let l = nss::parse_num_line(line)?;
-                    *k = nss::words(l.rest).count();
-                    if l.name == nm || nss::words(l.rest).any(|w| w == nm) {
-                        return Some(fill_protoent(&mut *res, buf, buflen, &l));
-                    }
-                    None
-                }))
-            },
-            &|f, en| {
-                let f: unsafe extern "C" fn(*const c_char, *mut protoent, *mut c_char, usize, *mut c_int) -> c_int = core::mem::transmute(f);
-                f(name, res, buf, buflen, en)
-            },
-        )
-    }
+    unsafe { r_shell(res, buf, buflen, result, Str(name), |r, b, nm| protobyname_r(nm, r, b)) }
+}
+
+pub fn protobynumber_r(proto: c_int, res: &mut protoent, buf: &mut [u8]) -> (c_int, bool) {
+    let out = RefCell::new(OutBufs { res, buf });
+    by_key(
+        b"protocols",
+        b"getprotobynumber_r",
+        None,
+        &|| {
+            let mut o = out.borrow_mut();
+            let o = &mut *o;
+            scan_status(None, scan(Db::Protocols, Fit::new(0, o.buf), |line, k| {
+                let l = nss::parse_num_line(line)?;
+                *k = nss::words(l.rest).count();
+                if l.num == proto { Some(fill_protoent(o.res, o.buf, &l)) } else { None }
+            }))
+        },
+        &|en| {
+            let (r, b, n) = out.borrow_mut().raw();
+            (proto, r, b, n, en)
+        },
+    )
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getprotobynumber_r(proto: c_int, res: *mut protoent, buf: *mut c_char, buflen: usize, result: *mut *mut protoent) -> c_int {
-    unsafe {
-        by_key(
-            b"protocols",
-            b"getprotobynumber_r",
-            res,
-            result,
-            core::ptr::null_mut(),
-            &|| {
-                scan_status(core::ptr::null_mut(), scan(Db::Protocols, Fit::new(0, buf, buflen), |line, k| {
-                    let l = nss::parse_num_line(line)?;
-                    *k = nss::words(l.rest).count();
-                    if l.num == proto { Some(fill_protoent(&mut *res, buf, buflen, &l)) } else { None }
-                }))
-            },
-            &|f, en| {
-                let f: unsafe extern "C" fn(c_int, *mut protoent, *mut c_char, usize, *mut c_int) -> c_int = core::mem::transmute(f);
-                f(proto, res, buf, buflen, en)
-            },
-        )
-    }
+    unsafe { r_shell(res, buf, buflen, result, (), |r, b, ()| protobynumber_r(proto, r, b)) }
+}
+
+pub fn netbyname_r(name: &CStr, res: &mut netent, buf: &mut [u8], h_errnop: Option<&Cell<c_int>>) -> (c_int, bool) {
+    let nm = name.to_bytes();
+    let hp = h_errnop.map_or(core::ptr::null_mut(), Cell::as_ptr);
+    let out = RefCell::new(OutBufs { res, buf });
+    by_key_dns(
+        b"networks",
+        b"getnetbyname_r",
+        h_errnop,
+        &|| {
+            let mut o = out.borrow_mut();
+            let o = &mut *o;
+            scan_status(h_errnop, scan(Db::Networks, Fit::new(0, o.buf), |line, k| {
+                let l = nss::parse_net_line(line)?;
+                *k = nss::words(l.rest).count();
+                if eq_nocase(l.name, nm) || nss::words(l.rest).any(|w| eq_nocase(w, nm)) {
+                    return Some(fill_netent(o.res, o.buf, &l));
+                }
+                None
+            }))
+        },
+        &|en| {
+            let (r, b, n) = out.borrow_mut().raw();
+            (name.as_ptr(), r, b, n, en, hp)
+        },
+        Some(&|en| {
+            let (r, b, n) = out.borrow_mut().raw();
+            unsafe { crate::nssdns_abi::_nss_dns_getnetbyname_r(name.as_ptr(), r, b, n, en, hp) }
+        }),
+    )
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getnetbyname_r(name: *const c_char, res: *mut netent, buf: *mut c_char, buflen: usize, result: *mut *mut netent, h_errnop: *mut c_int) -> c_int {
-    unsafe {
-        let nm = cbytes(name);
-        by_key_dns(
-            b"networks",
-            b"getnetbyname_r",
-            res,
-            result,
-            h_errnop,
-            &|| {
-                scan_status(h_errnop, scan(Db::Networks, Fit::new(0, buf, buflen), |line, k| {
-                    let l = nss::parse_net_line(line)?;
-                    *k = nss::words(l.rest).count();
-                    if eq_nocase(l.name, nm) || nss::words(l.rest).any(|w| eq_nocase(w, nm)) {
-                        return Some(fill_netent(&mut *res, buf, buflen, &l));
-                    }
-                    None
-                }))
-            },
-            &|f, en| {
-                let f: unsafe extern "C" fn(*const c_char, *mut netent, *mut c_char, usize, *mut c_int, *mut c_int) -> c_int = core::mem::transmute(f);
-                f(name, res, buf, buflen, en, h_errnop)
-            },
-            Some(&|en| crate::nssdns_abi::_nss_dns_getnetbyname_r(name, res, buf, buflen, en, h_errnop)),
-        )
-    }
+    unsafe { r_shell(res, buf, buflen, result, (Str(name), OptCell(h_errnop)), |r, b, (nm, h)| netbyname_r(nm, r, b, h)) }
+}
+
+pub fn netbyaddr_r(net: u32, ty: c_int, res: &mut netent, buf: &mut [u8], h_errnop: Option<&Cell<c_int>>) -> (c_int, bool) {
+    let hp = h_errnop.map_or(core::ptr::null_mut(), Cell::as_ptr);
+    let out = RefCell::new(OutBufs { res, buf });
+    by_key_dns(
+        b"networks",
+        b"getnetbyaddr_r",
+        h_errnop,
+        &|| {
+            let mut o = out.borrow_mut();
+            let o = &mut *o;
+            scan_status(h_errnop, scan(Db::Networks, Fit::new(0, o.buf), |line, k| {
+                let l = nss::parse_net_line(line)?;
+                *k = nss::words(l.rest).count();
+                if (ty == AF_UNSPEC || ty == AF_INET) && l.net == net { Some(fill_netent(o.res, o.buf, &l)) } else { None }
+            }))
+        },
+        &|en| {
+            let (r, b, n) = out.borrow_mut().raw();
+            (net, ty, r, b, n, en, hp)
+        },
+        Some(&|en| {
+            let (r, b, n) = out.borrow_mut().raw();
+            unsafe { crate::nssdns_abi::_nss_dns_getnetbyaddr_r(net, ty, r, b, n, en, hp) }
+        }),
+    )
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getnetbyaddr_r(net: u32, ty: c_int, res: *mut netent, buf: *mut c_char, buflen: usize, result: *mut *mut netent, h_errnop: *mut c_int) -> c_int {
-    unsafe {
-        by_key_dns(
-            b"networks",
-            b"getnetbyaddr_r",
-            res,
-            result,
-            h_errnop,
-            &|| {
-                scan_status(h_errnop, scan(Db::Networks, Fit::new(0, buf, buflen), |line, k| {
-                    let l = nss::parse_net_line(line)?;
-                    *k = nss::words(l.rest).count();
-                    if (ty == AF_UNSPEC || ty == AF_INET) && l.net == net { Some(fill_netent(&mut *res, buf, buflen, &l)) } else { None }
-                }))
-            },
-            &|f, en| {
-                let f: unsafe extern "C" fn(u32, c_int, *mut netent, *mut c_char, usize, *mut c_int, *mut c_int) -> c_int = core::mem::transmute(f);
-                f(net, ty, res, buf, buflen, en, h_errnop)
-            },
-            Some(&|en| crate::nssdns_abi::_nss_dns_getnetbyaddr_r(net, ty, res, buf, buflen, en, h_errnop)),
-        )
-    }
+    unsafe { r_shell(res, buf, buflen, result, OptCell(h_errnop), |r, b, h| netbyaddr_r(net, ty, r, b, h)) }
+}
+
+pub fn rpcbyname_r(name: &CStr, res: &mut rpcent, buf: &mut [u8]) -> (c_int, bool) {
+    let nm = name.to_bytes();
+    let out = RefCell::new(OutBufs { res, buf });
+    by_key(
+        b"rpc",
+        b"getrpcbyname_r",
+        None,
+        &|| {
+            let mut o = out.borrow_mut();
+            let o = &mut *o;
+            scan_status(None, scan(Db::Rpc, Fit::new(0, o.buf), |line, k| {
+                let l = nss::parse_num_line(line)?;
+                *k = nss::words(l.rest).count();
+                if l.name == nm || nss::words(l.rest).any(|w| w == nm) {
+                    return Some(fill_rpcent(o.res, o.buf, &l));
+                }
+                None
+            }))
+        },
+        &|en| {
+            let (r, b, n) = out.borrow_mut().raw();
+            (name.as_ptr(), r, b, n, en)
+        },
+    )
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getrpcbyname_r(name: *const c_char, res: *mut rpcent, buf: *mut c_char, buflen: usize, result: *mut *mut rpcent) -> c_int {
-    unsafe {
-        let nm = cbytes(name);
-        by_key(
-            b"rpc",
-            b"getrpcbyname_r",
-            res,
-            result,
-            core::ptr::null_mut(),
-            &|| {
-                scan_status(core::ptr::null_mut(), scan(Db::Rpc, Fit::new(0, buf, buflen), |line, k| {
-                    let l = nss::parse_num_line(line)?;
-                    *k = nss::words(l.rest).count();
-                    if l.name == nm || nss::words(l.rest).any(|w| w == nm) {
-                        return Some(fill_rpcent(&mut *res, buf, buflen, &l));
-                    }
-                    None
-                }))
-            },
-            &|f, en| {
-                let f: unsafe extern "C" fn(*const c_char, *mut rpcent, *mut c_char, usize, *mut c_int) -> c_int = core::mem::transmute(f);
-                f(name, res, buf, buflen, en)
-            },
-        )
-    }
+    unsafe { r_shell(res, buf, buflen, result, Str(name), |r, b, nm| rpcbyname_r(nm, r, b)) }
+}
+
+pub fn rpcbynumber_r(number: c_int, res: &mut rpcent, buf: &mut [u8]) -> (c_int, bool) {
+    let out = RefCell::new(OutBufs { res, buf });
+    by_key(
+        b"rpc",
+        b"getrpcbynumber_r",
+        None,
+        &|| {
+            let mut o = out.borrow_mut();
+            let o = &mut *o;
+            scan_status(None, scan(Db::Rpc, Fit::new(0, o.buf), |line, k| {
+                let l = nss::parse_num_line(line)?;
+                *k = nss::words(l.rest).count();
+                if l.num == number { Some(fill_rpcent(o.res, o.buf, &l)) } else { None }
+            }))
+        },
+        &|en| {
+            let (r, b, n) = out.borrow_mut().raw();
+            (number, r, b, n, en)
+        },
+    )
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getrpcbynumber_r(number: c_int, res: *mut rpcent, buf: *mut c_char, buflen: usize, result: *mut *mut rpcent) -> c_int {
-    unsafe {
-        by_key(
-            b"rpc",
-            b"getrpcbynumber_r",
-            res,
-            result,
-            core::ptr::null_mut(),
-            &|| {
-                scan_status(core::ptr::null_mut(), scan(Db::Rpc, Fit::new(0, buf, buflen), |line, k| {
-                    let l = nss::parse_num_line(line)?;
-                    *k = nss::words(l.rest).count();
-                    if l.num == number { Some(fill_rpcent(&mut *res, buf, buflen, &l)) } else { None }
-                }))
-            },
-            &|f, en| {
-                let f: unsafe extern "C" fn(c_int, *mut rpcent, *mut c_char, usize, *mut c_int) -> c_int = core::mem::transmute(f);
-                f(number, res, buf, buflen, en)
-            },
-        )
-    }
+    unsafe { r_shell(res, buf, buflen, result, (), |r, b, ()| rpcbynumber_r(number, r, b)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getservbyname(name: *const c_char, proto: *const c_char) -> *mut servent {
-    with_static(&SERVENT_S, |res, buf, cap, out| unsafe { getservbyname_r(name, proto, res, buf, cap, out) })
+    let (nm, pr) = unsafe { (Str(name), OptStr(proto)).conv() };
+    with_static(&SERVENT_S, false, |res, buf| servbyname_r(nm, pr, res, buf))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getservbyport(port: c_int, proto: *const c_char) -> *mut servent {
-    with_static(&SERVENT_S, |res, buf, cap, out| unsafe { getservbyport_r(port, proto, res, buf, cap, out) })
+    let pr = unsafe { ffi::cstr(proto) };
+    with_static(&SERVENT_S, false, |res, buf| servbyport_r(port, pr, res, buf))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getprotobyname(name: *const c_char) -> *mut protoent {
-    with_static(&PROTOENT_S, |res, buf, cap, out| unsafe { getprotobyname_r(name, res, buf, cap, out) })
+    let nm = unsafe { ffi::cstr_nonnull(name) };
+    with_static(&PROTOENT_S, false, |res, buf| protobyname_r(nm, res, buf))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn getprotobynumber(proto: c_int) -> *mut protoent {
-    with_static(&PROTOENT_S, |res, buf, cap, out| unsafe { getprotobynumber_r(proto, res, buf, cap, out) })
+pub extern "C" fn getprotobynumber(proto: c_int) -> *mut protoent {
+    with_static(&PROTOENT_S, false, |res, buf| protobynumber_r(proto, res, buf))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getrpcbyname(name: *const c_char) -> *mut rpcent {
-    with_static(&RPCENT_S, |res, buf, cap, out| unsafe { getrpcbyname_r(name, res, buf, cap, out) })
+    let nm = unsafe { ffi::cstr_nonnull(name) };
+    with_static(&RPCENT_S, false, |res, buf| rpcbyname_r(nm, res, buf))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn getrpcbynumber(number: c_int) -> *mut rpcent {
-    with_static(&RPCENT_S, |res, buf, cap, out| unsafe { getrpcbynumber_r(number, res, buf, cap, out) })
+pub extern "C" fn getrpcbynumber(number: c_int) -> *mut rpcent {
+    with_static(&RPCENT_S, false, |res, buf| rpcbynumber_r(number, res, buf))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getnetbyname(name: *const c_char) -> *mut netent {
-    let mut h = 0;
-    let r = with_static(&NETENT_S, |res, buf, cap, out| unsafe { getnetbyname_r(name, res, buf, cap, out, &mut h) });
-    if h != 0 {
-        set_h_errno(h);
+    let nm = unsafe { ffi::cstr_nonnull(name) };
+    let h = Cell::new(0);
+    let r = with_static(&NETENT_S, false, |res, buf| netbyname_r(nm, res, buf, Some(&h)));
+    if h.get() != 0 {
+        set_h_errno(h.get());
     }
     r
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn getnetbyaddr(net: u32, ty: c_int) -> *mut netent {
-    let mut h = 0;
-    let r = with_static(&NETENT_S, |res, buf, cap, out| unsafe { getnetbyaddr_r(net, ty, res, buf, cap, out, &mut h) });
-    if h != 0 {
-        set_h_errno(h);
+pub extern "C" fn getnetbyaddr(net: u32, ty: c_int) -> *mut netent {
+    let h = Cell::new(0);
+    let r = with_static(&NETENT_S, false, |res, buf| netbyaddr_r(net, ty, res, buf, Some(&h)));
+    if h.get() != 0 {
+        set_h_errno(h.get());
     }
     r
 }
 
+use core::sync::atomic::{AtomicBool, Ordering};
+use rusty_libc_core::lock::RawMutex;
 use rusty_libc_core::nssent::{self, EntOps, Fn3};
 use rusty_libc_core::nssmod;
+use rusty_libc_core::sync_cell::SyncCell;
 
 const ST_TRYAGAIN: i32 = -2;
 const ST_UNAVAIL: i32 = -1;
@@ -1657,18 +1780,37 @@ struct NetDb {
     f: FileEnt,
 }
 
-impl NetDb {
-    const fn new() -> NetDb {
-        NetDb { st: nssent::EntState::new(), f: FileEnt { r: LineReader::closed() } }
+struct DbSlot {
+    lock: RawMutex,
+    started: AtomicBool,
+    db: SyncCell<NetDb>,
+}
+
+impl DbSlot {
+    const fn new() -> DbSlot {
+        DbSlot { lock: RawMutex::new(), started: AtomicBool::new(false), db: SyncCell::new(NetDb { st: nssent::EntState::new(), f: FileEnt { r: LineReader::closed() } }) }
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut NetDb) -> R) -> R {
+        self.lock.lock_always();
+        let r = unsafe {
+            self.db.with_unsync(|db| {
+                let r = f(db);
+                self.started.store(db.st.is_started(), Ordering::Relaxed);
+                r
+            })
+        };
+        self.lock.unlock_always();
+        r
     }
 }
 
-static mut HOST_DB: NetDb = NetDb::new();
-static mut SERV_DB: NetDb = NetDb::new();
-static mut PROTO_DB: NetDb = NetDb::new();
-static mut NET_DB: NetDb = NetDb::new();
-static mut RPC_DB: NetDb = NetDb::new();
-static mut ALIAS_DB: NetDb = NetDb::new();
+static HOST_DB: DbSlot = DbSlot::new();
+static SERV_DB: DbSlot = DbSlot::new();
+static PROTO_DB: DbSlot = DbSlot::new();
+static NET_DB: DbSlot = DbSlot::new();
+static RPC_DB: DbSlot = DbSlot::new();
+static ALIAS_DB: DbSlot = DbSlot::new();
 
 struct Names {
     db: &'static [u8],
@@ -1687,15 +1829,19 @@ const NET_NAMES: Names = Names { db: b"networks", dbid: Db::Networks, set: b"set
 const RPC_NAMES: Names = Names { db: b"rpc", dbid: Db::Rpc, set: b"setrpcent", get: b"getrpcent_r", end: b"endrpcent", stay: true, h: false };
 const ALIAS_NAMES: Names = Names { db: b"aliases", dbid: Db::Aliases, set: b"setaliasent", get: b"getaliasent_r", end: b"endaliasent", stay: false, h: false };
 
-type ReadFn<T> = unsafe fn(&mut FileEnt, *mut T, *mut c_char, usize) -> i32;
+type ReadFn<T> = fn(&mut FileEnt, &mut T, &mut [u8], usize) -> i32;
 
-struct NetOps<'a, T> {
+struct EntOut<'a, T> {
+    res: &'a mut T,
+    buf: &'a mut [u8],
+    limit: usize,
+    read: ReadFn<T>,
+}
+
+struct NetOps<'a, 'b, T> {
     f: &'a mut FileEnt,
     names: &'static Names,
-    res: *mut T,
-    buf: *mut c_char,
-    len: usize,
-    read: Option<ReadFn<T>>,
+    out: Option<EntOut<'b, T>>,
     h: *mut c_int,
 }
 
@@ -1703,7 +1849,7 @@ fn is_files(src: &nssmod::Source) -> bool {
     nssent::is_files(src)
 }
 
-impl<T> EntOps for NetOps<'_, T> {
+impl<T> EntOps for NetOps<'_, '_, T> {
     fn has(&mut self, src: &nssmod::Source, f: Fn3) -> bool {
         if is_files(src) {
             return true;
@@ -1719,56 +1865,47 @@ impl<T> EntOps for NetOps<'_, T> {
         nssmod::function(src.name(), n) != 0
     }
     fn call_set(&mut self, src: &nssmod::Source, stay: i32) -> i32 {
-        unsafe {
-            if is_files(src) {
-                return file_set(self.f, self.names.dbid);
-            }
-            let f = nssmod::function(src.name(), self.names.set);
-            if f == 0 {
-                return ST_UNAVAIL;
-            }
-            if self.names.stay {
-                let f: unsafe extern "C" fn(c_int) -> c_int = core::mem::transmute(f);
-                f(stay)
-            } else {
-                let f: unsafe extern "C" fn() -> c_int = core::mem::transmute(f);
-                f()
-            }
+        if is_files(src) {
+            return file_set(self.f, self.names.dbid);
+        }
+        let f = nssmod::function(src.name(), self.names.set);
+        if f == 0 {
+            return ST_UNAVAIL;
+        }
+        if self.names.stay {
+            unsafe { (stay,).call(f) }
+        } else {
+            unsafe { ().call(f) }
         }
     }
     fn call_get(&mut self, src: &nssmod::Source) -> i32 {
-        unsafe {
-            if is_files(src) {
-                if !self.f.r.is_open() {
-                    let saved = errno::get();
-                    let st = file_set(self.f, self.names.dbid);
-                    errno::set(saved);
-                    if st != ST_SUCCESS {
-                        return st;
-                    }
+        let Some(out) = self.out.as_mut() else { return ST_UNAVAIL };
+        if is_files(src) {
+            if !self.f.r.is_open() {
+                let saved = errno::get();
+                let st = file_set(self.f, self.names.dbid);
+                errno::set(saved);
+                if st != ST_SUCCESS {
+                    return st;
                 }
-                return (self.read.unwrap())(self.f, self.res, self.buf, self.len);
             }
-            let f = nssmod::function(src.name(), self.names.get);
-            if f == 0 {
-                return ST_UNAVAIL;
-            }
-            let f: unsafe extern "C" fn(*mut T, *mut c_char, usize, *mut c_int, *mut c_int) -> c_int = core::mem::transmute(f);
-            let st = f(self.res, self.buf, self.len, errno::location(), self.h);
-            if (-2..=1).contains(&st) { st } else { ST_UNAVAIL }
+            return (out.read)(self.f, out.res, out.buf, out.limit);
         }
+        let f = nssmod::function(src.name(), self.names.get);
+        if f == 0 {
+            return ST_UNAVAIL;
+        }
+        let st = unsafe { (out.res as *mut T, out.buf.as_mut_ptr().cast::<c_char>(), out.limit, errno::location(), self.h).call(f) };
+        if (-2..=1).contains(&st) { st } else { ST_UNAVAIL }
     }
     fn call_end(&mut self, src: &nssmod::Source) {
-        unsafe {
-            if is_files(src) {
-                self.f.r.close();
-                return;
-            }
-            let f = nssmod::function(src.name(), self.names.end);
-            if f != 0 {
-                let f: unsafe extern "C" fn() -> c_int = core::mem::transmute(f);
-                f();
-            }
+        if is_files(src) {
+            self.f.r.close();
+            return;
+        }
+        let f = nssmod::function(src.name(), self.names.end);
+        if f != 0 {
+            unsafe { ().call(f) };
         }
     }
 }
@@ -1790,43 +1927,33 @@ fn file_set(f: &mut FileEnt, db: Db) -> i32 {
     }
 }
 
-unsafe fn db_set<T>(db: *mut NetDb, names: &'static Names, stay: c_int) {
-    unsafe {
-        let db = &mut *db;
-        db.st.lock.lock_always();
-        let mut ops = NetOps::<T> { f: &mut db.f, names, res: core::ptr::null_mut(), buf: core::ptr::null_mut(), len: 0, read: None, h: core::ptr::null_mut() };
+fn db_set<T>(slot: &DbSlot, names: &'static Names, stay: c_int) {
+    slot.with(|db| {
+        let mut ops = NetOps::<T> { f: &mut db.f, names, out: None, h: core::ptr::null_mut() };
         db.st.setent(names.db, stay, &mut ops, names.stay);
-        db.st.lock.unlock_always();
-    }
+    })
 }
 
-unsafe fn db_end<T>(db: *mut NetDb, names: &'static Names) {
-    unsafe {
-        let db = &mut *db;
-        if !db.st.is_started() {
-            return;
-        }
-        db.st.lock.lock_always();
-        let mut ops = NetOps::<T> { f: &mut db.f, names, res: core::ptr::null_mut(), buf: core::ptr::null_mut(), len: 0, read: None, h: core::ptr::null_mut() };
+fn db_end<T>(slot: &DbSlot, names: &'static Names) {
+    if !slot.started.load(Ordering::Relaxed) {
+        return;
+    }
+    slot.with(|db| {
+        let mut ops = NetOps::<T> { f: &mut db.f, names, out: None, h: core::ptr::null_mut() };
         db.st.endent(names.db, &mut ops);
-        db.st.lock.unlock_always();
-    }
+    })
 }
 
-unsafe fn db_get<T>(db: *mut NetDb, names: &'static Names, read: ReadFn<T>, res: *mut T, buf: *mut c_char, len: usize, result: *mut *mut T) -> c_int {
-    unsafe {
-        let db = &mut *db;
-        db.st.lock.lock_always();
-        let hp: *mut c_int = if names.h { crate::strerr::__h_errno.as_ptr() } else { core::ptr::null_mut() };
-        let mut ops = NetOps::<T> { f: &mut db.f, names, res, buf, len, read: Some(read), h: hp };
-        let rc = db.st.getent(names.db, &mut ops, names.stay, &|| hp.is_null() || *hp == NETDB_INTERNAL);
-        db.st.lock.unlock_always();
-        *result = if rc == 0 { res } else { core::ptr::null_mut() };
-        rc
-    }
+fn db_get<T>(slot: &DbSlot, names: &'static Names, read: ReadFn<T>, res: &mut T, buf: &mut [u8], limit: usize) -> (c_int, bool) {
+    let hp: *mut c_int = if names.h { crate::strerr::__h_errno.as_ptr() } else { core::ptr::null_mut() };
+    let rc = slot.with(|db| {
+        let mut ops = NetOps::<T> { f: &mut db.f, names, out: Some(EntOut { res, buf, limit, read }), h: hp };
+        db.st.getent(names.db, &mut ops, names.stay, &|| !names.h || crate::strerr::h_errno() == NETDB_INTERNAL)
+    });
+    (rc, rc == 0)
 }
 
-unsafe fn read_ent(f: &mut FileEnt, fit: Fit, h: bool, mut parse: impl FnMut(&[u8], &mut usize) -> Option<Result<(), i32>>) -> i32 {
+fn read_ent(f: &mut FileEnt, fit: Fit, h: bool, mut parse: impl FnMut(&[u8], &mut usize) -> Option<Result<(), i32>>) -> i32 {
     let erange = |f: &mut FileEnt, unread: bool| {
         if unread {
             f.r.unread();
@@ -1847,7 +1974,6 @@ unsafe fn read_ent(f: &mut FileEnt, fit: Fit, h: bool, mut parse: impl FnMut(&[u
             }
             return ST_NOTFOUND;
         };
-        let line = unsafe { core::slice::from_raw_parts(line.as_ptr(), line.len()) };
         if !fit.read_ok(rawlen) {
             return erange(f, true);
         }
@@ -1872,185 +1998,171 @@ unsafe fn read_ent(f: &mut FileEnt, fit: Fit, h: bool, mut parse: impl FnMut(&[u
     }
 }
 
-unsafe fn read_serv(f: &mut FileEnt, res: *mut servent, buf: *mut c_char, len: usize) -> i32 {
-    unsafe {
-        read_ent(f, Fit::new(0, buf, len), false, |line, k| {
-            let l = nss::parse_serv_line(line)?;
-            *k = nss::words(l.rest).count();
-            Some(fill_servent(&mut *res, buf, len, &l))
-        })
-    }
+fn read_serv(f: &mut FileEnt, res: &mut servent, buf: &mut [u8], _limit: usize) -> i32 {
+    read_ent(f, Fit::new(0, buf), false, |line, k| {
+        let l = nss::parse_serv_line(line)?;
+        *k = nss::words(l.rest).count();
+        Some(fill_servent(res, buf, &l))
+    })
 }
-unsafe fn read_proto(f: &mut FileEnt, res: *mut protoent, buf: *mut c_char, len: usize) -> i32 {
-    unsafe {
-        read_ent(f, Fit::new(0, buf, len), false, |line, k| {
-            let l = nss::parse_num_line(line)?;
-            *k = nss::words(l.rest).count();
-            Some(fill_protoent(&mut *res, buf, len, &l))
-        })
-    }
+fn read_proto(f: &mut FileEnt, res: &mut protoent, buf: &mut [u8], _limit: usize) -> i32 {
+    read_ent(f, Fit::new(0, buf), false, |line, k| {
+        let l = nss::parse_num_line(line)?;
+        *k = nss::words(l.rest).count();
+        Some(fill_protoent(res, buf, &l))
+    })
 }
-unsafe fn read_net(f: &mut FileEnt, res: *mut netent, buf: *mut c_char, len: usize) -> i32 {
-    unsafe {
-        read_ent(f, Fit::new(0, buf, len), true, |line, k| {
-            let l = nss::parse_net_line(line)?;
-            *k = nss::words(l.rest).count();
-            Some(fill_netent(&mut *res, buf, len, &l))
-        })
-    }
+fn read_net(f: &mut FileEnt, res: &mut netent, buf: &mut [u8], _limit: usize) -> i32 {
+    read_ent(f, Fit::new(0, buf), true, |line, k| {
+        let l = nss::parse_net_line(line)?;
+        *k = nss::words(l.rest).count();
+        Some(fill_netent(res, buf, &l))
+    })
 }
-unsafe fn read_rpc(f: &mut FileEnt, res: *mut rpcent, buf: *mut c_char, len: usize) -> i32 {
-    unsafe {
-        read_ent(f, Fit::new(0, buf, len), false, |line, k| {
-            let l = nss::parse_num_line(line)?;
-            *k = nss::words(l.rest).count();
-            Some(fill_rpcent(&mut *res, buf, len, &l))
-        })
-    }
+fn read_rpc(f: &mut FileEnt, res: &mut rpcent, buf: &mut [u8], _limit: usize) -> i32 {
+    read_ent(f, Fit::new(0, buf), false, |line, k| {
+        let l = nss::parse_num_line(line)?;
+        *k = nss::words(l.rest).count();
+        Some(fill_rpcent(res, buf, &l))
+    })
 }
-unsafe fn read_host(f: &mut FileEnt, res: *mut hostent, buf: *mut c_char, len: usize) -> i32 {
-    unsafe {
-        read_ent(f, Fit::new(32, buf, len), true, |line, k| {
-            let h = nss::parse_host_line(line, AF_INET, false)?;
-            *k = nss::words(h.rest).count();
-            let a = Addr { family: h.family, bytes: h.addr, scope: 0 };
-            Some(fill_hostent(&mut *res, buf, len, h.name, h.rest, h.family, &[a]))
-        })
-    }
+fn read_host(f: &mut FileEnt, res: &mut hostent, buf: &mut [u8], _limit: usize) -> i32 {
+    read_ent(f, Fit::new(32, buf), true, |line, k| {
+        let h = nss::parse_host_line(line, AF_INET, false)?;
+        *k = nss::words(h.rest).count();
+        let a = Addr { family: h.family, bytes: h.addr, scope: 0 };
+        Some(fill_hostent(res, buf, h.name, h.rest, h.family, &[a]))
+    })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn setservent(stay: c_int) {
-    unsafe { db_set::<servent>(&raw mut SERV_DB, &SERV_NAMES, stay) }
+pub extern "C" fn setservent(stay: c_int) {
+    db_set::<servent>(&SERV_DB, &SERV_NAMES, stay)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn endservent() {
-    unsafe { db_end::<servent>(&raw mut SERV_DB, &SERV_NAMES) }
+    db_end::<servent>(&SERV_DB, &SERV_NAMES)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn setprotoent(stay: c_int) {
-    unsafe { db_set::<protoent>(&raw mut PROTO_DB, &PROTO_NAMES, stay) }
+    db_set::<protoent>(&PROTO_DB, &PROTO_NAMES, stay)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn endprotoent() {
-    unsafe { db_end::<protoent>(&raw mut PROTO_DB, &PROTO_NAMES) }
+    db_end::<protoent>(&PROTO_DB, &PROTO_NAMES)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn setnetent(stay: c_int) {
-    unsafe { db_set::<netent>(&raw mut NET_DB, &NET_NAMES, stay) }
+    db_set::<netent>(&NET_DB, &NET_NAMES, stay)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn endnetent() {
-    unsafe { db_end::<netent>(&raw mut NET_DB, &NET_NAMES) }
+    db_end::<netent>(&NET_DB, &NET_NAMES)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn setrpcent(stay: c_int) {
-    unsafe { db_set::<rpcent>(&raw mut RPC_DB, &RPC_NAMES, stay) }
+    db_set::<rpcent>(&RPC_DB, &RPC_NAMES, stay)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn endrpcent() {
-    unsafe { db_end::<rpcent>(&raw mut RPC_DB, &RPC_NAMES) }
+    db_end::<rpcent>(&RPC_DB, &RPC_NAMES)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sethostent(stay: c_int) {
-    unsafe { db_set::<hostent>(&raw mut HOST_DB, &HOST_NAMES, stay) }
+    db_set::<hostent>(&HOST_DB, &HOST_NAMES, stay)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn endhostent() {
-    unsafe { db_end::<hostent>(&raw mut HOST_DB, &HOST_NAMES) }
+    db_end::<hostent>(&HOST_DB, &HOST_NAMES)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn setaliasent() {
-    unsafe { db_set::<aliasent>(&raw mut ALIAS_DB, &ALIAS_NAMES, 0) }
+    db_set::<aliasent>(&ALIAS_DB, &ALIAS_NAMES, 0)
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn endaliasent() {
-    unsafe { db_end::<aliasent>(&raw mut ALIAS_DB, &ALIAS_NAMES) }
+    db_end::<aliasent>(&ALIAS_DB, &ALIAS_NAMES)
+}
+
+pub fn servent_r(res: &mut servent, buf: &mut [u8]) -> (c_int, bool) {
+    {
+        let n = buf.len();
+        db_get(&SERV_DB, &SERV_NAMES, read_serv, res, buf, n)
+    }
+}
+pub fn protoent_r(res: &mut protoent, buf: &mut [u8]) -> (c_int, bool) {
+    {
+        let n = buf.len();
+        db_get(&PROTO_DB, &PROTO_NAMES, read_proto, res, buf, n)
+    }
+}
+pub fn netent_r(res: &mut netent, buf: &mut [u8]) -> (c_int, bool) {
+    {
+        let n = buf.len();
+        db_get(&NET_DB, &NET_NAMES, read_net, res, buf, n)
+    }
+}
+pub fn rpcent_r(res: &mut rpcent, buf: &mut [u8]) -> (c_int, bool) {
+    {
+        let n = buf.len();
+        db_get(&RPC_DB, &RPC_NAMES, read_rpc, res, buf, n)
+    }
+}
+pub fn hostent_r(res: &mut hostent, buf: &mut [u8]) -> (c_int, bool) {
+    {
+        let n = buf.len();
+        db_get(&HOST_DB, &HOST_NAMES, read_host, res, buf, n)
+    }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getservent_r(res: *mut servent, buf: *mut c_char, buflen: usize, result: *mut *mut servent) -> c_int {
-    unsafe { db_get::<servent>(&raw mut SERV_DB, &SERV_NAMES, read_serv, res, buf, buflen, result) }
+    unsafe { r_shell(res, buf, buflen, result, (), |r, b, ()| servent_r(r, b)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getprotoent_r(res: *mut protoent, buf: *mut c_char, buflen: usize, result: *mut *mut protoent) -> c_int {
-    unsafe { db_get::<protoent>(&raw mut PROTO_DB, &PROTO_NAMES, read_proto, res, buf, buflen, result) }
+    unsafe { r_shell(res, buf, buflen, result, (), |r, b, ()| protoent_r(r, b)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getnetent_r(res: *mut netent, buf: *mut c_char, buflen: usize, result: *mut *mut netent, _h_errnop: *mut c_int) -> c_int {
-    unsafe {
-        db_get::<netent>(&raw mut NET_DB, &NET_NAMES, read_net, res, buf, buflen, result)
-    }
+    unsafe { r_shell(res, buf, buflen, result, (), |r, b, ()| netent_r(r, b)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getrpcent_r(res: *mut rpcent, buf: *mut c_char, buflen: usize, result: *mut *mut rpcent) -> c_int {
-    unsafe { db_get::<rpcent>(&raw mut RPC_DB, &RPC_NAMES, read_rpc, res, buf, buflen, result) }
+    unsafe { r_shell(res, buf, buflen, result, (), |r, b, ()| rpcent_r(r, b)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn gethostent_r(res: *mut hostent, buf: *mut c_char, buflen: usize, result: *mut *mut hostent, _h_errnop: *mut c_int) -> c_int {
-    unsafe {
-        db_get::<hostent>(&raw mut HOST_DB, &HOST_NAMES, read_host, res, buf, buflen, result)
-    }
-}
-
-fn with_static_ent<T: Copy>(s: &Spin<Static<T>>, mut f: impl FnMut(*mut T, *mut c_char, usize, *mut *mut T) -> c_int) -> *mut T {
-    let mut g = s.lock();
-    if g.buf.is_null() {
-        g.buf = unsafe { rusty_libc_malloc::malloc(BUF0) } as *mut c_char;
-        if g.buf.is_null() {
-            errno::set(ENOMEM);
-            return core::ptr::null_mut();
-        }
-        g.cap = BUF0;
-    }
-    loop {
-        let (res, buf, cap) = (&mut g.res as *mut T, g.buf, g.cap);
-        let mut out: *mut T = core::ptr::null_mut();
-        let r = f(res, buf, cap, &mut out);
-        if r == ERANGE {
-            let ncap = g.cap * 2;
-            let nb = unsafe { rusty_libc_malloc::realloc(g.buf as *mut c_void, ncap) } as *mut c_char;
-            if nb.is_null() {
-                errno::set(ENOMEM);
-                return core::ptr::null_mut();
-            }
-            g.buf = nb;
-            g.cap = ncap;
-            continue;
-        }
-        return if r == 0 { out } else { core::ptr::null_mut() };
-    }
+    unsafe { r_shell(res, buf, buflen, result, (), |r, b, ()| hostent_r(r, b)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn getservent() -> *mut servent {
-    with_static_ent(&SERVENT_S, |res, buf, cap, out| unsafe { getservent_r(res, buf, cap, out) })
+pub extern "C" fn getservent() -> *mut servent {
+    with_static(&SERVENT_S, true, servent_r)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn getprotoent() -> *mut protoent {
-    with_static_ent(&PROTOENT_S, |res, buf, cap, out| unsafe { getprotoent_r(res, buf, cap, out) })
+pub extern "C" fn getprotoent() -> *mut protoent {
+    with_static(&PROTOENT_S, true, protoent_r)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn getnetent() -> *mut netent {
-    let mut h = 0;
-    with_static_ent(&NETENT_S, |res, buf, cap, out| unsafe { getnetent_r(res, buf, cap, out, &mut h) })
+pub extern "C" fn getnetent() -> *mut netent {
+    with_static(&NETENT_S, true, netent_r)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn getrpcent() -> *mut rpcent {
-    with_static_ent(&RPCENT_S, |res, buf, cap, out| unsafe { getrpcent_r(res, buf, cap, out) })
+pub extern "C" fn getrpcent() -> *mut rpcent {
+    with_static(&RPCENT_S, true, rpcent_r)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn gethostent() -> *mut hostent {
-    let mut h = 0;
-    with_static_ent(&HOSTENT_S, |res, buf, cap, out| unsafe { gethostent_r(res, buf, cap, out, &mut h) })
+pub extern "C" fn gethostent() -> *mut hostent {
+    with_static(&HOSTENT_S, true, hostent_r)
 }
 
 const ST_RETURN: i32 = 2;
@@ -2059,276 +2171,285 @@ fn c_isspace(c: u8) -> bool {
     matches!(c, b' ' | 9..=13)
 }
 
-unsafe fn cut_at_comment_or_newline(p: *mut u8) {
-    unsafe {
-        let mut q = p;
-        while *q != 0 {
-            if *q == b'#' || *q == b'\n' {
-                *q = 0;
-                return;
-            }
-            q = q.add(1);
+fn cut_at_comment_or_newline(b: &mut [u8], at: usize) {
+    let mut q = at;
+    while b[q] != 0 {
+        if b[q] == b'#' || b[q] == b'\n' {
+            b[q] = 0;
+            return;
         }
+        q += 1;
     }
 }
 
-unsafe fn c_strlen(p: *const u8) -> usize {
-    unsafe {
-        let mut n = 0;
-        while *p.add(n) != 0 {
-            n += 1;
-        }
-        n
-    }
+fn cstr_at(b: &[u8], at: usize) -> &[u8] {
+    let n = b[at..].iter().position(|&c| c == 0).unwrap_or(b.len() - at);
+    &b[at..at + n]
 }
 
-unsafe fn get_next_alias(st: &mut LineReader, matchname: Option<&[u8]>, result: *mut aliasent, buffer: *mut u8, buflen: usize) -> i32 {
-    unsafe {
-        let mut status = ST_NOTFOUND;
-        let mut ignore = false;
-        (*result).alias_members_len = 0;
-        let no_room = || {
-            errno::set(ERANGE);
-            ST_TRYAGAIN
+fn get_next_alias(st: &mut LineReader, matchname: Option<&[u8]>, result: &mut aliasent, b: &mut [u8], limit: usize) -> i32 {
+    let buflen = limit;
+    let base = b.as_mut_ptr();
+    let mut status = ST_NOTFOUND;
+    let mut ignore = false;
+    result.alias_members_len = 0;
+    let no_room = || {
+        errno::set(ERANGE);
+        ST_TRYAGAIN
+    };
+    loop {
+        let mut fu = 0usize;
+        let mut room_left = buflen - (buflen % 8);
+        if room_left < 2 {
+            return no_room();
+        }
+        b[fu + room_left - 1] = 0xff;
+        if !st.fgets(&mut b[fu..fu + room_left]) {
+            break;
+        }
+        if b[fu + room_left - 1] != 0xff {
+            return no_room();
+        }
+        let mut line = fu;
+        if ignore && c_isspace(b[fu]) {
+            continue;
+        }
+        cut_at_comment_or_newline(b, fu);
+        while c_isspace(b[line]) {
+            line += 1;
+        }
+        let name_at = fu;
+        result.alias_name = base.wrapping_add(fu).cast();
+        while b[line] != 0 && b[line] != b':' {
+            b[fu] = b[line];
+            fu += 1;
+            line += 1;
+        }
+        if b[line] == 0 || name_at == fu {
+            continue;
+        }
+        b[fu] = 0;
+        fu += 1;
+        let used = fu - name_at;
+        if room_left < used {
+            return no_room();
+        }
+        room_left -= used;
+        line += 1;
+        ignore = match matchname {
+            Some(m) => !eq_nocase(cstr_at(b, name_at), m),
+            None => false,
         };
-        loop {
-            let mut first_unused = buffer;
-            let mut room_left = buflen - (buflen % 8);
-            if room_left < 2 {
-                return no_room();
-            }
-            *first_unused.add(room_left - 1) = 0xff;
-            if !st.fgets(first_unused, room_left) {
-                break;
-            }
-            if *first_unused.add(room_left - 1) != 0xff {
-                return no_room();
-            }
-            let mut line = first_unused;
-            if ignore && c_isspace(*first_unused) {
-                continue;
-            }
-            cut_at_comment_or_newline(first_unused);
-            while c_isspace(*line) {
-                line = line.add(1);
-            }
-            let name_at = first_unused;
-            (*result).alias_name = first_unused as *mut c_char;
-            while *line != 0 && *line != b':' {
-                *first_unused = *line;
-                first_unused = first_unused.add(1);
-                line = line.add(1);
-            }
-            if *line == 0 || name_at == first_unused {
-                continue;
-            }
-            *first_unused = 0;
-            first_unused = first_unused.add(1);
-            let used = first_unused.offset_from(name_at) as usize;
-            if room_left < used {
-                return no_room();
-            }
-            room_left -= used;
-            line = line.add(1);
-            ignore = match matchname {
-                Some(m) => !eq_nocase(core::slice::from_raw_parts(name_at, c_strlen(name_at)), m),
-                None => false,
-            };
-            if !ignore {
-              loop {
-                while c_isspace(*line) {
-                    line = line.add(1);
+        if !ignore {
+            loop {
+                while c_isspace(b[line]) {
+                    line += 1;
                 }
-                let mut cp = first_unused;
-                while *line != 0 && *line != b',' {
-                    *first_unused = *line;
-                    first_unused = first_unused.add(1);
-                    line = line.add(1);
+                let mut cp = fu;
+                while b[line] != 0 && b[line] != b',' {
+                    b[fu] = b[line];
+                    fu += 1;
+                    line += 1;
                 }
-                if first_unused != cp {
-                    if *line != 0 {
-                        line = line.add(1);
+                if fu != cp {
+                    if b[line] != 0 {
+                        line += 1;
                     }
-                    *first_unused = 0;
-                    first_unused = first_unused.add(1);
-                    let is_include = core::slice::from_raw_parts(cp, 9.min(first_unused.offset_from(cp) as usize)) == b":include:";
+                    b[fu] = 0;
+                    fu += 1;
+                    let is_include = b[cp..cp + 9.min(fu - cp)] == *b":include:";
                     if !is_include {
-                        let n = first_unused.offset_from(cp) as usize;
+                        let n = fu - cp;
                         if room_left < n + 8 {
                             return no_room();
                         }
                         room_left -= n + 8;
-                        (*result).alias_members_len += 1;
+                        result.alias_members_len += 1;
                     } else {
-                        first_unused = cp;
+                        fu = cp;
                         let mut path = Buf::<320>::new();
-                        path.push_all(core::slice::from_raw_parts(cp.add(9), c_strlen(cp.add(9))));
+                        path.push_all(cstr_at(b, cp + 9));
                         path.push(0);
                         let listfile = LineReader::open(&path).ok();
                         let old_line = if listfile.is_some() {
-                            let n = c_strlen(line);
-                            let o = rusty_libc_malloc::malloc(n + 1) as *mut u8;
-                            if !o.is_null() {
-                                core::ptr::copy_nonoverlapping(line, o, n + 1);
-                            }
-                            o
+                            let n = cstr_at(b, line).len();
+                            let mut v = HeapVec::<u8>::new();
+                            if v.extend_from(&b[line..line + n + 1]) { Some(v) } else { None }
                         } else {
-                            core::ptr::null_mut()
+                            None
                         };
-                        if let (Some(mut lf), false) = (listfile, old_line.is_null()) {
+                        if let (Some(mut lf), Some(old)) = (listfile, old_line) {
                             while !lf.at_eof() {
                                 if room_left < 2 {
-                                    rusty_libc_malloc::free(old_line as *mut c_void);
                                     return no_room();
                                 }
-                                *first_unused.add(room_left - 1) = 0xff;
-                                if !lf.fgets(first_unused, room_left) {
+                                b[fu + room_left - 1] = 0xff;
+                                if !lf.fgets(&mut b[fu..fu + room_left]) {
                                     break;
                                 }
-                                line = first_unused;
-                                if *first_unused.add(room_left - 1) != 0xff {
-                                    rusty_libc_malloc::free(old_line as *mut c_void);
+                                line = fu;
+                                if b[fu + room_left - 1] != 0xff {
                                     return no_room();
                                 }
-                                cut_at_comment_or_newline(line);
+                                cut_at_comment_or_newline(b, line);
                                 loop {
-                                    while c_isspace(*line) {
-                                        line = line.add(1);
+                                    while c_isspace(b[line]) {
+                                        line += 1;
                                     }
-                                    cp = first_unused;
-                                    while *line != 0 && *line != b',' {
-                                        *first_unused = *line;
-                                        first_unused = first_unused.add(1);
-                                        line = line.add(1);
+                                    cp = fu;
+                                    while b[line] != 0 && b[line] != b',' {
+                                        b[fu] = b[line];
+                                        fu += 1;
+                                        line += 1;
                                     }
-                                    if *line != 0 {
-                                        line = line.add(1);
+                                    if b[line] != 0 {
+                                        line += 1;
                                     }
-                                    if first_unused != cp {
-                                        *first_unused = 0;
-                                        first_unused = first_unused.add(1);
-                                        let n = first_unused.offset_from(cp) as usize;
+                                    if fu != cp {
+                                        b[fu] = 0;
+                                        fu += 1;
+                                        let n = fu - cp;
                                         if room_left < n + 8 {
-                                            rusty_libc_malloc::free(old_line as *mut c_void);
                                             return no_room();
                                         }
                                         room_left -= n + 8;
-                                        (*result).alias_members_len += 1;
+                                        result.alias_members_len += 1;
                                     }
-                                    if *line == 0 {
+                                    if b[line] == 0 {
                                         break;
                                     }
                                 }
                             }
                             drop(lf);
-                            *first_unused.add(room_left - 1) = 0;
-                            let n = c_strlen(old_line).min(room_left);
-                            core::ptr::copy_nonoverlapping(old_line, first_unused, n);
-                            core::ptr::write_bytes(first_unused.add(n), 0, room_left - n);
-                            rusty_libc_malloc::free(old_line as *mut c_void);
-                            line = first_unused;
-                            if *first_unused.add(room_left - 1) != 0 {
+                            b[fu + room_left - 1] = 0;
+                            let n = cstr_at(&old, 0).len().min(room_left);
+                            b[fu..fu + n].copy_from_slice(&old[..n]);
+                            b[fu + n..fu + room_left].fill(0);
+                            line = fu;
+                            if b[fu + room_left - 1] != 0 {
                                 return no_room();
                             }
-                        } else if !old_line.is_null() {
-                            rusty_libc_malloc::free(old_line as *mut c_void);
                         }
                     }
                 }
-                if *line == 0 {
+                if b[line] == 0 {
                     let ch = st.getc();
                     if ch == -1 || ch == b'\n' as i32 || !c_isspace(ch as u8) {
                         if ch != -1 {
                             st.ungetc();
                         }
-                        let a = (first_unused as usize + 7) & !7;
-                        first_unused = a as *mut u8;
-                        let members = first_unused as *mut *mut c_char;
-                        (*result).alias_members = members;
-                        let mut c = (*result).alias_name as *mut u8;
-                        for cnt in 0..(*result).alias_members_len {
-                            c = c.add(c_strlen(c) + 1);
-                            *members.add(cnt) = c as *mut c_char;
+                        let at = ((base as usize + fu + 7) & !7) - base as usize;
+                        if at > b.len() {
+                            return no_room();
                         }
-                        status = if (*result).alias_members_len == 0 { ST_RETURN } else { ST_SUCCESS };
+                        let (text, rest) = b.split_at_mut(at);
+                        let Some(members) = Carve::new(rest).ptr_array(result.alias_members_len) else { return no_room() };
+                        let tp = text.as_mut_ptr();
+                        let mut c = name_at;
+                        for m in members.iter_mut() {
+                            c += cstr_at(text, c).len() + 1;
+                            *m = tp.wrapping_add(c).cast();
+                        }
+                        result.alias_members = members.as_mut_ptr();
+                        status = if result.alias_members_len == 0 { ST_RETURN } else { ST_SUCCESS };
                         break;
                     }
-                    *first_unused.add(room_left - 1) = 0xff;
-                    if !st.fgets(first_unused, room_left) {
-                        line = first_unused;
-                        *line = 0;
+                    b[fu + room_left - 1] = 0xff;
+                    if !st.fgets(&mut b[fu..fu + room_left]) {
+                        line = fu;
+                        b[line] = 0;
                         continue;
                     }
-                    line = first_unused;
-                    if *first_unused.add(room_left - 1) != 0xff {
+                    line = fu;
+                    if b[fu + room_left - 1] != 0xff {
                         return no_room();
                     }
-                    cut_at_comment_or_newline(line);
+                    cut_at_comment_or_newline(b, line);
                 }
             }
-            }
-            if status != ST_NOTFOUND {
-                break;
-            }
         }
-        status
+        if status != ST_NOTFOUND {
+            break;
+        }
     }
+    status
+}
+
+pub(crate) const ALIAS_SLACK: usize = 7;
+
+pub fn aliasent_r(res: &mut aliasent, buf: &mut [u8]) -> (c_int, bool) {
+    let n = buf.len();
+    alias_ent(res, buf, n)
+}
+
+fn alias_ent(res: &mut aliasent, buf: &mut [u8], limit: usize) -> (c_int, bool) {
+    db_get(&ALIAS_DB, &ALIAS_NAMES, read_aliasf, res, buf, limit)
+}
+
+fn alias_slack(buflen: usize) -> usize {
+    if buflen >= 8 { buflen.saturating_add(ALIAS_SLACK) } else { buflen }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getaliasent_r(res: *mut aliasent, buf: *mut c_char, buflen: usize, result: *mut *mut aliasent) -> c_int {
-    unsafe { db_get::<aliasent>(&raw mut ALIAS_DB, &ALIAS_NAMES, read_aliasf, res, buf, buflen, result) }
+    unsafe { r_shell(res, buf, alias_slack(buflen), result, (), |r, b, ()| alias_ent(r, b, buflen)) }
 }
 
-unsafe fn read_aliasf(f: &mut FileEnt, res: *mut aliasent, buf: *mut c_char, len: usize) -> i32 {
-    unsafe {
-        (*res).alias_local = 1;
-        loop {
-            let st = get_next_alias(&mut f.r, None, res, buf as *mut u8, len);
-            if st != ST_RETURN {
-                return st;
-            }
+fn read_aliasf(f: &mut FileEnt, res: &mut aliasent, buf: &mut [u8], limit: usize) -> i32 {
+    res.alias_local = 1;
+    loop {
+        let st = get_next_alias(&mut f.r, None, res, buf, limit);
+        if st != ST_RETURN {
+            return st;
         }
     }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn getaliasbyname_r(name: *const c_char, res: *mut aliasent, buf: *mut c_char, buflen: usize, result: *mut *mut aliasent) -> c_int {
-    unsafe {
-        by_key(
-            b"aliases",
-            b"getaliasbyname_r",
-            res,
-            result,
-            core::ptr::null_mut(),
-            &|| {
-                let mut r = match nss::open_db(Db::Aliases) {
-                    Ok(r) => r,
-                    Err(e) => return scan_status(core::ptr::null_mut(), Scan::Unavail(e)),
-                };
-                (*res).alias_local = 1;
-                loop {
-                    let st = get_next_alias(&mut r, Some(cbytes(name)), res, buf as *mut u8, buflen);
-                    if st != ST_RETURN {
-                        return st;
-                    }
+pub fn aliasbyname_r(name: &CStr, res: &mut aliasent, buf: &mut [u8]) -> (c_int, bool) {
+    let n = buf.len();
+    alias_byname(name, res, buf, n)
+}
+
+fn alias_byname(name: &CStr, res: &mut aliasent, buf: &mut [u8], limit: usize) -> (c_int, bool) {
+    let out = RefCell::new(OutBufs { res, buf });
+    by_key(
+        b"aliases",
+        b"getaliasbyname_r",
+        None,
+        &|| {
+            let mut r = match nss::open_db(Db::Aliases) {
+                Ok(r) => r,
+                Err(e) => return scan_status(None, Scan::Unavail(e)),
+            };
+            let mut o = out.borrow_mut();
+            let o = &mut *o;
+            o.res.alias_local = 1;
+            loop {
+                let st = get_next_alias(&mut r, Some(name.to_bytes()), o.res, o.buf, limit);
+                if st != ST_RETURN {
+                    return st;
                 }
-            },
-            &|f, en| {
-                let f: unsafe extern "C" fn(*const c_char, *mut aliasent, *mut c_char, usize, *mut c_int) -> c_int = core::mem::transmute(f);
-                f(name, res, buf, buflen, en)
-            },
-        )
-    }
+            }
+        },
+        &|en| {
+            let (r, b, _) = out.borrow_mut().raw();
+            (name.as_ptr(), r, b, limit, en)
+        },
+    )
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn getaliasent() -> *mut aliasent {
-    with_static_ent(&ALIASENT_S, |res, buf, cap, out| unsafe { getaliasent_r(res, buf, cap, out) })
+pub unsafe extern "C" fn getaliasbyname_r(name: *const c_char, res: *mut aliasent, buf: *mut c_char, buflen: usize, result: *mut *mut aliasent) -> c_int {
+    unsafe { r_shell(res, buf, alias_slack(buflen), result, Str(name), |r, b, nm| alias_byname(nm, r, b, buflen)) }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub extern "C" fn getaliasent() -> *mut aliasent {
+    with_static(&ALIASENT_S, true, aliasent_r)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getaliasbyname(name: *const c_char) -> *mut aliasent {
-    with_static(&ALIASENT_S, |res, buf, cap, out| unsafe { getaliasbyname_r(name, res, buf, cap, out) })
+    let nm = unsafe { ffi::cstr_nonnull(name) };
+    with_static(&ALIASENT_S, false, |res, buf| aliasbyname_r(nm, res, buf))
 }
-

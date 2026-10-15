@@ -328,14 +328,12 @@ static MIN_X87: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0x80, 0x01, 0x00, 0, 0, 0, 0, 0
 #[inline]
 pub fn raise_flags(flags: u32) {
     use core::arch::asm;
-    unsafe {
-        if flags & FE_OVERFLOW as u32 != 0 {
-            asm!("fld tbyte ptr [{a}]", "fld st(0)", "fmulp st(1), st", "fstp st(0)", a = in(reg) MAX_X87.as_ptr(), out("st(0)") _, out("st(1)") _, options(nostack));
-        } else if flags & FE_UNDERFLOW as u32 != 0 {
-            asm!("fld tbyte ptr [{a}]", "fld st(0)", "fmulp st(1), st", "fstp st(0)", a = in(reg) MIN_X87.as_ptr(), out("st(0)") _, out("st(1)") _, options(nostack));
-        } else if flags & FE_INEXACT as u32 != 0 {
-            asm!("fld tbyte ptr [{a}]", "fld tbyte ptr [{b}]", "fdivp st(1), st", "fstp st(0)", a = in(reg) ONE_X87.as_ptr(), b = in(reg) THREE_X87.as_ptr(), out("st(0)") _, out("st(1)") _, options(nostack));
-        }
+    if flags & FE_OVERFLOW as u32 != 0 {
+        unsafe { asm!("fld tbyte ptr [{a}]", "fld st(0)", "fmulp st(1), st", "fstp st(0)", a = in(reg) MAX_X87.as_ptr(), out("st(0)") _, out("st(1)") _, options(nostack)) };
+    } else if flags & FE_UNDERFLOW as u32 != 0 {
+        unsafe { asm!("fld tbyte ptr [{a}]", "fld st(0)", "fmulp st(1), st", "fstp st(0)", a = in(reg) MIN_X87.as_ptr(), out("st(0)") _, out("st(1)") _, options(nostack)) };
+    } else if flags & FE_INEXACT as u32 != 0 {
+        unsafe { asm!("fld tbyte ptr [{a}]", "fld tbyte ptr [{b}]", "fdivp st(1), st", "fstp st(0)", a = in(reg) ONE_X87.as_ptr(), b = in(reg) THREE_X87.as_ptr(), out("st(0)") _, out("st(1)") _, options(nostack)) };
     }
 }
 

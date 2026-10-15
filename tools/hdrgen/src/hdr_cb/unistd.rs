@@ -448,6 +448,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("CLOSE_RANGE_CLOEXEC", V::Txt("4U")),
     ]),
     Item::Blank,
+    Item::Decl("extern char **__environ;"),
     Item::Decl("extern char **environ;"),
     Item::Raw(Reason::GlibcMacro, r#"#define TEMP_FAILURE_RETRY(expression) \
   (__extension__ ({ long int __result; \

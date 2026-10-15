@@ -103,12 +103,66 @@ pub const LIST: [Def; 37] = [
     d("glibc.rtld.optional_static_tls", Ty::Size, 0, SMAX, 512, b""),
 ];
 pub const COUNT: usize = LIST.len();
+
+const fn names(alias: bool) -> [&'static str; COUNT] {
+    let mut out = [""; COUNT];
+    let mut i = 0;
+    while i < COUNT {
+        out[i] = if alias {
+            match core::str::from_utf8(LIST[i].alias) {
+                Ok(s) => s,
+                Err(_) => panic!("alias not UTF-8"),
+            }
+        } else {
+            LIST[i].name
+        };
+        i += 1;
+    }
+    out
+}
+static NAMES: crate::strtab::StrTab<COUNT, { crate::strtab::packed_len(&names(false)) }> = crate::strtab::StrTab::new(&names(false));
+static ALIASES: crate::strtab::StrTab<COUNT, { crate::strtab::packed_len(&names(true)) }> = crate::strtab::StrTab::new(&names(true));
+
+#[derive(Clone, Copy)]
+pub struct Num {
+    pub ty: Ty,
+    pub min: i64,
+    pub max: i64,
+    pub def: i64,
+}
+static NUMS: [Num; COUNT] = {
+    let mut out = [Num { ty: Ty::I32, min: 0, max: 0, def: 0 }; COUNT];
+    let mut i = 0;
+    while i < COUNT {
+        out[i] = Num { ty: LIST[i].ty, min: LIST[i].min, max: LIST[i].max, def: LIST[i].def };
+        i += 1;
+    }
+    out
+};
+
+pub fn name(i: usize) -> &'static str {
+    NAMES.get(i)
+}
+
+pub fn num(i: usize) -> Num {
+    NUMS[i]
+}
 pub const HWCAPS: usize = 0;
 pub const MAP32: usize = 2;
 pub const ENABLE_SECURE: usize = 33;
 pub const EXECSTACK: usize = 34;
 pub const NNS: usize = 35;
 pub const OPTIONAL_STATIC_TLS: usize = 36;
+pub const MALLOC_ARENA_MAX: usize = 13;
+pub const MALLOC_ARENA_TEST: usize = 14;
+pub const MALLOC_HUGETLB: usize = 16;
+pub const MALLOC_MMAP_MAX: usize = 17;
+pub const MALLOC_MMAP_THRESHOLD: usize = 18;
+pub const MALLOC_PERTURB: usize = 20;
+pub const MALLOC_TCACHE_COUNT: usize = 21;
+pub const MALLOC_TCACHE_MAX: usize = 22;
+pub const MALLOC_TOP_PAD: usize = 24;
+pub const MALLOC_TRIM_THRESHOLD: usize = 25;
 
 #[derive(Clone, Copy)]
 pub struct Val<'a> {
@@ -124,7 +178,7 @@ impl Default for Values<'_> {
     fn default() -> Self {
         let mut v = [Val { num: 0, str: None, initialized: false }; COUNT];
         for (i, x) in v.iter_mut().enumerate() {
-            x.num = LIST[i].def;
+            x.num = NUMS[i].def;
         }
         Values(v)
     }
@@ -132,7 +186,7 @@ impl Default for Values<'_> {
 
 impl<'a> Values<'a> {
     pub fn initialize(&mut self, i: usize, v: &'a [u8]) -> bool {
-        let def = &LIST[i];
+        let def = &NUMS[i];
         let cur = &mut self.0[i];
         if def.ty == Ty::Str {
             cur.str = Some(v);
@@ -243,7 +297,7 @@ fn pairs<'a>(s: &'a [u8], mut f: impl FnMut(&'a [u8], &'a [u8])) -> bool {
 }
 
 pub fn index_of(name: &[u8]) -> Option<usize> {
-    LIST.iter().position(|d| d.name.as_bytes() == name)
+    NAMES.position(name)
 }
 
 pub fn parse<'a>(s: &'a [u8], warn: &mut dyn FnMut(Warning<'a>)) -> Tunables<'a> {
@@ -259,7 +313,7 @@ pub fn parse<'a>(s: &'a [u8], warn: &mut dyn FnMut(Warning<'a>)) -> Tunables<'a>
     }
     if let Some(v) = toset[ENABLE_SECURE] {
         match parse_num(v) {
-            None => warn(Warning::BadValue(v, LIST[ENABLE_SECURE].name)),
+            None => warn(Warning::BadValue(v, name(ENABLE_SECURE))),
             Some(1) => {
                 t.enable_secure = true;
                 return t;
@@ -271,7 +325,7 @@ pub fn parse<'a>(s: &'a [u8], warn: &mut dyn FnMut(Warning<'a>)) -> Tunables<'a>
         if let Some(v) = *v
             && !t.values.initialize(i, v)
         {
-            warn(Warning::BadValue(v, LIST[i].name));
+            warn(Warning::BadValue(v, name(i)));
         }
     }
     t.sync();
@@ -291,7 +345,7 @@ pub fn hwcaps_items<'a>(list: &'a [u8], mut f: impl FnMut(&'a [u8], bool)) {
     }
 }
 
-pub const HWCAP_FEATURES: &[(&[u8], usize, usize, u32, bool)] = &[
+pub const HWCAP_FEATURES: [(&[u8], usize, usize, u32, bool); 30] = [
     (b"AVX", 0, 2, 28, false),
     (b"CX8", 0, 3, 8, false),
     (b"FMA", 0, 2, 12, false),
@@ -324,7 +378,33 @@ pub const HWCAP_FEATURES: &[(&[u8], usize, usize, u32, bool)] = &[
     (b"AVX512VL", 1, 1, 31, false),
 ];
 
-pub const UNSECURE_ENVVARS: &[&[u8]] = &[
+const fn hwcap_names() -> [&'static [u8]; HWCAP_FEATURES.len()] {
+    let mut out: [&[u8]; HWCAP_FEATURES.len()] = [&[]; HWCAP_FEATURES.len()];
+    let mut i = 0;
+    while i < out.len() {
+        out[i] = HWCAP_FEATURES[i].0;
+        i += 1;
+    }
+    out
+}
+static HWCAP_NAMES: crate::strtab::StrTab<{ HWCAP_FEATURES.len() }, { crate::strtab::packed_len_bytes(&hwcap_names()) }> =
+    crate::strtab::StrTab::from_bytes(&hwcap_names());
+static HWCAP_BITS: [(usize, usize, u32, bool); HWCAP_FEATURES.len()] = {
+    let mut out = [(0, 0, 0, false); HWCAP_FEATURES.len()];
+    let mut i = 0;
+    while i < out.len() {
+        let f = HWCAP_FEATURES[i];
+        out[i] = (f.1, f.2, f.3, f.4);
+        i += 1;
+    }
+    out
+};
+
+pub fn hwcap_feature(name: &[u8]) -> Option<(usize, usize, u32, bool)> {
+    HWCAP_NAMES.position(name).map(|i| HWCAP_BITS[i])
+}
+
+pub const UNSECURE_ENVVARS: [&[u8]; 34] = [
     b"GCONV_PATH", b"GETCONF_DIR", b"GLIBC_TUNABLES", b"HOSTALIASES", b"LD_AUDIT", b"LD_BIND_NOT", b"LD_BIND_NOW", b"LD_DEBUG",
     b"LD_DEBUG_OUTPUT", b"LD_DYNAMIC_WEAK", b"LD_LIBRARY_PATH", b"LD_ORIGIN_PATH", b"LD_PRELOAD", b"LD_PROFILE", b"LD_PROFILE_OUTPUT",
     b"LD_SHOW_AUXV", b"LD_VERBOSE", b"LD_WARN", b"LOCALDOMAIN", b"LOCPATH", b"MALLOC_ARENA_MAX", b"MALLOC_ARENA_TEST",
@@ -332,52 +412,70 @@ pub const UNSECURE_ENVVARS: &[&[u8]] = &[
     b"MALLOC_TRIM_THRESHOLD_", b"NIS_PATH", b"NLSPATH", b"RESOLV_HOST_CONF", b"RES_OPTIONS", b"TMPDIR", b"TZDIR",
 ];
 
+static UNSECURE: crate::strtab::StrTab<34, { crate::strtab::packed_len_bytes(&UNSECURE_ENVVARS) }> = crate::strtab::StrTab::from_bytes(&UNSECURE_ENVVARS);
+
 unsafe fn cbytes<'a>(p: *const u8) -> &'a [u8] {
     let mut n = 0;
-    unsafe {
-        while *p.add(n) != 0 {
-            n += 1;
+    loop {
+        let q = unsafe { p.add(n) };
+        if unsafe { *q } == 0 {
+            break;
         }
-        core::slice::from_raw_parts(p, n)
+        n += 1;
     }
+    unsafe { core::slice::from_raw_parts(p, n) }
+}
+
+#[inline(always)]
+unsafe fn entry(envp: *const *mut u8, i: usize) -> *mut u8 {
+    let e = unsafe { envp.add(i) };
+    unsafe { *e }
 }
 
 pub unsafe fn scrub_unsecure_env(envp: *mut *mut u8) {
-    unsafe {
-        let mut w = envp;
-        let mut r = envp;
-        while !(*r).is_null() {
-            let v = cbytes(*r);
-            let name = match v.iter().position(|&c| c == b'=') {
-                Some(p) => &v[..p],
-                None => v,
-            };
-            if !UNSECURE_ENVVARS.contains(&name) {
-                *w = *r;
-                w = w.add(1);
-            }
-            r = r.add(1);
+    let (mut w, mut r) = (0usize, 0usize);
+    loop {
+        let e = unsafe { entry(envp, r) };
+        if e.is_null() {
+            break;
         }
-        *w = core::ptr::null_mut();
+        let v = unsafe { cbytes(e) };
+        let name = match v.iter().position(|&c| c == b'=') {
+            Some(p) => &v[..p],
+            None => v,
+        };
+        if UNSECURE.position(name).is_none() {
+            let slot = unsafe { envp.add(w) };
+            unsafe { *slot = e };
+            w += 1;
+        }
+        r += 1;
     }
+    let slot = unsafe { envp.add(w) };
+    unsafe { *slot = core::ptr::null_mut() };
 }
 
 pub unsafe fn find_env<'a>(envp: *const *mut u8) -> Option<&'a [u8]> {
-    unsafe {
-        const NAME: &[u8] = b"GLIBC_TUNABLES=";
-        let mut e = envp;
-        while !(*e).is_null() {
-            let p = *e;
-            let mut i = 0;
-            while i < NAME.len() && *p.add(i) == NAME[i] {
-                i += 1;
-            }
-            if i == NAME.len() {
-                return Some(cbytes(p.add(i)));
-            }
-            e = e.add(1);
+    const NAME: &[u8] = b"GLIBC_TUNABLES=";
+    let mut k = 0;
+    loop {
+        let p = unsafe { entry(envp, k) };
+        if p.is_null() {
+            return None;
         }
-        None
+        let mut i = 0;
+        while i < NAME.len() {
+            let q = unsafe { p.add(i) };
+            if unsafe { *q } != NAME[i] {
+                break;
+            }
+            i += 1;
+        }
+        if i == NAME.len() {
+            let v = unsafe { p.add(i) };
+            return Some(unsafe { cbytes(v) });
+        }
+        k += 1;
     }
 }
 
@@ -398,18 +496,75 @@ pub fn warning_text(w: &Warning<'_>, whole: &[u8], out: &mut dyn FnMut(&[u8])) {
     }
 }
 
-pub unsafe fn init_static(envp: *mut *mut u8, mut secure: bool, warn: &mut dyn FnMut(&[u8]), hwcaps: &mut dyn FnMut(&[u8])) {
-    unsafe {
-        if let Some(v) = find_env(envp).filter(|_| !secure) {
+pub unsafe fn apply_aliases<'a>(vals: &mut Values<'a>, envp: *const *mut u8, warn: &mut dyn FnMut(Warning<'a>)) {
+    {
+        let mut alias: [Option<&'a [u8]>; COUNT] = [None; COUNT];
+        let mut k = 0;
+        loop {
+            let p = unsafe { entry(envp, k) };
+            if p.is_null() {
+                break;
+            }
+            let v: &'a [u8] = unsafe { cbytes(p) };
+            if let Some(eq) = v.iter().position(|&c| c == b'=')
+                && let Some(i) = (0..COUNT).find(|&i| !ALIASES.bytes(i).is_empty() && ALIASES.bytes(i) == &v[..eq])
+            {
+                alias[i] = Some(&v[eq + 1..]);
+            }
+            k += 1;
+        }
+        for (i, a) in alias.iter().enumerate() {
+            if let Some(v) = *a
+                && !vals.0[i].initialized
+                && !vals.initialize(i, v)
+            {
+                warn(Warning::BadValue(v, name(i)));
+            }
+        }
+    }
+}
+
+static NUM: [core::sync::atomic::AtomicI64; COUNT] = [const { core::sync::atomic::AtomicI64::new(0) }; COUNT];
+static SET: [core::sync::atomic::AtomicBool; COUNT] = [const { core::sync::atomic::AtomicBool::new(false) }; COUNT];
+
+pub fn store(vals: &Values<'_>) {
+    use core::sync::atomic::Ordering::Relaxed;
+    for (i, v) in vals.0.iter().enumerate() {
+        NUM[i].store(v.num, Relaxed);
+        SET[i].store(v.initialized, Relaxed);
+    }
+}
+
+pub fn stored(i: usize) -> Option<i64> {
+    use core::sync::atomic::Ordering::Relaxed;
+    SET[i].load(Relaxed).then(|| NUM[i].load(Relaxed))
+}
+
+pub unsafe fn init_static(envp: *mut *mut u8, mut secure: bool, warn: &mut dyn FnMut(&[u8]), hwcaps: &mut dyn FnMut(&[u8])) -> bool {
+    {
+        let mut vals = Values::default();
+        if let Some(v) = unsafe { find_env(envp) }.filter(|_| !secure) {
             let t = parse(v, &mut |w| warning_text(&w, v, warn));
             secure = t.enable_secure;
             if let Some(h) = t.hwcaps.filter(|_| !secure) {
                 hwcaps(h);
             }
+            vals = t.values;
+        }
+        if !secure {
+            unsafe {
+                apply_aliases(&mut vals, envp, &mut |w| {
+                    if let Warning::BadValue(v, _) = w {
+                        warning_text(&w, v, warn)
+                    }
+                })
+            };
+            store(&vals);
         }
         if secure {
-            scrub_unsecure_env(envp);
+            unsafe { scrub_unsecure_env(envp) };
         }
+        secure
     }
 }
 

@@ -8,8 +8,6 @@ license.workspace = true
 rusty-libc-core = { path = "../rusty-libc-core" }
 rusty-libc-mem = { path = "../rusty-libc-mem" }
 rusty-libc-malloc = { path = "../rusty-libc-malloc" }
-rusty-libc-ctype = { path = "../rusty-libc-ctype" }
-rusty-libc-stdlib = { path = "../rusty-libc-stdlib" }
 rusty-libc-pthread = { path = "../rusty-libc-pthread" }
 
 [features]

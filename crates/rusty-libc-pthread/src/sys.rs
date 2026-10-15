@@ -119,22 +119,25 @@ pub fn gettid() -> i32 {
     }
 }
 
-pub fn raw_gettid() -> i32 {
-    unsafe { syscall0(SYS_GETTID) as i32 }
+pub use rusty_libc_core::unistd::{getpid, gettid as raw_gettid};
+
+#[inline(always)]
+fn word_arg(addr: &AtomicU32) -> usize {
+    addr as *const AtomicU32 as usize
 }
 
-pub fn getpid() -> i32 {
-    unsafe { syscall0(39) as i32 }
+#[inline(always)]
+fn abs_arg(abs: Option<&Timespec>) -> usize {
+    abs.map_or(0, |t| t as *const Timespec as usize)
 }
 
 #[inline]
-pub fn futex_wait(addr: *const AtomicU32, val: u32, private: bool) -> c_int {
-    errno_of(unsafe { syscall4(SYS_FUTEX, addr as usize, FUTEX_WAIT | pflag(private), val as usize, 0) })
+pub fn futex_wait(addr: &AtomicU32, val: u32, private: bool) -> c_int {
+    errno_of(unsafe { syscall4(SYS_FUTEX, word_arg(addr), FUTEX_WAIT | pflag(private), val as usize, 0) })
 }
 
-fn abs_check(clock: c_int, abs: *const Timespec) -> c_int {
-    if !abs.is_null() {
-        let ts = unsafe { &*abs };
+fn abs_check(clock: c_int, abs: Option<&Timespec>) -> c_int {
+    if let Some(ts) = abs {
         if !valid_nsec(ts) || (clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC) {
             return EINVAL;
         }
@@ -153,44 +156,49 @@ fn wait_op(clock: c_int, private: bool) -> usize {
     op
 }
 
-pub fn futex_wait_abs_cp(addr: *const AtomicU32, val: u32, clock: c_int, abs: *const Timespec, private: bool) -> c_int {
+pub fn futex_wait_abs_cp(addr: &AtomicU32, val: u32, clock: c_int, abs: Option<&Timespec>, private: bool) -> c_int {
     let e = abs_check(clock, abs);
     if e != 0 {
         return e;
     }
-    errno_of(unsafe { sys_cp(SYS_FUTEX, addr as usize, wait_op(clock, private), val as usize, abs as usize, 0, FUTEX_BITSET_MATCH_ANY) })
+    errno_of(unsafe { sys_cp(SYS_FUTEX, word_arg(addr), wait_op(clock, private), val as usize, abs_arg(abs), 0, FUTEX_BITSET_MATCH_ANY) })
 }
 
-pub fn futex_wait_abs(addr: *const AtomicU32, val: u32, clock: c_int, abs: *const Timespec, private: bool) -> c_int {
+pub fn futex_wait_abs(addr: &AtomicU32, val: u32, clock: c_int, abs: Option<&Timespec>, private: bool) -> c_int {
     let e = abs_check(clock, abs);
     if e != 0 {
         return e;
     }
-    errno_of(unsafe { syscall6(SYS_FUTEX, addr as usize, wait_op(clock, private), val as usize, abs as usize, 0, FUTEX_BITSET_MATCH_ANY) })
+    errno_of(unsafe { syscall6(SYS_FUTEX, word_arg(addr), wait_op(clock, private), val as usize, abs_arg(abs), 0, FUTEX_BITSET_MATCH_ANY) })
 }
 
-pub fn futex_wait_cp(addr: *const AtomicU32, val: u32, private: bool) -> c_int {
-    errno_of(unsafe { sys_cp(SYS_FUTEX, addr as usize, FUTEX_WAIT | pflag(private), val as usize, 0, 0, 0) })
+pub fn futex_wait_cp(addr: &AtomicU32, val: u32, private: bool) -> c_int {
+    errno_of(unsafe { sys_cp(SYS_FUTEX, word_arg(addr), FUTEX_WAIT | pflag(private), val as usize, 0, 0, 0) })
 }
 
 #[inline]
-pub fn futex_wake(addr: *const AtomicU32, n: i32, private: bool) -> i32 {
-    unsafe { syscall3(SYS_FUTEX, addr as usize, FUTEX_WAKE | pflag(private), n as usize) as i32 }
+pub fn futex_wake(addr: &AtomicU32, n: i32, private: bool) -> i32 {
+    unsafe { syscall3(SYS_FUTEX, word_arg(addr), FUTEX_WAKE | pflag(private), n as usize) as i32 }
+}
+
+#[inline(always)]
+pub fn low_word(w: &core::sync::atomic::AtomicU64) -> &AtomicU32 {
+    unsafe { &*(w as *const core::sync::atomic::AtomicU64 as *const AtomicU32) }
 }
 
 pub fn tgkill(pid: i32, tid: i32, sig: c_int) -> c_int {
-    errno_of(unsafe { syscall3(SYS_TGKILL, pid as usize, tid as usize, sig as usize) })
+    rusty_libc_core::signal::tgkill(pid, tid, sig).err().map_or(0, |e| e.0)
 }
 
 pub fn clock_gettime(clock: c_int, ts: &mut Timespec) -> c_int {
-    errno_of(unsafe { syscall2(SYS_CLOCK_GETTIME, clock as usize, ts as *mut Timespec as usize) })
+    errno_of(unsafe { rusty_libc_core::vdso::clock_gettime_raw(clock, ts as *mut Timespec as *mut core::ffi::c_void) })
 }
 
 pub fn sched_yield() {
     unsafe { syscall0(SYS_SCHED_YIELD) };
 }
 
-pub unsafe fn mmap(len: usize, prot: usize) -> Result<*mut u8, c_int> {
+pub fn mmap(len: usize, prot: usize) -> Result<*mut u8, c_int> {
     let r = unsafe { syscall6(rusty_libc_core::syscall::SYS_MMAP, 0, len, prot, 0x22 | 0x20000, usize::MAX, 0) };
     let e = errno_of(r);
     if e != 0 { Err(e) } else { Ok(r as *mut u8) }
@@ -225,6 +233,16 @@ pub fn align_up(x: usize, a: usize) -> usize {
 #[inline(always)]
 pub unsafe fn au32<'a>(p: *const u32) -> &'a AtomicU32 {
     unsafe { &*(p as *const AtomicU32) }
+}
+
+#[inline(always)]
+pub unsafe fn arg<'a, T>(p: *const T) -> &'a T {
+    unsafe { &*p }
+}
+
+#[inline(always)]
+pub unsafe fn arg_mut<'a, T>(p: *mut T) -> &'a mut T {
+    unsafe { &mut *p }
 }
 
 pub fn timespec_add_ns(ts: &mut Timespec, ns: i64) {

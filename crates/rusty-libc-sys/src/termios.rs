@@ -1,13 +1,13 @@
 use crate::misc::sci;
 use core::ffi::{c_char, c_int};
-use rusty_libc_core::syscall::{SYS_IOCTL, check, syscall1, syscall2, syscall3};
+use crate::kernel::plain;
+use rusty_libc_core::syscall::{SYS_IOCTL, check, syscall3};
 use rusty_libc_core::{Errno, errno};
 
 const SYS_DUP2: usize = 33;
 const SYS_SETSID: usize = 112;
 const SYS_GETSID: usize = 124;
 const SYS_CLOSE: usize = 3;
-const SYS_OPEN: usize = 2;
 
 const TCGETS2: usize = 0x802C_542A;
 const TCSETS2: usize = 0x402C_542B;
@@ -211,220 +211,216 @@ pub fn makeraw(t: &mut termios) {
     t.c_cc[VTIME] = 0;
 }
 
+pub fn setospeed(t: &mut termios, speed: u32) {
+    t.c_ospeed = speed;
+    t.c_cflag &= !CBAUD;
+    t.c_cflag |= speed_to_cbaud(speed);
+}
+
+pub fn setispeed(t: &mut termios, speed: u32) {
+    t.c_ispeed = speed;
+    t.c_cflag &= !CIBAUD;
+    t.c_cflag |= speed_to_cbaud(speed) << IBSHIFT;
+}
+
+pub fn setspeed(t: &mut termios, speed: u32) {
+    let cb = speed_to_cbaud(speed);
+    t.c_ospeed = speed;
+    t.c_ispeed = speed;
+    t.c_cflag &= !(CBAUD | CIBAUD);
+    t.c_cflag |= cb | (cb << IBSHIFT);
+}
+
+fn old_code_speed(code: u32) -> Option<u32> {
+    let real = cbaud_to_speed(code, u32::MAX);
+    if real == u32::MAX { None } else { Some(real) }
+}
+
+fn apply_ospeed_old(t: &mut termios, real: u32, code: u32) {
+    t.c_ospeed = real;
+    t.c_cflag &= !CBAUD;
+    t.c_cflag |= code;
+}
+
+fn apply_ispeed_old(t: &mut termios, real: u32, code: u32) {
+    t.c_ispeed = real;
+    t.c_cflag &= !CIBAUD;
+    t.c_cflag |= code << IBSHIFT;
+}
+
+fn apply_speed_old(t: &mut termios, real: u32, code: u32) {
+    t.c_ospeed = real;
+    t.c_ispeed = real;
+    t.c_cflag &= !(CBAUD | CIBAUD);
+    t.c_cflag |= code | (code << IBSHIFT);
+}
+
+fn bad_code() -> c_int {
+    errno::set(EINVAL);
+    -1
+}
+
+pub fn setospeed_old(t: &mut termios, code: u32) -> c_int {
+    let Some(real) = old_code_speed(code) else { return bad_code() };
+    apply_ospeed_old(t, real, code);
+    0
+}
+
+pub fn setispeed_old(t: &mut termios, code: u32) -> c_int {
+    let Some(real) = old_code_speed(code) else { return bad_code() };
+    apply_ispeed_old(t, real, code);
+    0
+}
+
+pub fn setspeed_old(t: &mut termios, code: u32) -> c_int {
+    let Some(real) = old_code_speed(code) else { return bad_code() };
+    apply_speed_old(t, real, code);
+    0
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn tcgetattr(fd: c_int, t: *mut termios) -> c_int {
-    unsafe {
-        match tcgetattr_r(fd) {
-            Ok(v) => {
-                core::ptr::write_bytes(t, 0, 1);
-                (*t).c_iflag = v.c_iflag;
-                (*t).c_oflag = v.c_oflag;
-                (*t).c_cflag = v.c_cflag;
-                (*t).c_lflag = v.c_lflag;
-                (*t).c_line = v.c_line;
-                (*t).c_cc = v.c_cc;
-                (*t).c_ispeed = v.c_ispeed;
-                (*t).c_ospeed = v.c_ospeed;
-                0
-            }
-            Err(Errno(e)) => {
-                errno::set(e);
-                -1
-            }
+    match tcgetattr_r(fd) {
+        Ok(v) => {
+            use core::mem::{offset_of, size_of};
+            let mut img = [0u8; size_of::<termios>()];
+            let mut put = |off: usize, b: &[u8]| img[off..off + b.len()].copy_from_slice(b);
+            put(offset_of!(termios, c_iflag), &v.c_iflag.to_ne_bytes());
+            put(offset_of!(termios, c_oflag), &v.c_oflag.to_ne_bytes());
+            put(offset_of!(termios, c_cflag), &v.c_cflag.to_ne_bytes());
+            put(offset_of!(termios, c_lflag), &v.c_lflag.to_ne_bytes());
+            put(offset_of!(termios, c_line), &[v.c_line]);
+            put(offset_of!(termios, c_cc), &v.c_cc);
+            put(offset_of!(termios, c_ispeed), &v.c_ispeed.to_ne_bytes());
+            put(offset_of!(termios, c_ospeed), &v.c_ospeed.to_ne_bytes());
+            unsafe { t.cast::<[u8; size_of::<termios>()]>().write(img) };
+            0
+        }
+        Err(Errno(e)) => {
+            errno::set(e);
+            -1
         }
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn tcsetattr(fd: c_int, action: c_int, t: *const termios) -> c_int {
-    unsafe {
-        match tcsetattr_r(fd, action, &*t) {
-            Ok(()) => 0,
-            Err(Errno(e)) => {
-                errno::set(e);
-                -1
-            }
+    match tcsetattr_r(fd, action, unsafe { &*t }) {
+        Ok(()) => 0,
+        Err(Errno(e)) => {
+            errno::set(e);
+            -1
         }
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn cfgetospeed(t: *const termios) -> u32 {
-    unsafe { (*t).c_ospeed }
+    unsafe { &*t }.c_ospeed
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn cfgetispeed(t: *const termios) -> u32 {
-    unsafe { (*t).c_ispeed }
+    unsafe { &*t }.c_ispeed
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn cfgetobaud(t: *const termios) -> u32 {
-    unsafe { (*t).c_ospeed }
-}
+crate::unistd::alias!(
+    cfgetobaud => cfgetospeed(t: *const termios) -> u32
+);
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn cfgetibaud(t: *const termios) -> u32 {
-    unsafe { (*t).c_ispeed }
-}
+crate::unistd::alias!(
+    cfgetibaud => cfgetispeed(t: *const termios) -> u32
+);
 
 #[cfg(all(feature = "export", not(feature = "shared")))]
 mod versioned {
     use super::*;
     #[unsafe(export_name = "cfgetospeed@GLIBC_2.2.5")]
     pub unsafe extern "C" fn cfgetospeed_v(t: *const termios) -> u32 {
-        unsafe { (*t).c_cflag & CBAUD }
+        unsafe { cfgetospeed_old(t) }
     }
     #[unsafe(export_name = "cfgetispeed@GLIBC_2.2.5")]
     pub unsafe extern "C" fn cfgetispeed_v(t: *const termios) -> u32 {
-        unsafe { ((*t).c_cflag >> IBSHIFT) & CBAUD }
+        unsafe { cfgetispeed_old(t) }
     }
     #[unsafe(export_name = "cfsetospeed@GLIBC_2.2.5")]
     pub unsafe extern "C" fn cfsetospeed_v(t: *mut termios, speed: u32) -> c_int {
-        let real = cbaud_to_speed(speed, u32::MAX);
-        if real == u32::MAX {
-            errno::set(EINVAL);
-            return -1;
-        }
-        unsafe {
-            (*t).c_ospeed = real;
-            (*t).c_cflag &= !CBAUD;
-            (*t).c_cflag |= speed;
-        }
-        0
+        unsafe { cfsetospeed_old(t, speed) }
     }
     #[unsafe(export_name = "cfsetispeed@GLIBC_2.2.5")]
     pub unsafe extern "C" fn cfsetispeed_v(t: *mut termios, speed: u32) -> c_int {
-        let real = cbaud_to_speed(speed, u32::MAX);
-        if real == u32::MAX {
-            errno::set(EINVAL);
-            return -1;
-        }
-        unsafe {
-            (*t).c_ispeed = real;
-            (*t).c_cflag &= !CIBAUD;
-            (*t).c_cflag |= speed << IBSHIFT;
-        }
-        0
+        unsafe { cfsetispeed_old(t, speed) }
     }
     #[unsafe(export_name = "cfsetspeed@GLIBC_2.2.5")]
     pub unsafe extern "C" fn cfsetspeed_v(t: *mut termios, speed: u32) -> c_int {
-        let real = cbaud_to_speed(speed, u32::MAX);
-        if real == u32::MAX {
-            errno::set(EINVAL);
-            return -1;
-        }
-        unsafe {
-            (*t).c_ospeed = real;
-            (*t).c_ispeed = real;
-            (*t).c_cflag &= !(CBAUD | CIBAUD);
-            (*t).c_cflag |= speed | (speed << IBSHIFT);
-        }
-        0
+        unsafe { cfsetspeed_old(t, speed) }
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn cfsetospeed(t: *mut termios, speed: u32) -> c_int {
-    unsafe {
-        (*t).c_ospeed = speed;
-        (*t).c_cflag &= !CBAUD;
-        (*t).c_cflag |= speed_to_cbaud(speed);
-        0
-    }
+    setospeed(unsafe { &mut *t }, speed);
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn cfsetispeed(t: *mut termios, speed: u32) -> c_int {
-    unsafe {
-        (*t).c_ispeed = speed;
-        (*t).c_cflag &= !CIBAUD;
-        (*t).c_cflag |= speed_to_cbaud(speed) << IBSHIFT;
-        0
-    }
+    setispeed(unsafe { &mut *t }, speed);
+    0
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn cfsetobaud(t: *mut termios, speed: u32) -> c_int {
-    unsafe { cfsetospeed(t, speed) }
-}
+crate::unistd::alias!(
+    cfsetobaud => cfsetospeed(t: *mut termios, speed: u32) -> c_int
+);
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn cfsetibaud(t: *mut termios, speed: u32) -> c_int {
-    unsafe { cfsetispeed(t, speed) }
-}
+crate::unistd::alias!(
+    cfsetibaud => cfsetispeed(t: *mut termios, speed: u32) -> c_int
+);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn cfsetspeed(t: *mut termios, speed: u32) -> c_int {
-    unsafe {
-        let cb = speed_to_cbaud(speed);
-        (*t).c_ospeed = speed;
-        (*t).c_ispeed = speed;
-        (*t).c_cflag &= !(CBAUD | CIBAUD);
-        (*t).c_cflag |= cb | (cb << IBSHIFT);
-        0
-    }
+    setspeed(unsafe { &mut *t }, speed);
+    0
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn cfsetbaud(t: *mut termios, speed: u32) -> c_int {
-    unsafe { cfsetspeed(t, speed) }
-}
+crate::unistd::alias!(
+    cfsetbaud => cfsetspeed(t: *mut termios, speed: u32) -> c_int
+);
 
 pub unsafe fn cfgetospeed_old(t: *const termios) -> u32 {
-    unsafe { (*t).c_cflag & CBAUD }
+    unsafe { &*t }.c_cflag & CBAUD
 }
 
 pub unsafe fn cfgetispeed_old(t: *const termios) -> u32 {
-    unsafe { ((*t).c_cflag >> IBSHIFT) & CBAUD }
+    (unsafe { &*t }.c_cflag >> IBSHIFT) & CBAUD
 }
 
 pub unsafe fn cfsetospeed_old(t: *mut termios, speed: u32) -> c_int {
-    unsafe {
-        let real = cbaud_to_speed(speed, u32::MAX);
-        if real == u32::MAX {
-            errno::set(EINVAL);
-            return -1;
-        }
-        (*t).c_ospeed = real;
-        (*t).c_cflag &= !CBAUD;
-        (*t).c_cflag |= speed;
-        0
-    }
+    let Some(real) = old_code_speed(speed) else { return bad_code() };
+    apply_ospeed_old(unsafe { &mut *t }, real, speed);
+    0
 }
 
 pub unsafe fn cfsetispeed_old(t: *mut termios, speed: u32) -> c_int {
-    unsafe {
-        let real = cbaud_to_speed(speed, u32::MAX);
-        if real == u32::MAX {
-            errno::set(EINVAL);
-            return -1;
-        }
-        (*t).c_ispeed = real;
-        (*t).c_cflag &= !CIBAUD;
-        (*t).c_cflag |= speed << IBSHIFT;
-        0
-    }
+    let Some(real) = old_code_speed(speed) else { return bad_code() };
+    apply_ispeed_old(unsafe { &mut *t }, real, speed);
+    0
 }
 
 pub unsafe fn cfsetspeed_old(t: *mut termios, speed: u32) -> c_int {
-    unsafe {
-        let real = cbaud_to_speed(speed, u32::MAX);
-        if real == u32::MAX {
-            errno::set(EINVAL);
-            return -1;
-        }
-        (*t).c_ospeed = real;
-        (*t).c_ispeed = real;
-        (*t).c_cflag &= !(CBAUD | CIBAUD);
-        (*t).c_cflag |= speed | (speed << IBSHIFT);
-        0
-    }
+    let Some(real) = old_code_speed(speed) else { return bad_code() };
+    apply_speed_old(unsafe { &mut *t }, real, speed);
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn cfmakeraw(t: *mut termios) {
-    unsafe { makeraw(&mut *t) }
+    makeraw(unsafe { &mut *t })
+}
+
+#[inline]
+fn tty_ioctl_int(fd: c_int, request: usize, arg: usize) -> usize {
+    unsafe { syscall3(SYS_IOCTL, fd as usize, request, arg) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -434,160 +430,148 @@ pub extern "C" fn tcdrain(fd: c_int) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn tcflow(fd: c_int, action: c_int) -> c_int {
-    unsafe { sci(syscall3(SYS_IOCTL, fd as usize, TCXONC, action as isize as usize)) }
+    sci(tty_ioctl_int(fd, TCXONC, action as isize as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn tcflush(fd: c_int, queue: c_int) -> c_int {
-    unsafe { sci(syscall3(SYS_IOCTL, fd as usize, TCFLSH, queue as isize as usize)) }
+    sci(tty_ioctl_int(fd, TCFLSH, queue as isize as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn tcsendbreak(fd: c_int, duration: c_int) -> c_int {
-    unsafe {
-        if duration <= 0 {
-            sci(syscall3(SYS_IOCTL, fd as usize, TCSBRK, 0))
-        } else {
-            sci(syscall3(SYS_IOCTL, fd as usize, TCSBRKP, ((duration as i64 + 99) / 100) as usize))
-        }
+    if duration <= 0 {
+        sci(tty_ioctl_int(fd, TCSBRK, 0))
+    } else {
+        sci(tty_ioctl_int(fd, TCSBRKP, ((duration as i64 + 99) / 100) as usize))
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn tcgetpgrp(fd: c_int) -> c_int {
-    let mut pgrp: c_int = 0;
-    unsafe {
-        let r = sci(syscall3(SYS_IOCTL, fd as usize, TIOCGPGRP, &mut pgrp as *mut c_int as usize));
-        if r < 0 { r } else { pgrp }
-    }
+    let (r, pgrp) = crate::kernel::ioctl_get_int(fd as usize, TIOCGPGRP);
+    let r = sci(r);
+    if r < 0 { r } else { pgrp }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn tcsetpgrp(fd: c_int, pgrp: c_int) -> c_int {
-    unsafe { sci(syscall3(SYS_IOCTL, fd as usize, TIOCSPGRP, &pgrp as *const c_int as usize)) }
+    sci(crate::kernel::ioctl_set_int(fd as usize, TIOCSPGRP, &pgrp))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn tcgetsid(fd: c_int) -> c_int {
-    unsafe {
-        let serrno = errno::get();
-        let mut sid: c_int = 0;
-        let r = sci(syscall3(SYS_IOCTL, fd as usize, TIOCGSID, &mut sid as *mut c_int as usize));
-        if r >= 0 {
-            return sid;
-        }
-        if errno::get() != EINVAL {
-            return -1;
-        }
-        errno::set(serrno);
-        let pgrp = tcgetpgrp(fd);
-        if pgrp == -1 {
-            return -1;
-        }
-        let s = sci(syscall1(SYS_GETSID, pgrp as usize));
-        if s == -1 && errno::get() == ESRCH {
-            errno::set(ENOTTY);
-        }
-        s
+    let serrno = errno::get();
+    let (r, sid) = crate::kernel::ioctl_get_int(fd as usize, TIOCGSID);
+    if sci(r) >= 0 {
+        return sid;
     }
+    if errno::get() != EINVAL {
+        return -1;
+    }
+    errno::set(serrno);
+    let pgrp = tcgetpgrp(fd);
+    if pgrp == -1 {
+        return -1;
+    }
+    let s = sci(plain!(SYS_GETSID, pgrp as usize));
+    if s == -1 && errno::get() == ESRCH {
+        errno::set(ENOTTY);
+    }
+    s
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn openpty(amaster: *mut c_int, aslave: *mut c_int, name: *mut c_char, termp: *const termios, winp: *const winsize) -> c_int {
-    unsafe {
-        let ptmx = rusty_libc_stdlib::misc::getpt();
-        if ptmx == -1 {
-            return -1;
+    let ptmx = rusty_libc_stdlib::misc::getpt();
+    if ptmx == -1 {
+        return -1;
+    }
+    let mut buf = [0 as c_char; 4096];
+    let mut slave: c_int = -1;
+    let ok = 'body: {
+        if rusty_libc_stdlib::misc::grantpt(ptmx) != 0 || rusty_libc_stdlib::misc::unlockpt(ptmx) != 0 {
+            break 'body false;
         }
-        let mut buf = [0 as c_char; 4096];
-        let mut slave: c_int = -1;
-        let ok = 'body: {
-            if rusty_libc_stdlib::misc::grantpt(ptmx) != 0 || rusty_libc_stdlib::misc::unlockpt(ptmx) != 0 {
+        slave = sci(tty_ioctl_int(ptmx, TIOCGPTPEER, O_RDWR | O_NOCTTY));
+        if slave == -1 {
+            if unsafe { rusty_libc_stdlib::misc::ptsname_r(ptmx, buf.as_mut_ptr(), buf.len()) } != 0 {
                 break 'body false;
             }
-            slave = sci(syscall3(SYS_IOCTL, ptmx as usize, TIOCGPTPEER, O_RDWR | O_NOCTTY));
+            slave = sci(unsafe { rusty_libc_core::syscall::sys_open(buf.as_ptr() as usize, O_RDWR | O_NOCTTY, 0) });
             if slave == -1 {
-                if rusty_libc_stdlib::misc::ptsname_r(ptmx, buf.as_mut_ptr(), buf.len()) != 0 {
-                    break 'body false;
-                }
-                slave = sci(syscall3(SYS_OPEN, buf.as_ptr() as usize, O_RDWR | O_NOCTTY, 0));
-                if slave == -1 {
-                    break 'body false;
-                }
+                break 'body false;
             }
-            if !termp.is_null() {
-                let _ = tcsetattr(slave, 2, termp);
-            }
-            if !winp.is_null() {
-                syscall3(SYS_IOCTL, slave as usize, TIOCSWINSZ, winp as usize);
-            }
-            *amaster = ptmx;
-            *aslave = slave;
-            if !name.is_null() {
-                if buf[0] == 0 && rusty_libc_stdlib::misc::ptsname_r(ptmx, buf.as_mut_ptr(), buf.len()) != 0 {
-                    break 'body false;
-                }
-                rusty_libc_mem::strcpy(name.cast(), buf.as_ptr().cast());
-            }
-            true
-        };
-        if !ok {
-            let e = errno::get();
-            syscall1(SYS_CLOSE, ptmx as usize);
-            if slave != -1 {
-                syscall1(SYS_CLOSE, slave as usize);
-            }
-            errno::set(e);
-            return -1;
         }
-        0
+        if !termp.is_null() {
+            let _ = unsafe { tcsetattr(slave, 2, termp) };
+        }
+        if !winp.is_null() {
+            unsafe { syscall3(SYS_IOCTL, slave as usize, TIOCSWINSZ, winp as usize) };
+        }
+        unsafe { amaster.write(ptmx) };
+        unsafe { aslave.write(slave) };
+        if !name.is_null() {
+            if buf[0] == 0 && unsafe { rusty_libc_stdlib::misc::ptsname_r(ptmx, buf.as_mut_ptr(), buf.len()) } != 0 {
+                break 'body false;
+            }
+            unsafe { rusty_libc_mem::strcpy(name.cast(), buf.as_ptr().cast()) };
+        }
+        true
+    };
+    if !ok {
+        let e = errno::get();
+        plain!(SYS_CLOSE, ptmx as usize);
+        if slave != -1 {
+            plain!(SYS_CLOSE, slave as usize);
+        }
+        errno::set(e);
+        return -1;
     }
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn login_tty(fd: c_int) -> c_int {
-    unsafe {
-        syscall1(SYS_SETSID, 0);
-        if sci(syscall3(SYS_IOCTL, fd as usize, TIOCSCTTY, 0)) == -1 {
-            return -1;
-        }
-        for target in 0..3usize {
-            while sci(syscall2(SYS_DUP2, fd as usize, target)) == -1 && errno::get() == EBUSY {}
-        }
-        if fd > 2 {
-            syscall1(SYS_CLOSE, fd as usize);
-        }
-        0
+    plain!(SYS_SETSID, 0);
+    if sci(tty_ioctl_int(fd, TIOCSCTTY, 0)) == -1 {
+        return -1;
     }
+    for target in 0..3usize {
+        while sci(plain!(SYS_DUP2, fd as usize, target)) == -1 && errno::get() == EBUSY {}
+    }
+    if fd > 2 {
+        plain!(SYS_CLOSE, fd as usize);
+    }
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn forkpty(amaster: *mut c_int, name: *mut c_char, termp: *const termios, winp: *const winsize) -> c_int {
-    unsafe {
-        let mut master = -1;
-        let mut slave = -1;
-        if openpty(&mut master, &mut slave, name, termp, winp) == -1 {
-            return -1;
+    let mut master = -1;
+    let mut slave = -1;
+    if unsafe { openpty(&mut master, &mut slave, name, termp, winp) } == -1 {
+        return -1;
+    }
+    match crate::unistd::fork() {
+        -1 => {
+            let e = errno::get();
+            plain!(SYS_CLOSE, master as usize);
+            plain!(SYS_CLOSE, slave as usize);
+            errno::set(e);
+            -1
         }
-        match rusty_libc_core::unistd::fork() {
-            Err(Errno(e)) => {
-                syscall1(SYS_CLOSE, master as usize);
-                syscall1(SYS_CLOSE, slave as usize);
-                errno::set(e);
-                -1
+        0 => {
+            plain!(SYS_CLOSE, master as usize);
+            if unsafe { login_tty(slave) } != 0 {
+                plain!(rusty_libc_core::syscall::SYS_EXIT_GROUP, 1);
             }
-            Ok(0) => {
-                syscall1(SYS_CLOSE, master as usize);
-                if login_tty(slave) != 0 {
-                    rusty_libc_core::syscall::syscall1(rusty_libc_core::syscall::SYS_EXIT_GROUP, 1);
-                }
-                0
-            }
-            Ok(pid) => {
-                *amaster = master;
-                syscall1(SYS_CLOSE, slave as usize);
-                pid
-            }
+            0
+        }
+        pid => {
+            unsafe { amaster.write(master) };
+            plain!(SYS_CLOSE, slave as usize);
+            pid
         }
     }
 }

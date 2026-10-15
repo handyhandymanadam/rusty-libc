@@ -1,10 +1,11 @@
 #![no_std]
 #![no_builtins]
-#![allow(clippy::missing_safety_doc)]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 
 mod mem;
 pub mod simd;
 mod search;
+mod slices;
 mod str;
 
 simd::slot_table! {
@@ -37,6 +38,7 @@ simd::slot_table! {
 
 pub use mem::*;
 pub use search::*;
+pub use slices::*;
 pub use str::*;
 
 #[macro_export]

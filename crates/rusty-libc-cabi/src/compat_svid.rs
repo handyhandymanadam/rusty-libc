@@ -7,7 +7,7 @@ unsafe extern "C" {
     fn dlvsym(handle: *mut core::ffi::c_void, name: *const core::ffi::c_char, version: *const core::ffi::c_char) -> *mut core::ffi::c_void;
     static mut __rl_cd__LIB_VERSION_2_2_5: c_int;
 }
-static mut LV_PTR: *const c_int = core::ptr::null();
+static LV_PTR: core::sync::atomic::AtomicPtr<c_int> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 const EDOM: c_int = 33;
 const ERANGE: c_int = 34;
@@ -22,8 +22,18 @@ pub enum Ty {
     Q,
 }
 
+#[derive(Clone, Copy)]
+pub struct Name(pub u16, pub u8);
+
+impl Name {
+    fn of(self, blob: &'static [u8]) -> &'static str {
+        let b = blob.get(self.0 as usize..self.0 as usize + self.1 as usize).unwrap_or(&[]);
+        core::str::from_utf8(b).unwrap_or("")
+    }
+}
+
 pub struct Desc {
-    pub stem: &'static str,
+    pub stem: Name,
     pub ty: Ty,
     pub finite: bool,
     pub shape: u8,
@@ -31,10 +41,22 @@ pub struct Desc {
 }
 
 pub struct Raw {
-    pub name: &'static str,
+    pub name: Name,
     pub ty: Ty,
     pub errno: u8,
     pub nan: u8,
+}
+
+impl Desc {
+    pub fn stem(&self) -> &'static str {
+        self.stem.of(&DESC_STEMS)
+    }
+}
+
+impl Raw {
+    pub fn name(&self) -> &'static str {
+        self.name.of(&RAW_NAMES)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -44,7 +66,7 @@ pub struct Val {
 }
 
 impl Val {
-    unsafe fn load(p: *const u8, ty: Ty) -> Val {
+    fn load(p: &[u8], ty: Ty) -> Val {
         let mut b = [0u8; 16];
         let n = match ty {
             Ty::F => 4,
@@ -52,11 +74,11 @@ impl Val {
             Ty::L => 10,
             Ty::Q => 16,
         };
-        unsafe { core::ptr::copy_nonoverlapping(p, b.as_mut_ptr(), n) };
+        b[..n].copy_from_slice(&p[..n]);
         Val { b, ty }
     }
-    unsafe fn store(&self, p: *mut u8) {
-        unsafe { core::ptr::copy_nonoverlapping(self.b.as_ptr(), p, 16) };
+    fn store(&self, p: &mut [u8]) {
+        p[..16].copy_from_slice(&self.b);
     }
     fn bits(&self) -> u128 {
         u128::from_le_bytes(self.b)
@@ -199,13 +221,14 @@ fn pow2(e: i32) -> f64 {
 }
 
 fn lib_version() -> c_int {
-    unsafe {
-        if LV_PTR.is_null() {
-            let p = dlvsym(core::ptr::null_mut(), c"_LIB_VERSION".as_ptr(), c"GLIBC_2.2.5".as_ptr()) as *const c_int;
-            LV_PTR = if p.is_null() { &raw const __rl_cd__LIB_VERSION_2_2_5 } else { p };
-        }
-        core::ptr::read_volatile(LV_PTR)
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut lv = LV_PTR.load(Relaxed);
+    if lv.is_null() {
+        let p = unsafe { dlvsym(core::ptr::null_mut(), c"_LIB_VERSION".as_ptr(), c"GLIBC_2.2.5".as_ptr()) } as *mut c_int;
+        lv = if p.is_null() { &raw mut __rl_cd__LIB_VERSION_2_2_5 } else { p };
+        LV_PTR.store(lv, Relaxed);
     }
+    unsafe { core::ptr::read_volatile(lv) }
 }
 
 const HUGE: f64 = 3.402_823_466_385_288_6e38;
@@ -222,7 +245,7 @@ fn zdz() -> f64 {
 }
 
 fn write2(s: &[u8]) {
-    unsafe { rusty_libc_core::syscall::syscall3(1, 2, s.as_ptr() as usize, s.len()) };
+    let _ = rusty_libc_core::unistd::write_nocancel(2, s);
 }
 
 fn kernel_standard(x: f64, _y: f64, typ: i32, y_half_int: bool) -> f64 {
@@ -313,7 +336,7 @@ fn raw_rule(stem: &str, ty: Ty) -> Option<&'static Raw> {
         "tgamma" => "gamma_r",
         s => s,
     };
-    RAW.iter().find(|r| r.name == stem && r.ty == ty)
+    RAW.iter().find(|r| r.name() == stem && r.ty == ty)
 }
 
 fn nan_make(neg: bool, ty: Ty) -> Val {
@@ -329,9 +352,9 @@ struct Args {
 }
 
 fn raw_fix(d: &Desc, a: &Args, z: Val, errno_before: c_int) -> Val {
-    let Some(r) = raw_rule(d.stem, d.ty) else { return z };
+    let Some(r) = raw_rule(d.stem(), d.ty) else { return z };
     let xv = if d.shape == b'I' { &a.y } else { &a.x };
-    let keep = match d.stem {
+    let keep = match d.stem() {
         "y1" | "yn" | "jn" if d.ty != Ty::F => xv.is_finite() && !xv.is_zero() && !xv.neg() && (z.is_inf() || z.is_zero()),
         "lgamma" | "lgamma_r" if d.ty == Ty::D => z.is_inf() && xv.is_finite() && xv.is_integer() && le0(xv),
         "lgamma" | "lgamma_r" if d.ty == Ty::Q => z.is_inf() && xv.is_zero(),
@@ -342,7 +365,7 @@ fn raw_fix(d: &Desc, a: &Args, z: Val, errno_before: c_int) -> Val {
     }
     let mut z = z;
     if d.finite && d.ty == Ty::L {
-        match d.stem {
+        match d.stem() {
             "log" | "log2" | "log10" if a.x.is_nan() => feraise(FE_INVALID),
             "y0" | "y1" if a.x.is_zero() => {
                 restore_flags(a.flags_before);
@@ -359,19 +382,17 @@ fn raw_fix(d: &Desc, a: &Args, z: Val, errno_before: c_int) -> Val {
             _ => {}
         }
     }
-    if d.stem == "gamma_r" {
-        unsafe {
-            match d.ty {
-                Ty::D => *a.ptr = 0,
-                Ty::F => {}
-                _ => {
-                    let mut sg = 0;
-                    if z.is_finite() && !z.is_zero() && xv.neg() && !xv.is_zero() && xv.is_finite() && !xv.is_integer() {
-                        sg = if z.neg() { -1 } else { 1 };
-                        z = z.with_sign(false);
-                    }
-                    *a.ptr = sg;
+    if d.stem() == "gamma_r" {
+        match d.ty {
+            Ty::D => unsafe { *a.ptr = 0 },
+            Ty::F => {}
+            _ => {
+                let mut sg = 0;
+                if z.is_finite() && !z.is_zero() && xv.neg() && !xv.is_zero() && xv.is_finite() && !xv.is_integer() {
+                    sg = if z.neg() { -1 } else { 1 };
+                    z = z.with_sign(false);
                 }
+                unsafe { *a.ptr = sg };
             }
         }
     }
@@ -384,10 +405,10 @@ fn raw_fix(d: &Desc, a: &Args, z: Val, errno_before: c_int) -> Val {
     z
 }
 
-static mut KS_TAKEN: bool = false;
+static KS_TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn ks(d: &Desc, code: i32, x: f64, y: f64, yv: Option<&Val>) -> Val {
-    unsafe { KS_TAKEN = true };
+    KS_TAKEN.store(true, core::sync::atomic::Ordering::Relaxed);
     let base = match d.ty {
         Ty::D => 0,
         Ty::F => 100,
@@ -430,11 +451,11 @@ fn wrapper(d: &Desc, a: &Args, z: Val) -> Val {
     let finite_args = x.is_finite() && (d.shape != b'2' || y.is_finite());
     let tl = x_tloss_k(d.ty);
     let sb = x.neg() as i32;
-    match d.stem {
+    match d.stem() {
         "acos" | "asin" => {
             if gt_abs_int(x, 1) && not_ieee {
                 feraise(FE_INVALID);
-                return ks(d, if d.stem == "acos" { 1 } else { 2 }, xd, xd, None);
+                return ks(d, if d.stem() == "acos" { 1 } else { 2 }, xd, xd, None);
             }
         }
         "acosh" => {
@@ -468,7 +489,7 @@ fn wrapper(d: &Desc, a: &Args, z: Val) -> Val {
         }
         "exp" | "exp2" | "exp10" => {
             if (!z.is_finite() || z.is_zero()) && x.is_finite() && not_ieee {
-                let c = match d.stem {
+                let c = match d.stem() {
                     "exp" => 6,
                     "exp2" => 44,
                     _ => 46,
@@ -493,11 +514,11 @@ fn wrapper(d: &Desc, a: &Args, z: Val) -> Val {
         }
         "j0" | "j1" => {
             if gt_abs_int(x, tl) && not_ieee && lv != 2 {
-                return ks(d, if d.stem == "j0" { 34 } else { 36 }, xd, xd, None);
+                return ks(d, if d.stem() == "j0" { 34 } else { 36 }, xd, xd, None);
             }
         }
         "y0" | "y1" => {
-            let (c_neg, c_zero, c_tloss) = if d.stem == "y0" { (9, 8, 35) } else { (11, 10, 37) };
+            let (c_neg, c_zero, c_tloss) = if d.stem() == "y0" { (9, 8, 35) } else { (11, 10, 37) };
             if (le0(x) || (gt_abs_int(x, tl) && !x.neg())) && not_ieee {
                 if lt0(x) {
                     feraise(FE_INVALID);
@@ -537,7 +558,7 @@ fn wrapper(d: &Desc, a: &Args, z: Val) -> Val {
         }
         "log" | "log10" | "log2" => {
             if le0(x) && not_ieee {
-                let (cz, cn) = match d.stem {
+                let (cz, cn) = match d.stem() {
                     "log" => (16, 17),
                     "log10" => (18, 19),
                     _ => (48, 49),
@@ -624,47 +645,57 @@ fn lt1(x: &Val) -> bool {
 
 include!("compat_svid_gen.rs");
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __rl_sv_pre(frame: *mut u8, _id: u32) {
-    unsafe {
-        *(frame.add(48) as *mut c_int) = errno::get();
-        *(frame.add(52) as *mut c_int) = rusty_libc_math::fenv::fetestexcept(0x3d);
-    }
+type Frame = [u8; 64];
+
+unsafe fn frame<'a>(frame: *mut u8) -> &'a mut Frame {
+    unsafe { &mut *frame.cast::<Frame>() }
+}
+
+fn word(f: &Frame, at: usize) -> u64 {
+    u64::from_ne_bytes(f[at..at + 8].try_into().unwrap())
+}
+
+fn int(f: &Frame, at: usize) -> c_int {
+    c_int::from_ne_bytes(f[at..at + 4].try_into().unwrap())
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __rl_sv_post(frame: *mut u8, id: u32) {
-    unsafe {
-        let d = &DESCS[id as usize];
-        let ty = d.ty;
-        let sz = 16usize;
-        let _ = sz;
-        let x = Val::load(frame, ty);
-        let mut a = Args { flags_before: *(frame.add(52) as *const c_int), x, y: x, n: 0, ptr: core::ptr::null_mut() };
-        match d.shape {
-            b'2' => a.y = Val::load(frame.add(16), ty),
-            b'I' => {
-                a.n = *(frame.add(16) as *const i64) as i32;
-                a.y = a.x;
-            }
-            b'R' => a.ptr = *(frame.add(16) as *const *mut c_int),
-            _ => {}
+pub unsafe extern "C" fn __rl_sv_pre(frame_ptr: *mut u8, _id: u32) {
+    let f = unsafe { frame(frame_ptr) };
+    f[48..52].copy_from_slice(&errno::get().to_ne_bytes());
+    f[52..56].copy_from_slice(&rusty_libc_math::fenv::fetestexcept(0x3d).to_ne_bytes());
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __rl_sv_post(frame_ptr: *mut u8, id: u32) {
+    let f = unsafe { frame(frame_ptr) };
+    let d = &DESCS[id as usize];
+    let ty = d.ty;
+    let x = Val::load(&f[..16], ty);
+    let mut a = Args { flags_before: int(f, 52), x, y: x, n: 0, ptr: core::ptr::null_mut() };
+    match d.shape {
+        b'2' => a.y = Val::load(&f[16..32], ty),
+        b'I' => {
+            a.n = word(f, 16) as i64 as i32;
+            a.y = a.x;
         }
-        let errno_before = *(frame.add(48) as *const c_int);
-        let z = Val::load(frame.add(32), ty);
-        let mut z = if d.modern_raw { z } else { raw_fix(d, &a, z, errno_before) };
-        if !d.finite {
-            let precheck = matches!(d.stem, "acos" | "asin" | "acosh" | "atanh" | "atan2" | "fmod" | "remainder" | "j0" | "j1" | "jn" | "y0" | "y1" | "yn" | "log" | "log10" | "log2" | "sqrt");
-            let after = rusty_libc_math::fenv::fetestexcept(0x3d);
-            if precheck {
-                restore_flags(a.flags_before);
-            }
-            KS_TAKEN = false;
-            z = wrapper(d, &a, z);
-            if precheck && !KS_TAKEN {
-                restore_flags(after);
-            }
-        }
-        z.store(frame.add(32));
+        b'R' => a.ptr = core::ptr::with_exposed_provenance_mut(word(f, 16) as usize),
+        _ => {}
     }
+    let errno_before = int(f, 48);
+    let z = Val::load(&f[32..48], ty);
+    let mut z = if d.modern_raw { z } else { raw_fix(d, &a, z, errno_before) };
+    if !d.finite {
+        let precheck = matches!(d.stem(), "acos" | "asin" | "acosh" | "atanh" | "atan2" | "fmod" | "remainder" | "j0" | "j1" | "jn" | "y0" | "y1" | "yn" | "log" | "log10" | "log2" | "sqrt");
+        let after = rusty_libc_math::fenv::fetestexcept(0x3d);
+        if precheck {
+            restore_flags(a.flags_before);
+        }
+        KS_TAKEN.store(false, core::sync::atomic::Ordering::Relaxed);
+        z = wrapper(d, &a, z);
+        if precheck && !KS_TAKEN.load(core::sync::atomic::Ordering::Relaxed) {
+            restore_flags(after);
+        }
+    }
+    z.store(&mut f[32..48]);
 }

@@ -13,8 +13,8 @@ pub fn sqrtl_impl(x: F80) -> F80 {
     }
     r
 }
-unsafe extern "C" fn sqrtl_inner(x: *const F80, o: *mut F80) {
-    unsafe { put_f80(o, sqrtl_impl(*x)) }
+extern "C" fn sqrtl_inner(x: &crate::longdouble::common::LdArg, o: &mut crate::longdouble::common::LdOut) {
+    crate::longdouble::common::put(o, sqrtl_impl(x.get()))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -223,24 +223,24 @@ pub fn remainderl_impl(x: F80, y: F80) -> F80 {
     }
     rem_core(x, y, true).0
 }
-pub unsafe fn remquol_impl(x: F80, y: F80, quo: *mut i32) -> F80 {
+pub fn remquol_impl(x: F80, y: F80, quo: &mut Option<i32>) -> F80 {
     if x.is_nan_() || y.is_nan_() || is_inf(x) || y.is_zero_() {
         let p = x87::mul(x, y);
         return x87::div(p, p);
     }
     if is_inf(y) || x.is_zero_() {
-        unsafe { *quo = 0 };
+        *quo = Some(0);
         return x;
     }
     let (r, q) = rem_core(x, y, true);
-    unsafe { *quo = if is_neg(x) != is_neg(y) { -q } else { q } };
+    *quo = Some(if is_neg(x) != is_neg(y) { -q } else { q });
     r
 }
-unsafe extern "C" fn fmodl_inner(x: *const F80, y: *const F80, o: *mut F80) {
-    unsafe { put_f80(o, fmodl_impl(load_f80(x), load_f80(y))) }
+extern "C" fn fmodl_inner(x: &crate::longdouble::common::LdArg, y: &crate::longdouble::common::LdArg, o: &mut crate::longdouble::common::LdOut) {
+    crate::longdouble::common::put(o, fmodl_impl(x.get(), y.get()))
 }
-unsafe extern "C" fn remainderl_inner(x: *const F80, y: *const F80, o: *mut F80) {
-    unsafe { put_f80(o, remainderl_impl(load_f80(x), load_f80(y))) }
+extern "C" fn remainderl_inner(x: &crate::longdouble::common::LdArg, y: &crate::longdouble::common::LdArg, o: &mut crate::longdouble::common::LdOut) {
+    crate::longdouble::common::put(o, remainderl_impl(x.get(), y.get()))
 }
 
 macro_rules! rem_asm {

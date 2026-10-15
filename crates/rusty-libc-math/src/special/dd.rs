@@ -322,7 +322,10 @@ pub(super) fn sqrt_f(x: f64) -> f64 {
     #[cfg(target_arch = "x86_64")]
     {
         use core::arch::x86_64::{_mm_cvtsd_f64, _mm_set_sd, _mm_sqrt_sd};
-        unsafe { _mm_cvtsd_f64(_mm_sqrt_sd(_mm_set_sd(0.0), _mm_set_sd(x))) }
+        let z = unsafe { _mm_set_sd(0.0) };
+        let v = unsafe { _mm_set_sd(x) };
+        let r = unsafe { _mm_sqrt_sd(z, v) };
+        unsafe { _mm_cvtsd_f64(r) }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

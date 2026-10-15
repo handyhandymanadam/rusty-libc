@@ -1,3 +1,4 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::types::*;
 use crate::util::{sc, sci};
 use core::ffi::{c_int, c_uint, c_void};
@@ -28,7 +29,7 @@ const SIOCATMARK: usize = 0x8905;
 const S_IFMT: u32 = 0o170000;
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int {
+pub extern "C" fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int {
     sci(unsafe { syscall3(SYS_SOCKET, domain as usize, ty as usize, protocol as usize) })
 }
 
@@ -129,15 +130,10 @@ pub unsafe extern "C" fn setsockopt(fd: c_int, level: c_int, name: c_int, val: *
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn isfdtype(fd: c_int, fdtype: c_int) -> c_int {
-    let mut st = [0u64; 18];
-    let saved = rusty_libc_core::errno::get();
-    let r = sci(unsafe { syscall2(SYS_FSTAT, fd as usize, st.as_mut_ptr() as usize) });
-    rusty_libc_core::errno::set(saved);
-    if r == -1 {
-        return -1;
+    match rusty_libc_core::unistd::fstat_basic(fd) {
+        Ok((mode, _, _)) => ((mode & S_IFMT) == fdtype as u32) as c_int,
+        Err(_) => -1,
     }
-    let mode = (st[3] & 0xffff_ffff) as u32;
-    ((mode & S_IFMT) == fdtype as u32) as c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -156,18 +152,25 @@ const fn cmsg_align(len: usize) -> usize {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __cmsg_nxthdr(mhdr: *mut msghdr, cmsg: *mut cmsghdr) -> *mut cmsghdr {
-    unsafe {
-        let len = (*cmsg).cmsg_len;
-        if len < core::mem::size_of::<cmsghdr>() {
-            return core::ptr::null_mut();
-        }
-        let size_needed = core::mem::size_of::<cmsghdr>() + (cmsg_align(len) - len);
-        let remaining = ((*mhdr).msg_control as usize).wrapping_add((*mhdr).msg_controllen).wrapping_sub(cmsg as usize);
-        if remaining < size_needed || remaining - size_needed < len {
-            return core::ptr::null_mut();
-        }
-        (cmsg as *mut u8).add(cmsg_align(len)) as *mut cmsghdr
+    let len = unsafe { (*cmsg).cmsg_len };
+    let m = unsafe { &*mhdr };
+    let (control, controllen) = (m.msg_control as usize, m.msg_controllen);
+    match cmsg_next_offset(control, controllen, cmsg as usize, len) {
+        Some(off) => cmsg.cast::<u8>().wrapping_add(off).cast::<cmsghdr>(),
+        None => core::ptr::null_mut(),
     }
+}
+
+pub(crate) fn cmsg_next_offset(control: usize, controllen: usize, cmsg: usize, len: usize) -> Option<usize> {
+    if len < core::mem::size_of::<cmsghdr>() {
+        return None;
+    }
+    let size_needed = core::mem::size_of::<cmsghdr>() + (cmsg_align(len) - len);
+    let remaining = control.wrapping_add(controllen).wrapping_sub(cmsg);
+    if remaining < size_needed || remaining - size_needed < len {
+        return None;
+    }
+    Some(cmsg_align(len))
 }
 
 pub const fn cmsg_align_len(len: usize) -> usize {
@@ -180,9 +183,8 @@ pub const fn cmsg_space(len: usize) -> usize {
     cmsg_align(len) + cmsg_align(core::mem::size_of::<cmsghdr>())
 }
 pub unsafe fn cmsg_firsthdr(mhdr: *const msghdr) -> *mut cmsghdr {
-    unsafe {
-        if (*mhdr).msg_controllen >= core::mem::size_of::<cmsghdr>() { (*mhdr).msg_control as *mut cmsghdr } else { core::ptr::null_mut() }
-    }
+    let m = unsafe { &*mhdr };
+    if m.msg_controllen >= core::mem::size_of::<cmsghdr>() { m.msg_control as *mut cmsghdr } else { core::ptr::null_mut() }
 }
 pub unsafe fn cmsg_data(cmsg: *mut cmsghdr) -> *mut u8 {
     unsafe { (cmsg as *mut u8).add(core::mem::size_of::<cmsghdr>()) }

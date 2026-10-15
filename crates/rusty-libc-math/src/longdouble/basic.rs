@@ -387,29 +387,29 @@ pub unsafe extern "C" fn logbl(_x: f64) -> f64 {
     core::arch::naked_asm!("fld tbyte ptr [rsp + 8]", "fxtract", "fstp st(0)", "ret")
 }
 
-pub unsafe fn frexpl_impl(x: F80, e: *mut i32) -> F80 {
-    unsafe { *e = 0 };
+pub fn frexpl_impl(x: F80, e: &mut i32) -> F80 {
     if x.is_nan_() || is_inf(x) || x.is_zero_() {
+        *e = 0;
         return if x.is_nan_() { nan1(x) } else { x };
     }
     let (ue, m) = normalized(x);
-    unsafe { *e = ue + 1 };
+    *e = ue + 1;
     mk(is_neg(x), 16382, m)
 }
-ld_ptr!(frexpl, super::frexpl_impl, i32);
+ld_ptr!(frexpl, super::frexpl_impl, i32, always);
 
-pub unsafe fn modfl_impl(x: F80, ip: *mut F80) -> F80 {
+pub fn modfl_impl(x: F80, ip: &mut Option<F80>) -> F80 {
     if x.is_nan_() {
         let n = nan1(x);
-        unsafe { *ip = n };
+        *ip = Some(n);
         return n;
     }
     if is_inf(x) {
-        unsafe { *ip = x };
+        *ip = Some(x);
         return zero(is_neg(x));
     }
     let (i, _) = round_int(x, Rm::Trunc);
-    unsafe { *ip = i };
+    *ip = Some(i);
     if i.is_zero_() || exp_field(x) as i32 - 16383 >= 63 {
         if i.is_zero_() {
             return x;
@@ -573,8 +573,8 @@ pub fn nextdownl_impl(x: F80) -> F80 {
     }
     step(x, false)
 }
-unsafe extern "C" fn nextafterl_inner(x: *const F80, y: *const F80, o: *mut F80) {
-    unsafe { put_f80(o, nextafterl_impl(load_f80(x), load_f80(y))) }
+extern "C" fn nextafterl_inner(x: &crate::longdouble::common::LdArg, y: &crate::longdouble::common::LdArg, o: &mut crate::longdouble::common::LdOut) {
+    crate::longdouble::common::put(o, nextafterl_impl(x.get(), y.get()))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -820,11 +820,11 @@ pub fn fminimum_mag_numl_impl(x: F80, y: F80) -> F80 {
     }
     pick_mag(x, y, false)
 }
-unsafe extern "C" fn fmaxl_inner(x: *const F80, y: *const F80, o: *mut F80) {
-    unsafe { put_f80(o, fmaxl_impl(load_f80(x), load_f80(y))) }
+extern "C" fn fmaxl_inner(x: &crate::longdouble::common::LdArg, y: &crate::longdouble::common::LdArg, o: &mut crate::longdouble::common::LdOut) {
+    crate::longdouble::common::put(o, fmaxl_impl(x.get(), y.get()))
 }
-unsafe extern "C" fn fminl_inner(x: *const F80, y: *const F80, o: *mut F80) {
-    unsafe { put_f80(o, fminl_impl(load_f80(x), load_f80(y))) }
+extern "C" fn fminl_inner(x: &crate::longdouble::common::LdArg, y: &crate::longdouble::common::LdArg, o: &mut crate::longdouble::common::LdOut) {
+    crate::longdouble::common::put(o, fminl_impl(x.get(), y.get()))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -902,8 +902,8 @@ pub fn fdiml_impl(x: F80, y: F80) -> F80 {
     }
     r
 }
-unsafe extern "C" fn fdiml_inner(x: *const F80, y: *const F80, o: *mut F80) {
-    unsafe { put_f80(o, fdiml_impl(load_f80(x), load_f80(y))) }
+extern "C" fn fdiml_inner(x: &crate::longdouble::common::LdArg, y: &crate::longdouble::common::LdArg, o: &mut crate::longdouble::common::LdOut) {
+    crate::longdouble::common::put(o, fdiml_impl(x.get(), y.get()))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -969,18 +969,12 @@ fn nan_payload(tag: &[u8]) -> u64 {
     v
 }
 
-pub unsafe fn nanl_impl(tag: *const core::ffi::c_char) -> F80 {
-    let mut n = 0;
-    while unsafe { *tag.add(n) } != 0 {
-        n += 1;
-    }
-    let t = unsafe { core::slice::from_raw_parts(tag.cast::<u8>(), n) };
+pub fn nanl_impl(t: &[u8]) -> F80 {
     f80_from_bits(HIGH | QUIET | (nan_payload(t) & (QUIET - 1)), 0x7fff)
 }
-ptr_to_ld!(nanl, super::nanl_impl, *const core::ffi::c_char);
+ptr_to_ld!(nanl, super::nanl_impl, *const core::ffi::c_char, rusty_libc_core::ffi::cstr_bytes_scalar);
 
-pub unsafe fn getpayloadl_impl(p: *const F80) -> F80 {
-    let x = unsafe { *p };
+pub fn getpayloadl_impl(x: F80) -> F80 {
     if !x.is_nan_() {
         return one(true);
     }
@@ -990,19 +984,16 @@ pub unsafe fn getpayloadl_impl(p: *const F80) -> F80 {
     }
     f80_from_bits(pl << pl.leading_zeros(), (16383 + 63 - pl.leading_zeros()) as u16)
 }
-ptr_to_ld!(getpayloadl, super::getpayloadl_impl, *const F80);
+ptr_to_ld!(getpayloadl, super::getpayloadl_impl, *const F80, core::ptr::read);
 
-pub unsafe fn setpayloadl_impl(res: *mut F80, p: F80) -> i32 {
-    unsafe { setpay(res, p, false) }
+pub fn setpayloadl_impl(p: F80) -> (i32, F80) {
+    setpay(p, false)
 }
-pub unsafe fn setpayloadsigl_impl(res: *mut F80, p: F80) -> i32 {
-    unsafe { setpay(res, p, true) }
+pub fn setpayloadsigl_impl(p: F80) -> (i32, F80) {
+    setpay(p, true)
 }
-unsafe fn setpay(res: *mut F80, p: F80, sig: bool) -> i32 {
-    let bad = || {
-        unsafe { *res = zero(false) };
-        1
-    };
+fn setpay(p: F80, sig: bool) -> (i32, F80) {
+    let bad = || (1, zero(false));
     if p.is_nan_() || is_inf(p) || is_neg(p) {
         return bad();
     }
@@ -1021,19 +1012,19 @@ unsafe fn setpay(res: *mut F80, p: F80, sig: bool) -> i32 {
     if sig && v == 0 {
         return bad();
     }
-    unsafe { *res = f80_from_bits(HIGH | v | if sig { 0 } else { QUIET }, 0x7fff) };
-    0
+    (0, f80_from_bits(HIGH | v | if sig { 0 } else { QUIET }, 0x7fff))
 }
 ptr_ld_to_int!(setpayloadl, super::setpayloadl_impl);
 ptr_ld_to_int!(setpayloadsigl, super::setpayloadsigl_impl);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn canonicalizel(cx: *mut F80, x: *const F80) -> i32 {
-    let v = unsafe { *x };
+    let v = unsafe { x.read() };
     if iscanonicall_impl(v) == 0 {
         return 1;
     }
-    unsafe { *cx = if v.is_nan_() { nan1(v) } else { v } };
+    let r = if v.is_nan_() { nan1(v) } else { v };
+    unsafe { cx.write(r) };
     0
 }
 
@@ -1051,11 +1042,15 @@ fn total_order(x: F80, y: F80) -> bool {
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn totalorderl(x: *const F80, y: *const F80) -> i32 {
-    total_order(unsafe { *x }, unsafe { *y }) as i32
+    let x = unsafe { x.read() };
+    let y = unsafe { y.read() };
+    total_order(x, y) as i32
 }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn totalordermagl(x: *const F80, y: *const F80) -> i32 {
-    total_order(abs(unsafe { *x }), abs(unsafe { *y })) as i32
+    let x = unsafe { x.read() };
+    let y = unsafe { y.read() };
+    total_order(abs(x), abs(y)) as i32
 }
 
 #[allow(dead_code)]

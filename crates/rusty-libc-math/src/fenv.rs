@@ -62,14 +62,14 @@ pub(crate) fn mxcsr_set(v: u32) {
 }
 
 #[inline]
-fn cw_get() -> u16 {
+pub(crate) fn cw_get() -> u16 {
     let mut v: u16 = 0;
     unsafe { asm!("fnstcw [{0}]", in(reg) &mut v, options(nostack, preserves_flags)) };
     v
 }
 
 #[inline]
-fn cw_set(v: u16) {
+pub(crate) fn cw_set(v: u16) {
     unsafe { asm!("fldcw [{0}]", in(reg) &v, options(nostack, preserves_flags)) };
 }
 
@@ -141,14 +141,20 @@ pub extern "C" fn fetestexcept(excepts: c_int) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fegetexceptflag(flagp: *mut FexceptT, excepts: c_int) -> c_int {
-    unsafe { *flagp = fetestexcept(excepts) as FexceptT };
+    let flag = fetestexcept(excepts) as FexceptT;
+    unsafe { flagp.write(flag) };
     0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fesetexceptflag(flagp: *const FexceptT, excepts: c_int) -> c_int {
+    let flag = unsafe { flagp.read() };
+    set_exception_flags(flag, excepts)
+}
+
+pub fn set_exception_flags(flag: FexceptT, excepts: c_int) -> c_int {
     let excepts = (excepts & FE_ALL_EXCEPT) as u32;
-    let flag = u32::from(unsafe { *flagp });
+    let flag = u32::from(flag);
     let mut env = FenvT::default();
     env_store(&mut env);
     env.status_word &= !((excepts & !flag) as u16);
@@ -161,7 +167,8 @@ pub unsafe extern "C" fn fesetexceptflag(flagp: *const FexceptT, excepts: c_int)
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fetestexceptflag(flagp: *const FexceptT, excepts: c_int) -> c_int {
-    (u32::from(unsafe { *flagp }) & excepts as u32 & FE_ALL_EXCEPT as u32) as c_int
+    let flag = unsafe { flagp.read() };
+    (u32::from(flag) & excepts as u32 & FE_ALL_EXCEPT as u32) as c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -187,19 +194,49 @@ pub extern "C" fn fesetround(round: c_int) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fegetenv(envp: *mut FenvT) -> c_int {
-    let env = unsafe { &mut *envp };
+    let mut env = FenvT::default();
+    get_env(&mut env);
+    unsafe { envp.write(env) };
+    0
+}
+
+pub fn get_env(env: &mut FenvT) {
     env_get_x87(env);
     env.mxcsr = mxcsr_get();
-    0
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum EnvSrc<'a> {
+    Default,
+    NoMask,
+    Saved(&'a FenvT),
+}
+
+impl<'a> EnvSrc<'a> {
+    #[inline]
+    pub unsafe fn from_c(envp: *const FenvT) -> EnvSrc<'a> {
+        if envp == FE_DFL_ENV {
+            EnvSrc::Default
+        } else if envp == FE_NOMASK_ENV {
+            EnvSrc::NoMask
+        } else {
+            EnvSrc::Saved(unsafe { &*envp })
+        }
+    }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fesetenv(envp: *const FenvT) -> c_int {
+    set_env(unsafe { EnvSrc::from_c(envp) });
+    0
+}
+
+pub fn set_env(src: EnvSrc<'_>) {
     let mut t = FenvT::default();
     env_store(&mut t);
     t.mxcsr = mxcsr_get();
     let x87_all = FE_ALL_EXCEPT_X86 as u16;
-    if envp == FE_DFL_ENV {
+    if let EnvSrc::Default = src {
         t.control_word |= x87_all;
         t.control_word &= !(FE_TOWARDZERO as u16);
         t.control_word |= FPU_EXTENDED;
@@ -213,7 +250,7 @@ pub unsafe extern "C" fn fesetenv(envp: *const FenvT) -> c_int {
         t.mxcsr |= FE_ALL_EXCEPT_X86 << 7;
         t.mxcsr &= !0x6000;
         t.mxcsr &= !0x8040;
-    } else if envp == FE_NOMASK_ENV {
+    } else if let EnvSrc::NoMask = src {
         t.control_word &= !((FE_ALL_EXCEPT | FE_TOWARDZERO) as u16);
         t.control_word |= FE_DENORM as u16;
         t.control_word |= FPU_EXTENDED;
@@ -228,8 +265,7 @@ pub unsafe extern "C" fn fesetenv(envp: *const FenvT) -> c_int {
         t.mxcsr &= !((FE_ALL_EXCEPT as u32) << 7);
         t.mxcsr |= (FE_DENORM as u32) << 7;
         t.mxcsr &= !0x8040;
-    } else {
-        let e = unsafe { &*envp };
+    } else if let EnvSrc::Saved(e) = src {
         let keep = x87_all | FE_TOWARDZERO as u16 | FPU_EXTENDED;
         t.control_word = (t.control_word & !keep) | (e.control_word & keep);
         t.status_word = (t.status_word & !x87_all) | (e.status_word & x87_all);
@@ -242,25 +278,33 @@ pub unsafe extern "C" fn fesetenv(envp: *const FenvT) -> c_int {
     }
     env_load(&t);
     mxcsr_set(t.mxcsr);
-    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn feholdexcept(envp: *mut FenvT) -> c_int {
-    let env = unsafe { &mut *envp };
+    let mut env = FenvT::default();
+    hold_into(&mut env);
+    unsafe { envp.write(env) };
+    0
+}
+
+pub fn hold_into(env: &mut FenvT) {
     env_store(env);
     env.mxcsr = mxcsr_get();
     unsafe { asm!("fnclex", options(nomem, nostack)) };
     mxcsr_set((env.mxcsr | 0x1f80) & !0x3f);
-    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn feupdateenv(envp: *const FenvT) -> c_int {
-    let pending = fetestexcept(FE_ALL_EXCEPT);
-    unsafe { fesetenv(envp) };
-    feraiseexcept(pending);
+    update_env_src(unsafe { EnvSrc::from_c(envp) });
     0
+}
+
+pub fn update_env_src(src: EnvSrc<'_>) {
+    let pending = fetestexcept(FE_ALL_EXCEPT);
+    set_env(src);
+    feraiseexcept(pending);
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -290,27 +334,40 @@ pub extern "C" fn fegetexcept() -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fegetmode(modep: *mut FemodeT) -> c_int {
-    let m = unsafe { &mut *modep };
-    m.control_word = cw_get();
-    m.mxcsr = mxcsr_get();
+    let m = get_mode();
+    unsafe { modep.cast::<u16>().write(m.control_word) };
+    let mxcsr = modep.wrapping_byte_add(core::mem::offset_of!(FemodeT, mxcsr)).cast::<u32>();
+    unsafe { mxcsr.write(m.mxcsr) };
     0
+}
+
+pub fn get_mode() -> FemodeT {
+    FemodeT { control_word: cw_get(), reserved: 0, mxcsr: mxcsr_get() }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fesetmode(modep: *const FemodeT) -> c_int {
+    let m = if modep == FE_DFL_MODE {
+        None
+    } else {
+        Some(unsafe { &*modep })
+    };
+    set_mode(m);
+    0
+}
+
+pub fn set_mode(m: Option<&FemodeT>) {
     let mut mxcsr = mxcsr_get() & FE_ALL_EXCEPT_X86;
     let cw;
-    if modep == FE_DFL_MODE {
-        cw = 0x37f;
-        mxcsr |= FE_ALL_EXCEPT_X86 << 7;
-    } else {
-        let m = unsafe { &*modep };
+    if let Some(m) = m {
         cw = m.control_word;
         mxcsr |= m.mxcsr & !FE_ALL_EXCEPT_X86;
+    } else {
+        cw = 0x37f;
+        mxcsr |= FE_ALL_EXCEPT_X86 << 7;
     }
     cw_set(cw);
     mxcsr_set(mxcsr);
-    0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -386,22 +443,22 @@ pub struct Env(pub FenvT);
 
 pub fn save_env() -> Env {
     let mut e = FenvT::default();
-    unsafe { fegetenv(&mut e) };
+    get_env(&mut e);
     Env(e)
 }
 
 pub fn restore_env(env: &Env) {
-    unsafe { fesetenv(&env.0) };
+    set_env(EnvSrc::Saved(&env.0));
 }
 
 pub fn hold_exceptions() -> Env {
     let mut e = FenvT::default();
-    unsafe { feholdexcept(&mut e) };
+    hold_into(&mut e);
     Env(e)
 }
 
 pub fn update_env(env: &Env) {
-    unsafe { feupdateenv(&env.0) };
+    update_env_src(EnvSrc::Saved(&env.0));
 }
 
 pub fn with_round_mode<R>(mode: RoundMode, f: impl FnOnce() -> R) -> R {

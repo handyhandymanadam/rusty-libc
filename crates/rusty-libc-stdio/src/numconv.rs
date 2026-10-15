@@ -2,6 +2,7 @@ use crate::rust_api::{Arg, snprintf};
 use core::arch::naked_asm;
 use core::ffi::{CStr, c_char, c_int};
 use rusty_libc_core::errno;
+use rusty_libc_core::sync_cell::SyncCell;
 use rusty_libc_core::floatparse::{self, Bits, Target};
 use rusty_libc_core::x87::{self, F80};
 
@@ -226,120 +227,116 @@ fn ecvt_r_impl<T: Real>(mut value: T, ndigit: c_int, decpt: &mut c_int, sign: &m
     0
 }
 
-static mut ECVT_BUF: [u8; 20] = [0; 20];
-static mut FCVT_BUF: [u8; 20] = [0; 20];
-static mut FCVT_PTR: *mut u8 = core::ptr::null_mut();
-static mut QECVT_BUF: [u8; 33] = [0; 33];
-static mut QFCVT_BUF: [u8; 33] = [0; 33];
-static mut QFCVT_PTR: *mut u8 = core::ptr::null_mut();
+static ECVT_BUF: SyncCell<[u8; 20]> = SyncCell::new([0; 20]);
+static FCVT_BUF: SyncCell<[u8; 20]> = SyncCell::new([0; 20]);
+static FCVT_PTR: SyncCell<*mut u8> = SyncCell::new(core::ptr::null_mut());
+static QECVT_BUF: SyncCell<[u8; 33]> = SyncCell::new([0; 33]);
+static QFCVT_BUF: SyncCell<[u8; 33]> = SyncCell::new([0; 33]);
+static QFCVT_PTR: SyncCell<*mut u8> = SyncCell::new(core::ptr::null_mut());
 
-unsafe fn slice_of(p: *mut u8, n: usize) -> &'static mut [u8] {
-    unsafe { core::slice::from_raw_parts_mut(p, n) }
+unsafe fn fcvt_static<T: Real, const N: usize>(value: T, ndigit: c_int, decpt: &mut c_int, sign: &mut c_int, small: &SyncCell<[u8; N]>, bufptr: &SyncCell<*mut u8>) -> *mut c_char {
+    if unsafe { bufptr.read() }.is_null() {
+        if unsafe { small.with_unsync(|b| fcvt_r_impl(value, ndigit, decpt, sign, b)) } != -1 {
+            return small.as_ptr().cast();
+        }
+        let p = crate::file::alloc(T::FCVT_MAXDIG);
+        unsafe { bufptr.write(p) };
+        if p.is_null() {
+            return small.as_ptr().cast();
+        }
+    }
+    let p = unsafe { bufptr.read() };
+    let _ = fcvt_r_impl(value, ndigit, decpt, sign, unsafe { core::slice::from_raw_parts_mut(p, T::FCVT_MAXDIG) });
+    p.cast()
 }
 
-unsafe fn fcvt_static<T: Real>(value: T, ndigit: c_int, decpt: *mut c_int, sign: *mut c_int, small: *mut u8, small_len: usize, bufptr: *mut *mut u8) -> *mut c_char {
-    unsafe {
-        if (*bufptr).is_null() {
-            if fcvt_r_impl(value, ndigit, &mut *decpt, &mut *sign, slice_of(small, small_len)) != -1 {
-                return small.cast();
-            }
-            *bufptr = rusty_libc_malloc::malloc(T::FCVT_MAXDIG) as *mut u8;
-            if (*bufptr).is_null() {
-                return small.cast();
-            }
-        }
-        let _ = fcvt_r_impl(value, ndigit, &mut *decpt, &mut *sign, slice_of(*bufptr, T::FCVT_MAXDIG));
-        (*bufptr).cast()
-    }
+#[inline(always)]
+unsafe fn outs<'a>(decpt: *mut c_int, sign: *mut c_int) -> (&'a mut c_int, &'a mut c_int) {
+    let d = unsafe { &mut *decpt };
+    let s = unsafe { &mut *sign };
+    (d, s)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ecvt(value: f64, ndigit: c_int, decpt: *mut c_int, sign: *mut c_int) -> *mut c_char {
-    unsafe {
-        let b = core::ptr::addr_of_mut!(ECVT_BUF) as *mut u8;
-        let _ = ecvt_r_impl(value, ndigit, &mut *decpt, &mut *sign, slice_of(b, 20));
-        b.cast()
-    }
+    let (d, s) = unsafe { outs(decpt, sign) };
+    let _ = unsafe { ECVT_BUF.with_unsync(|b| ecvt_r_impl(value, ndigit, d, s, b)) };
+    ECVT_BUF.as_ptr().cast()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fcvt(value: f64, ndigit: c_int, decpt: *mut c_int, sign: *mut c_int) -> *mut c_char {
-    unsafe { fcvt_static(value, ndigit, decpt, sign, core::ptr::addr_of_mut!(FCVT_BUF) as *mut u8, 20, core::ptr::addr_of_mut!(FCVT_PTR)) }
+    let (d, s) = unsafe { outs(decpt, sign) };
+    unsafe { fcvt_static(value, ndigit, d, s, &FCVT_BUF, &FCVT_PTR) }
+}
+
+unsafe fn put_text(tmp: &[u8], buf: *mut c_char) -> *mut c_char {
+    let n = tmp.iter().position(|&b| b == 0).unwrap_or(tmp.len() - 1);
+    unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf as *mut u8, n + 1) };
+    buf
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn gcvt(value: f64, ndigit: c_int, buf: *mut c_char) -> *mut c_char {
-    unsafe {
-        let mut tmp = [0u8; 64];
-        snprintf(&mut tmp, c"%.*g", &[Arg::Int(i64::from(ndigit.min(f64::NDIGIT_MAX))), Arg::Double(value)]);
-        let n = CStr::from_ptr(tmp.as_ptr().cast()).to_bytes().len();
-        core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf as *mut u8, n + 1);
-        buf
+    let mut tmp = [0u8; 64];
+    snprintf(&mut tmp, c"%.*g", &[Arg::Int(i64::from(ndigit.min(f64::NDIGIT_MAX))), Arg::Double(value)]);
+    unsafe { put_text(&tmp, buf) }
+}
+
+unsafe fn r_buf<'a>(buf: *mut c_char, len: usize) -> Option<&'a mut [u8]> {
+    if buf.is_null() {
+        errno::set(22);
+        return None;
     }
+    Some(unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ecvt_r(value: f64, ndigit: c_int, decpt: *mut c_int, sign: *mut c_int, buf: *mut c_char, len: usize) -> c_int {
-    unsafe {
-        if buf.is_null() {
-            errno::set(22);
-            return -1;
-        }
-        ecvt_r_impl(value, ndigit, &mut *decpt, &mut *sign, slice_of(buf as *mut u8, len))
-    }
+    let Some(b) = (unsafe { r_buf(buf, len) }) else { return -1 };
+    let (d, s) = unsafe { outs(decpt, sign) };
+    ecvt_r_impl(value, ndigit, d, s, b)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fcvt_r(value: f64, ndigit: c_int, decpt: *mut c_int, sign: *mut c_int, buf: *mut c_char, len: usize) -> c_int {
-    unsafe {
-        if buf.is_null() {
-            errno::set(22);
-            return -1;
-        }
-        fcvt_r_impl(value, ndigit, &mut *decpt, &mut *sign, slice_of(buf as *mut u8, len))
-    }
+    let Some(b) = (unsafe { r_buf(buf, len) }) else { return -1 };
+    let (d, s) = unsafe { outs(decpt, sign) };
+    fcvt_r_impl(value, ndigit, d, s, b)
 }
 
 unsafe extern "C" fn qecvt_inner(ndigit: c_int, decpt: *mut c_int, sign: *mut c_int, v: *const F80) -> *mut c_char {
-    unsafe {
-        let b = core::ptr::addr_of_mut!(QECVT_BUF) as *mut u8;
-        let _ = ecvt_r_impl(*v, ndigit, &mut *decpt, &mut *sign, slice_of(b, 33));
-        b.cast()
-    }
+    let v = unsafe { *v };
+    let (d, s) = unsafe { outs(decpt, sign) };
+    let _ = unsafe { QECVT_BUF.with_unsync(|b| ecvt_r_impl(v, ndigit, d, s, b)) };
+    QECVT_BUF.as_ptr().cast()
 }
 
 unsafe extern "C" fn qfcvt_inner(ndigit: c_int, decpt: *mut c_int, sign: *mut c_int, v: *const F80) -> *mut c_char {
-    unsafe { fcvt_static(*v, ndigit, decpt, sign, core::ptr::addr_of_mut!(QFCVT_BUF) as *mut u8, 33, core::ptr::addr_of_mut!(QFCVT_PTR)) }
+    let v = unsafe { *v };
+    let (d, s) = unsafe { outs(decpt, sign) };
+    unsafe { fcvt_static(v, ndigit, d, s, &QFCVT_BUF, &QFCVT_PTR) }
 }
 
 unsafe extern "C" fn qgcvt_inner(ndigit: c_int, buf: *mut c_char, v: *const F80) -> *mut c_char {
-    unsafe {
-        let mut tmp = [0u8; 96];
-        snprintf(&mut tmp, c"%.*Lg", &[Arg::Int(i64::from(ndigit.min(F80::NDIGIT_MAX))), Arg::LongDouble((*v).0)]);
-        let n = CStr::from_ptr(tmp.as_ptr().cast()).to_bytes().len();
-        core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf as *mut u8, n + 1);
-        buf
-    }
+    let v = unsafe { *v };
+    let mut tmp = [0u8; 96];
+    snprintf(&mut tmp, c"%.*Lg", &[Arg::Int(i64::from(ndigit.min(F80::NDIGIT_MAX))), Arg::LongDouble(v.0)]);
+    unsafe { put_text(&tmp, buf) }
 }
 
 unsafe extern "C" fn qecvt_r_inner(ndigit: c_int, decpt: *mut c_int, sign: *mut c_int, buf: *mut c_char, len: usize, v: *const F80) -> c_int {
-    unsafe {
-        if buf.is_null() {
-            errno::set(22);
-            return -1;
-        }
-        ecvt_r_impl(*v, ndigit, &mut *decpt, &mut *sign, slice_of(buf as *mut u8, len))
-    }
+    let Some(b) = (unsafe { r_buf(buf, len) }) else { return -1 };
+    let v = unsafe { *v };
+    let (d, s) = unsafe { outs(decpt, sign) };
+    ecvt_r_impl(v, ndigit, d, s, b)
 }
 
 unsafe extern "C" fn qfcvt_r_inner(ndigit: c_int, decpt: *mut c_int, sign: *mut c_int, buf: *mut c_char, len: usize, v: *const F80) -> c_int {
-    unsafe {
-        if buf.is_null() {
-            errno::set(22);
-            return -1;
-        }
-        fcvt_r_impl(*v, ndigit, &mut *decpt, &mut *sign, slice_of(buf as *mut u8, len))
-    }
+    let Some(b) = (unsafe { r_buf(buf, len) }) else { return -1 };
+    let v = unsafe { *v };
+    let (d, s) = unsafe { outs(decpt, sign) };
+    fcvt_r_impl(v, ndigit, d, s, b)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -373,52 +370,55 @@ pub unsafe extern "C" fn qfcvt_r() {
 }
 
 unsafe fn strfrom(dest: *mut c_char, size: usize, format: *const c_char, arg: Arg<'static>, long: bool) -> c_int {
-    unsafe {
-        let mut f = format as *const u8;
-        if *f != b'%' {
-            rusty_libc_core::process::abort();
-        }
-        f = f.add(1);
-        let mut precision: Option<i64> = None;
-        if *f == b'.' {
-            f = f.add(1);
-            if (*f).is_ascii_digit() {
-                let mut v: i64 = 0;
-                while (*f).is_ascii_digit() {
-                    v = (v * 10 + i64::from(*f - b'0')).min(i64::from(i32::MAX));
-                    f = f.add(1);
-                }
-                precision = Some(v);
-            } else {
-                precision = Some(0);
+    let f = unsafe { rusty_libc_core::ffi::cstr_bytes(format) };
+    let out = unsafe { rusty_libc_core::ffi::bytes_mut(dest as *mut u8, size) };
+    strfrom_s(out, f, arg, long)
+}
+
+fn strfrom_s(out: &mut [u8], f: &[u8], arg: Arg<'static>, long: bool) -> c_int {
+    let at = |i: usize| f.get(i).copied().unwrap_or(0);
+    if at(0) != b'%' {
+        rusty_libc_core::process::abort();
+    }
+    let mut i = 1;
+    let mut precision: Option<i64> = None;
+    if at(i) == b'.' {
+        i += 1;
+        if at(i).is_ascii_digit() {
+            let mut v: i64 = 0;
+            while at(i).is_ascii_digit() {
+                v = (v * 10 + i64::from(at(i) - b'0')).min(i64::from(i32::MAX));
+                i += 1;
             }
+            precision = Some(v);
+        } else {
+            precision = Some(0);
         }
-        let spec = *f;
-        if !matches!(spec, b'a' | b'A' | b'e' | b'E' | b'f' | b'F' | b'g' | b'G') {
-            rusty_libc_core::process::abort();
-        }
-        let mut fmt = [0u8; 12];
-        let mut k = 0;
-        fmt[k] = b'%';
+    }
+    let spec = at(i);
+    if !matches!(spec, b'a' | b'A' | b'e' | b'E' | b'f' | b'F' | b'g' | b'G') {
+        rusty_libc_core::process::abort();
+    }
+    let mut fmt = [0u8; 12];
+    let mut k = 0;
+    fmt[k] = b'%';
+    k += 1;
+    if precision.is_some() {
+        fmt[k] = b'.';
+        fmt[k + 1] = b'*';
+        k += 2;
+    }
+    if long {
+        fmt[k] = b'L';
         k += 1;
-        if precision.is_some() {
-            fmt[k] = b'.';
-            fmt[k + 1] = b'*';
-            k += 2;
-        }
-        if long {
-            fmt[k] = b'L';
-            k += 1;
-        }
-        fmt[k] = spec;
-        k += 1;
-        fmt[k] = 0;
-        let cfmt = CStr::from_ptr(fmt.as_ptr().cast());
-        let out: &mut [u8] = if size == 0 { &mut [] } else { core::slice::from_raw_parts_mut(dest as *mut u8, size) };
-        match precision {
-            Some(p) => snprintf(out, cfmt, &[Arg::Int(p), arg]),
-            None => snprintf(out, cfmt, &[arg]),
-        }
+    }
+    fmt[k] = spec;
+    k += 1;
+    fmt[k] = 0;
+    let Ok(cfmt) = CStr::from_bytes_until_nul(&fmt) else { unreachable!() };
+    match precision {
+        Some(p) => snprintf(out, cfmt, &[Arg::Int(p), arg]),
+        None => snprintf(out, cfmt, &[arg]),
     }
 }
 
@@ -433,7 +433,8 @@ pub unsafe extern "C" fn strfromf(dest: *mut c_char, size: usize, format: *const
 }
 
 unsafe extern "C" fn strfroml_inner(dest: *mut c_char, size: usize, format: *const c_char, v: *const F80) -> c_int {
-    unsafe { strfrom(dest, size, format, Arg::LongDouble((*v).0), true) }
+    let v = unsafe { *v };
+    unsafe { strfrom(dest, size, format, Arg::LongDouble(v.0), true) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -461,7 +462,8 @@ pub unsafe extern "C" fn strfromf64x() {
 }
 
 unsafe extern "C" fn strfromf128_inner(dest: *mut c_char, size: usize, format: *const c_char, v: *const u128) -> c_int {
-    unsafe { strfrom(dest, size, format, Arg::Quad(v.read_unaligned()), true) }
+    let v = unsafe { v.read_unaligned() };
+    unsafe { strfrom(dest, size, format, Arg::Quad(v), true) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

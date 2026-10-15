@@ -1,4 +1,3 @@
-#![allow(clippy::deref_addrof)]
 use core::cmp::Ordering;
 use core::ffi::{c_int, c_void};
 use core::mem::MaybeUninit;
@@ -10,283 +9,365 @@ pub type Compare = unsafe extern "C" fn(*const c_void, *const c_void) -> c_int;
 
 const STACK_SIZE: usize = 1024;
 const INDIRECT_THRESHOLD: usize = 32;
-const PTR: usize = core::mem::size_of::<*mut u8>();
+const IDX: usize = core::mem::size_of::<usize>();
 
-#[derive(Clone, Copy, PartialEq)]
-enum Var {
-    Words32,
-    Words64,
-    VoidArg,
-    Bytes,
+trait Cmp: Copy {
+    fn cmp(&self, a: &[u8], b: &[u8]) -> c_int;
+    unsafe fn cmp_ptr(&self, a: *const u8, b: *const u8) -> c_int;
 }
 
-struct Param {
-    s: usize,
-    var: Var,
-    cmp: CompareArg,
+#[derive(Clone, Copy)]
+struct CArg {
+    f: CompareArg,
     arg: *mut c_void,
-    t: *mut u8,
 }
 
-fn swap_type(base: *mut u8, size: usize) -> Var {
-    if size & 3 == 0 && (base as usize) & 3 == 0 {
-        if size == 4 {
-            return Var::Words32;
-        } else if size == 8 && (base as usize) & 7 == 0 {
-            return Var::Words64;
-        }
+impl Cmp for CArg {
+    #[inline(always)]
+    fn cmp(&self, a: &[u8], b: &[u8]) -> c_int {
+        unsafe { (self.f)(a.as_ptr().cast(), b.as_ptr().cast(), self.arg) }
     }
-    Var::Bytes
+    #[inline(always)]
+    unsafe fn cmp_ptr(&self, a: *const u8, b: *const u8) -> c_int {
+        unsafe { (self.f)(a.cast(), b.cast(), self.arg) }
+    }
 }
 
-unsafe fn msort(p: &Param, b: *mut u8, n: usize) {
+#[derive(Clone, Copy)]
+struct C2 {
+    f: Compare,
+}
+
+impl Cmp for C2 {
+    #[inline(always)]
+    fn cmp(&self, a: &[u8], b: &[u8]) -> c_int {
+        unsafe { (self.f)(a.as_ptr().cast(), b.as_ptr().cast()) }
+    }
+    #[inline(always)]
+    unsafe fn cmp_ptr(&self, a: *const u8, b: *const u8) -> c_int {
+        unsafe { (self.f)(a.cast(), b.cast()) }
+    }
+}
+
+fn msort_fixed<T: Copy>(b: &mut [T], tmp: &mut [T], cmp: impl FnMut(&T, &T) -> c_int + Copy) {
+    let n = b.len();
     if n <= 1 {
         return;
     }
-    let mut n1 = n / 2;
-    let mut n2 = n - n1;
-    let mut b1 = b;
-    let mut b2 = unsafe { b.add(n1 * p.s) };
-    unsafe {
-        msort(p, b1, n1);
-        msort(p, b2, n2);
+    let n1 = n / 2;
+    {
+        let (b1, b2) = b.split_at_mut(n1);
+        msort_fixed(b1, tmp, cmp);
+        msort_fixed(b2, tmp, cmp);
     }
-    let mut tmp = p.t;
-    let s = p.s;
-    let cmp = p.cmp;
-    let arg = p.arg;
-    unsafe {
-        match p.var {
-            Var::Words32 => {
-                while n1 > 0 && n2 > 0 {
-                    if cmp(b1.cast(), b2.cast(), arg) <= 0 {
-                        tmp.cast::<u32>().write(b1.cast::<u32>().read());
-                        b1 = b1.add(4);
-                        n1 -= 1;
-                    } else {
-                        tmp.cast::<u32>().write(b2.cast::<u32>().read());
-                        b2 = b2.add(4);
-                        n2 -= 1;
-                    }
-                    tmp = tmp.add(4);
-                }
-            }
-            Var::Words64 => {
-                while n1 > 0 && n2 > 0 {
-                    if cmp(b1.cast(), b2.cast(), arg) <= 0 {
-                        tmp.cast::<u64>().write(b1.cast::<u64>().read());
-                        b1 = b1.add(8);
-                        n1 -= 1;
-                    } else {
-                        tmp.cast::<u64>().write(b2.cast::<u64>().read());
-                        b2 = b2.add(8);
-                        n2 -= 1;
-                    }
-                    tmp = tmp.add(8);
-                }
-            }
-            Var::VoidArg => {
-                while n1 > 0 && n2 > 0 {
-                    if cmp(b1.cast::<*const c_void>().read(), b2.cast::<*const c_void>().read(), arg) <= 0 {
-                        tmp.cast::<*mut u8>().write(b1.cast::<*mut u8>().read());
-                        b1 = b1.add(PTR);
-                        n1 -= 1;
-                    } else {
-                        tmp.cast::<*mut u8>().write(b2.cast::<*mut u8>().read());
-                        b2 = b2.add(PTR);
-                        n2 -= 1;
-                    }
-                    tmp = tmp.add(PTR);
-                }
-            }
-            Var::Bytes => {
-                while n1 > 0 && n2 > 0 {
-                    if cmp(b1.cast(), b2.cast(), arg) <= 0 {
-                        ptr::copy_nonoverlapping(b1, tmp, s);
-                        b1 = b1.add(s);
-                        n1 -= 1;
-                    } else {
-                        ptr::copy_nonoverlapping(b2, tmp, s);
-                        b2 = b2.add(s);
-                        n2 -= 1;
-                    }
-                    tmp = tmp.add(s);
-                }
+    let mut cmp = cmp;
+    let out = &mut tmp[..n];
+    let (mut l, mut r) = b.split_at(n1);
+    if let (Some(mut x), Some(mut y)) = (l.first(), r.first()) {
+        for slot in out.iter_mut() {
+            if cmp(x, y) <= 0 {
+                *slot = *x;
+                l = &l[1..];
+                let Some(v) = l.first() else { break };
+                x = v;
+            } else {
+                *slot = *y;
+                r = &r[1..];
+                let Some(v) = r.first() else { break };
+                y = v;
             }
         }
-        if n1 > 0 {
-            ptr::copy_nonoverlapping(b1, tmp, n1 * s);
-        }
-        ptr::copy_nonoverlapping(p.t, b, (n - n2) * s);
     }
+    let k = n - r.len();
+    let t = k - l.len();
+    out[t..k].copy_from_slice(l);
+    b[..k].copy_from_slice(&out[..k]);
 }
 
-unsafe fn indirect_msort(p: &Param, b: *mut u8, n: usize, s: usize) {
-    unsafe {
-        let tp = p.t.add(n * PTR).cast::<*mut u8>();
-        let tmp_storage = tp.add(n).cast::<u8>();
-        let mut ip = b;
-        for i in 0..n {
-            tp.add(i).write(ip);
-            ip = ip.add(s);
+fn msort_bytes(b: &mut [u8], n: usize, s: usize, tmp: &mut [u8], c: impl Cmp) {
+    if n <= 1 {
+        return;
+    }
+    let n1 = n / 2;
+    let mid = n1 * s;
+    {
+        let (b1, b2) = b.split_at_mut(mid);
+        msort_bytes(b1, n1, s, tmp, c);
+        msort_bytes(b2, n - n1, s, tmp, c);
+    }
+    let (l, r) = b.split_at(mid);
+    let out = &mut tmp[..b.len()];
+    let (mut lc, mut rc) = (l.chunks_exact(s), r.chunks_exact(s));
+    let (mut x, mut y) = (lc.next(), rc.next());
+    let mut i = 0usize;
+    let mut t = 0usize;
+    for o in out.chunks_exact_mut(s) {
+        let (Some(xe), Some(ye)) = (x, y) else { break };
+        if c.cmp(xe, ye) <= 0 {
+            o.copy_from_slice(xe);
+            x = lc.next();
+            i += s;
+        } else {
+            o.copy_from_slice(ye);
+            y = rc.next();
         }
-        msort(p, tp.cast(), n);
-        let mut ip = b;
-        for i in 0..n {
-            let mut kp = tp.add(i).read();
-            if kp != ip {
-                let mut j = i;
-                let mut jp = ip;
-                ptr::copy_nonoverlapping(ip, tmp_storage, s);
-                loop {
-                    let k = (kp as usize - b as usize) / s;
-                    tp.add(j).write(jp);
-                    ptr::copy_nonoverlapping(kp, jp, s);
-                    j = k;
-                    jp = kp;
-                    kp = tp.add(k).read();
-                    if kp == ip {
-                        break;
-                    }
-                }
-                tp.add(j).write(jp);
-                ptr::copy_nonoverlapping(tmp_storage, jp, s);
-            }
-            ip = ip.add(s);
+        t += s;
+    }
+    let rest = &l[i..];
+    let k = t + rest.len();
+    if !rest.is_empty() {
+        out[t..k].copy_from_slice(rest);
+    }
+    b[..k].copy_from_slice(&out[..k]);
+}
+
+fn msort_zero(n: usize, cmp: &mut impl FnMut() -> c_int) {
+    if n <= 1 {
+        return;
+    }
+    let (mut n1, mut n2) = (n / 2, n - n / 2);
+    msort_zero(n1, cmp);
+    msort_zero(n2, cmp);
+    while n1 > 0 && n2 > 0 {
+        if cmp() <= 0 {
+            n1 -= 1;
+        } else {
+            n2 -= 1;
         }
     }
 }
 
-unsafe fn mergesort(base: *mut u8, n: usize, size: usize, cmp: CompareArg, arg: *mut c_void, buf: *mut u8) {
+fn indirect_msort(data: &mut [u8], n: usize, s: usize, scratch: &mut [u8], c: impl Cmp) {
+    let (merge_tmp, rest) = scratch.split_at_mut(n * IDX);
+    let (tp, rest) = rest.split_at_mut(n * IDX);
+    let tmp_storage = &mut rest[..s];
+    let (merge_tmp, _) = merge_tmp.as_chunks_mut::<IDX>();
+    let (tp, _) = tp.as_chunks_mut::<IDX>();
+    for (i, slot) in tp.iter_mut().enumerate() {
+        *slot = i.to_ne_bytes();
+    }
+    {
+        let base = data.as_ptr();
+        msort_fixed(tp, merge_tmp, move |a: &[u8; IDX], b: &[u8; IDX]| {
+            let (ia, ib) = (usize::from_ne_bytes(*a), usize::from_ne_bytes(*b));
+            unsafe { c.cmp_ptr(base.wrapping_add(ia * s), base.wrapping_add(ib * s)) }
+        });
+    }
+    let idx = |tp: &[[u8; IDX]], i: usize| usize::from_ne_bytes(tp[i]);
+    for i in 0..n {
+        let mut kp = idx(tp, i);
+        if kp != i {
+            let (mut j, mut jp) = (i, i);
+            tmp_storage.copy_from_slice(&data[i * s..i * s + s]);
+            loop {
+                let k = kp;
+                tp[j] = jp.to_ne_bytes();
+                data.copy_within(kp * s..kp * s + s, jp * s);
+                j = k;
+                jp = kp;
+                kp = idx(tp, k);
+                if kp == i {
+                    break;
+                }
+            }
+            tp[j] = jp.to_ne_bytes();
+            data[jp * s..jp * s + s].copy_from_slice(tmp_storage);
+        }
+    }
+}
+
+fn mergesort(data: &mut [u8], n: usize, size: usize, buf: &mut [u8], c: impl Cmp) {
     if size > INDIRECT_THRESHOLD {
-        let p = Param { s: PTR, cmp, arg, var: Var::VoidArg, t: buf };
-        unsafe { indirect_msort(&p, base, n, size) }
-    } else {
-        let p = Param { s: size, cmp, arg, var: swap_type(base, size), t: buf };
-        unsafe { msort(&p, base, n) }
+        return indirect_msort(data, n, size, buf, c);
+    }
+    fn fixed<const N: usize>(data: &mut [u8], buf: &mut [u8], c: impl Cmp) {
+        let (d, _) = data.as_chunks_mut::<N>();
+        let (t, _) = buf.as_chunks_mut::<N>();
+        msort_fixed(d, t, move |a: &[u8; N], b: &[u8; N]| c.cmp(a, b));
+    }
+    match size {
+        1 => fixed::<1>(data, buf, c),
+        2 => fixed::<2>(data, buf, c),
+        4 => fixed::<4>(data, buf, c),
+        8 => fixed::<8>(data, buf, c),
+        16 => fixed::<16>(data, buf, c),
+        s => msort_bytes(data, n, s, buf, c),
     }
 }
 
-unsafe fn swap(a: *mut u8, b: *mut u8, size: usize) {
-    unsafe { ptr::swap_nonoverlapping(a, b, size) }
+fn swap_elems(b: &mut [u8], s: usize, x: usize, y: usize) {
+    let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+    let (l, r) = b.split_at_mut(hi * s);
+    l[lo * s..lo * s + s].swap_with_slice(&mut r[..s]);
 }
 
-unsafe fn siftdown(base: *mut u8, size: usize, mut k: usize, n: usize, cmp: CompareArg, arg: *mut c_void) {
-    unsafe {
-        while 2 * k < n {
-            let mut j = 2 * k + 1;
-            if j < n && cmp(base.add(j * size).cast(), base.add((j + 1) * size).cast(), arg) < 0 {
-                j += 1;
-            }
-            if j == k || cmp(base.add(k * size).cast(), base.add(j * size).cast(), arg) >= 0 {
-                break;
-            }
-            swap(base.add(size * j), base.add(k * size), size);
-            k = j;
+fn elem(b: &[u8], s: usize, i: usize) -> &[u8] {
+    &b[i * s..i * s + s]
+}
+
+fn siftdown(b: &mut [u8], s: usize, mut k: usize, n: usize, c: impl Cmp) {
+    while 2 * k < n {
+        let mut j = 2 * k + 1;
+        if j < n && c.cmp(elem(b, s, j), elem(b, s, j + 1)) < 0 {
+            j += 1;
         }
+        if j == k || c.cmp(elem(b, s, k), elem(b, s, j)) >= 0 {
+            break;
+        }
+        swap_elems(b, s, j, k);
+        k = j;
     }
 }
 
-unsafe fn heapsort(base: *mut u8, mut n: usize, size: usize, cmp: CompareArg, arg: *mut c_void) {
+fn heapsort(b: &mut [u8], mut n: usize, s: usize, c: impl Cmp) {
     if n == 0 {
         return;
     }
-    unsafe {
-        let mut k = n / 2;
-        loop {
-            siftdown(base, size, k, n, cmp, arg);
-            if k == 0 {
-                break;
-            }
-            k -= 1;
+    let mut k = n / 2;
+    loop {
+        siftdown(b, s, k, n, c);
+        if k == 0 {
+            break;
         }
-        loop {
-            swap(base, base.add(n * size), size);
-            n -= 1;
-            if n == 0 {
-                break;
+        k -= 1;
+    }
+    loop {
+        swap_elems(b, s, 0, n);
+        n -= 1;
+        if n == 0 {
+            break;
+        }
+        siftdown(b, s, 0, n, c);
+    }
+}
+
+unsafe fn sort_raw(base: *mut u8, nmemb: usize, size: usize, c: impl Cmp) {
+    if nmemb <= 1 {
+        return;
+    }
+    let total = if size > INDIRECT_THRESHOLD {
+        nmemb.checked_mul(2 * IDX).and_then(|v| v.checked_add(size))
+    } else {
+        nmemb.checked_mul(size)
+    };
+    if size == 0 {
+        return msort_zero(nmemb, &mut move || unsafe { c.cmp_ptr(base, base) });
+    }
+    let Some(len) = nmemb.checked_mul(size) else { return };
+    let data = unsafe { rusty_libc_core::ffi::bytes_mut(base, len) };
+    match total {
+        Some(t) if t <= STACK_SIZE => {
+            #[repr(align(8))]
+            struct Stack(MaybeUninit<[u8; STACK_SIZE]>);
+            let mut stack = Stack(MaybeUninit::uninit());
+            let buf = unsafe { core::slice::from_raw_parts_mut(stack.0.as_mut_ptr().cast::<u8>(), t) };
+            mergesort(data, nmemb, size, buf, c);
+        }
+        _ => {
+            let block = match total {
+                Some(t) => {
+                    let save = errno::get();
+                    let b = crate::cmem::malloc(t);
+                    errno::set(save);
+                    (!b.is_null()).then_some((b, t))
+                }
+                None => None,
+            };
+            match block {
+                None => heapsort(data, nmemb - 1, size, c),
+                Some((b, t)) => {
+                    let buf = unsafe { core::slice::from_raw_parts_mut(b, t) };
+                    mergesort(data, nmemb, size, buf, c);
+                    unsafe { crate::cmem::free(b) };
+                }
             }
-            siftdown(base, size, 0, n, cmp, arg);
         }
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn qsort_r(base: *mut c_void, nmemb: usize, size: usize, cmp: CompareArg, arg: *mut c_void) {
-    if nmemb <= 1 {
-        return;
-    }
-    let base = base.cast::<u8>();
-    let total = if size > INDIRECT_THRESHOLD {
-        nmemb.checked_mul(2 * PTR).and_then(|v| v.checked_add(size))
-    } else {
-        nmemb.checked_mul(size)
-    };
-    match total {
-        Some(t) if t <= STACK_SIZE => {
-            #[repr(align(8))]
-            struct Stack(MaybeUninit<[u8; STACK_SIZE]>);
-            let mut stack = Stack(MaybeUninit::uninit());
-            unsafe { mergesort(base, nmemb, size, cmp, arg, stack.0.as_mut_ptr().cast()) }
-        }
-        _ => {
-            let buf = match total {
-                Some(t) => {
-                    let save = errno::get();
-                    let b = unsafe { rusty_libc_malloc::stdlib_api::malloc(t) }.cast::<u8>();
-                    errno::set(save);
-                    b
-                }
-                None => ptr::null_mut(),
-            };
-            if buf.is_null() {
-                unsafe { heapsort(base, nmemb - 1, size, cmp, arg) }
-            } else {
-                unsafe {
-                    mergesort(base, nmemb, size, cmp, arg, buf);
-                    rusty_libc_malloc::stdlib_api::free(buf.cast());
-                }
-            }
-        }
-    }
+    unsafe { sort_raw(base.cast(), nmemb, size, CArg { f: cmp, arg }) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn qsort(base: *mut c_void, nmemb: usize, size: usize, cmp: Compare) {
-    let cmp: CompareArg = unsafe { core::mem::transmute::<Compare, CompareArg>(cmp) };
-    unsafe { qsort_r(base, nmemb, size, cmp, ptr::null_mut()) }
+    unsafe { sort_raw(base.cast(), nmemb, size, C2 { f: cmp }) }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn bsearch(key: *const c_void, base: *const c_void, mut nmemb: usize, size: usize, cmp: Compare) -> *mut c_void {
-    let mut base = base.cast::<u8>();
+#[inline]
+fn bsearch_idx(mut nmemb: usize, mut probe: impl FnMut(usize) -> c_int) -> Option<usize> {
+    let mut lo = 0usize;
     while nmemb != 0 {
-        let p = unsafe { base.add((nmemb >> 1) * size) };
-        let c = unsafe { cmp(key, p.cast()) };
+        let mid = lo + (nmemb >> 1);
+        let c = probe(mid);
         if c == 0 {
-            return p.cast_mut().cast();
+            return Some(mid);
         }
         if c > 0 {
-            base = unsafe { p.add(size) };
+            lo = mid + 1;
             nmemb -= 1;
         }
         nmemb >>= 1;
     }
-    ptr::null_mut()
+    None
 }
 
-unsafe extern "C" fn trampoline<T, F: FnMut(&T, &T) -> Ordering>(a: *const c_void, b: *const c_void, arg: *mut c_void) -> c_int {
-    let f = unsafe { &mut *arg.cast::<F>() };
-    match f(unsafe { &*a.cast::<T>() }, unsafe { &*b.cast::<T>() }) {
-        Ordering::Less => -1,
-        Ordering::Equal => 0,
-        Ordering::Greater => 1,
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn bsearch(key: *const c_void, base: *const c_void, nmemb: usize, size: usize, cmp: Compare) -> *mut c_void {
+    let base = base.cast::<u8>();
+    let at = |i: usize| base.wrapping_add(i * size);
+    match bsearch_idx(nmemb, |i| unsafe { cmp(key, at(i).cast()) }) {
+        Some(i) => at(i).cast_mut().cast(),
+        None => ptr::null_mut(),
     }
 }
 
 pub fn sort_by<T: Copy, F: FnMut(&T, &T) -> Ordering>(v: &mut [T], mut f: F) {
-    unsafe {
-        qsort_r(v.as_mut_ptr().cast(), v.len(), core::mem::size_of::<T>(), trampoline::<T, F>, (&raw mut f).cast());
+    if v.len() <= 1 {
+        return;
+    }
+    let cell = core::cell::RefCell::new(&mut f);
+    let cmp = |a: &T, b: &T| (cell.borrow_mut())(a, b) as c_int;
+    match crate::cmem::CVec::filled(v.len(), v[0]) {
+        Some(mut tmp) => msort_fixed(v, tmp.as_mut_slice(), cmp),
+        None => heapsort_typed(v, &mut { cmp }),
+    }
+}
+
+fn heapsort_typed<T>(v: &mut [T], cmp: &mut impl FnMut(&T, &T) -> c_int) {
+    let sift = |v: &mut [T], mut k: usize, n: usize, cmp: &mut dyn FnMut(&T, &T) -> c_int| {
+        while 2 * k < n {
+            let mut j = 2 * k + 1;
+            if j < n && cmp(&v[j], &v[j + 1]) < 0 {
+                j += 1;
+            }
+            if j == k || cmp(&v[k], &v[j]) >= 0 {
+                break;
+            }
+            v.swap(j, k);
+            k = j;
+        }
+    };
+    let mut n = v.len() - 1;
+    if n == 0 {
+        return;
+    }
+    let mut k = n / 2;
+    loop {
+        sift(v, k, n, cmp);
+        if k == 0 {
+            break;
+        }
+        k -= 1;
+    }
+    loop {
+        v.swap(0, n);
+        n -= 1;
+        if n == 0 {
+            break;
+        }
+        sift(v, 0, n, cmp);
     }
 }
 
@@ -295,19 +376,6 @@ pub fn sort<T: Copy + Ord>(v: &mut [T]) {
 }
 
 pub fn binary_search_by<T, F: FnMut(&T) -> Ordering>(v: &[T], mut f: F) -> Option<usize> {
-    let (mut lo, mut n) = (0usize, v.len());
-    while n != 0 {
-        let mid = lo + (n >> 1);
-        match f(&v[mid]) {
-            Ordering::Equal => return Some(mid),
-            Ordering::Greater => {
-                lo = mid + 1;
-                n -= 1;
-            }
-            Ordering::Less => {}
-        }
-        n >>= 1;
-    }
-    None
+    bsearch_idx(v.len(), |i| f(&v[i]) as c_int)
 }
 

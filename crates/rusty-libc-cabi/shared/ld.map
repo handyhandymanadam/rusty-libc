@@ -27,7 +27,8 @@ GLIBC_PRIVATE {
     __libc_ldso_dladdr;
     __libc_ldso_dladdr1;
     __libc_ldso_dlclose;
-    __libc_ldso_dlerror;
+    __libc_ldso_dlerror_compose;
+    __libc_ldso_dlerror_record;
     __libc_ldso_dlinfo;
     __libc_ldso_dlmopen;
     __libc_ldso_dlopen;
@@ -39,6 +40,7 @@ GLIBC_PRIVATE {
     __libc_ldso_iterate_phdr;
     __libc_ldso_main_runs_own_init;
     __libc_ldso_tls_dbslots;
+    __libc_ldso_tls_dtor_ref;
     __libc_ldso_tls_free_block;
     __libc_ldso_tls_info;
     __libc_ldso_tls_init_block;

@@ -2,7 +2,8 @@ use crate::tables::*;
 use crate::{CHARSET, Charset, charset, code_charset, wchar_t, wint_t};
 use core::sync::atomic::Ordering;
 use crate::wstring::locale_t;
-use core::ffi::{CStr, c_char, c_int, c_ulong};
+use core::ffi::{c_char, c_int, c_ulong};
+use rusty_libc_core::ffi::cstr_bytes;
 
 const CLASS_NAMES: [&[u8]; 14] = [
     b"alnum",
@@ -41,25 +42,25 @@ fn delta(index: &[u8], data: &[i32], shift: u32, c: u32) -> u32 {
 
 #[inline(always)]
 fn has(c: u32, bit: u32) -> bool {
-    has_in(core::ptr::null(), true, c, bit)
+    has_in(None, true, c, bit)
 }
 
 #[inline]
-fn ctype_of(loc: usize) -> *const rusty_libc_core::locale::CatData {
-    rusty_libc_core::locale::of_locale(loc, rusty_libc_core::locale::LC_CTYPE)
+unsafe fn ctype_of(loc: usize) -> Option<&'static rusty_libc_core::locale::CatData> {
+    unsafe { rusty_libc_core::locale::of_locale(loc, rusty_libc_core::locale::LC_CTYPE) }
 }
 
 #[inline(always)]
-fn wtab(d: *const rusty_libc_core::locale::CatData, use_cur: bool) -> Option<&'static rusty_libc_core::locale::WideTables> {
+fn wtab(d: Option<&'static rusty_libc_core::locale::CatData>, use_cur: bool) -> Option<&'static rusty_libc_core::locale::WideTables> {
     if rusty_libc_core::locale::wide_special() {
         core::hint::cold_path();
-        return rusty_libc_core::locale::wide_tables(if use_cur { ctype_of(0) } else { d });
+        return rusty_libc_core::locale::wide_tables(if use_cur { rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE) } else { d });
     }
     None
 }
 
 #[inline(always)]
-fn has_in(d: *const rusty_libc_core::locale::CatData, use_cur: bool, c: u32, bit: u32) -> bool {
+fn has_in(d: Option<&'static rusty_libc_core::locale::CatData>, use_cur: bool, c: u32, bit: u32) -> bool {
     if !rusty_libc_core::locale::locale_slow() {
         return match code_charset(CHARSET.load(Ordering::Relaxed) as u32) {
             Charset::Utf8 | Charset::Other => props(c) & (1 << bit) != 0,
@@ -126,7 +127,8 @@ macro_rules! classes {
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $cl(wc: wint_t, locale: locale_t) -> c_int {
-            c_int::from(has_in(ctype_of(locale as usize), false, wc, $bit))
+            let d = unsafe { ctype_of(locale as usize) };
+            c_int::from(has_in(d, false, wc, $bit))
         }
     )*};
 }
@@ -148,7 +150,7 @@ classes! {
 
 #[inline]
 pub fn to_lower(c: u32) -> u32 {
-    if let Some(w) = wtab(core::ptr::null(), true) {
+    if let Some(w) = wtab(None, true) {
         return unsafe { rusty_libc_core::locale::trans_lookup(w.tolower, c) };
     }
     to_lower_builtin(c)
@@ -163,7 +165,7 @@ fn to_lower_builtin(c: u32) -> u32 {
 
 #[inline]
 pub fn to_upper(c: u32) -> u32 {
-    if let Some(w) = wtab(core::ptr::null(), true) {
+    if let Some(w) = wtab(None, true) {
         return unsafe { rusty_libc_core::locale::trans_lookup(w.toupper, c) };
     }
     to_upper_builtin(c)
@@ -177,7 +179,7 @@ fn to_upper_builtin(c: u32) -> u32 {
 }
 
 pub fn class_runs(bit: u32, emit: &mut dyn FnMut(u32, u32)) {
-    if let Some(w) = wtab(core::ptr::null(), true)
+    if let Some(w) = wtab(None, true)
         && bit < 12
     {
         let mut from_0x80 = |lo: u32, hi: u32| {
@@ -235,7 +237,7 @@ pub fn class_runs(bit: u32, emit: &mut dyn FnMut(u32, u32)) {
 }
 
 pub fn upper_changed(emit: &mut dyn FnMut(u32, u32)) {
-    if let Some(w) = wtab(core::ptr::null(), true) {
+    if let Some(w) = wtab(None, true) {
         unsafe { rusty_libc_core::locale::trans_changed(w.toupper, emit) };
         return;
     }
@@ -282,7 +284,7 @@ pub fn width(c: u32) -> Option<u8> {
     if !rusty_libc_core::locale::locale_slow() {
         return width_in(code_charset(CHARSET.load(Ordering::Relaxed) as u32), c);
     }
-    if let Some(w) = wtab(core::ptr::null(), true) {
+    if let Some(w) = wtab(None, true) {
         return match unsafe { rusty_libc_core::locale::width_lookup(w.width, c) } {
             0xff => None,
             x => Some(x),
@@ -329,7 +331,7 @@ pub unsafe extern "C" fn towupper(wc: wint_t) -> wint_t {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn towlower_l(wc: wint_t, locale: locale_t) -> wint_t {
-    match wtab(ctype_of(locale as usize), false) {
+    match wtab(unsafe { ctype_of(locale as usize) }, false) {
         Some(w) => unsafe { rusty_libc_core::locale::trans_lookup(w.tolower, wc) },
         None => to_lower_builtin(wc),
     }
@@ -337,7 +339,7 @@ pub unsafe extern "C" fn towlower_l(wc: wint_t, locale: locale_t) -> wint_t {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn towupper_l(wc: wint_t, locale: locale_t) -> wint_t {
-    match wtab(ctype_of(locale as usize), false) {
+    match wtab(unsafe { ctype_of(locale as usize) }, false) {
         Some(w) => unsafe { rusty_libc_core::locale::trans_lookup(w.toupper, wc) },
         None => to_upper_builtin(wc),
     }
@@ -349,7 +351,7 @@ static TRANS: [i32; 3] = [0, 1, 2];
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wctype(name: *const c_char) -> c_ulong {
-    unsafe { class_by_name(CStr::from_ptr(name).to_bytes()) }
+    class_by_name(unsafe { cstr_bytes(name) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -375,7 +377,7 @@ pub unsafe extern "C" fn iswctype(wc: wint_t, desc: c_ulong) -> c_int {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn iswctype_l(wc: wint_t, desc: c_ulong, locale: locale_t) -> c_int {
     let i = desc.wrapping_sub(CLASS_TAG);
-    (i < 14 && has_in(ctype_of(locale as usize), false, wc, i as u32)) as c_int
+    (i < 14 && has_in(unsafe { ctype_of(locale as usize) }, false, wc, i as u32)) as c_int
 }
 
 pub fn in_class(wc: u32, desc: c_ulong) -> bool {
@@ -385,18 +387,16 @@ pub fn in_class(wc: u32, desc: c_ulong) -> bool {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wctrans(name: *const c_char) -> *const i32 {
-    unsafe { trans_by_name(CStr::from_ptr(name).to_bytes()) }
+    trans_by_name(unsafe { cstr_bytes(name) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wctrans_l(name: *const c_char, locale: locale_t) -> *const i32 {
-    unsafe {
-        let name = CStr::from_ptr(name).to_bytes();
-        if name == b"to_inpunct" {
-            return inpunct_of(wtab(ctype_of(locale as usize), false));
-        }
-        trans_by_name(name)
+    let name = unsafe { cstr_bytes(name) };
+    if name == b"to_inpunct" {
+        return inpunct_of(wtab(unsafe { ctype_of(locale as usize) }, false));
     }
+    trans_by_name(name)
 }
 
 fn inpunct_of(w: Option<&rusty_libc_core::locale::WideTables>) -> *const i32 {
@@ -405,7 +405,7 @@ fn inpunct_of(w: Option<&rusty_libc_core::locale::WideTables>) -> *const i32 {
 
 pub fn trans_by_name(name: &[u8]) -> *const i32 {
     match name {
-        b"to_inpunct" => inpunct_of(wtab(core::ptr::null(), true)),
+        b"to_inpunct" => inpunct_of(wtab(None, true)),
         b"tolower" => &TRANS[0],
         b"toupper" => &TRANS[1],
         b"totitle" if charset() != Charset::C => &TRANS[2],
@@ -447,34 +447,29 @@ pub unsafe extern "C" fn wcwidth(wc: wchar_t) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn wcswidth(s: *const wchar_t, n: usize) -> c_int {
-    unsafe {
-        let mut total: c_int = 0;
-        if !rusty_libc_core::locale::locale_slow() {
-            let cs = code_charset(CHARSET.load(Ordering::Relaxed) as u32);
-            for i in 0..n {
-                let c = *s.add(i);
-                if c == 0 {
-                    break;
-                }
-                match width_in(cs, c as u32) {
-                    Some(w) => total = total.wrapping_add(c_int::from(w)),
-                    None => return -1,
-                }
-            }
-            return total;
-        }
-        for i in 0..n {
-            let c = *s.add(i);
-            if c == 0 {
-                break;
-            }
-            match width(c as u32) {
+    swidth(unsafe { crate::wcstr::CharsN::new(s, n) })
+}
+
+#[inline(always)]
+fn swidth(s: crate::wcstr::CharsN) -> c_int {
+    let mut total: c_int = 0;
+    if !rusty_libc_core::locale::locale_slow() {
+        let cs = code_charset(CHARSET.load(Ordering::Relaxed) as u32);
+        for c in s {
+            match width_in(cs, c) {
                 Some(w) => total = total.wrapping_add(c_int::from(w)),
                 None => return -1,
             }
         }
-        total
+        return total;
     }
+    for c in s {
+        match width(c) {
+            Some(w) => total = total.wrapping_add(c_int::from(w)),
+            None => return -1,
+        }
+    }
+    total
 }
 
 

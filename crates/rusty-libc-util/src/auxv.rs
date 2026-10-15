@@ -1,4 +1,5 @@
-use rusty_libc_core::{errno, syscall};
+use rusty_libc_core::sync_cell::SyncCell;
+use rusty_libc_core::{errno, unistd};
 
 pub const AT_NULL: u64 = 0;
 pub const AT_IGNORE: u64 = 1;
@@ -37,7 +38,7 @@ const MAX_PAIRS: usize = 64;
 const HWCAP_X86_64: u64 = 1 << 1;
 const HWCAP_X86_AVX512_1: u64 = 1 << 2;
 
-static mut VEC: [u64; MAX_PAIRS * 2] = [0; MAX_PAIRS * 2];
+static VEC: SyncCell<[u64; MAX_PAIRS * 2]> = SyncCell::new([0; MAX_PAIRS * 2]);
 static STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 fn cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
@@ -71,61 +72,56 @@ fn hwcap() -> u64 {
     hw
 }
 
-unsafe fn load() {
+fn load() {
     use core::sync::atomic::Ordering::{Acquire, Release};
-    unsafe {
-        match STATE.compare_exchange(0, 1, Acquire, Acquire) {
-            Ok(_) => {}
-            Err(_) => {
-                while STATE.load(Acquire) != 2 {
-                    core::hint::spin_loop();
-                }
-                return;
+    match STATE.compare_exchange(0, 1, Acquire, Acquire) {
+        Ok(_) => {}
+        Err(_) => {
+            while STATE.load(Acquire) != 2 {
+                core::hint::spin_loop();
             }
-        }
-        read_vector();
-        STATE.store(2, Release);
-    }
-}
-
-unsafe fn read_vector() {
-    unsafe {
-        let path = b"/proc/self/auxv\0";
-        let fd = syscall::syscall3(syscall::SYS_OPEN, path.as_ptr() as usize, 0o2000000, 0);
-        if syscall::check(fd).is_err() {
             return;
         }
-        let base = core::ptr::addr_of_mut!(VEC) as *mut u8;
-        let cap = MAX_PAIRS * 16;
-        let mut got = 0usize;
-        while got < cap {
-            let r = syscall::syscall3(syscall::SYS_READ, fd, base.add(got) as usize, cap - got);
-            match syscall::check(r) {
-                Ok(0) => break,
-                Ok(n) => got += n,
-                Err(e) if e.0 == rusty_libc_core::errno::EINTR => {}
-                Err(_) => break,
-            }
-        }
-        syscall::syscall1(syscall::SYS_CLOSE, fd);
     }
+    let mut raw = [0u8; MAX_PAIRS * 16];
+    let got = read_vector(&mut raw);
+    let v = unsafe { &mut *VEC.as_ptr() };
+    for (i, w) in raw[..got].as_chunks::<8>().0.iter().enumerate() {
+        v[i] = u64::from_ne_bytes(*w);
+    }
+    STATE.store(2, Release);
+}
+
+fn read_vector(raw: &mut [u8]) -> usize {
+    let Ok(fd) = crate::cmem::open(c"/proc/self/auxv", 0o2000000, 0) else { return 0 };
+    let mut got = 0usize;
+    while got < raw.len() {
+        match unistd::read_nocancel(fd, &mut raw[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.0 == rusty_libc_core::errno::EINTR => {}
+            Err(_) => break,
+        }
+    }
+    let _ = unistd::close(fd);
+    got
+}
+
+fn vector() -> &'static [u64; MAX_PAIRS * 2] {
+    load();
+    unsafe { &*VEC.as_ptr() }
 }
 
 pub fn get(kind: u64) -> Option<u64> {
     if kind == AT_HWCAP {
         return Some(hwcap());
     }
-    unsafe {
-        load();
-        let v = core::ptr::addr_of!(VEC) as *const u64;
-        for i in 0..MAX_PAIRS {
-            let t = *v.add(i * 2);
-            if t == AT_NULL {
-                break;
-            }
-            if t == kind {
-                return Some(*v.add(i * 2 + 1));
-            }
+    for pair in vector().as_chunks::<2>().0 {
+        if pair[0] == AT_NULL {
+            break;
+        }
+        if pair[0] == kind {
+            return Some(pair[1]);
         }
     }
     if kind == AT_HWCAP2 { Some(0) } else { None }
@@ -161,18 +157,21 @@ pub unsafe extern "C" fn getauxval(kind: u64) -> u64 {
 
 pub unsafe fn init_vector(auxv: *const u64) {
     use core::sync::atomic::Ordering::Release;
-    unsafe {
-        let v = core::ptr::addr_of_mut!(VEC) as *mut u64;
-        let mut n = 0;
-        while n < MAX_PAIRS - 1 && *auxv.add(n * 2) != AT_NULL {
-            *v.add(n * 2) = *auxv.add(n * 2);
-            *v.add(n * 2 + 1) = *auxv.add(n * 2 + 1);
-            n += 1;
+    let pairs = auxv.cast::<[u64; 2]>();
+    let v = unsafe { &mut *VEC.as_ptr() };
+    let mut n = 0;
+    while n < MAX_PAIRS - 1 {
+        let pair = unsafe { *pairs.wrapping_add(n) };
+        if pair[0] == AT_NULL {
+            break;
         }
-        *v.add(n * 2) = AT_NULL;
-        *v.add(n * 2 + 1) = 0;
-        STATE.store(2, Release);
+        v[n * 2] = pair[0];
+        v[n * 2 + 1] = pair[1];
+        n += 1;
     }
+    v[n * 2] = AT_NULL;
+    v[n * 2 + 1] = 0;
+    STATE.store(2, Release);
 }
 
 pub unsafe extern "C" fn __init_auxv(auxv: *const u64) {

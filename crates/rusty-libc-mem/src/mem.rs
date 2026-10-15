@@ -4,157 +4,146 @@ use core::ffi::{c_int, c_void};
 use core::ptr::null_mut;
 
 #[inline(always)]
-unsafe fn rd<T>(p: *const u8) -> T {
-    unsafe { p.cast::<T>().read_unaligned() }
+unsafe fn rd<T>(p: *const u8, off: usize) -> T {
+    let q = unsafe { p.add(off) };
+    unsafe { q.cast::<T>().read_unaligned() }
 }
 #[inline(always)]
-unsafe fn wr<T>(p: *mut u8, v: T) {
-    unsafe { p.cast::<T>().write_unaligned(v) }
+unsafe fn wr<T>(p: *mut u8, off: usize, v: T) {
+    let q = unsafe { p.add(off) };
+    unsafe { q.cast::<T>().write_unaligned(v) }
 }
 
 #[inline(always)]
 unsafe fn copy_tiny(d: *mut u8, s: *const u8, n: usize) {
-    unsafe {
-        if n >= 8 {
-            let (a, b): (u64, u64) = (rd(s), rd(s.add(n - 8)));
-            wr(d, a);
-            wr(d.add(n - 8), b);
-        } else if n >= 4 {
-            let (a, b): (u32, u32) = (rd(s), rd(s.add(n - 4)));
-            wr(d, a);
-            wr(d.add(n - 4), b);
-        } else if n >= 2 {
-            let (a, b): (u16, u16) = (rd(s), rd(s.add(n - 2)));
-            wr(d, a);
-            wr(d.add(n - 2), b);
-        } else {
-            *d = *s;
-        }
+    if n >= 8 {
+        let (a, b): (u64, u64) = (unsafe { rd(s, 0) }, unsafe { rd(s, n - 8) });
+        unsafe { wr(d, 0, a) };
+        unsafe { wr(d, n - 8, b) };
+    } else if n >= 4 {
+        let (a, b): (u32, u32) = (unsafe { rd(s, 0) }, unsafe { rd(s, n - 4) });
+        unsafe { wr(d, 0, a) };
+        unsafe { wr(d, n - 4, b) };
+    } else if n >= 2 {
+        let (a, b): (u16, u16) = (unsafe { rd(s, 0) }, unsafe { rd(s, n - 2) });
+        unsafe { wr(d, 0, a) };
+        unsafe { wr(d, n - 2, b) };
+    } else {
+        let b = unsafe { *s };
+        unsafe { *d = b };
     }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn copy_upto_8w<V: Vector>(d: *mut u8, s: *const u8, n: usize) {
-    unsafe {
-        let w = V::W;
-        if n < w {
-            if n < 16 {
-                if n != 0 {
-                    copy_tiny(d, s, n);
-                }
-            } else {
-                let a = Sse2::loadu(s);
-                let b = Sse2::loadu(s.add(n - 16));
-                Sse2::storeu(d, a);
-                Sse2::storeu(d.add(n - 16), b);
+    let w = V::W;
+    if n < w {
+        if n < 16 {
+            if n != 0 {
+                unsafe { copy_tiny(d, s, n) };
             }
-        } else if n <= 2 * w {
-            let a = V::loadu(s);
-            let b = V::loadu(s.add(n - w));
-            V::storeu(d, a);
-            V::storeu(d.add(n - w), b);
-        } else if n <= 4 * w {
-            let (a, b) = (V::loadu(s), V::loadu(s.add(w)));
-            let (c, e) = (V::loadu(s.add(n - 2 * w)), V::loadu(s.add(n - w)));
-            V::storeu(d, a);
-            V::storeu(d.add(w), b);
-            V::storeu(d.add(n - 2 * w), c);
-            V::storeu(d.add(n - w), e);
         } else {
-            let (a, b, c, e) = (V::loadu(s), V::loadu(s.add(w)), V::loadu(s.add(2 * w)), V::loadu(s.add(3 * w)));
-            let t = n - 4 * w;
-            let (f, g, h, i) = (V::loadu(s.add(t)), V::loadu(s.add(t + w)), V::loadu(s.add(t + 2 * w)), V::loadu(s.add(t + 3 * w)));
-            V::storeu(d, a);
-            V::storeu(d.add(w), b);
-            V::storeu(d.add(2 * w), c);
-            V::storeu(d.add(3 * w), e);
-            V::storeu(d.add(t), f);
-            V::storeu(d.add(t + w), g);
-            V::storeu(d.add(t + 2 * w), h);
-            V::storeu(d.add(t + 3 * w), i);
+            let (a, b) = (unsafe { Sse2::loadu(s) }, unsafe { Sse2::loadu_at(s, n - 16) });
+            unsafe { Sse2::storeu(d, a) };
+            unsafe { Sse2::storeu_at(d, n - 16, b) };
         }
+    } else if n <= 2 * w {
+        let (a, b) = (unsafe { V::loadu(s) }, unsafe { V::loadu_at(s, n - w) });
+        unsafe { V::storeu(d, a) };
+        unsafe { V::storeu_at(d, n - w, b) };
+    } else if n <= 4 * w {
+        let (a, b) = (unsafe { V::loadu(s) }, unsafe { V::loadu_at(s, w) });
+        let (c, e) = (unsafe { V::loadu_at(s, n - 2 * w) }, unsafe { V::loadu_at(s, n - w) });
+        unsafe { V::storeu(d, a) };
+        unsafe { V::storeu_at(d, w, b) };
+        unsafe { V::storeu_at(d, n - 2 * w, c) };
+        unsafe { V::storeu_at(d, n - w, e) };
+    } else {
+        let (a, b, c, e) = (unsafe { V::loadu(s) }, unsafe { V::loadu_at(s, w) }, unsafe { V::loadu_at(s, 2 * w) }, unsafe { V::loadu_at(s, 3 * w) });
+        let t = n - 4 * w;
+        let (f, g, h, i) = (unsafe { V::loadu_at(s, t) }, unsafe { V::loadu_at(s, t + w) }, unsafe { V::loadu_at(s, t + 2 * w) }, unsafe { V::loadu_at(s, t + 3 * w) });
+        unsafe { V::storeu(d, a) };
+        unsafe { V::storeu_at(d, w, b) };
+        unsafe { V::storeu_at(d, 2 * w, c) };
+        unsafe { V::storeu_at(d, 3 * w, e) };
+        unsafe { V::storeu_at(d, t, f) };
+        unsafe { V::storeu_at(d, t + w, g) };
+        unsafe { V::storeu_at(d, t + 2 * w, h) };
+        unsafe { V::storeu_at(d, t + 3 * w, i) };
     }
 }
 
 #[inline(always)]
 unsafe fn copy_large_fwd<V: Vector>(d: *mut u8, s: *const u8, n: usize) {
-    unsafe {
-        let w = V::W;
-        let head = V::loadu(s);
-        let t = n - 4 * w;
-        let (t0, t1, t2, t3) = (V::loadu(s.add(t)), V::loadu(s.add(t + w)), V::loadu(s.add(t + 2 * w)), V::loadu(s.add(t + 3 * w)));
-        let d_al = ((d as usize + w) & !(w - 1)) as *mut u8;
-        let mut sp = s.add(d_al as usize - d as usize);
-        let mut dp = d_al;
-        let end = d.add(t);
-        while dp < end {
-            let (a, b, c, e) = (V::loadu(sp), V::loadu(sp.add(w)), V::loadu(sp.add(2 * w)), V::loadu(sp.add(3 * w)));
-            V::store(dp, a);
-            V::store(dp.add(w), b);
-            V::store(dp.add(2 * w), c);
-            V::store(dp.add(3 * w), e);
-            sp = sp.add(4 * w);
-            dp = dp.add(4 * w);
-        }
-        V::storeu(d.add(t), t0);
-        V::storeu(d.add(t + w), t1);
-        V::storeu(d.add(t + 2 * w), t2);
-        V::storeu(d.add(t + 3 * w), t3);
-        V::storeu(d, head);
+    let w = V::W;
+    let head = unsafe { V::loadu(s) };
+    let t = n - 4 * w;
+    let (t0, t1, t2, t3) = (unsafe { V::loadu_at(s, t) }, unsafe { V::loadu_at(s, t + w) }, unsafe { V::loadu_at(s, t + 2 * w) }, unsafe { V::loadu_at(s, t + 3 * w) });
+    let d_al = ((d as usize + w) & !(w - 1)) as *mut u8;
+    let mut sp = unsafe { s.add(d_al as usize - d as usize) };
+    let mut dp = d_al;
+    let end = unsafe { d.add(t) };
+    while dp < end {
+        let (a, b, c, e) = (unsafe { V::loadu(sp) }, unsafe { V::loadu_at(sp, w) }, unsafe { V::loadu_at(sp, 2 * w) }, unsafe { V::loadu_at(sp, 3 * w) });
+        unsafe { V::store(dp, a) };
+        unsafe { V::store_at(dp, w, b) };
+        unsafe { V::store_at(dp, 2 * w, c) };
+        unsafe { V::store_at(dp, 3 * w, e) };
+        sp = unsafe { sp.add(4 * w) };
+        dp = unsafe { dp.add(4 * w) };
     }
+    unsafe { V::storeu_at(d, t, t0) };
+    unsafe { V::storeu_at(d, t + w, t1) };
+    unsafe { V::storeu_at(d, t + 2 * w, t2) };
+    unsafe { V::storeu_at(d, t + 3 * w, t3) };
+    unsafe { V::storeu(d, head) };
 }
 
 #[inline(always)]
 unsafe fn copy_large_bwd<V: Vector>(d: *mut u8, s: *const u8, n: usize) {
-    unsafe {
-        let w = V::W;
-        let tail = V::loadu(s.add(n - w));
-        let (h0, h1, h2, h3) = (V::loadu(s), V::loadu(s.add(w)), V::loadu(s.add(2 * w)), V::loadu(s.add(3 * w)));
-        let d_end = ((d as usize + n) & !(w - 1)) as *mut u8;
-        let mut sp = s.add(n - (d as usize + n - d_end as usize));
-        let mut dp = d_end;
-        let low = d.add(4 * w);
-        while dp >= low {
-            sp = sp.sub(4 * w);
-            dp = dp.sub(4 * w);
-            let (a, b, c, e) = (V::loadu(sp), V::loadu(sp.add(w)), V::loadu(sp.add(2 * w)), V::loadu(sp.add(3 * w)));
-            V::store(dp, a);
-            V::store(dp.add(w), b);
-            V::store(dp.add(2 * w), c);
-            V::store(dp.add(3 * w), e);
-        }
-        V::storeu(d.add(n - w), tail);
-        V::storeu(d, h0);
-        V::storeu(d.add(w), h1);
-        V::storeu(d.add(2 * w), h2);
-        V::storeu(d.add(3 * w), h3);
+    let w = V::W;
+    let tail = unsafe { V::loadu_at(s, n - w) };
+    let (h0, h1, h2, h3) = (unsafe { V::loadu(s) }, unsafe { V::loadu_at(s, w) }, unsafe { V::loadu_at(s, 2 * w) }, unsafe { V::loadu_at(s, 3 * w) });
+    let d_end = ((d as usize + n) & !(w - 1)) as *mut u8;
+    let mut sp = unsafe { s.add(n - (d as usize + n - d_end as usize)) };
+    let mut dp = d_end;
+    let low = unsafe { d.add(4 * w) };
+    while dp >= low {
+        sp = unsafe { sp.sub(4 * w) };
+        dp = unsafe { dp.sub(4 * w) };
+        let (a, b, c, e) = (unsafe { V::loadu(sp) }, unsafe { V::loadu_at(sp, w) }, unsafe { V::loadu_at(sp, 2 * w) }, unsafe { V::loadu_at(sp, 3 * w) });
+        unsafe { V::store(dp, a) };
+        unsafe { V::store_at(dp, w, b) };
+        unsafe { V::store_at(dp, 2 * w, c) };
+        unsafe { V::store_at(dp, 3 * w, e) };
     }
+    unsafe { V::storeu_at(d, n - w, tail) };
+    unsafe { V::storeu(d, h0) };
+    unsafe { V::storeu_at(d, w, h1) };
+    unsafe { V::storeu_at(d, 2 * w, h2) };
+    unsafe { V::storeu_at(d, 3 * w, h3) };
 }
 
 #[inline(always)]
 pub(crate) unsafe fn memmove_impl<V: Vector>(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
-    unsafe {
-        if n <= 8 * V::W {
-            copy_upto_8w::<V>(d, s, n);
-        } else if (d as usize).wrapping_sub(s as usize) >= n {
-            copy_large_fwd::<V>(d, s, n);
-        } else {
-            copy_large_bwd::<V>(d, s, n);
-        }
-        d
+    if n <= 8 * V::W {
+        unsafe { copy_upto_8w::<V>(d, s, n) };
+    } else if (d as usize).wrapping_sub(s as usize) >= n {
+        unsafe { copy_large_fwd::<V>(d, s, n) };
+    } else {
+        unsafe { copy_large_bwd::<V>(d, s, n) };
     }
+    d
 }
 
 #[inline(always)]
 pub(crate) unsafe fn memcpy_impl<V: Vector>(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
-    unsafe {
-        if n <= 8 * V::W {
-            copy_upto_8w::<V>(d, s, n);
-        } else {
-            copy_large_fwd::<V>(d, s, n);
-        }
-        d
+    if n <= 8 * V::W {
+        unsafe { copy_upto_8w::<V>(d, s, n) };
+    } else {
+        unsafe { copy_large_fwd::<V>(d, s, n) };
     }
+    d
 }
 
 pair!(memmove_sse2, memmove_avx2, memmove_impl, (d: *mut u8, s: *const u8, n: usize) -> *mut u8);
@@ -472,79 +461,79 @@ pub unsafe extern "C" fn memmove(dest: *mut c_void, src: *const c_void, n: usize
 
 #[inline(always)]
 pub(crate) unsafe fn memset_impl<V: Vector>(d: *mut u8, c: c_int, n: usize) -> *mut u8 {
-    unsafe {
-        let c = c as u8;
-        let w = V::W;
-        if n < w {
-            if n < 16 {
-                if n == 0 {
-                    return d;
-                }
-                let p = u64::from(c).wrapping_mul(0x0101_0101_0101_0101);
-                if n >= 8 {
-                    wr(d, p);
-                    wr(d.add(n - 8), p);
-                } else if n >= 4 {
-                    wr(d, p as u32);
-                    wr(d.add(n - 4), p as u32);
-                } else if n >= 2 {
-                    wr(d, p as u16);
-                    wr(d.add(n - 2), p as u16);
-                } else {
-                    *d = c;
-                }
+    let c = c as u8;
+    let w = V::W;
+    if n < w {
+        if n < 16 {
+            if n == 0 {
+                return d;
+            }
+            let p = u64::from(c).wrapping_mul(0x0101_0101_0101_0101);
+            if n >= 8 {
+                unsafe { wr(d, 0, p) };
+                unsafe { wr(d, n - 8, p) };
+            } else if n >= 4 {
+                unsafe { wr(d, 0, p as u32) };
+                unsafe { wr(d, n - 4, p as u32) };
+            } else if n >= 2 {
+                unsafe { wr(d, 0, p as u16) };
+                unsafe { wr(d, n - 2, p as u16) };
             } else {
-                let v = Sse2::splat(c);
-                Sse2::storeu(d, v);
-                Sse2::storeu(d.add(n - 16), v);
+                unsafe { *d = c };
             }
-            return d;
-        }
-        let v = V::splat(c);
-        if n <= 2 * w {
-            V::storeu(d, v);
-            V::storeu(d.add(n - w), v);
-        } else if n <= 4 * w {
-            V::storeu(d, v);
-            V::storeu(d.add(w), v);
-            V::storeu(d.add(n - 2 * w), v);
-            V::storeu(d.add(n - w), v);
-        } else if n <= 8 * w {
-            V::storeu(d, v);
-            V::storeu(d.add(w), v);
-            V::storeu(d.add(2 * w), v);
-            V::storeu(d.add(3 * w), v);
-            V::storeu(d.add(n - 4 * w), v);
-            V::storeu(d.add(n - 3 * w), v);
-            V::storeu(d.add(n - 2 * w), v);
-            V::storeu(d.add(n - w), v);
         } else {
-            let t = n - 4 * w;
-            V::storeu(d, v);
-            let d_al = ((d as usize + w) & !(w - 1)) as *mut u8;
-            let mut dp = d_al;
-            let end = d.add(t);
-            while dp < end {
-                V::store(dp, v);
-                V::store(dp.add(w), v);
-                V::store(dp.add(2 * w), v);
-                V::store(dp.add(3 * w), v);
-                dp = dp.add(4 * w);
-            }
-            for k in 0..4 {
-                V::storeu(d.add(t + k * w), v);
-            }
+            let v = unsafe { Sse2::splat(c) };
+            unsafe { Sse2::storeu(d, v) };
+            unsafe { Sse2::storeu_at(d, n - 16, v) };
         }
-        d
+        return d;
     }
+    let v = unsafe { V::splat(c) };
+    if n <= 2 * w {
+        unsafe { V::storeu(d, v) };
+        unsafe { V::storeu_at(d, n - w, v) };
+    } else if n <= 4 * w {
+        unsafe { V::storeu(d, v) };
+        unsafe { V::storeu_at(d, w, v) };
+        unsafe { V::storeu_at(d, n - 2 * w, v) };
+        unsafe { V::storeu_at(d, n - w, v) };
+    } else if n <= 8 * w {
+        unsafe { V::storeu(d, v) };
+        unsafe { V::storeu_at(d, w, v) };
+        unsafe { V::storeu_at(d, 2 * w, v) };
+        unsafe { V::storeu_at(d, 3 * w, v) };
+        unsafe { V::storeu_at(d, n - 4 * w, v) };
+        unsafe { V::storeu_at(d, n - 3 * w, v) };
+        unsafe { V::storeu_at(d, n - 2 * w, v) };
+        unsafe { V::storeu_at(d, n - w, v) };
+    } else {
+        let t = n - 4 * w;
+        unsafe { V::storeu(d, v) };
+        let d_al = ((d as usize + w) & !(w - 1)) as *mut u8;
+        let mut dp = d_al;
+        let end = unsafe { d.add(t) };
+        while dp < end {
+            unsafe { V::store(dp, v) };
+            unsafe { V::store_at(dp, w, v) };
+            unsafe { V::store_at(dp, 2 * w, v) };
+            unsafe { V::store_at(dp, 3 * w, v) };
+            dp = unsafe { dp.add(4 * w) };
+        }
+        for k in 0..4 {
+            unsafe { V::storeu_at(d, t + k * w, v) };
+        }
+    }
+    d
 }
 
 pair!(memset_sse2, memset_avx2, memset_impl, (d: *mut u8, c: c_int, n: usize) -> *mut u8);
 
 pub(crate) unsafe extern "C" fn memcpy_large(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
-    unsafe {
-        let apart = (d as usize).wrapping_sub(s as usize) >= n && (s as usize).wrapping_sub(d as usize) >= n;
-        if apart { copy_streaming(d, s, n) } else { memmove_avx2(d, s, n) }
+    let apart = (d as usize).wrapping_sub(s as usize) >= n && (s as usize).wrapping_sub(d as usize) >= n;
+    if apart {
+        unsafe { copy_streaming(d, s, n) }
+    } else {
+        unsafe { memmove_avx2(d, s, n) }
     }
 }
 
@@ -553,100 +542,91 @@ pub(crate) unsafe fn copy_streaming(d: *mut u8, s: *const u8, n: usize) -> *mut 
     use core::arch::x86_64::*;
     const BLOCK: usize = 4 * 4096;
     const STREAM_MIN: usize = 2 * BLOCK + 256;
-    unsafe {
-        if n < STREAM_MIN {
-            return memmove_avx2(d, s, n);
-        }
-        let dp = ((d as usize + 63) & !63) as *mut u8;
-        let head = dp as usize - d as usize;
-        let blocks = (n - head) / BLOCK;
-        let off = (s as usize).wrapping_sub(d as usize);
-        let mut p = dp;
-        let end = dp.add(blocks * BLOCK);
-        while p < end {
-            let mut i = 0;
-            while i < 4096 {
-                let q = p.add(i);
-                for pg in 0..4 {
-                    let sp = q.add(pg * 4096).wrapping_add(off) as *const u8;
-                    let dq = q.add(pg * 4096);
-                    let a = _mm256_loadu_si256(sp.cast());
-                    let b = _mm256_loadu_si256(sp.add(32).cast());
-                    let c = _mm256_loadu_si256(sp.add(64).cast());
-                    let e = _mm256_loadu_si256(sp.add(96).cast());
-                    _mm256_stream_si256(dq.cast(), a);
-                    _mm256_stream_si256(dq.add(32).cast(), b);
-                    _mm256_stream_si256(dq.add(64).cast(), c);
-                    _mm256_stream_si256(dq.add(96).cast(), e);
-                }
-                i += 128;
-            }
-            p = p.add(BLOCK);
-        }
-        _mm_sfence();
-        if head != 0 {
-            memmove_avx2(d, s, head);
-        }
-        let done = head + blocks * BLOCK;
-        memmove_avx2(d.add(done), s.add(done), n - done);
-        d
+    if n < STREAM_MIN {
+        return unsafe { memmove_avx2(d, s, n) };
     }
+    let dp = ((d as usize + 63) & !63) as *mut u8;
+    let head = dp as usize - d as usize;
+    let blocks = (n - head) / BLOCK;
+    let off = (s as usize).wrapping_sub(d as usize);
+    let mut p = dp;
+    let end = unsafe { dp.add(blocks * BLOCK) };
+    while p < end {
+        let mut i = 0;
+        while i < 4096 {
+            for pg in 0..4 {
+                let dq = p.wrapping_add(i + pg * 4096);
+                let sp = dq.wrapping_add(off) as *const u8;
+                let a = unsafe { _mm256_loadu_si256(sp.cast()) };
+                let b = unsafe { _mm256_loadu_si256(sp.wrapping_add(32).cast()) };
+                let c = unsafe { _mm256_loadu_si256(sp.wrapping_add(64).cast()) };
+                let e = unsafe { _mm256_loadu_si256(sp.wrapping_add(96).cast()) };
+                unsafe { _mm256_stream_si256(dq.cast(), a) };
+                unsafe { _mm256_stream_si256(dq.wrapping_add(32).cast(), b) };
+                unsafe { _mm256_stream_si256(dq.wrapping_add(64).cast(), c) };
+                unsafe { _mm256_stream_si256(dq.wrapping_add(96).cast(), e) };
+            }
+            i += 128;
+        }
+        p = p.wrapping_add(BLOCK);
+    }
+    _mm_sfence();
+    if head != 0 {
+        unsafe { memmove_avx2(d, s, head) };
+    }
+    let done = head + blocks * BLOCK;
+    unsafe { memmove_avx2(d.wrapping_add(done), s.wrapping_add(done), n - done) };
+    d
 }
 
 pub(crate) unsafe extern "C" fn memset_large(d: *mut u8, c: c_int, n: usize) -> *mut u8 {
-    unsafe {
-        if n >= simd::NT_SET_FROM.load(core::sync::atomic::Ordering::Relaxed) {
-            set_streaming(d, c as u8, n)
-        } else {
-            set_zmm(d, c as u8, n)
-        }
+    if n >= simd::NT_SET_FROM.load(core::sync::atomic::Ordering::Relaxed) {
+        unsafe { set_streaming(d, c as u8, n) }
+    } else {
+        unsafe { set_zmm(d, c as u8, n) }
     }
 }
 
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn set_streaming(d: *mut u8, c: u8, n: usize) -> *mut u8 {
     use core::arch::x86_64::*;
-    unsafe {
-        let v = _mm256_set1_epi8(c as i8);
-        _mm256_storeu_si256(d.cast(), v);
-        _mm256_storeu_si256(d.add(32).cast(), v);
-        let mut dp = ((d as usize + 64) & !63) as *mut u8;
-        let end = d.add(n - 128);
-        while dp < end {
-            _mm256_stream_si256(dp.cast(), v);
-            _mm256_stream_si256(dp.add(32).cast(), v);
-            _mm256_stream_si256(dp.add(64).cast(), v);
-            _mm256_stream_si256(dp.add(96).cast(), v);
-            dp = dp.add(128);
-        }
-        _mm_sfence();
-        for k in 0..4 {
-            _mm256_storeu_si256(d.add(n - 128 + 32 * k).cast(), v);
-        }
-        d
+    let v = _mm256_set1_epi8(c as i8);
+    unsafe { _mm256_storeu_si256(d.cast(), v) };
+    unsafe { _mm256_storeu_si256(d.wrapping_add(32).cast(), v) };
+    let mut dp = ((d as usize + 64) & !63) as *mut u8;
+    let end = d.wrapping_add(n - 128);
+    while dp < end {
+        unsafe { _mm256_stream_si256(dp.cast(), v) };
+        unsafe { _mm256_stream_si256(dp.wrapping_add(32).cast(), v) };
+        unsafe { _mm256_stream_si256(dp.wrapping_add(64).cast(), v) };
+        unsafe { _mm256_stream_si256(dp.wrapping_add(96).cast(), v) };
+        dp = dp.wrapping_add(128);
     }
+    _mm_sfence();
+    for k in 0..4 {
+        unsafe { _mm256_storeu_si256(d.wrapping_add(n - 128 + 32 * k).cast(), v) };
+    }
+    d
 }
 
 #[target_feature(enable = "avx512f,avx512bw")]
 pub(crate) unsafe fn set_zmm(d: *mut u8, c: u8, n: usize) -> *mut u8 {
     use core::arch::x86_64::*;
-    unsafe {
-        let v = _mm512_set1_epi8(c as i8);
-        _mm512_storeu_si512(d.cast(), v);
-        let mut dp = ((d as usize + 64) & !63) as *mut u8;
-        let end = d.add(n - 256);
-        while dp < end {
-            _mm512_store_si512(dp.cast(), v);
-            _mm512_store_si512(dp.add(64).cast(), v);
-            _mm512_store_si512(dp.add(128).cast(), v);
-            _mm512_store_si512(dp.add(192).cast(), v);
-            dp = dp.add(256);
-        }
-        for k in 0..4 {
-            _mm512_storeu_si512(d.add(n - 256 + 64 * k).cast(), v);
-        }
-        d
+    let v = _mm512_set1_epi8(c as i8);
+    unsafe { _mm512_storeu_si512(d.cast(), v) };
+    let mut dp = ((d as usize + 64) & !63) as *mut u8;
+    let end = d.wrapping_add(n - 256);
+    while dp < end {
+        unsafe { _mm512_store_si512(dp.cast(), v) };
+        unsafe { _mm512_store_si512(dp.wrapping_add(64).cast(), v) };
+        unsafe { _mm512_store_si512(dp.wrapping_add(128).cast(), v) };
+        unsafe { _mm512_store_si512(dp.wrapping_add(192).cast(), v) };
+        dp = dp.wrapping_add(256);
     }
+    for k in 0..4 {
+        unsafe { _mm512_storeu_si512(d.wrapping_add(n - 256 + 64 * k).cast(), v) };
+    }
+    d
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -778,93 +758,100 @@ macro_rules! memcmp_block {
 #[inline(always)]
 unsafe fn diff_at(a: *const u8, b: *const u8, neq: u32) -> c_int {
     let i = neq.trailing_zeros() as usize;
-    unsafe { c_int::from(*a.add(i)) - c_int::from(*b.add(i)) }
+    let x: u8 = unsafe { rd(a, i) };
+    let y: u8 = unsafe { rd(b, i) };
+    c_int::from(x) - c_int::from(y)
 }
 
 #[inline(always)]
 pub(crate) unsafe fn memcmp_impl<V: Vector>(a: *const u8, b: *const u8, n: usize) -> c_int {
-    unsafe {
-        let w = V::W;
-        if n == 0 {
-            return 0;
-        }
-        if n <= w {
-            let neq = if same_page(a, w) && same_page(b, w) {
-                let e = V::mask(V::eq(V::loadu(a), V::loadu(b)));
-                !e & low_bits(n)
-            } else if (a as usize & (PAGE - 1)) >= w - n && (b as usize & (PAGE - 1)) >= w - n {
-                let e = V::mask(V::eq(V::loadu(a.wrapping_sub(w - n)), V::loadu(b.wrapping_sub(w - n))));
-                (!e & full::<V>()) >> (w - n)
-            } else {
-                let mut i = 0;
-                while i < n && *a.add(i) == *b.add(i) {
-                    i += 1;
-                }
-                return if i == n { 0 } else { c_int::from(*a.add(i)) - c_int::from(*b.add(i)) };
-            };
-            return if neq == 0 { 0 } else { diff_at(a, b, neq) };
-        }
-        if n <= 4 * w {
-            let neq = !V::mask(V::eq(V::loadu(a), V::loadu(b))) & full::<V>();
-            if neq != 0 {
-                return diff_at(a, b, neq);
-            }
-            if n <= 2 * w {
-                let (pa, pb) = (a.add(n - w), b.add(n - w));
-                let neq = !V::mask(V::eq(V::loadu(pa), V::loadu(pb))) & full::<V>();
-                return if neq != 0 { diff_at(pa, pb, neq) } else { 0 };
-            }
-            let (p1a, p1b) = (a.add(w), b.add(w));
-            let (p2a, p2b) = (a.add(n - 2 * w), b.add(n - 2 * w));
-            let (p3a, p3b) = (a.add(n - w), b.add(n - w));
-            let x1 = V::eq(V::loadu(p1a), V::loadu(p1b));
-            let x2 = V::eq(V::loadu(p2a), V::loadu(p2b));
-            let x3 = V::eq(V::loadu(p3a), V::loadu(p3b));
-            if V::mask(V::and(x1, V::and(x2, x3))) == full::<V>() {
-                return 0;
-            }
-            for (pa, pb, x) in [(p1a, p1b, x1), (p2a, p2b, x2), (p3a, p3b, x3)] {
-                let neq = !V::mask(x) & full::<V>();
-                if neq != 0 {
-                    return diff_at(pa, pb, neq);
-                }
-            }
-            return 0;
-        }
-        let mut i = 0;
-        while i + 4 * w <= n {
-            let r = cmp_block::<V>(a.add(i), b.add(i));
-            if r != 0 {
-                return r;
-            }
-            i += 4 * w;
-        }
-        if i < n {
-            return cmp_block::<V>(a.add(n - 4 * w), b.add(n - 4 * w));
-        }
-        0
+    let w = V::W;
+    if n == 0 {
+        return 0;
     }
+    if n <= w {
+        let neq = if same_page(a, w) && same_page(b, w) {
+            let va = unsafe { V::loadu(a) };
+            let vb = unsafe { V::loadu(b) };
+            !V::mask(V::eq(va, vb)) & low_bits(n)
+        } else if (a as usize & (PAGE - 1)) >= w - n && (b as usize & (PAGE - 1)) >= w - n {
+            let va = unsafe { V::loadu(a.wrapping_sub(w - n)) };
+            let vb = unsafe { V::loadu(b.wrapping_sub(w - n)) };
+            (!V::mask(V::eq(va, vb)) & full::<V>()) >> (w - n)
+        } else {
+            let mut i = 0;
+            while i < n && unsafe { rd::<u8>(a, i) } == unsafe { rd::<u8>(b, i) } {
+                i += 1;
+            }
+            return if i == n { 0 } else { c_int::from(unsafe { rd::<u8>(a, i) }) - c_int::from(unsafe { rd::<u8>(b, i) }) };
+        };
+        return if neq == 0 { 0 } else { unsafe { diff_at(a, b, neq) } };
+    }
+    if n <= 4 * w {
+        let neq = !V::mask(V::eq(unsafe { V::loadu(a) }, unsafe { V::loadu(b) })) & full::<V>();
+        if neq != 0 {
+            return unsafe { diff_at(a, b, neq) };
+        }
+        if n <= 2 * w {
+            let (pa, pb) = (a.wrapping_add(n - w), b.wrapping_add(n - w));
+            let neq = !V::mask(V::eq(unsafe { V::loadu(pa) }, unsafe { V::loadu(pb) })) & full::<V>();
+            return if neq != 0 { unsafe { diff_at(pa, pb, neq) } } else { 0 };
+        }
+        let (p1a, p1b) = (a.wrapping_add(w), b.wrapping_add(w));
+        let (p2a, p2b) = (a.wrapping_add(n - 2 * w), b.wrapping_add(n - 2 * w));
+        let (p3a, p3b) = (a.wrapping_add(n - w), b.wrapping_add(n - w));
+        let a1 = unsafe { V::loadu(p1a) };
+        let x1 = V::eq(a1, unsafe { V::loadu(p1b) });
+        let a2 = unsafe { V::loadu(p2a) };
+        let x2 = V::eq(a2, unsafe { V::loadu(p2b) });
+        let a3 = unsafe { V::loadu(p3a) };
+        let x3 = V::eq(a3, unsafe { V::loadu(p3b) });
+        if V::mask(V::and(x1, V::and(x2, x3))) == full::<V>() {
+            return 0;
+        }
+        for (pa, pb, x) in [(p1a, p1b, x1), (p2a, p2b, x2), (p3a, p3b, x3)] {
+            let neq = !V::mask(x) & full::<V>();
+            if neq != 0 {
+                return unsafe { diff_at(pa, pb, neq) };
+            }
+        }
+        return 0;
+    }
+    let mut i = 0;
+    while i + 4 * w <= n {
+        let r = unsafe { cmp_block::<V>(a.wrapping_add(i), b.wrapping_add(i)) };
+        if r != 0 {
+            return r;
+        }
+        i += 4 * w;
+    }
+    if i < n {
+        return unsafe { cmp_block::<V>(a.wrapping_add(n - 4 * w), b.wrapping_add(n - 4 * w)) };
+    }
+    0
 }
 
 #[inline(always)]
 unsafe fn cmp_block<V: Vector>(pa: *const u8, pb: *const u8) -> c_int {
-    unsafe {
-        let w = V::W;
-        let x0 = V::eq(V::loadu(pa), V::loadu(pb));
-        let x1 = V::eq(V::loadu(pa.add(w)), V::loadu(pb.add(w)));
-        let x2 = V::eq(V::loadu(pa.add(2 * w)), V::loadu(pb.add(2 * w)));
-        let x3 = V::eq(V::loadu(pa.add(3 * w)), V::loadu(pb.add(3 * w)));
-        if V::mask(V::and(V::and(x0, x1), V::and(x2, x3))) == full::<V>() {
-            return 0;
-        }
-        for (k, x) in [x0, x1, x2, x3].into_iter().enumerate() {
-            let neq = !V::mask(x) & full::<V>();
-            if neq != 0 {
-                return diff_at(pa.add(k * w), pb.add(k * w), neq);
-            }
-        }
-        0
+    let w = V::W;
+    let a0 = unsafe { V::loadu(pa) };
+    let x0 = V::eq(a0, unsafe { V::loadu(pb) });
+    let a1 = unsafe { V::loadu_at(pa, w) };
+    let x1 = V::eq(a1, unsafe { V::loadu_at(pb, w) });
+    let a2 = unsafe { V::loadu_at(pa, 2 * w) };
+    let x2 = V::eq(a2, unsafe { V::loadu_at(pb, 2 * w) });
+    let a3 = unsafe { V::loadu_at(pa, 3 * w) };
+    let x3 = V::eq(a3, unsafe { V::loadu_at(pb, 3 * w) });
+    if V::mask(V::and(V::and(x0, x1), V::and(x2, x3))) == full::<V>() {
+        return 0;
     }
+    for (k, x) in [x0, x1, x2, x3].into_iter().enumerate() {
+        let neq = !V::mask(x) & full::<V>();
+        if neq != 0 {
+            return unsafe { diff_at(pa.wrapping_add(k * w), pb.wrapping_add(k * w), neq) };
+        }
+    }
+    0
 }
 
 pair!(memcmp_sse2, memcmp_avx2, memcmp_impl, (a: *const u8, b: *const u8, n: usize) -> c_int);
@@ -1152,13 +1139,13 @@ pub unsafe extern "C" fn bcmp(a: *const c_void, b: *const c_void, n: usize) -> c
 
 #[inline(always)]
 unsafe fn small_eq_mask<V: Vector>(s: *const u8, vc: V, n: usize) -> u32 {
-    unsafe {
-        let w = V::W;
-        if same_page(s, w) {
-            V::mask(V::eq(V::loadu(s), vc)) & low_bits(n)
-        } else {
-            V::mask(V::eq(V::loadu(s.wrapping_sub(w - n)), vc)) >> (w - n)
-        }
+    let w = V::W;
+    if same_page(s, w) {
+        let v = unsafe { V::loadu(s) };
+        V::mask(V::eq(v, vc)) & low_bits(n)
+    } else {
+        let v = unsafe { V::loadu(s.wrapping_sub(w - n)) };
+        V::mask(V::eq(v, vc)) >> (w - n)
     }
 }
 
@@ -1179,65 +1166,70 @@ macro_rules! memchr_block {
 
 #[inline(always)]
 pub(crate) unsafe fn memchr_impl<V: Vector>(s: *const u8, c: c_int, n: usize) -> *const u8 {
-    unsafe {
-        if n == 0 {
-            return core::ptr::null();
-        }
-        let n = n.min(usize::MAX - s as usize);
-        let end = s as usize + n;
-        let w = V::W;
-        let vc = V::splat(c as u8);
-        let base = s as usize & !(w - 1);
-        let off = s as usize - base;
-        let m = V::mask(V::eq(V::load(base as *const u8), vc)) >> off;
-        if m != 0 {
-            let p = s as usize + m.trailing_zeros() as usize;
-            return if p < end { p as *const u8 } else { core::ptr::null() };
-        }
-        let mut p = base + w;
-        while p < end && p & (4 * w - 1) != 0 {
-            let m = V::mask(V::eq(V::load(p as *const u8), vc));
-            if m != 0 {
-                let q = p + m.trailing_zeros() as usize;
-                return if q < end { q as *const u8 } else { core::ptr::null() };
-            }
-            p += w;
-        }
-        while end - p.min(end) >= 4 * w {
-            if let Some(r) = find_block_fwd::<V>(p as *const u8, vc, true) {
-                return r;
-            }
-            p += 4 * w;
-        }
-        while p < end {
-            let m = V::mask(V::eq(V::load(p as *const u8), vc));
-            if m != 0 {
-                let q = p + m.trailing_zeros() as usize;
-                return if q < end { q as *const u8 } else { core::ptr::null() };
-            }
-            p += w;
-        }
-        core::ptr::null()
+    if n == 0 {
+        return core::ptr::null();
     }
+    let n = n.min(usize::MAX - s as usize);
+    let end = s as usize + n;
+    let w = V::W;
+    let vc = unsafe { V::splat(c as u8) };
+    let base = s as usize & !(w - 1);
+    let off = s as usize - base;
+    let v = unsafe { V::load(base as *const u8) };
+    let m = V::mask(V::eq(v, vc)) >> off;
+    if m != 0 {
+        let p = s as usize + m.trailing_zeros() as usize;
+        return if p < end { p as *const u8 } else { core::ptr::null() };
+    }
+    let mut p = base + w;
+    while p < end && p & (4 * w - 1) != 0 {
+        let v = unsafe { V::load(p as *const u8) };
+        let m = V::mask(V::eq(v, vc));
+        if m != 0 {
+            let q = p + m.trailing_zeros() as usize;
+            return if q < end { q as *const u8 } else { core::ptr::null() };
+        }
+        p += w;
+    }
+    while end - p.min(end) >= 4 * w {
+        if let Some(r) = unsafe { find_block_fwd::<V, true>(p as *const u8, vc) } {
+            return r;
+        }
+        p += 4 * w;
+    }
+    while p < end {
+        let v = unsafe { V::load(p as *const u8) };
+        let m = V::mask(V::eq(v, vc));
+        if m != 0 {
+            let q = p + m.trailing_zeros() as usize;
+            return if q < end { q as *const u8 } else { core::ptr::null() };
+        }
+        p += w;
+    }
+    core::ptr::null()
 }
 
 #[inline(always)]
-unsafe fn find_block_fwd<V: Vector>(p: *const u8, vc: V, aligned: bool) -> Option<*const u8> {
-    unsafe {
-        let w = V::W;
-        let ld = |q: *const u8| if aligned { V::load(q) } else { V::loadu(q) };
-        let (e0, e1, e2, e3) = (V::eq(ld(p), vc), V::eq(ld(p.add(w)), vc), V::eq(ld(p.add(2 * w)), vc), V::eq(ld(p.add(3 * w)), vc));
-        if V::mask(V::or(V::or(e0, e1), V::or(e2, e3))) == 0 {
-            return None;
+unsafe fn find_block_fwd<V: Vector, const ALIGNED: bool>(p: *const u8, vc: V) -> Option<*const u8> {
+    let w = V::W;
+    let ld = |q: *const u8| {
+        if ALIGNED {
+            unsafe { V::load(q) }
+        } else {
+            unsafe { V::loadu(q) }
         }
-        for (k, e) in [e0, e1, e2, e3].into_iter().enumerate() {
-            let m = V::mask(e);
-            if m != 0 {
-                return Some(p.add(k * w + m.trailing_zeros() as usize));
-            }
-        }
-        None
+    };
+    let (e0, e1, e2, e3) = (V::eq(ld(p), vc), V::eq(ld(p.wrapping_add(w)), vc), V::eq(ld(p.wrapping_add(2 * w)), vc), V::eq(ld(p.wrapping_add(3 * w)), vc));
+    if V::mask(V::or(V::or(e0, e1), V::or(e2, e3))) == 0 {
+        return None;
     }
+    for (k, e) in [e0, e1, e2, e3].into_iter().enumerate() {
+        let m = V::mask(e);
+        if m != 0 {
+            return Some(p.wrapping_add(k * w + m.trailing_zeros() as usize));
+        }
+    }
+    None
 }
 
 pair!(memchr_sse2, memchr_avx2, memchr_impl, (s: *const u8, c: c_int, n: usize) -> *const u8);
@@ -1502,76 +1494,78 @@ pub unsafe extern "C" fn memchr(s: *const c_void, c: c_int, n: usize) -> *mut c_
 
 #[inline(always)]
 unsafe fn memrchr_impl<V: Vector>(s: *const u8, c: c_int, n: usize) -> *const u8 {
-    unsafe {
-        let c = c as u8;
-        let w = V::W;
-        if n == 0 {
-            return core::ptr::null();
-        }
-        let vc = V::splat(c);
-        if n <= w {
-            let m = small_eq_mask::<V>(s, vc, n);
-            return if m != 0 { s.add(31 - m.leading_zeros() as usize) } else { core::ptr::null() };
-        }
-        let end = s.add(n);
-        let q = end.sub(w);
-        let e3 = V::eq(V::loadu(q), vc);
-        if n <= 2 * w {
-            let e0 = V::eq(V::loadu(s), vc);
-            if V::mask(V::or(e0, e3)) == 0 {
-                return core::ptr::null();
-            }
-            let m = V::mask(e3);
-            if m != 0 {
-                return q.add(31 - m.leading_zeros() as usize);
-            }
-            return s.add(31 - V::mask(e0).leading_zeros() as usize);
-        }
-        if n <= 4 * w {
-            let (e2, e1, e0) = (V::eq(V::loadu(end.sub(2 * w)), vc), V::eq(V::loadu(s.add(w)), vc), V::eq(V::loadu(s), vc));
-            if V::mask(V::or(V::or(e0, e1), V::or(e2, e3))) == 0 {
-                return core::ptr::null();
-            }
-            for (r, e) in [(q, e3), (end.sub(2 * w), e2), (s.add(w), e1), (s, e0)] {
-                let m = V::mask(e);
-                if m != 0 {
-                    return r.add(31 - m.leading_zeros() as usize);
-                }
-            }
+    let c = c as u8;
+    let w = V::W;
+    if n == 0 {
+        return core::ptr::null();
+    }
+    let vc = unsafe { V::splat(c) };
+    if n <= w {
+        let m = unsafe { small_eq_mask::<V>(s, vc, n) };
+        return if m != 0 { s.wrapping_add(31 - m.leading_zeros() as usize) } else { core::ptr::null() };
+    }
+    let end = s.wrapping_add(n);
+    let q = end.wrapping_sub(w);
+    let e3 = V::eq(unsafe { V::loadu(q) }, vc);
+    if n <= 2 * w {
+        let e0 = V::eq(unsafe { V::loadu(s) }, vc);
+        if V::mask(V::or(e0, e3)) == 0 {
             return core::ptr::null();
         }
         let m = V::mask(e3);
         if m != 0 {
-            return q.add(31 - m.leading_zeros() as usize);
+            return q.wrapping_add(31 - m.leading_zeros() as usize);
         }
-        let mut p = (q as usize & !(w - 1)) as *const u8;
-        while p >= s.wrapping_add(3 * w) {
-            if let Some(r) = find_block_bwd::<V>(p.wrapping_sub(3 * w), vc, true) {
-                return r;
-            }
-            p = p.wrapping_sub(4 * w);
-        }
-        find_block_bwd::<V>(s, vc, false).unwrap_or(core::ptr::null())
+        return s.wrapping_add(31 - V::mask(e0).leading_zeros() as usize);
     }
+    if n <= 4 * w {
+        let (e2, e1, e0) = (V::eq(unsafe { V::loadu_at(s, n - 2 * w) }, vc), V::eq(unsafe { V::loadu_at(s, w) }, vc), V::eq(unsafe { V::loadu(s) }, vc));
+        if V::mask(V::or(V::or(e0, e1), V::or(e2, e3))) == 0 {
+            return core::ptr::null();
+        }
+        for (r, e) in [(q, e3), (end.wrapping_sub(2 * w), e2), (s.wrapping_add(w), e1), (s, e0)] {
+            let m = V::mask(e);
+            if m != 0 {
+                return r.wrapping_add(31 - m.leading_zeros() as usize);
+            }
+        }
+        return core::ptr::null();
+    }
+    let m = V::mask(e3);
+    if m != 0 {
+        return q.wrapping_add(31 - m.leading_zeros() as usize);
+    }
+    let mut p = (q as usize & !(w - 1)) as *const u8;
+    while p >= s.wrapping_add(3 * w) {
+        if let Some(r) = unsafe { find_block_bwd::<V, true>(p.wrapping_sub(3 * w), vc) } {
+            return r;
+        }
+        p = p.wrapping_sub(4 * w);
+    }
+    unsafe { find_block_bwd::<V, false>(s, vc) }.unwrap_or(core::ptr::null())
 }
 
 #[inline(always)]
-unsafe fn find_block_bwd<V: Vector>(p: *const u8, vc: V, aligned: bool) -> Option<*const u8> {
-    unsafe {
-        let w = V::W;
-        let ld = |q: *const u8| if aligned { V::load(q) } else { V::loadu(q) };
-        let (e0, e1, e2, e3) = (V::eq(ld(p), vc), V::eq(ld(p.add(w)), vc), V::eq(ld(p.add(2 * w)), vc), V::eq(ld(p.add(3 * w)), vc));
-        if V::mask(V::or(V::or(e0, e1), V::or(e2, e3))) == 0 {
-            return None;
+unsafe fn find_block_bwd<V: Vector, const ALIGNED: bool>(p: *const u8, vc: V) -> Option<*const u8> {
+    let w = V::W;
+    let ld = |q: *const u8| {
+        if ALIGNED {
+            unsafe { V::load(q) }
+        } else {
+            unsafe { V::loadu(q) }
         }
-        for (k, e) in [e3, e2, e1, e0].into_iter().enumerate() {
-            let m = V::mask(e);
-            if m != 0 {
-                return Some(p.add((3 - k) * w + 31 - m.leading_zeros() as usize));
-            }
-        }
-        None
+    };
+    let (e0, e1, e2, e3) = (V::eq(ld(p), vc), V::eq(ld(p.wrapping_add(w)), vc), V::eq(ld(p.wrapping_add(2 * w)), vc), V::eq(ld(p.wrapping_add(3 * w)), vc));
+    if V::mask(V::or(V::or(e0, e1), V::or(e2, e3))) == 0 {
+        return None;
     }
+    for (k, e) in [e3, e2, e1, e0].into_iter().enumerate() {
+        let m = V::mask(e);
+        if m != 0 {
+            return Some(p.wrapping_add((3 - k) * w + 31 - m.leading_zeros() as usize));
+        }
+    }
+    None
 }
 
 pair!(memrchr_sse2, memrchr_avx2, memrchr_impl, (s: *const u8, c: c_int, n: usize) -> *const u8);
@@ -1805,36 +1799,36 @@ pub unsafe extern "C" fn memrchr(s: *const c_void, c: c_int, n: usize) -> *mut c
 
 #[inline(always)]
 unsafe fn rawmemchr_impl<V: Vector>(s: *const u8, c: c_int) -> *const u8 {
-    unsafe {
-        let c = c as u8;
-        let w = V::W;
-        let vc = V::splat(c);
-        let base = (s as usize & !(w - 1)) as *const u8;
-        let skip = s as usize - base as usize;
-        let m = V::mask(V::eq(V::load(base), vc)) >> skip;
-        if m != 0 {
-            return s.add(m.trailing_zeros() as usize);
-        }
-        let mut p = base.add(w);
-        loop {
-            if (p as usize & (PAGE - 1)) <= PAGE - 4 * w {
-                let (e0, e1, e2, e3) = (V::eq(V::load(p), vc), V::eq(V::load(p.add(w)), vc), V::eq(V::load(p.add(2 * w)), vc), V::eq(V::load(p.add(3 * w)), vc));
-                if V::mask(V::or(V::or(e0, e1), V::or(e2, e3))) != 0 {
-                    for (k, e) in [e0, e1, e2, e3].into_iter().enumerate() {
-                        let m = V::mask(e);
-                        if m != 0 {
-                            return p.add(k * w + m.trailing_zeros() as usize);
-                        }
+    let c = c as u8;
+    let w = V::W;
+    let vc = unsafe { V::splat(c) };
+    let base = (s as usize & !(w - 1)) as *const u8;
+    let skip = s as usize - base as usize;
+    let v = unsafe { V::load(base) };
+    let m = V::mask(V::eq(v, vc)) >> skip;
+    if m != 0 {
+        return s.wrapping_add(m.trailing_zeros() as usize);
+    }
+    let mut p = base.wrapping_add(w);
+    loop {
+        if (p as usize & (PAGE - 1)) <= PAGE - 4 * w {
+            let (e0, e1, e2, e3) = (V::eq(unsafe { V::load(p) }, vc), V::eq(unsafe { V::load_at(p, w) }, vc), V::eq(unsafe { V::load_at(p, 2 * w) }, vc), V::eq(unsafe { V::load_at(p, 3 * w) }, vc));
+            if V::mask(V::or(V::or(e0, e1), V::or(e2, e3))) != 0 {
+                for (k, e) in [e0, e1, e2, e3].into_iter().enumerate() {
+                    let m = V::mask(e);
+                    if m != 0 {
+                        return p.wrapping_add(k * w + m.trailing_zeros() as usize);
                     }
                 }
-                p = p.add(4 * w);
-            } else {
-                let m = V::mask(V::eq(V::load(p), vc));
-                if m != 0 {
-                    return p.add(m.trailing_zeros() as usize);
-                }
-                p = p.add(w);
             }
+            p = p.wrapping_add(4 * w);
+        } else {
+            let v = unsafe { V::load(p) };
+            let m = V::mask(V::eq(v, vc));
+            if m != 0 {
+                return p.wrapping_add(m.trailing_zeros() as usize);
+            }
+            p = p.wrapping_add(w);
         }
     }
 }
@@ -1849,16 +1843,14 @@ pub unsafe extern "C" fn rawmemchr(s: *const c_void, c: c_int) -> *mut c_void {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn memccpy(dest: *mut c_void, src: *const c_void, c: c_int, n: usize) -> *mut c_void {
-    unsafe {
-        let p = memchr(src, c, n);
-        if p.is_null() {
-            memcpy(dest, src, n);
-            null_mut()
-        } else {
-            let len = p as usize - src as usize + 1;
-            memcpy(dest, src, len);
-            dest.cast::<u8>().add(len).cast()
-        }
+    let p = unsafe { memchr(src, c, n) };
+    if p.is_null() {
+        unsafe { memcpy(dest, src, n) };
+        null_mut()
+    } else {
+        let len = p as usize - src as usize + 1;
+        unsafe { memcpy(dest, src, len) };
+        dest.cast::<u8>().wrapping_add(len).cast()
     }
 }
 
@@ -1881,10 +1873,8 @@ pub unsafe extern "C" fn mempcpy(dest: *mut c_void, src: *const c_void, n: usize
 }
 
 unsafe extern "C" fn mempcpy_slow(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
-    unsafe {
-        memcpy(dest, src, n);
-        dest.cast::<u8>().add(n).cast()
-    }
+    unsafe { memcpy(dest, src, n) };
+    dest.cast::<u8>().wrapping_add(n).cast()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -1899,18 +1889,19 @@ pub unsafe extern "C" fn bzero(s: *mut c_void, n: usize) {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn explicit_bzero(s: *mut c_void, n: usize) {
-    unsafe {
-        memset(s, 0, n);
-        asm!("/* {0} */", in(reg) s, options(nostack, preserves_flags));
-    }
+    unsafe { memset(s, 0, n) };
+    keep_stores(s);
+}
+
+#[inline(always)]
+fn keep_stores(s: *mut c_void) {
+    unsafe { asm!("/* {0} */", in(reg) s, options(nostack, preserves_flags)) };
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn memset_explicit(s: *mut c_void, c: c_int, n: usize) -> *mut c_void {
-    unsafe {
-        memset(s, c, n);
-        asm!("/* {0} */", in(reg) s, options(nostack, preserves_flags));
-    }
+    unsafe { memset(s, c, n) };
+    keep_stores(s);
     s
 }
 
@@ -1919,27 +1910,23 @@ pub unsafe extern "C" fn swab(src: *const c_void, dest: *mut c_void, n: isize) {
     if n <= 0 {
         return;
     }
-    let s = src.cast::<u8>();
-    let d = dest.cast::<u8>();
-    let mut i = 0usize;
     let n = n as usize;
-    while i + 1 < n {
-        unsafe {
-            let (a, b) = (s.add(i).read(), s.add(i + 1).read());
-            d.add(i).write(b);
-            d.add(i + 1).write(a);
-        }
-        i += 2;
+    let (s, d) = (src as usize, dest as usize);
+    if s.abs_diff(d) >= n {
+        let from = unsafe { core::slice::from_raw_parts(src.cast::<u8>(), n) };
+        let to = unsafe { core::slice::from_raw_parts_mut(dest.cast::<u8>(), n) };
+        crate::slices::swab_bytes(from, to);
+    } else {
+        let lo = s.min(d);
+        let all = unsafe { core::slice::from_raw_parts_mut(lo as *mut u8, s.abs_diff(d) + n) };
+        crate::slices::swab_overlapping(all, s - lo, d - lo, n);
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn memfrob(s: *mut c_void, n: usize) -> *mut c_void {
-    let p = s.cast::<u8>();
-    let mut i = 0;
-    while i < n {
-        unsafe { p.add(i).write(p.add(i).read() ^ 42) };
-        i += 1;
+    if n != 0 {
+        crate::slices::memfrob_bytes(unsafe { core::slice::from_raw_parts_mut(s.cast::<u8>(), n) });
     }
     s
 }

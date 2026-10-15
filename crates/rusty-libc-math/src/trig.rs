@@ -3,13 +3,13 @@
 pub(crate) mod dd;
 pub(crate) mod direct;
 pub(crate) mod fast;
-mod finv;
-mod fhyp;
-mod fsc;
+pub(crate) mod finv;
+pub(crate) mod fhyp;
+pub(crate) mod fsc;
 pub(crate) mod fpi;
 mod fast_tables;
 pub(crate) mod hyp;
-mod inv;
+pub(crate) mod inv;
 pub(crate) mod lg;
 mod kern;
 mod reduce;
@@ -274,7 +274,7 @@ fn sin_impl<const F: bool>(x: f64) -> f64 {
         }
     }
     if ab < TINY {
-        return tiny_x(x);
+        return tiny_dir(x, true);
     }
     if ab >= INF_BITS {
         return nonfinite_arg(x);
@@ -303,7 +303,7 @@ fn cos_impl<const F: bool>(x: f64) -> f64 {
         }
     }
     if ab < TINY {
-        return if ab == 0 { 1.0 } else { inexact(1.0) };
+        return if ab == 0 { 1.0 } else { cos_tiny() };
     }
     if ab >= INF_BITS {
         return nonfinite_arg(x);
@@ -323,7 +323,7 @@ fn tan_impl<const F: bool>(x: f64) -> f64 {
         return direct::tan_small::<F>(x);
     }
     if ab < TINY {
-        return tiny_x(x);
+        return tiny_dir(x, false);
     }
     if ab >= INF_BITS {
         return nonfinite_arg(x);
@@ -339,7 +339,7 @@ directed_paths!(sincos_impl_dir_fma, sincos_impl_dir_plain, sincos_fma, sincos_n
 fn sincos_impl<const F: bool>(x: f64) -> (f64, f64) {
     let ab = x.to_bits() & !SIGN;
     if ab < TINY {
-        return (tiny_x(x), if ab == 0 { 1.0 } else { inexact(1.0) });
+        return if ab == 0 { (x, 1.0) } else { (tiny_dir(x, true), cos_tiny()) };
     }
     if ab >= INF_BITS {
         let r = nonfinite_arg(x);
@@ -420,10 +420,8 @@ pub fn sin_cos(x: f64) -> (f64, f64) {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sincos(x: f64, s: *mut f64, c: *mut f64) {
     let (a, b) = sin_cos(x);
-    unsafe {
-        *s = a;
-        *c = b;
-    }
+    unsafe { s.write(a) };
+    unsafe { c.write(b) };
 }
 
 #[inline(always)]
@@ -434,7 +432,7 @@ fn asin_impl<const F: bool>(x: f64) -> f64 {
         return h + l;
     }
     if ab < TINY {
-        return tiny_x(x);
+        return tiny_dir(x, false);
     }
     if ab > 0x3ff0_0000_0000_0000 {
         return if ab > INF_BITS { black_box(x) + black_box(x) } else { domain_error_svid() };
@@ -484,7 +482,7 @@ fn atan_impl<const F: bool>(x: f64) -> f64 {
         }
     }
     if ab < TINY {
-        return tiny_x(x);
+        return tiny_dir(x, true);
     }
     if ab >= INF_BITS {
         return if ab > INF_BITS { black_box(x) + black_box(x) } else { inexact(copysign(PIO2.0, x)) };
@@ -727,8 +725,8 @@ fn tanh_impl<const F: bool>(x: f64) -> f64 {
     if unlikely(ab < TINY) {
         return tanh_tiny(x);
     }
-    if unlikely(ab > INF_BITS) {
-        return black_box(x) + black_box(x);
+    if unlikely(ab >= INF_BITS) {
+        return if ab == INF_BITS { copysign(1.0, x) } else { black_box(x) + black_box(x) };
     }
     if unlikely(ab >= 0x4036_0000_0000_0000) {
         return black_box(copysign(1.0, x)) - black_box(copysign(1.0e-30, x));
@@ -738,15 +736,26 @@ fn tanh_impl<const F: bool>(x: f64) -> f64 {
 
 #[inline(never)]
 fn tanh_tiny(x: f64) -> f64 {
+    tiny_dir(x, true)
+}
+
+#[inline(never)]
+fn tiny_dir(x: f64, below: bool) -> f64 {
     let r = tiny_x(x);
     if r == 0.0 || dd::is_nearest() {
         return r;
     }
-    let toward_zero = f64::from_bits(x.to_bits() - 1);
-    match (dd::rounding_control(), x > 0.0) {
-        (2, true) | (1, false) => x,
-        _ => toward_zero,
+    let away = matches!((dd::rounding_control(), x > 0.0), (2, true) | (1, false));
+    match (below, away) {
+        (true, true) | (false, false) => x,
+        (true, false) => f64::from_bits(x.to_bits() - 1),
+        (false, true) => f64::from_bits(x.to_bits() + 1),
     }
+}
+
+#[inline(never)]
+fn cos_tiny() -> f64 {
+    black_box(1.0f64) - black_box(f64::from_bits(0x3c30_0000_0000_0000))
 }
 
 #[cold]
@@ -1486,8 +1495,16 @@ fn sinf_impl<const F: bool>(x: f32) -> f32 {
     if in_fsc_range(x) {
         return fsc::sinf::<F>(x);
     }
+    if above_fsc_range(x) {
+        return fsc::sinf_slow(x);
+    }
     tiny_x32(x);
     sin_impl::<F>(x as f64) as f32
+}
+
+#[inline(always)]
+fn above_fsc_range(x: f32) -> bool {
+    (0x49b7_1b00..0x7f80_0000).contains(&(x.to_bits() & 0x7fff_ffff))
 }
 
 #[inline(always)]
@@ -1500,12 +1517,18 @@ fn cosf_impl<const F: bool>(x: f32) -> f32 {
     if in_fsc_range(x) {
         return fsc::cosf::<F>(x);
     }
+    if above_fsc_range(x) {
+        return fsc::cosf_slow(x);
+    }
     cos_impl::<F>(x as f64) as f32
 }
 #[inline(always)]
 fn tanf_impl<const F: bool>(x: f32) -> f32 {
     if in_fsc_range(x) {
         return fsc::tanf::<F>(x);
+    }
+    if above_fsc_range(x) {
+        return fsc::tanf_slow(x);
     }
     tiny_x32(x);
     tan_impl::<F>(x as f64) as f32
@@ -1514,6 +1537,9 @@ fn tanf_impl<const F: bool>(x: f32) -> f32 {
 fn sincosf_impl<const F: bool>(x: f32) -> (f32, f32) {
     if in_fsc_range(x) {
         return fsc::sincosf::<F>(x);
+    }
+    if above_fsc_range(x) {
+        return (fsc::sinf_slow(x), fsc::cosf_slow(x));
     }
     tiny_x32(x);
     let (s, c) = sincos_impl::<F>(x as f64);
@@ -1525,8 +1551,7 @@ fn asinf_impl<const F: bool>(x: f32) -> f32 {
     if (0x3200_0000..0x3f80_0000).contains(&ab) {
         return finv::asinf::<F>(x);
     }
-    tiny_x32(x);
-    f32_default_nan(asin_impl::<F>(x as f64), x)
+    asinf_tail::<F>(x)
 }
 #[inline(always)]
 fn acosf_impl<const F: bool>(x: f32) -> f32 {
@@ -1534,7 +1559,7 @@ fn acosf_impl<const F: bool>(x: f32) -> f32 {
     if (0x3200_0000..0x3f80_0000).contains(&ab) {
         return finv::acosf::<F>(x);
     }
-    f32_default_nan(acos_impl::<F>(x as f64), x)
+    acosf_tail::<F>(x)
 }
 #[inline(always)]
 fn atanf_impl<const F: bool>(x: f32) -> f32 {
@@ -1542,8 +1567,7 @@ fn atanf_impl<const F: bool>(x: f32) -> f32 {
     if (0x3200_0000..0x7f80_0000).contains(&ab) {
         return finv::atanf::<F>(x);
     }
-    tiny_x32(x);
-    atan_impl::<F>(x as f64) as f32
+    atanf_tail::<F>(x)
 }
 #[inline(always)]
 fn atan2f_impl<const F: bool>(y: f32, x: f32) -> f32 {
@@ -1607,6 +1631,15 @@ cold_tail!(tanhf_tail, tanhf_tail_fma, tanhf_tail_nofma, |x| tanh_impl::<F>(x as
 cold_tail!(asinhf_tail, asinhf_tail_fma, asinhf_tail_nofma, |x| asinh_impl::<F>(x as f64) as f32);
 cold_tail!(acoshf_tail, acoshf_tail_fma, acoshf_tail_nofma, |x| acosh_impl::<F>(x as f64) as f32);
 cold_tail!(atanhf_tail, atanhf_tail_fma, atanhf_tail_nofma, |x| atanh_impl::<F>(x as f64) as f32);
+cold_tail!(asinf_tail, asinf_tail_fma, asinf_tail_nofma, |x| {
+    tiny_x32(x);
+    f32_default_nan(asin_impl::<F>(x as f64), x)
+});
+cold_tail!(acosf_tail, acosf_tail_fma, acosf_tail_nofma, |x| f32_default_nan(acos_impl::<F>(x as f64), x));
+cold_tail!(atanf_tail, atanf_tail_fma, atanf_tail_nofma, |x| {
+    tiny_x32(x);
+    atan_impl::<F>(x as f64) as f32
+});
 
 #[inline(always)]
 fn sinhf_impl<const F: bool>(x: f32) -> f32 {
@@ -1633,7 +1666,7 @@ fn tanhf_impl<const F: bool>(x: f32) -> f32 {
     tiny_x32(x);
     let ab = x.to_bits() & 0x7fff_ffff;
     if (0x3200_0000..0x4120_0000).contains(&ab) {
-        return fhyp::tanhf::<F>(x);
+        return fhyp::tanhf_slow(x);
     }
     tanhf_tail::<F>(x)
 }
@@ -1667,86 +1700,99 @@ fn atanhf_impl<const F: bool>(x: f32) -> f32 {
     tiny_x32(x);
     let ab = x.to_bits() & 0x7fff_ffff;
     if (0x3200_0000..0x3f80_0000).contains(&ab) {
-        return fhyp::atanhf::<F>(x);
+        return fhyp::atanhf_slow(x);
     }
     atanhf_tail::<F>(x)
 }
 #[inline(always)]
-fn sinpif_impl<const F: bool>(x: f32) -> f32 {
-    if dd::directed_if((x.to_bits() & 0x7fff_ffff).wrapping_sub(1) < 0x3300_0000 - 1) {
-        return sinpif_directed(x);
+fn cr_f32(x: f64, k: impl Fn(f64) -> D, slow: fn(f64) -> D) -> f32 {
+    if dd::is_nearest() {
+        let (h, l) = k(x);
+        if let Some(v) = crate::exp::ffast::round_cr_x(h + l, 4) {
+            return v;
+        }
     }
-    sinpif_body::<F>(x)
+    cr_f32_guarded(x, slow)
 }
 
-#[cold]
 #[inline(never)]
-fn sinpif_directed(x: f32) -> f32 {
-    let rc = dd::rounding_control();
-    let _g = dd::NearestGuard::new();
-    if (x.to_bits() & 0x7fff_ffff) < 0x2400_0000 {
-        return crate::special::float::tiny_mul_dir_f32(x, PI.0, PI.1, rc);
-    }
-    sinpif_body::<false>(x)
+#[cold]
+fn cr_f32_guarded(x: f64, k: fn(f64) -> D) -> f32 {
+    let y = {
+        let _g = NearestGuard::new();
+        let (h, l) = k(dd::launder(x));
+        dd::launder(crate::exp::ffast::pair_rounding(h, l))
+    };
+    dd::launder(y) as f32
 }
 
 #[inline(always)]
-fn sinpif_body<const F: bool>(x: f32) -> f32 {
+fn pif_inexact(ab: u32, s: i32) -> bool {
+    ab.wrapping_sub(1) < 0x4b00_0000 - 1 && !is_multiple_bits(f64::from(f32::from_bits(ab)).to_bits(), s)
+}
+
+#[inline(always)]
+fn sinpif_impl<const F: bool>(x: f32) -> f32 {
     if let Some(r) = fpi::sinpif::<F>(x) {
         return r;
     }
-    force_underflow32(sinpi_impl::<F>(x as f64) as f32)
-}
-#[inline(always)]
-fn cospif_impl<const F: bool>(x: f32) -> f32 {
-    if dd::directed_if((x.to_bits() & 0x7fff_ffff).wrapping_sub(1) < 0x3300_0000 - 1) {
-        return cospif_directed(x);
-    }
-    cospif_body::<F>(x)
+    sinpif_slow(x)
 }
 
 #[cold]
 #[inline(never)]
-fn cospif_directed(x: f32) -> f32 {
-    let _g = dd::NearestGuard::new();
-    cospif_body::<false>(x)
+fn sinpif_slow(x: f32) -> f32 {
+    if pif_inexact(x.to_bits() & 0x7fff_ffff, 1) {
+        let r = cr_f32_guarded(f64::from(x), |a| {
+            let (h, l) = direct::sin_pi::<false>(mod2(fabs(a)));
+            let s = a.to_bits() & SIGN;
+            (f64::from_bits(h.to_bits() ^ s), f64::from_bits(l.to_bits() ^ s))
+        });
+        return force_underflow32(r);
+    }
+    force_underflow32(sinpi_impl::<false>(f64::from(x)) as f32)
 }
 
 #[inline(always)]
-fn cospif_body<const F: bool>(x: f32) -> f32 {
+fn cospif_impl<const F: bool>(x: f32) -> f32 {
     if let Some(r) = fpi::cospif::<F>(x) {
         return r;
+    }
+    cospif_slow(x)
+}
+
+#[cold]
+#[inline(never)]
+fn cospif_slow(x: f32) -> f32 {
+    if pif_inexact(x.to_bits() & 0x7fff_ffff, 1) {
+        return cr_f32_guarded(f64::from(x), |a| direct::cos_pi::<false>(mod2(fabs(a))));
     }
     if x.is_nan() {
         return black_box(x) + black_box(x);
     }
-    cospi_impl::<F>(x as f64) as f32
+    cospi_impl::<false>(f64::from(x)) as f32
 }
+
 #[inline(always)]
 fn tanpif_impl<const F: bool>(x: f32) -> f32 {
-    if dd::directed_if((x.to_bits() & 0x7fff_ffff).wrapping_sub(1) < 0x3300_0000 - 1) {
-        return tanpif_directed(x);
+    if let Some(r) = fpi::tanpif::<F>(x) {
+        return r;
     }
-    tanpif_body::<F>(x)
+    tanpif_slow(x)
 }
 
 #[cold]
 #[inline(never)]
-fn tanpif_directed(x: f32) -> f32 {
-    let rc = dd::rounding_control();
-    let _g = dd::NearestGuard::new();
-    if (x.to_bits() & 0x7fff_ffff) < 0x2400_0000 {
-        return crate::special::float::tiny_mul_dir_f32(x, PI.0, PI.1, rc);
+fn tanpif_slow(x: f32) -> f32 {
+    if pif_inexact(x.to_bits() & 0x7fff_ffff, 2) {
+        let r = cr_f32_guarded(f64::from(x), |a| {
+            let (h, l) = direct::tan_pi::<false>(mod2(fabs(a)));
+            let s = a.to_bits() & SIGN;
+            (f64::from_bits(h.to_bits() ^ s), f64::from_bits(l.to_bits() ^ s))
+        });
+        return force_underflow32(r);
     }
-    tanpif_body::<false>(x)
-}
-
-#[inline(always)]
-fn tanpif_body<const F: bool>(x: f32) -> f32 {
-    if let Some(r) = fpi::tanpif::<F>(x) {
-        return r;
-    }
-    force_underflow32(tanpi_impl::<F>(x as f64) as f32)
+    force_underflow32(tanpi_impl::<false>(f64::from(x)) as f32)
 }
 #[inline(always)]
 fn asinpif_impl<const F: bool>(x: f32) -> f32 {
@@ -1762,15 +1808,69 @@ fn pi_inverse_result32(r: f32, x: f32) -> f32 {
     force_underflow32(r)
 }
 #[inline(always)]
-fn acospif_impl<const F: bool>(x: f32) -> f32 {
-    acospi_impl::<F>(x as f64) as f32
+pub(crate) fn acospif_pair<const F: bool>(a: f64) -> D {
+    if fabs(a) < SMALL_ARG {
+        let (th, tl) = mul_d::<F>(INV_PI, a);
+        dd::fast_two_sum(0.5, -(th + tl))
+    } else {
+        inv::acospi_pair::<F>(a)
+    }
 }
+
+const ACOSPIF_MARGIN: u64 = 1 << 6;
+
+#[inline(always)]
+fn acospif_impl<const F: bool>(x: f32) -> f32 {
+    if (0x3200_0000..0x3f80_0000).contains(&(x.to_bits() & 0x7fff_ffff)) {
+        return finv::acospif::<F>(x);
+    }
+    if (x.to_bits() & 0x7fff_ffff).wrapping_sub(1) < 0x3f80_0000 - 1 {
+        let a = f64::from(x);
+        let (h, l) = acospif_pair::<F>(a);
+        if let Some(v) = crate::exp::ffast::round_cr_x(h + l, ACOSPIF_MARGIN) {
+            return v;
+        }
+        return cr_f32_guarded(a, acospif_pair::<false>);
+    }
+    acospi_impl::<F>(f64::from(x)) as f32
+}
+
+#[inline(always)]
+pub(crate) fn atanpif_pair<const F: bool>(a: f64) -> D {
+    let ax = fabs(a);
+    let (h, l) = if ax < SMALL_ARG {
+        mul_d::<F>(INV_PI, ax)
+    } else if ax > 1.125_899_906_842_624e15 {
+        (0.5, -(INV_PI.0 / ax))
+    } else {
+        mul::<F>(inv::atan_pos::<F>(ax), INV_PI)
+    };
+    let s = a.to_bits() & SIGN;
+    (f64::from_bits(h.to_bits() ^ s), f64::from_bits(l.to_bits() ^ s))
+}
+
 #[inline(always)]
 fn atanpif_impl<const F: bool>(x: f32) -> f32 {
-    let r = atanpi_impl::<F>(x as f64) as f32;
-    if x != 0.0 && r == 0.0 {
-        set_errno(ERANGE);
+    let ab = x.to_bits() & 0x7fff_ffff;
+    if (0x3200_0000..0x4b80_0000).contains(&ab) && ab != 0x3f80_0000 {
+        return finv::atanpif::<F>(x);
     }
+    if ab.wrapping_sub(1) < 0x7f80_0000 - 1 && ab != 0x3f80_0000 {
+        let a = f64::from(x);
+        if ab >= 0x3c00_0000 {
+            let (h, l) = atanpif_pair::<F>(a);
+            if let Some(v) = crate::exp::ffast::round_cr_x(h + l, ACOSPIF_MARGIN) {
+                return v;
+            }
+            return cr_f32_guarded(a, atanpif_pair::<false>);
+        }
+        let r = cr_f32(a, atanpif_pair::<F>, atanpif_pair::<false>);
+        if r == 0.0 {
+            set_errno(ERANGE);
+        }
+        return force_underflow32(r);
+    }
+    let r = atanpi_impl::<F>(f64::from(x)) as f32;
     force_underflow32(r)
 }
 #[inline(always)]
@@ -1875,10 +1975,8 @@ pub fn sin_cosf(x: f32) -> (f32, f32) {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sincosf(x: f32, s: *mut f32, c: *mut f32) {
     let (a, b) = sin_cosf(x);
-    unsafe {
-        *s = a;
-        *c = b;
-    }
+    unsafe { s.write(a) };
+    unsafe { c.write(b) };
 }
 
 macro_rules! alias1 {

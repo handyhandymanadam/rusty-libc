@@ -172,10 +172,19 @@ pub(crate) fn exp2m1f_impl<const F: bool>(x: f32) -> f32 {
     if let Some(r) = super::ffast::exp2m1f::<F>(x) {
         return r;
     }
+    if x < -25.1 && x > f32::NEG_INFINITY {
+        return (crate::trig::dd::launder(-1.0) + f64::from_bits(0x3c30_0000_0000_0000)) as f32;
+    }
+    if (0x3200_0000..0x42c8_0000).contains(&(x.to_bits() & 0x7fff_ffff)) && x != (x as i32) as f32 {
+        return super::ffast::exp2m1f_slow(x);
+    }
     exp2m1f_slow::<F>(x)
 }
 
 fma_tail!(exp2m1f_slow, exp2m1f_slow_fma, exp2m1f_slow_nofma, |x| {
+    if (25.0..128.0).contains(&x) && x == (x as i32) as f32 {
+        return core::hint::black_box(pow2f(x as i32)) - core::hint::black_box(pow2f(-100));
+    }
     let ab = x.to_bits() & 0x7fff_ffff;
     if (0x3200_0000..0x42b0_0000).contains(&ab) {
         let xd = x as f64;
@@ -199,6 +208,14 @@ fn neg_one_inexact() -> f32 {
 pub(crate) fn exp10m1f_impl<const F: bool>(x: f32) -> f32 {
     if let Some(r) = super::ffast::exp10m1f::<F>(x) {
         return r;
+    }
+    if x < -7.6 && x > f32::NEG_INFINITY {
+        return (crate::trig::dd::launder(-1.0) + f64::from_bits(0x3c30_0000_0000_0000)) as f32;
+    }
+    let ab = x.to_bits() & 0x7fff_ffff;
+    let hi = if x.is_sign_negative() { 0x41f0_0000 } else { 0x4218_0000 };
+    if (0x3200_0000..hi).contains(&ab) && !(x > 0.0 && x == (x as i32) as f32) {
+        return super::ffast::exp10m1f_slow(x);
     }
     exp10m1f_slow::<F>(x)
 }
@@ -225,17 +242,40 @@ pub(crate) fn log1pf_impl<const F: bool>(x: f32) -> f32 {
     if let Some(r) = super::flog::log1pf::<F>(x) {
         return r;
     }
+    if (0x3200_0000..0x7f80_0000).contains(&(x.to_bits() & 0x7fff_ffff)) && x > -1.0 {
+        return super::flog::log1pf_slow(x);
+    }
     force_underflowf(x);
     dlog::log1p_impl::<F>(x as f64) as f32
 }
 
+pub(crate) const LOG2P1F_MARGIN: u64 = 1 << 4;
+pub(crate) const LOG10P1F_MARGIN: u64 = 1 << 4;
+
+#[inline(always)]
+fn log_p1_range(x: f32) -> bool {
+    (0x0080_0000..0x7f80_0000).contains(&(x.to_bits() & 0x7fff_ffff)) && x > -1.0
+}
+
 #[inline(always)]
 pub(crate) fn log2p1f_impl<const F: bool>(x: f32) -> f32 {
+    if log_p1_range(x) {
+        return match super::ffast::round_cr_x(dlog::log2p1_impl::<F>(f64::from(x)), LOG2P1F_MARGIN) {
+            Some(r) => r,
+            None => super::flog::log2p1f_slow(x),
+        };
+    }
     dlog::log2p1_impl::<F>(x as f64) as f32
 }
 
 #[inline(always)]
 pub(crate) fn log10p1f_impl<const F: bool>(x: f32) -> f32 {
+    if log_p1_range(x) && (x.to_bits() & 0x7fff_ffff) >= 0x0180_0000 {
+        return match super::ffast::round_cr_x(dlog::log10p1_impl::<F>(f64::from(x)), LOG10P1F_MARGIN) {
+            Some(r) => r,
+            None => super::flog::log10p1f_slow(x),
+        };
+    }
     force_underflowf(x);
     let r = dlog::log10p1_impl::<F>(x as f64) as f32;
     if r == 0.0 && x != 0.0 {
@@ -247,6 +287,9 @@ pub(crate) fn log10p1f_impl<const F: bool>(x: f32) -> f32 {
 #[inline(always)]
 pub(crate) fn log10f_impl<const F: bool>(x: f32) -> f32 {
     if let Some(r) = super::flog::log10f::<F>(x) {
+        return r;
+    }
+    if let Some(r) = super::flog::log10f_slow(x) {
         return r;
     }
     let r = dlog::log10_impl::<F>(x as f64);

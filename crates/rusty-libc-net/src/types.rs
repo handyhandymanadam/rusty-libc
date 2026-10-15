@@ -128,6 +128,7 @@ pub const EINVAL: i32 = 22;
 pub const EBUSY: i32 = 16;
 pub const ENOSPC: i32 = 28;
 pub const ERANGE: i32 = 34;
+pub const ENAMETOOLONG: i32 = 36;
 pub const EAFNOSUPPORT: i32 = 97;
 pub const ETIMEDOUT: i32 = 110;
 pub const EINPROGRESS: i32 = 115;

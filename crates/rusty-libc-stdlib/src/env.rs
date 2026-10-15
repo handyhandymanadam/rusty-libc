@@ -1,6 +1,8 @@
+use crate::zstr::ZStr;
 use core::ffi::c_char;
 use core::ptr::null_mut;
-use rusty_libc_core::{Errno, errno, syscall};
+use core::sync::atomic::{AtomicPtr, Ordering};
+use rusty_libc_core::{Errno, SyncCell, errno};
 
 unsafe extern "C" {
     static mut environ: *mut *mut c_char;
@@ -8,139 +10,227 @@ unsafe extern "C" {
 
 const ENOMEM: i32 = 12;
 const EINVAL: i32 = 22;
-const SYS_GETGID: usize = 104;
-const SYS_GETEGID: usize = 108;
 
 struct EnvArray {
-    next: *mut EnvArray,
-    array: *mut *mut c_char,
-    allocated: usize,
+    next: Option<&'static EnvArray>,
+    array: &'static [AtomicPtr<c_char>],
 }
-static mut ARRAY_LIST: *mut EnvArray = null_mut();
+static ARRAY_LIST: SyncCell<Option<&'static EnvArray>> = SyncCell::new(None);
 static ENV_LOCK: rusty_libc_core::lock::RawMutex = rusty_libc_core::lock::RawMutex::new();
 
-unsafe fn strlen(s: *const c_char) -> usize {
-    unsafe { rusty_libc_mem::strlen(s.cast()) }
-}
+struct EnvLock<'a>(#[allow(dead_code)] rusty_libc_core::lock::Guard<'a>);
 
-unsafe fn cstr<'a>(s: *const c_char) -> &'a [u8] {
-    unsafe { core::slice::from_raw_parts(s.cast(), strlen(s)) }
-}
-
-#[inline]
-unsafe fn load_entry(ep: *mut *mut c_char) -> *mut c_char {
-    unsafe { core::sync::atomic::AtomicPtr::from_ptr(ep).load(core::sync::atomic::Ordering::Relaxed) }
-}
-
-#[inline]
-unsafe fn store_entry(ep: *mut *mut c_char, v: *mut c_char) {
-    unsafe { core::sync::atomic::AtomicPtr::from_ptr(ep).store(v, core::sync::atomic::Ordering::Release) }
-}
-
-unsafe fn entry_is(s: *const c_char, name: &[u8]) -> bool {
-    unsafe {
-        let s = s as *const u8;
-        let mut i = 0;
-        while i < name.len() && *s.add(i) == name[i] {
-            i += 1;
-        }
-        i == name.len() && *s.add(i) == b'='
+impl EnvLock<'_> {
+    fn take() -> EnvLock<'static> {
+        EnvLock(ENV_LOCK.guard())
     }
-}
-
-unsafe fn array_containing(p: *mut *mut c_char) -> *mut EnvArray {
-    unsafe {
-        let mut a = ARRAY_LIST;
-        while !a.is_null() {
-            if p >= (*a).array && p < (*a).array.add((*a).allocated) {
-                return a;
+    fn head(&self) -> Option<&'static EnvArray> {
+        unsafe { ARRAY_LIST.read() }
+    }
+    fn set_head(&self, a: &'static EnvArray) {
+        unsafe { ARRAY_LIST.write(Some(a)) }
+    }
+    fn array_containing(&self, p: *const AtomicPtr<c_char>) -> Option<(&'static EnvArray, usize)> {
+        let mut a = self.head();
+        while let Some(arr) = a {
+            if arr.array.as_ptr_range().contains(&p) {
+                return Some((arr, (p as usize - arr.array.as_ptr() as usize) / size_of::<AtomicPtr<c_char>>()));
             }
-            a = (*a).next;
+            a = arr.next;
         }
-        null_mut()
+        None
+    }
+    fn new_array(&self, required: usize) -> Option<&'static EnvArray> {
+        let head = self.head();
+        let new_size = match head {
+            Some(h) if h.array.len() * 2 >= required => h.array.len() * 2,
+            _ => required + 16,
+        };
+        let p = crate::cmem::calloc(new_size, size_of::<*mut c_char>());
+        if p.is_null() {
+            return None;
+        }
+        let array = unsafe { core::slice::from_raw_parts(p.cast::<AtomicPtr<c_char>>(), new_size) };
+        let node = crate::cmem::malloc(size_of::<EnvArray>()).cast::<EnvArray>();
+        if node.is_null() {
+            unsafe { crate::cmem::free(p) };
+            return None;
+        }
+        unsafe { node.write(EnvArray { next: head, array }) };
+        let node: &'static EnvArray = unsafe { &*node };
+        self.set_head(node);
+        Some(node)
     }
 }
 
-unsafe fn in_array_list(p: *mut *mut c_char) -> bool {
-    unsafe { !array_containing(p).is_null() }
+#[inline]
+fn environ_now() -> *mut *mut c_char {
+    unsafe { rusty_libc_core::env::load_environ() }
 }
 
-unsafe fn new_array(required: usize) -> *mut EnvArray {
-    unsafe {
-        let new_size = if ARRAY_LIST.is_null() || (*ARRAY_LIST).allocated * 2 < required { required + 16 } else { (*ARRAY_LIST).allocated * 2 };
-        let array: *mut *mut c_char = rusty_libc_malloc::calloc(new_size, core::mem::size_of::<*mut c_char>()).cast();
-        if array.is_null() {
-            return null_mut();
+#[inline]
+fn set_environ(p: *mut *mut c_char, order: Ordering) {
+    unsafe { AtomicPtr::from_ptr(&raw mut environ) }.store(p, order);
+}
+
+#[derive(Clone, Copy)]
+struct EnvCur {
+    base: *mut *mut c_char,
+    pos: usize,
+}
+
+impl EnvCur {
+    unsafe fn new(base: *mut *mut c_char) -> EnvCur {
+        EnvCur { base, pos: 0 }
+    }
+    #[inline]
+    fn slot(&self, i: usize) -> &AtomicPtr<c_char> {
+        debug_assert!(i <= self.pos + 1);
+        let p = self.base.wrapping_add(i);
+        unsafe { AtomicPtr::from_ptr(p) }
+    }
+    #[inline]
+    fn cur(&self) -> *mut c_char {
+        self.slot(self.pos).load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn get(&self, i: usize) -> *mut c_char {
+        self.slot(i.min(self.pos)).load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn next_entry(&mut self) -> Option<*mut c_char> {
+        let e = self.cur();
+        if e.is_null() {
+            return None;
         }
-        let a: *mut EnvArray = rusty_libc_malloc::malloc(core::mem::size_of::<EnvArray>()).cast();
-        if a.is_null() {
-            rusty_libc_malloc::free(array.cast());
-            return null_mut();
+        self.pos += 1;
+        Some(e)
+    }
+    #[inline]
+    fn set_cur(&self, v: *mut c_char) {
+        self.slot(self.pos).store(v, Ordering::Release);
+    }
+    fn remove_cur(&self) {
+        let mut dp = *self;
+        loop {
+            let next = dp.slot(dp.pos + 1).load(Ordering::Relaxed);
+            dp.slot(dp.pos).store(next, Ordering::Release);
+            let c = rusty_libc_core::env::ENV_COUNTER.load(Ordering::Relaxed);
+            rusty_libc_core::env::ENV_COUNTER.store(c + 1, Ordering::Release);
+            if next.is_null() {
+                break;
+            }
+            dp.pos += 1;
         }
-        a.write(EnvArray { next: ARRAY_LIST, array, allocated: new_size });
-        ARRAY_LIST = a;
-        a
+    }
+    fn slot_ptr(&self, i: usize) -> *const AtomicPtr<c_char> {
+        self.base.wrapping_add(i).cast()
     }
 }
 
-unsafe fn add_to_environ(name: &[u8], value: &[u8], combined: *mut c_char, replace: bool) -> Result<(), Errno> {
-    unsafe {
-        let np_new: *mut c_char = if combined.is_null() {
+fn entry_is(s: *const c_char, name: &[u8]) -> bool {
+    let mut z = unsafe { ZStr::new(s.cast::<u8>()) };
+    for &c in name {
+        if z.cur() != c {
+            return false;
+        }
+        z.bump();
+    }
+    z.cur() == b'='
+}
+
+fn add_to_environ(name: &[u8], value: &[u8], combined: Option<*mut c_char>, replace: bool) -> Result<(), Errno> {
+    let (np_new, made) = match combined {
+        Some(c) => (c, false),
+        None => {
             let total = name.len().checked_add(value.len()).and_then(|t| t.checked_add(2)).ok_or(Errno(ENOMEM))?;
-            let s: *mut u8 = rusty_libc_malloc::malloc(total).cast();
+            let s = crate::cmem::malloc(total);
             if s.is_null() {
                 return Err(Errno(ENOMEM));
             }
-            core::ptr::copy_nonoverlapping(name.as_ptr(), s, name.len());
-            *s.add(name.len()) = b'=';
-            core::ptr::copy_nonoverlapping(value.as_ptr(), s.add(name.len() + 1), value.len());
-            *s.add(total - 1) = 0;
-            s.cast()
-        } else {
-            combined
-        };
-        let g = ENV_LOCK.guard();
-        let _ = &g;
-        let start = rusty_libc_core::env::load_environ();
-        let mut ep = start;
-        let mut result_environ = start;
-        let mut replace = replace;
-        if !ep.is_null() {
-            while !load_entry(ep).is_null() && !entry_is(load_entry(ep), name) {
-                ep = ep.add(1);
-            }
+            let b = unsafe { rusty_libc_core::ffi::bytes_mut(s, total) };
+            b[..name.len()].copy_from_slice(name);
+            b[name.len()] = b'=';
+            b[name.len() + 1..total - 1].copy_from_slice(value);
+            b[total - 1] = 0;
+            (s.cast::<c_char>(), true)
         }
-        if ep.is_null() || load_entry(ep).is_null() {
-            replace = true;
-            let used = if ep.is_null() { 0 } else { ep.offset_from(start) as usize };
-            let required = used + 2;
-            let own = array_containing(start);
-            if !own.is_null() && ep.add(1) < (*own).array.add((*own).allocated) {
-                *ep.add(1) = null_mut();
-            } else {
-                let target = if !ARRAY_LIST.is_null() && required <= (*ARRAY_LIST).allocated { ARRAY_LIST } else { new_array(required) };
-                if target.is_null() {
-                    if combined.is_null() {
-                        rusty_libc_malloc::free(np_new.cast());
-                    }
-                    return Err(Errno(ENOMEM));
-                }
-                for i in 0..used {
-                    store_entry((*target).array.add(i), load_entry(start.add(i)));
-                }
-                ep = (*target).array.add(used);
-                *ep.add(1) = null_mut();
-                result_environ = (*target).array;
-            }
+    };
+    let drop_copy = || {
+        if made {
+            unsafe { crate::cmem::free(np_new) };
         }
-        if replace || load_entry(ep).is_null() {
-            store_entry(ep, np_new);
-            core::sync::atomic::AtomicPtr::from_ptr(core::ptr::addr_of_mut!(environ)).store(result_environ, core::sync::atomic::Ordering::Release);
-        } else if combined.is_null() {
-            rusty_libc_malloc::free(np_new.cast());
-        }
-        Ok(())
+    };
+    let lk = EnvLock::take();
+    let start = environ_now();
+    let mut replace = replace;
+    let mut result_environ = start;
+    enum Slot {
+        Theirs(EnvCur),
+        Ours(&'static AtomicPtr<c_char>),
     }
+    let mut cur = None;
+    if !start.is_null() {
+        let mut c = unsafe { EnvCur::new(start) };
+        loop {
+            let at = c;
+            match c.next_entry() {
+                Some(e) if !entry_is(e, name) => {}
+                _ => {
+                    c = at;
+                    break;
+                }
+            }
+        }
+        cur = Some(c);
+    }
+    let slot = match cur {
+        Some(c) if !c.cur().is_null() => Slot::Theirs(c),
+        _ => {
+            replace = true;
+            let used = cur.map_or(0, |c| c.pos);
+            let required = used + 2;
+            match cur.and_then(|c| lk.array_containing(c.slot_ptr(0))) {
+                Some((own, at)) if at + used + 1 < own.array.len() => {
+                    own.array[at + used + 1].store(null_mut(), Ordering::Relaxed);
+                    Slot::Ours(&own.array[at + used])
+                }
+                _ => {
+                    let target = match lk.head() {
+                        Some(h) if required <= h.array.len() => Some(h),
+                        _ => lk.new_array(required),
+                    };
+                    let Some(target) = target else {
+                        drop_copy();
+                        return Err(Errno(ENOMEM));
+                    };
+                    if let Some(c) = cur {
+                        for (i, slot) in target.array[..used].iter().enumerate() {
+                            slot.store(c.get(i), Ordering::Release);
+                        }
+                    }
+                    target.array[used + 1].store(null_mut(), Ordering::Relaxed);
+                    result_environ = target.array.as_ptr().cast_mut().cast();
+                    Slot::Ours(&target.array[used])
+                }
+            }
+        }
+    };
+    let empty = match &slot {
+        Slot::Theirs(c) => c.cur().is_null(),
+        Slot::Ours(s) => s.load(Ordering::Relaxed).is_null(),
+    };
+    if replace || empty {
+        match slot {
+            Slot::Theirs(c) => c.set_cur(np_new),
+            Slot::Ours(s) => s.store(np_new, Ordering::Release),
+        }
+        set_environ(result_environ, Ordering::Release);
+    } else {
+        drop_copy();
+    }
+    drop(lk);
+    Ok(())
 }
 
 fn valid_name(name: &[u8]) -> bool {
@@ -148,159 +238,127 @@ fn valid_name(name: &[u8]) -> bool {
 }
 
 pub unsafe fn get<'a>(name: &[u8]) -> Option<&'a [u8]> {
-    unsafe {
-        let p = rusty_libc_core::env::getenv(name);
-        if p.is_null() { None } else { Some(cstr(p)) }
-    }
+    let p = unsafe { rusty_libc_core::env::getenv(name) };
+    unsafe { rusty_libc_core::ffi::cstr(p) }.map(core::ffi::CStr::to_bytes)
 }
 
-pub unsafe fn set(name: &[u8], value: &[u8], replace: bool) -> Result<(), Errno> {
-    unsafe {
-        if !valid_name(name) {
-            return Err(Errno(EINVAL));
-        }
-        add_to_environ(name, value, null_mut(), replace)
+pub fn set(name: &[u8], value: &[u8], replace: bool) -> Result<(), Errno> {
+    if !valid_name(name) {
+        return Err(Errno(EINVAL));
     }
+    add_to_environ(name, value, None, replace)
 }
 
-pub unsafe fn unset(name: &[u8]) -> Result<(), Errno> {
-    unsafe {
-        if !valid_name(name) {
-            return Err(Errno(EINVAL));
-        }
-        remove_all(name);
-        Ok(())
+pub fn unset(name: &[u8]) -> Result<(), Errno> {
+    if !valid_name(name) {
+        return Err(Errno(EINVAL));
     }
+    remove_all(name);
+    Ok(())
 }
 
-unsafe fn remove_all(name: &[u8]) {
-    unsafe {
-        let g = ENV_LOCK.guard();
-        let _ = &g;
-        let mut ep = rusty_libc_core::env::load_environ();
-        if ep.is_null() {
-            return;
-        }
-        loop {
-            let entry = load_entry(ep);
-            if entry.is_null() {
-                break;
-            }
-            if entry_is(entry, name) {
-                let mut dp = ep;
-                loop {
-                    let next = load_entry(dp.add(1));
-                    store_entry(dp, next);
-                    let c = rusty_libc_core::env::ENV_COUNTER.load(core::sync::atomic::Ordering::Relaxed);
-                    rusty_libc_core::env::ENV_COUNTER.store(c + 1, core::sync::atomic::Ordering::Release);
-                    if next.is_null() {
-                        break;
-                    }
-                    dp = dp.add(1);
-                }
-            } else {
-                ep = ep.add(1);
-            }
+fn remove_all(name: &[u8]) {
+    let lk = EnvLock::take();
+    let start = environ_now();
+    if start.is_null() {
+        return;
+    }
+    let mut ep = unsafe { EnvCur::new(start) };
+    loop {
+        let at = ep;
+        let Some(entry) = ep.next_entry() else { break };
+        if entry_is(entry, name) {
+            at.remove_cur();
+            ep = at;
         }
     }
+    drop(lk);
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
-    unsafe {
-        let n = cstr(name);
-        if n.is_empty() { null_mut() } else { rusty_libc_core::env::getenv(n) }
+    let n = unsafe { rusty_libc_core::ffi::cstr_bytes(name) };
+    if n.is_empty() {
+        return null_mut();
     }
+    unsafe { rusty_libc_core::env::getenv(n) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn secure_getenv(name: *const c_char) -> *mut c_char {
-    unsafe {
-        let secure = rusty_libc_core::lock::at_secure().unwrap_or_else(|| {
-            syscall::syscall0(syscall::SYS_GETUID) != syscall::syscall0(syscall::SYS_GETEUID)
-                || syscall::syscall0(SYS_GETGID) != syscall::syscall0(SYS_GETEGID)
-        });
-        if secure { null_mut() } else { getenv(name) }
+    use rusty_libc_core::unistd::{getegid, geteuid, getgid, getuid};
+    let secure = rusty_libc_core::lock::at_secure().unwrap_or_else(|| getuid() != geteuid() || getgid() != getegid());
+    if secure { null_mut() } else { unsafe { getenv(name) } }
+}
+
+fn ret(r: Result<(), Errno>) -> i32 {
+    match r {
+        Ok(()) => 0,
+        Err(Errno(e)) => {
+            errno::set(e);
+            -1
+        }
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setenv(name: *const c_char, value: *const c_char, overwrite: i32) -> i32 {
-    unsafe {
-        if name.is_null() || value.is_null() {
-            errno::set(EINVAL);
-            return -1;
-        }
-        match set(cstr(name), cstr(value), overwrite != 0) {
-            Ok(()) => 0,
-            Err(Errno(e)) => {
-                errno::set(e);
-                -1
-            }
-        }
-    }
+    let n = unsafe { rusty_libc_core::ffi::cstr(name) };
+    let v = unsafe { rusty_libc_core::ffi::cstr(value) };
+    let (Some(n), Some(v)) = (n, v) else {
+        errno::set(EINVAL);
+        return -1;
+    };
+    ret(set(n.to_bytes(), v.to_bytes(), overwrite != 0))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn unsetenv(name: *const c_char) -> i32 {
-    unsafe {
-        if name.is_null() {
-            errno::set(EINVAL);
-            return -1;
-        }
-        match unset(cstr(name)) {
-            Ok(()) => 0,
-            Err(Errno(e)) => {
-                errno::set(e);
-                -1
-            }
-        }
-    }
+    let Some(n) = (unsafe { rusty_libc_core::ffi::cstr(name) }) else {
+        errno::set(EINVAL);
+        return -1;
+    };
+    ret(unset(n.to_bytes()))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn putenv(string: *mut c_char) -> i32 {
-    unsafe {
-        if string.is_null() {
+    let Some(s) = (unsafe { rusty_libc_core::ffi::cstr(string) }) else {
+        errno::set(EINVAL);
+        return -1;
+    };
+    let s = s.to_bytes();
+    let Some(eq) = s.iter().position(|&c| c == b'=') else {
+        if s.is_empty() {
             errno::set(EINVAL);
-            return -1;
+        } else {
+            remove_all(s);
         }
-        let s = cstr(string);
-        let Some(eq) = s.iter().position(|&c| c == b'=') else {
-            if s.is_empty() {
-                errno::set(EINVAL);
-            } else {
-                remove_all(s);
+        return 0;
+    };
+    ret(add_to_environ(&s[..eq], &[], Some(string), true))
+}
+
+pub fn clear() {
+    let lk = EnvLock::take();
+    let start = environ_now();
+    if let Some((own, at)) = lk.array_containing(start.cast_const().cast()) {
+        for slot in &own.array[at..] {
+            if slot.load(Ordering::Relaxed).is_null() {
+                break;
             }
-            return 0;
-        };
-        match add_to_environ(&s[..eq], &[], string, true) {
-            Ok(()) => 0,
-            Err(Errno(e)) => {
-                errno::set(e);
-                -1
-            }
+            slot.store(null_mut(), Ordering::Relaxed);
         }
+        let c = rusty_libc_core::env::ENV_COUNTER.load(Ordering::Relaxed);
+        rusty_libc_core::env::ENV_COUNTER.store(c + 1, Ordering::Release);
     }
+    set_environ(null_mut(), Ordering::Relaxed);
+    drop(lk);
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn clearenv() -> i32 {
-    unsafe {
-        let g = ENV_LOCK.guard();
-        let _ = &g;
-        let start = rusty_libc_core::env::load_environ();
-        if in_array_list(start) {
-            let mut ep = start;
-            while !load_entry(ep).is_null() {
-                core::sync::atomic::AtomicPtr::from_ptr(ep).store(null_mut(), core::sync::atomic::Ordering::Relaxed);
-                ep = ep.add(1);
-            }
-            let c = rusty_libc_core::env::ENV_COUNTER.load(core::sync::atomic::Ordering::Relaxed);
-            rusty_libc_core::env::ENV_COUNTER.store(c + 1, core::sync::atomic::Ordering::Release);
-        }
-        core::sync::atomic::AtomicPtr::from_ptr(core::ptr::addr_of_mut!(environ)).store(null_mut(), core::sync::atomic::Ordering::Relaxed);
-        0
-    }
+    clear();
+    0
 }
 

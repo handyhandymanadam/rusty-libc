@@ -1,4 +1,5 @@
 use core::ffi::{c_char, c_int, c_void};
+use rusty_libc_core::ffi;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Area {
@@ -104,18 +105,17 @@ pub(crate) struct Query {
     pub(crate) verdict: Seg,
 }
 
-unsafe fn judge(info: &PhdrInfo, q: &mut Query) {
-    let hs = unsafe { core::slice::from_raw_parts(info.phdr, info.phnum as usize) };
+fn judge(addr: usize, hs: &[Phdr], q: &mut Query) {
     let mut size = q.end.wrapping_sub(q.ptr);
     for h in hs.iter().filter(|h| h.p_type == PT_LOAD) {
-        let from = info.addr.wrapping_add(h.p_vaddr as usize & !(PAGE - 1));
-        let to = info.addr.wrapping_add((h.p_vaddr as usize).wrapping_add(h.p_filesz as usize).wrapping_add(PAGE - 1) & !(PAGE - 1));
+        let from = addr.wrapping_add(h.p_vaddr as usize & !(PAGE - 1));
+        let to = addr.wrapping_add((h.p_vaddr as usize).wrapping_add(h.p_filesz as usize).wrapping_add(PAGE - 1) & !(PAGE - 1));
         if from < q.end && to > q.ptr {
             if h.p_flags & PF_W != 0 {
                 q.verdict = Seg::Writable;
                 if let Some(r) = hs.iter().find(|r| r.p_type == PT_GNU_RELRO) {
-                    let rs = info.addr.wrapping_add(r.p_vaddr as usize) & !(PAGE - 1);
-                    let re = info.addr.wrapping_add((r.p_vaddr as usize).wrapping_add(r.p_memsz as usize)) & !(PAGE - 1);
+                    let rs = addr.wrapping_add(r.p_vaddr as usize) & !(PAGE - 1);
+                    let re = addr.wrapping_add((r.p_vaddr as usize).wrapping_add(r.p_memsz as usize)) & !(PAGE - 1);
                     if rs <= q.ptr && q.end <= re {
                         q.verdict = Seg::ReadOnly;
                     }
@@ -144,59 +144,57 @@ unsafe fn judge(info: &PhdrInfo, q: &mut Query) {
     q.verdict = if size == 0 { Seg::ReadOnly } else { Seg::NoVerdict };
 }
 
+fn object(addr: usize, hs: &[Phdr], q: &mut Query) -> c_int {
+    let (mut lo, mut hi) = (usize::MAX, 0usize);
+    for h in hs.iter().filter(|h| h.p_type == PT_LOAD) {
+        lo = lo.min(addr.wrapping_add(h.p_vaddr as usize & !(PAGE - 1)));
+        hi = hi.max(addr.wrapping_add((h.p_vaddr as usize).wrapping_add(h.p_memsz as usize).wrapping_add(PAGE - 1) & !(PAGE - 1)));
+    }
+    if lo <= q.ptr && q.ptr < hi {
+        judge(addr, hs, q);
+        return 1;
+    }
+    0
+}
+
 unsafe extern "C" fn each_object(info: *mut PhdrInfo, _size: usize, data: *mut c_void) -> c_int {
-    unsafe {
-        let (info, q) = (&*info, &mut *(data as *mut Query));
-        if info.phdr.is_null() {
-            return 0;
-        }
-        let hs = core::slice::from_raw_parts(info.phdr, info.phnum as usize);
-        let (mut lo, mut hi) = (usize::MAX, 0usize);
-        for h in hs.iter().filter(|h| h.p_type == PT_LOAD) {
-            lo = lo.min(info.addr.wrapping_add(h.p_vaddr as usize & !(PAGE - 1)));
-            hi = hi.max(info.addr.wrapping_add((h.p_vaddr as usize).wrapping_add(h.p_memsz as usize).wrapping_add(PAGE - 1) & !(PAGE - 1)));
-        }
-        if lo <= q.ptr && q.ptr < hi {
-            judge(info, q);
-            return 1;
-        }
-        0
+    let info = unsafe { &*info };
+    let q = unsafe { &mut *data.cast::<Query>() };
+    if info.phdr.is_null() {
+        return 0;
+    }
+    let hs = unsafe { ffi::slice(info.phdr, info.phnum as usize) };
+    object(info.addr, hs, q)
+}
+
+fn iterate_objects(q: &mut Query) {
+    if let Some(iterate) = unsafe { dl_iterate_phdr } {
+        unsafe { iterate(Some(each_object), (q as *mut Query).cast()) };
+    } else {
+        program_object(q);
     }
 }
 
-unsafe fn iterate_objects(q: &mut Query) {
-    unsafe {
-        if let Some(iterate) = dl_iterate_phdr {
-            iterate(Some(each_object), (q as *mut Query).cast());
-        } else {
-            program_object(q);
-        }
+pub(crate) fn program_object(q: &mut Query) {
+    let ehdr = unsafe { __ehdr_start };
+    if ehdr.is_null() {
+        return;
     }
-}
-
-pub(crate) unsafe fn program_object(q: &mut Query) {
-    unsafe {
-        let ehdr = __ehdr_start;
-        if ehdr.is_null() {
-            return;
-        }
-        let rd16 = |off: usize| ehdr.add(off).cast::<u16>().read_unaligned();
-        let phoff = ehdr.add(32).cast::<u64>().read_unaligned() as usize;
-        let mut info = PhdrInfo {
-            addr: if rd16(16) == 3  { ehdr as usize } else { 0 },
-            name: core::ptr::null(),
-            phdr: ehdr.add(phoff).cast(),
-            phnum: rd16(56),
-        };
-        each_object(&mut info, size_of::<PhdrInfo>(), (q as *mut Query).cast());
-    }
+    let header = unsafe { ffi::bytes(ehdr, 64) };
+    let rd16 = |off: usize| u16::from_le_bytes([header[off], header[off + 1]]);
+    let phoff = u64::from_le_bytes(header[32..40].try_into().unwrap_or([0; 8])) as usize;
+    let phnum = rd16(56);
+    let phdr = ehdr.wrapping_add(phoff).cast::<Phdr>();
+    let hs = unsafe { ffi::slice(phdr, usize::from(phnum)) };
+    let addr = if rd16(16) == 3  { ehdr as usize } else { 0 };
+    object(addr, hs, q);
 }
 
 pub fn readonly_area(ptr: *const u8, size: usize) -> Area {
     let start = ptr as usize;
     let end = start.wrapping_add(size);
     let mut q = Query { ptr: start, end, verdict: Seg::NoVerdict };
-    unsafe { iterate_objects(&mut q) };
+    iterate_objects(&mut q);
     match q.verdict {
         Seg::ReadOnly => return Area::ReadOnly,
         Seg::Writable => return Area::Writable,

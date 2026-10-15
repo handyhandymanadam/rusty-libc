@@ -1,12 +1,11 @@
 #![no_std]
 #![no_builtins]
-#![allow(unsafe_op_in_unsafe_fn)]
-#![allow(clippy::missing_safety_doc)]
-#![allow(static_mut_refs)]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 
 pub mod audit;
 pub mod dl;
 pub mod elf;
+pub mod ffi;
 pub mod lookup;
 pub mod map;
 pub mod plt;
@@ -15,11 +14,20 @@ pub mod reloc;
 pub mod sys;
 pub mod tls;
 pub mod util;
+#[path = "../../rusty-libc-core/src/sync_cell.rs"]
+pub mod sync_cell;
+#[path = "../../rusty-libc-rs-core/src/strtab.rs"]
+pub mod strtab;
 #[path = "../../rusty-libc-core/src/tunables.rs"]
+#[allow(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 mod tunables;
+
+use core::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use sync_cell::SyncCell;
 
 pub mod ldebug {
     use super::sys;
+    use core::sync::atomic::{AtomicI32, AtomicU32, Ordering::Relaxed};
 
     pub const LIBS: u32 = 1 << 0;
     pub const IMPCALLS: u32 = 1 << 1;
@@ -35,8 +43,8 @@ pub mod ldebug {
     pub const TLS: u32 = 1 << 11;
     pub const SECURITY: u32 = 1 << 12;
 
-    static mut MASK: u32 = 0;
-    static mut FD: i32 = 2;
+    static MASK: AtomicU32 = AtomicU32::new(0);
+    static FD: AtomicI32 = AtomicI32::new(2);
 
     const OPTS: [(&[u8], &[u8], u32); 13] = [
         (b"libs", b"display library search paths", LIBS | IMPCALLS),
@@ -55,7 +63,7 @@ pub mod ldebug {
     ];
 
     pub fn mask() -> u32 {
-        unsafe { MASK }
+        MASK.load(Relaxed)
     }
 
     pub fn parse(v: &[u8]) {
@@ -71,7 +79,7 @@ pub mod ldebug {
                 }
             }
         }
-        unsafe { MASK |= m };
+        MASK.store(MASK.load(Relaxed) | m, Relaxed);
         if m & HELP != 0 {
             let mut o = super::Out::new(1);
             o.bytes(b"Valid options for the LD_DEBUG environment variable are:\n\n");
@@ -89,7 +97,7 @@ pub mod ldebug {
     }
 
     pub fn open_output(name: &[u8]) {
-        if unsafe { MASK } == 0 {
+        if MASK.load(Relaxed) == 0 {
             return;
         }
         let mut path = [0u8; 4096 + 24];
@@ -100,11 +108,12 @@ pub mod ldebug {
         let mut n = name.len();
         path[n] = b'.';
         n += 1;
-        n += dec(unsafe { sys::syscall3(sys::SYS_GETPID, 0, 0, 0) } as u64, &mut path[n..]);
+        n += dec(sys::getpid() as u64, &mut path[n..]);
         path[n] = 0;
         const FLAGS: usize = 0o1 | 0o2000 | 0o100 | 0o400000;
-        let fd = unsafe { sys::syscall6(sys::SYS_OPENAT, sys::AT_FDCWD as usize, path.as_ptr() as usize, FLAGS, 0o666, 0, 0) };
-        unsafe { FD = if fd < 0 { 1 } else { fd as i32 } };
+        let p = core::ffi::CStr::from_bytes_until_nul(&path[..n + 1]).unwrap_or(c"");
+        let fd = sys::openat(p, FLAGS, 0o666);
+        FD.store(if fd < 0 { 1 } else { fd as i32 }, Relaxed);
     }
 
     fn dec(mut v: u64, out: &mut [u8]) -> usize {
@@ -126,12 +135,12 @@ pub mod ldebug {
     pub fn write(msg: &[u8]) {
         let mut tag = [b' '; 12];
         let mut d = [0u8; 20];
-        let n = dec(unsafe { sys::syscall3(sys::SYS_GETPID, 0, 0, 0) } as u64, &mut d);
+        let n = dec(sys::getpid() as u64, &mut d);
         let n = n.min(10);
         tag[10 - n..10].copy_from_slice(&d[..n]);
         tag[10] = b':';
         tag[11] = b'\t';
-        let mut o = super::Out::new(unsafe { FD });
+        let mut o = super::Out::new(FD.load(Relaxed));
         for line in msg.split_inclusive(|&c| c == b'\n') {
             o.bytes(&tag);
             o.bytes(line);
@@ -145,12 +154,13 @@ pub mod ldebug {
 
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn __libc_ldso_debug_write(buf: *const u8, len: usize) {
-        write(unsafe { core::slice::from_raw_parts(buf, len) });
+        write(unsafe { crate::ffi::slice(buf, len) });
     }
 }
 
 mod tunable_api {
-    use super::tunables::{Ty, Values, COUNT, LIST};
+    use super::tunables::{COUNT, LIST, Ty, Values};
+    use crate::sync_cell::SyncCell;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -159,7 +169,7 @@ mod tunable_api {
         b: u64,
     }
 
-    static mut VALS: [TunableVal; COUNT] = {
+    static VALS: SyncCell<[TunableVal; COUNT]> = SyncCell::new({
         let mut v = [TunableVal { a: 0, b: 0 }; COUNT];
         let mut i = 0;
         while i < COUNT {
@@ -167,19 +177,32 @@ mod tunable_api {
             i += 1;
         }
         v
-    };
-    static mut INIT: [bool; COUNT] = [false; COUNT];
+    });
+    static INIT: SyncCell<[bool; COUNT]> = SyncCell::new([false; COUNT]);
 
-    pub unsafe fn store(t: &Values<'_>) {
+    pub fn store(t: &Values<'_>) {
         unsafe {
-            for (i, x) in t.0.iter().enumerate() {
-                VALS[i] = match x.str {
-                    Some(s) if LIST[i].ty == Ty::Str => TunableVal { a: s.as_ptr() as u64, b: s.len() as u64 },
-                    _ => TunableVal { a: x.num as u64, b: 0 },
-                };
-                INIT[i] = x.initialized;
-            }
-        }
+            VALS.with_unsync(|vals| {
+                for (i, x) in t.0.iter().enumerate() {
+                    vals[i] = match x.str {
+                        Some(s) if super::tunables::num(i).ty == Ty::Str => TunableVal { a: s.as_ptr() as u64, b: s.len() as u64 },
+                        _ => TunableVal { a: x.num as u64, b: 0 },
+                    };
+                }
+            })
+        };
+        unsafe {
+            INIT.with_unsync(|init| {
+                for (i, x) in t.0.iter().enumerate() {
+                    init[i] = x.initialized;
+                }
+            })
+        };
+    }
+
+    fn initialized(i: usize) -> bool {
+        let init = unsafe { INIT.read() };
+        init[i]
     }
 
     #[unsafe(no_mangle)]
@@ -188,24 +211,23 @@ mod tunable_api {
         if i >= COUNT {
             return;
         }
-        unsafe {
-            let cur = &raw mut VALS[i];
-            match LIST[i].ty {
-                Ty::I32 => *(valp as *mut i32) = (*cur).a as i32,
-                Ty::U64 | Ty::Size => *(valp as *mut u64) = (*cur).a,
-                Ty::Str => *(valp as *mut *const TunableVal) = cur,
-            }
-            if INIT[i] {
-                if let Some(cb) = callback {
-                    cb(cur);
-                }
-            }
+        let cur = (VALS.as_ptr() as *mut TunableVal).wrapping_add(i);
+        let v = unsafe { *cur };
+        match super::tunables::num(i).ty {
+            Ty::I32 => unsafe { *(valp as *mut i32) = v.a as i32 },
+            Ty::U64 | Ty::Size => unsafe { *(valp as *mut u64) = v.a },
+            Ty::Str => unsafe { *(valp as *mut *const TunableVal) = cur },
+        }
+        if initialized(i)
+            && let Some(cb) = callback
+        {
+            unsafe { cb(cur) };
         }
     }
 
     #[unsafe(no_mangle)]
     pub extern "C" fn __tunable_is_initialized(id: u32) -> bool {
-        unsafe { (id as usize) < COUNT && INIT[id as usize] }
+        (id as usize) < COUNT && initialized(id as usize)
     }
 }
 
@@ -213,82 +235,89 @@ use elf::*;
 use map::*;
 use util::*;
 
-unsafe fn make_vdso_map(base: usize) -> *mut LinkMap {
-    let eh = &*(base as *const Ehdr);
+unsafe fn make_vdso_map(base: usize) -> Option<Map> {
+    let eh = unsafe { ffi::at(base as *const Ehdr) };
     if &eh.ident[..4] != b"\x7fELF" || eh.phnum == 0 {
-        return core::ptr::null_mut();
+        return None;
     }
     let phdr = (base + eh.phoff as usize) as *const Phdr;
+    let phs = unsafe { ffi::slice(phdr, eh.phnum as usize) };
     let mut lo = usize::MAX;
     let mut hi = 0usize;
-    for i in 0..eh.phnum as usize {
-        let p = &*phdr.add(i);
+    for p in phs {
         if p.typ == PT_LOAD {
             lo = lo.min(p.vaddr as usize & !0xfff);
             hi = hi.max((p.vaddr + p.memsz) as usize);
         }
     }
     if lo == usize::MAX {
-        return core::ptr::null_mut();
+        return None;
     }
     let m = new_map();
-    (*m).l_addr = base.wrapping_sub(lo);
-    (*m).l_name = c"linux-vdso.so.1".as_ptr() as *const u8;
-    (*m).phdr = phdr;
-    (*m).phnum = eh.phnum as usize;
-    (*m).typ = ET_DYN;
-    (*m).map_start = base;
-    (*m).map_end = (*m).l_addr + hi;
-    (*m).is_vdso = true;
-    (*m).relocated = true;
-    (*m).init_called = true;
-    (*m).fini_called = true;
-    (*m).nodelete = true;
-    (*m).refcount = 1;
-    scan_phdrs(m);
-    if (*m).l_ld.is_null() {
-        return core::ptr::null_mut();
+    m.set_l_addr(base.wrapping_sub(lo));
+    unsafe { m.set_l_name(c"linux-vdso.so.1".as_ptr() as *const u8) };
+    unsafe { m.set_phdr(phdr) };
+    unsafe { m.set_phnum(eh.phnum as usize) };
+    m.set_typ(ET_DYN);
+    m.set_map_start(base);
+    m.set_map_end(m.l_addr() + hi);
+    m.set_is_vdso(true);
+    m.set_relocated(true);
+    m.set_init_called(true);
+    m.set_fini_called(true);
+    m.set_nodelete(true);
+    m.set_refcount(1);
+    unsafe { scan_phdrs(m) };
+    if m.l_ld().is_null() {
+        return None;
     }
-    parse_dynamic(m);
-    m
+    unsafe { parse_dynamic(m) };
+    Some(m)
 }
 
-unsafe fn order_chain() {
+fn order_chain() {
+    with_sort(|w| order_chain_in(&mut w.buf))
+}
+
+fn order_chain_in(buf: &mut [Option<Map>; 3 * MAX_MAPS]) {
     let s = st();
-    let mut all: [*mut LinkMap; MAX_MAPS] = [core::ptr::null_mut(); MAX_MAPS];
     let mut n = 0;
-    let mut c = ns(0).head;
-    while !c.is_null() && n < MAX_MAPS {
-        all[n] = c;
+    for c in ns(0).maps() {
+        if n == MAX_MAPS {
+            break;
+        }
+        buf[n] = Some(c);
         n += 1;
-        c = (*c).l_next;
     }
-    let mut new: [*mut LinkMap; MAX_MAPS] = [core::ptr::null_mut(); MAX_MAPS];
+    let (all, rest) = buf.split_at_mut(n);
+    let new = &mut rest[..(n + 1).min(MAX_MAPS)];
     let mut k = 0;
-    let mut push = |m: *mut LinkMap, new: &mut [*mut LinkMap; MAX_MAPS]| {
-        if k < MAX_MAPS && !new[..k].contains(&m) {
+    let mut push = |m: Option<Map>, new: &mut [Option<Map>]| {
+        if k < new.len() && !new[..k].contains(&m) {
             new[k] = m;
             k += 1;
         }
     };
-    push(s.main_map, &mut new);
+    push(s.main_map, new);
     for &m in &all[..n] {
-        if (*m).is_vdso {
-            push(m, &mut new);
+        if m.is_some_and(|m| m.is_vdso()) {
+            push(m, new);
         }
     }
-    for i in 0..ns(0).nglobal {
-        push(ns(0).scope()[i], &mut new);
+    for &g in ns(0).scope() {
+        push(Some(g), new);
     }
     for &m in &all[..n] {
-        push(m, &mut new);
+        push(m, new);
     }
     if k != n {
         return;
     }
     for i in 0..k {
-        (*new[i]).l_prev = if i == 0 { core::ptr::null_mut() } else { new[i - 1] };
-        (*new[i]).l_next = if i + 1 == k { core::ptr::null_mut() } else { new[i + 1] };
+        if let Some(m) = new[i] {
+            m.set_prev(if i == 0 { None } else { new[i - 1] });
+            m.set_next(if i + 1 == k { None } else { new[i + 1] });
+        }
     }
     ns(0).head = new[0];
     ns(0).tail = new[k - 1];
@@ -297,11 +326,11 @@ unsafe fn order_chain() {
 pub fn die(args: core::fmt::Arguments) -> ! {
     use core::fmt::Write;
     let mut o = Out::new(2);
-    let prog = unsafe { st().prog_name };
-    if prog.is_null() {
+    let prog = reloc::prog_name();
+    if st().prog_name.is_null() {
         let _ = o.write_str("ld.so");
     } else {
-        o.bytes(unsafe { cstr(prog) });
+        o.bytes(prog);
     }
     let _ = o.write_str(": ");
     let _ = o.write_fmt(args);
@@ -341,12 +370,13 @@ core::arch::global_asm!(
 unsafe fn relocate_self() -> usize {
     let base: usize;
     let dynp: *const Dyn;
-    core::arch::asm!("lea {0}, [rip + __ehdr_start]", "lea {1}, [rip + _DYNAMIC]", out(reg) base, out(reg) dynp, options(nomem, nostack, preserves_flags));
+    unsafe { core::arch::asm!("lea {0}, [rip + __ehdr_start]", "lea {1}, [rip + _DYNAMIC]", out(reg) base, out(reg) dynp, options(nomem, nostack, preserves_flags)) };
     let (mut rela, mut relasz, mut relr, mut relrsz, mut symtab, mut jmprel, mut pltrelsz) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     let mut d = dynp;
-    while (*d).tag != DT_NULL {
-        let v = (*d).val as usize;
-        match (*d).tag {
+    while unsafe { (*d).tag } != DT_NULL {
+        let e = unsafe { *d };
+        let v = e.val as usize;
+        match e.tag {
             DT_RELA => rela = base + v,
             DT_RELASZ => relasz = v,
             DT_RELR => relr = base + v,
@@ -356,7 +386,7 @@ unsafe fn relocate_self() -> usize {
             DT_PLTRELSZ => pltrelsz = v,
             _ => {}
         }
-        d = d.add(1);
+        d = d.wrapping_add(1);
     }
     let mut pass = 0;
     while pass < 2 {
@@ -364,15 +394,15 @@ unsafe fn relocate_self() -> usize {
         let n = size / core::mem::size_of::<Rela>();
         let mut i = 0;
         while i < n {
-            let r = &*((start as *const Rela).add(i));
+            let r = unsafe { *((start as *const Rela).wrapping_add(i)) };
             let ty = (r.info & 0xffff_ffff) as u32;
             let place = (base + r.offset as usize) as *mut usize;
             match ty {
-                R_X86_64_RELATIVE => *place = base.wrapping_add(r.addend as usize),
+                R_X86_64_RELATIVE => unsafe { *place = base.wrapping_add(r.addend as usize) },
                 R_X86_64_64 | R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
-                    let sym = &*((symtab as *const Sym).add((r.info >> 32) as usize));
+                    let sym = unsafe { *((symtab as *const Sym).wrapping_add((r.info >> 32) as usize)) };
                     let v = base.wrapping_add(sym.value as usize);
-                    *place = if ty == R_X86_64_64 { v.wrapping_add(r.addend as usize) } else { v };
+                    unsafe { *place = if ty == R_X86_64_64 { v.wrapping_add(r.addend as usize) } else { v } };
                 }
                 _ => {}
             }
@@ -385,19 +415,21 @@ unsafe fn relocate_self() -> usize {
         let mut w: *mut usize = core::ptr::null_mut();
         let mut i = 0;
         while i < n {
-            let e = *((relr as *const usize).add(i));
+            let e = unsafe { *((relr as *const usize).wrapping_add(i)) };
             if e & 1 == 0 {
                 w = (base + e) as *mut usize;
-                *w = (*w).wrapping_add(base);
-                w = w.add(1);
+                let v = unsafe { *w };
+                unsafe { *w = v.wrapping_add(base) };
+                w = w.wrapping_add(1);
             } else {
                 let mut bits = e >> 1;
                 while bits != 0 {
-                    let p = w.add(bits.trailing_zeros() as usize);
-                    *p = (*p).wrapping_add(base);
+                    let p = w.wrapping_add(bits.trailing_zeros() as usize);
+                    let v = unsafe { *p };
+                    unsafe { *p = v.wrapping_add(base) };
                     bits &= bits - 1;
                 }
-                w = w.add(63);
+                w = w.wrapping_add(63);
             }
             i += 1;
         }
@@ -413,96 +445,102 @@ fn env_value<'a>(s: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     }
 }
 
-unsafe fn make_ldso_map(base: usize) -> *mut LinkMap {
+unsafe fn make_ldso_map(base: usize) -> Map {
     let dynp: *mut Dyn;
-    core::arch::asm!("lea {0}, [rip + _DYNAMIC]", out(reg) dynp, options(nomem, nostack, preserves_flags));
-    let eh = &*(base as *const Ehdr);
+    unsafe { core::arch::asm!("lea {0}, [rip + _DYNAMIC]", out(reg) dynp, options(nomem, nostack, preserves_flags)) };
+    let eh = unsafe { ffi::at(base as *const Ehdr) };
     let m = new_map();
-    (*m).l_addr = base;
-    (*m).l_name = dup(b"/lib64/ld-linux-x86-64.so.2");
-    (*m).l_ld = dynp;
-    (*m).phdr = (base + eh.phoff as usize) as *const Phdr;
-    (*m).phnum = eh.phnum as usize;
-    (*m).typ = ET_DYN;
-    (*m).entry = base + eh.entry as usize;
-    (*m).is_ldso = true;
-    (*m).relocated = true;
-    (*m).init_called = true;
-    (*m).nodelete = true;
-    (*m).refcount = 1;
+    m.set_l_addr(base);
+    unsafe { m.set_l_name(dup(b"/lib64/ld-linux-x86-64.so.2").as_ptr() as *const u8) };
+    unsafe { m.set_l_ld(dynp) };
+    unsafe { m.set_phdr((base + eh.phoff as usize) as *const Phdr) };
+    unsafe { m.set_phnum(eh.phnum as usize) };
+    m.set_typ(ET_DYN);
+    m.set_entry(base + eh.entry as usize);
+    m.set_is_ldso(true);
+    m.set_relocated(true);
+    m.set_init_called(true);
+    m.set_nodelete(true);
+    m.set_refcount(1);
     let (mut lo, mut hi) = (usize::MAX, 0usize);
-    for i in 0..(*m).phnum {
-        let p = &*(*m).phdr.add(i);
+    for p in m.phdrs() {
         if p.typ == PT_LOAD {
             lo = lo.min(p.vaddr as usize & !0xfff);
             hi = hi.max((p.vaddr + p.memsz) as usize);
         }
     }
-    (*m).map_start = base + lo;
-    (*m).map_end = base + hi;
-    scan_phdrs(m);
-    parse_dynamic(m);
+    m.set_map_start(base + lo);
+    m.set_map_end(base + hi);
+    unsafe { scan_phdrs(m) };
+    unsafe { parse_dynamic(m) };
     m
 }
 
-unsafe fn join_names(a: *const u8, b: &[u8]) -> *const u8 {
-    unsafe {
-        if a.is_null() {
-            return dup(b);
-        }
-        let a = cstr(a);
-        let p = alloc_perm(a.len() + 1 + b.len() + 1, 1);
-        core::ptr::copy_nonoverlapping(a.as_ptr(), p, a.len());
-        *p.add(a.len()) = b':';
-        core::ptr::copy_nonoverlapping(b.as_ptr(), p.add(a.len() + 1), b.len());
-        *p.add(a.len() + 1 + b.len()) = 0;
-        p
-    }
+fn join_names(a: *const u8, b: &[u8]) -> *const u8 {
+    let Some(a) = (unsafe { ffi::cstr_opt(a) }) else { return dup(b).as_ptr() as *const u8 };
+    let len = a.len() + 1 + b.len() + 1;
+    let p = alloc_perm(len, 1);
+    let d = unsafe { ffi::slice_mut(p, len) };
+    d[..a.len()].copy_from_slice(a);
+    d[a.len()] = b':';
+    d[a.len() + 1..len - 1].copy_from_slice(b);
+    d[len - 1] = 0;
+    p
 }
 
-unsafe fn add_global(m: *mut LinkMap) {
-    if (*m).in_global {
+fn add_global(m: Map) {
+    if m.in_global() {
         return;
     }
-    if ns((*m).l_ns as usize).push_global(m) {
-        (*m).in_global = true;
+    if ns(m.l_ns() as usize).push_global(m) {
+        m.set_in_global(true);
     }
 }
 
-unsafe fn load_closure(from: usize) -> bool {
+pub(crate) fn load_needed(m: Map, with_filtees: bool, mut loaded: impl FnMut(Map)) -> bool {
+    let names = || m.dep_names().filter(move |&(_, k)| with_filtees || k == 0);
+    let count = names().count();
+    let needed = alloc_perm(count.max(1) * 8, 8) as *mut *mut LinkMap;
+    unsafe { m.set_needed(needed) };
+    unsafe { m.set_nneeded(0) };
+    let filtees = if with_filtees { alloc_perm(count.max(1) * 8, 8) as *mut *mut LinkMap } else { core::ptr::null_mut() };
+    if with_filtees {
+        unsafe { m.set_filtees(filtees) };
+        unsafe { m.set_nfiltees(0) };
+    }
+    for (name, kind) in names() {
+        let Some(d) = load_library(m.l_ns() as usize, name, Some(m)) else {
+            if kind == 0 {
+                return false;
+            }
+            continue;
+        };
+        let k = m.nneeded();
+        unsafe { *needed.wrapping_add(k) = d.as_ptr() };
+        unsafe { m.set_nneeded(k + 1) };
+        if kind != 0 {
+            let f = m.nfiltees();
+            unsafe { *filtees.wrapping_add(f) = d.as_ptr() };
+            unsafe { m.set_nfiltees(f + 1) };
+            if kind == 2 {
+                m.set_filter_hard(true);
+            }
+        }
+        loaded(d);
+    }
+    true
+}
+
+fn load_closure(from: usize) -> bool {
     let mut i = from;
     while i < ns(0).nglobal {
         let m = ns(0).scope()[i];
         i += 1;
-        if (*m).is_ldso {
+        if m.is_ldso() {
             continue;
         }
-        let mut count = 0usize;
-        dep_names(m, |_, _| count += 1);
-        (*m).needed = alloc_perm(count.max(1) * 8, 8) as *mut *mut LinkMap;
-        (*m).nneeded = 0;
-        (*m).filtees = alloc_perm(count.max(1) * 8, 8) as *mut *mut LinkMap;
-        (*m).nfiltees = 0;
-        let mut ok = true;
-        dep_names(m, |name, kind| {
-            if !ok {
-                return;
-            }
-            let d = load_library((*m).l_ns as usize, name, m);
-            if d.is_null() {
-                ok = kind != 0;
-                return;
-            }
-            *(*m).needed.add((*m).nneeded) = d;
-            (*m).nneeded += 1;
-            if kind != 0 {
-                *(*m).filtees.add((*m).nfiltees) = d;
-                (*m).nfiltees += 1;
-                if kind == 2 {
-                    (*m).filter_hard = true;
-                }
-            }
-            if !(*d).in_global {
+        let ok = load_needed(m, true, |d| {
+            if !d.in_global() {
                 add_global(d);
             }
         });
@@ -513,84 +551,121 @@ unsafe fn load_closure(from: usize) -> bool {
     true
 }
 
-pub unsafe fn build_scope(m: *mut LinkMap) {
-    let mut list: [*mut LinkMap; 512] = [core::ptr::null_mut(); 512];
+pub fn build_scope(m: Map) {
+    if !build_scope_in::<32>(m) {
+        build_scope_big(m);
+    }
+}
+
+#[inline(never)]
+fn build_scope_big(m: Map) {
+    build_scope_in::<512>(m);
+}
+
+#[inline(always)]
+fn build_scope_in<const N: usize>(m: Map) -> bool {
+    let mut list: [Map; N] = [m; N];
     let mut n = 1;
-    list[0] = m;
     let mut i = 0;
     while i < n {
         let c = list[i];
         i += 1;
-        for k in 0..(*c).nneeded {
-            let d = *(*c).needed.add(k);
-            if !list[..n].contains(&d) && n < 512 {
-                list[n] = d;
-                n += 1;
+        for &d in c.needed() {
+            if !list[..n].contains(&d) {
+                if n < N {
+                    list[n] = d;
+                    n += 1;
+                } else if N < 512 {
+                    return false;
+                }
             }
         }
     }
-    let arr = alloc_perm(n * 8, 8) as *mut *mut LinkMap;
-    core::ptr::copy_nonoverlapping(list.as_ptr(), arr, n);
-    (*m).scope = arr;
-    (*m).nscope = n;
+    let arr = alloc_perm(n * 8, 8) as *mut Map;
+    unsafe { ffi::slice_mut(arr, n) }.copy_from_slice(&list[..n]);
+    unsafe { m.set_scope(arr as *mut *mut LinkMap) };
+    unsafe { m.set_nscope(n) };
+    true
 }
 
-static mut INIT_COUNTER: usize = 0;
+static INIT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-pub static mut INIT_ENV: *mut *mut u8 = core::ptr::null_mut();
+static INIT_ENV: AtomicPtr<*mut u8> = AtomicPtr::new(core::ptr::null_mut());
+
+pub fn init_env_swap(env: *mut *mut u8) -> *mut *mut u8 {
+    INIT_ENV.swap(env, Relaxed)
+}
 
 type InitFn = unsafe extern "C" fn(i32, *mut *mut u8, *mut *mut u8);
 
-pub unsafe fn call_init(m: *mut LinkMap) {
-    if (*m).init_called {
+pub fn call_init(m: Map) {
+    if m.init_called() {
         return;
     }
-    (*m).init_called = true;
-    INIT_COUNTER += 1;
-    (*m).init_seq = INIT_COUNTER;
+    m.set_init_called(true);
+    let seq = INIT_COUNTER.load(Relaxed) + 1;
+    INIT_COUNTER.store(seq, Relaxed);
+    m.set_init_seq(seq);
     let s = st();
-    let envp = if INIT_ENV.is_null() { s.envp } else { INIT_ENV };
-    if (*m).init != 0 {
-        let f: InitFn = core::mem::transmute((*m).init);
-        f(s.argc as i32, s.argv, envp);
+    let env = INIT_ENV.load(Relaxed);
+    let envp = if env.is_null() { s.envp } else { env };
+    if m.init() != 0 {
+        let f: InitFn = unsafe { core::mem::transmute(m.init()) };
+        unsafe { f(s.argc as i32, s.argv, envp) };
     }
-    for i in 0..(*m).init_arraysz / 8 {
-        let f: InitFn = core::mem::transmute(*(*m).init_array.add(i));
-        f(s.argc as i32, s.argv, envp);
+    for &a in m.init_array() {
+        let f: InitFn = unsafe { core::mem::transmute(a) };
+        unsafe { f(s.argc as i32, s.argv, envp) };
     }
+    tls::libc_initialised(m);
 }
 
-pub unsafe fn init_tree(m: *mut LinkMap, skip_self: bool) {
-    if (*m).init_called && !(*m).is_main {
+pub fn init_tree(m: Map, skip_self: bool) {
+    if m.init_called() && !m.is_main() {
         return;
     }
-    const CAP: usize = 256;
-    let mut list = [core::ptr::null_mut::<LinkMap>(); CAP];
-    let mut n = 1;
+    let mut list = [m; 32];
+    let Some(n) = closure_into(m, &mut list) else {
+        init_tree_big(m, skip_self);
+        return;
+    };
+    init_sorted::<32>(&list, n, m, skip_self);
+}
+
+#[inline(never)]
+fn init_tree_big(m: Map, skip_self: bool) {
+    let mut list = [m; 256];
+    let Some(n) = closure_into(m, &mut list) else {
+        visit_all(m, skip_self);
+        return;
+    };
+    init_sorted::<256>(&list, n, m, skip_self);
+}
+
+#[inline(always)]
+fn closure_into(m: Map, list: &mut [Map]) -> Option<usize> {
     list[0] = m;
+    let mut n = 1;
     let mut i = 0;
     while i < n {
         let c = list[i];
         i += 1;
-        for k in 0..(*c).nneeded {
-            let d = *(*c).needed.add(k);
+        for &d in c.needed() {
             if !list[..n].contains(&d) {
-                if n == CAP {
-                    static mut VISITING: [*mut LinkMap; MAX_MAPS] = [core::ptr::null_mut(); MAX_MAPS];
-                    visit(m, skip_self, &mut VISITING, 0);
-                    return;
+                if n == list.len() {
+                    return None;
                 }
                 list[n] = d;
                 n += 1;
             }
         }
     }
-    init_sorted(&list, n, m, skip_self);
+    Some(n)
 }
 
-unsafe fn init_sorted(list: &[*mut LinkMap; 256], n: usize, first: *mut LinkMap, skip_first: bool) {
-    let mut visited = [false; 256];
-    let mut rpo = [core::ptr::null_mut::<LinkMap>(); 256];
+fn init_sorted<const N: usize>(list: &[Map], n: usize, first: Map, skip_first: bool) {
+    let mut visited = [false; N];
+    let mut rpo: [Option<Map>; N] = [None; N];
     let mut head = n;
     for i in (0..n).rev() {
         init_dfs(list, n, &mut visited, &mut rpo, &mut head, list[i]);
@@ -598,165 +673,175 @@ unsafe fn init_sorted(list: &[*mut LinkMap; 256], n: usize, first: *mut LinkMap,
             break;
         }
     }
-    if let Some(p) = rpo[..n].iter().position(|&x| x == first) {
-        if p != 0 {
-            rpo.copy_within(0..p, 1);
-            rpo[0] = first;
-        }
+    if let Some(p) = rpo[..n].iter().position(|&x| x == Some(first))
+        && p != 0
+    {
+        rpo.copy_within(0..p, 1);
+        rpo[0] = Some(first);
     }
     for idx in (0..n).rev() {
-        let c = rpo[idx];
-        if c.is_null() || (skip_first && c == first) || (*c).is_ldso || (*c).init_called && !(*c).is_main {
+        let Some(c) = rpo[idx] else { continue };
+        if (skip_first && c == first) || c.is_ldso() || c.init_called() && !c.is_main() {
             continue;
         }
         call_init(c);
     }
 }
 
-pub unsafe fn init_global() {
-    let mut list = [core::ptr::null_mut::<LinkMap>(); 256];
-    let mut n = 0;
-    for i in 0..ns(0).nglobal {
-        if n < 256 {
-            list[n] = ns(0).scope()[i];
-            n += 1;
-        }
-    }
-    if n == 0 {
-        return;
-    }
-    if n >= 256 {
-        for i in 0..ns(0).nglobal {
-            let m = ns(0).scope()[i];
-            if !(*m).is_main {
+pub fn init_global() {
+    let g = ns(0).scope();
+    let Some(&first) = g.first() else { return };
+    if g.len() >= 256 {
+        for &m in g {
+            if !m.is_main() {
                 init_tree(m, false);
             }
         }
         return;
     }
-    init_sorted(&list, n, list[0], (*list[0]).is_main);
+    init_sorted::<256>(g, g.len(), first, first.is_main());
 }
 
-unsafe fn init_dfs(list: &[*mut LinkMap; 256], n: usize, visited: &mut [bool; 256], rpo: &mut [*mut LinkMap; 256], head: &mut usize, map: *mut LinkMap) {
+fn init_dfs(list: &[Map], n: usize, visited: &mut [bool], rpo: &mut [Option<Map>], head: &mut usize, map: Map) {
     let Some(ix) = list[..n].iter().position(|&x| x == map) else { return };
     if visited[ix] {
         return;
     }
     visited[ix] = true;
-    for k in 0..(*map).nneeded {
-        let dep = *(*map).needed.add(k);
-        if let Some(di) = list[..n].iter().position(|&x| x == dep) {
-            if !visited[di] && !(*dep).is_main {
-                init_dfs(list, n, visited, rpo, head, dep);
-            }
+    for &dep in map.needed() {
+        if let Some(di) = list[..n].iter().position(|&x| x == dep)
+            && !visited[di] && !dep.is_main()
+        {
+            init_dfs(list, n, visited, rpo, head, dep);
         }
     }
     *head -= 1;
-    rpo[*head] = map;
+    rpo[*head] = Some(map);
 }
 
-unsafe fn visit(m: *mut LinkMap, skip_self: bool, stack: &mut [*mut LinkMap; MAX_MAPS], depth: usize) {
-    if depth >= MAX_MAPS || stack[..depth].contains(&m) {
+#[inline(never)]
+fn visit_all(m: Map, skip_self: bool) {
+    let mut stack: [Option<Map>; MAX_MAPS] = [None; MAX_MAPS];
+    visit(m, skip_self, &mut stack, 0);
+}
+
+fn visit(m: Map, skip_self: bool, stack: &mut [Option<Map>; MAX_MAPS], depth: usize) {
+    if depth >= MAX_MAPS || stack[..depth].contains(&Some(m)) {
         return;
     }
-    stack[depth] = m;
-    for k in 0..(*m).nneeded {
-        let d = *(*m).needed.add(k);
-        if !(*d).init_called && !(*d).is_ldso {
+    stack[depth] = Some(m);
+    for &d in m.needed() {
+        if !d.init_called() && !d.is_ldso() {
             visit(d, false, stack, depth + 1);
         }
     }
-    if !skip_self && !(*m).is_ldso {
+    if !skip_self && !m.is_ldso() {
         call_init(m);
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __libc_ldso_init_main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) {
-    let m = st().main_map;
-    if !m.is_null() && !(*m).init_called {
+pub extern "C" fn __libc_ldso_init_main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) {
+    if let Some(m) = st().main_map
+        && !m.init_called()
+    {
         call_init(m);
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __libc_ldso_auxv() -> *const usize {
+pub extern "C" fn __libc_ldso_auxv() -> *const usize {
     st().auxv
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __libc_ldso_main_runs_own_init() {
-    let m = st().main_map;
-    if !m.is_null() {
-        (*m).init_called = true;
-        (*m).fini_called = true;
+pub extern "C" fn __libc_ldso_main_runs_own_init() {
+    if let Some(m) = st().main_map {
+        m.set_init_called(true);
+        m.set_fini_called(true);
     }
 }
 
-static mut SORT_MAPS: [*mut LinkMap; MAX_MAPS] = [core::ptr::null_mut(); MAX_MAPS];
-static mut SORT_RPO: [*mut LinkMap; MAX_MAPS] = [core::ptr::null_mut(); MAX_MAPS];
-static mut SORT_OUT: [*mut LinkMap; MAX_MAPS] = [core::ptr::null_mut(); MAX_MAPS];
-static mut SORT_VISITED: [bool; MAX_MAPS] = [false; MAX_MAPS];
+#[repr(C)]
+struct Sort {
+    visited: [bool; MAX_MAPS],
+    buf: [Option<Map>; 3 * MAX_MAPS],
+}
+static SORT: SyncCell<Sort> = SyncCell::new(Sort { visited: [false; MAX_MAPS], buf: [None; 3 * MAX_MAPS] });
 
-unsafe fn sort_index(n: usize, m: *mut LinkMap) -> Option<usize> {
-    (*(&raw const SORT_MAPS)).iter().take(n).position(|&x| x == m)
+type SortViews<'a> = (&'a mut [Option<Map>], &'a mut [Option<Map>], &'a mut [Option<Map>], &'a mut [bool]);
+
+fn with_sort<R>(f: impl FnOnce(&mut Sort) -> R) -> R {
+    unsafe { SORT.with_unsync(f) }
 }
 
-unsafe fn dfs_traversal(n: usize, out: *mut [*mut LinkMap; MAX_MAPS], head: &mut usize, map: *mut LinkMap, do_reldeps: Option<&mut bool>) {
-    let Some(ix) = sort_index(n, map) else { return };
-    if SORT_VISITED[ix] {
+impl Sort {
+    fn split(&mut self, n: usize) -> SortViews<'_> {
+        let (maps, rest) = self.buf.split_at_mut(n);
+        let (rpo, rest) = rest.split_at_mut(n);
+        (maps, rpo, &mut rest[..n], &mut self.visited[..n])
+    }
+}
+
+fn sort_index(maps: &[Option<Map>], n: usize, m: Map) -> Option<usize> {
+    maps.iter().take(n).position(|&x| x == Some(m))
+}
+
+fn dfs_traversal(maps: &[Option<Map>], visited: &mut [bool], n: usize, out: &mut [Option<Map>], head: &mut usize, map: Map, do_reldeps: Option<&mut bool>) {
+    let Some(ix) = sort_index(maps, n, map) else { return };
+    if visited[ix] {
         return;
     }
-    SORT_VISITED[ix] = true;
+    visited[ix] = true;
     let mut flag = do_reldeps;
-    for k in 0..(*map).nneeded {
-        let dep = *(*map).needed.add(k);
-        if let Some(di) = sort_index(n, dep) {
-            if !SORT_VISITED[di] && !(*dep).is_main {
-                dfs_traversal(n, out, head, dep, flag.as_deref_mut());
-            }
+    for &dep in map.needed() {
+        if let Some(di) = sort_index(maps, n, dep)
+            && !visited[di] && !dep.is_main()
+        {
+            dfs_traversal(maps, visited, n, out, head, dep, flag.as_deref_mut());
         }
     }
-    if let Some(f) = flag.as_deref_mut() {
-        if (*map).nreldeps > 0 {
-            *f = true;
-            for k in (0..(*map).nreldeps).rev() {
-                let dep = *(*map).reldeps.add(k);
-                if let Some(di) = sort_index(n, dep) {
-                    if !SORT_VISITED[di] && !(*dep).is_main {
-                        dfs_traversal(n, out, head, dep, Some(&mut *f));
-                    }
-                }
+    if let Some(f) = flag
+        && map.nreldeps() > 0
+    {
+        *f = true;
+        for &dep in map.reldeps().iter().rev() {
+            if let Some(di) = sort_index(maps, n, dep)
+                && !visited[di] && !dep.is_main()
+            {
+                dfs_traversal(maps, visited, n, out, head, dep, Some(&mut *f));
             }
         }
     }
     *head -= 1;
-    (*out)[*head] = map;
+    out[*head] = Some(map);
 }
 
-unsafe fn fini_order(n: usize) -> *mut [*mut LinkMap; MAX_MAPS] {
-    let maps = &raw mut SORT_MAPS;
-    let rpo = &raw mut SORT_RPO;
-    let out = &raw mut SORT_OUT;
-    let first = (*maps)[0];
-    for v in (*(&raw mut SORT_VISITED)).iter_mut().take(n) {
+fn fini_order(s: &mut Sort, n: usize) -> bool {
+    let (maps, rpo, out, visited) = s.split(n);
+    let first = maps[0];
+    for v in visited.iter_mut() {
         *v = false;
     }
     let mut head = n;
     let mut do_reldeps = false;
     for i in (0..n).rev() {
-        dfs_traversal(n, rpo, &mut head, (*maps)[i], Some(&mut do_reldeps));
+        if let Some(m) = maps[i] {
+            dfs_traversal(maps, visited, n, rpo, &mut head, m, Some(&mut do_reldeps));
+        }
         if head == 0 {
             break;
         }
     }
     let result = if do_reldeps {
-        for v in (*(&raw mut SORT_VISITED)).iter_mut().take(n) {
+        for v in visited.iter_mut() {
             *v = false;
         }
         let mut mh = n;
         for i in (0..n).rev() {
-            dfs_traversal(n, out, &mut mh, (*rpo)[i], None);
+            if let Some(m) = rpo[i] {
+                dfs_traversal(maps, visited, n, out, &mut mh, m, None);
+            }
             if mh == 0 {
                 break;
             }
@@ -765,20 +850,20 @@ unsafe fn fini_order(n: usize) -> *mut [*mut LinkMap; MAX_MAPS] {
     } else {
         rpo
     };
-    if let Some(i) = (*result).iter().take(n).position(|&x| x == first) {
-        if i != 0 {
-            let f = (*result)[i];
-            for j in (0..i).rev() {
-                (*result)[j + 1] = (*result)[j];
-            }
-            (*result)[0] = f;
+    if let Some(i) = result.iter().take(n).position(|&x| x == first)
+        && i != 0
+    {
+        let f = result[i];
+        for j in (0..i).rev() {
+            result[j + 1] = result[j];
         }
+        result[0] = f;
     }
-    result
+    do_reldeps
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _dl_fini() {
+pub extern "C" fn _dl_fini() {
     for auditing in [false, true] {
         if auditing {
             audit::finish();
@@ -792,63 +877,61 @@ pub unsafe extern "C" fn _dl_fini() {
     }
 }
 
-unsafe fn fini_namespace(nsid: usize) {
+fn fini_namespace(nsid: usize) {
     let head = ns(nsid).head;
     let mut audit = false;
     if audit::active() && !audit::is_audit_ns(nsid) {
-        let mut cur = head;
-        while !cur.is_null() {
-            audit |= (*cur).audit_opened && !(*cur).is_vdso;
-            cur = (*cur).l_next;
+        for cur in MapIter(head) {
+            audit |= cur.audit_opened() && !cur.is_vdso();
         }
     }
     if audit {
         audit::activity_ns(nsid, audit::LA_ACT_DELETE);
     }
-    let mut n = 0;
-    let mut cur = ns(nsid).head;
-    while !cur.is_null() && n < MAX_MAPS {
-        (*(&raw mut SORT_MAPS))[n] = cur;
-        n += 1;
-        cur = (*cur).l_next;
-    }
-    if n > 0 {
-        let order = fini_order(n);
-        for i in 0..n {
-            let m = (*order)[i];
-            if (*m).init_called && !(*m).fini_called && !(*m).is_ldso {
-                run_fini(m);
+    let (n, from_out) = with_sort(|s| {
+        let mut n = 0;
+        for cur in ns(nsid).maps() {
+            if n == MAX_MAPS {
+                break;
             }
-            if audit && !(*m).is_ldso && !(*m).is_vdso {
-                audit::objclose_once(m);
-            }
+            s.buf[n] = Some(cur);
+            n += 1;
+        }
+        let from_out = n > 0 && fini_order(s, n);
+        (n, from_out)
+    });
+    for i in 0..n {
+        let m = with_sort(|s| if from_out { s.buf[2 * n + i] } else { s.buf[n + i] });
+        let Some(m) = m else { continue };
+        if m.init_called() && !m.fini_called() && !m.is_ldso() {
+            run_fini(m);
+        }
+        if audit && !m.is_ldso() && !m.is_vdso() {
+            audit::objclose_once(m);
         }
     }
     if audit {
-        let mut cur = head;
-        while !cur.is_null() {
-            if (*cur).is_ldso {
+        for cur in MapIter(head) {
+            if cur.is_ldso() {
                 audit::objclose_once(cur);
             }
-            cur = (*cur).l_next;
         }
         audit::activity_ns(nsid, audit::LA_ACT_CONSISTENT);
     }
 }
 
-pub unsafe fn run_fini(m: *mut LinkMap) {
-    if (*m).fini_called {
+pub fn run_fini(m: Map) {
+    if m.fini_called() {
         return;
     }
-    (*m).fini_called = true;
-    let n = (*m).fini_arraysz / 8;
-    for i in (0..n).rev() {
-        let f: unsafe extern "C" fn() = core::mem::transmute(*(*m).fini_array.add(i));
-        f();
+    m.set_fini_called(true);
+    for &a in m.fini_array().iter().rev() {
+        let f: unsafe extern "C" fn() = unsafe { core::mem::transmute(a) };
+        unsafe { f() };
     }
-    if (*m).fini != 0 {
-        let f: unsafe extern "C" fn() = core::mem::transmute((*m).fini);
-        f();
+    if m.fini() != 0 {
+        let f: unsafe extern "C" fn() = unsafe { core::mem::transmute(m.fini()) };
+        unsafe { f() };
     }
 }
 
@@ -867,82 +950,110 @@ pub const RT_ADD: i32 = 1;
 pub const RT_DELETE: i32 = 2;
 
 #[unsafe(no_mangle)]
-pub static mut _r_debug: RDebug = RDebug { version: 1, map: core::ptr::null_mut(), brk: 0, state: 0, ldbase: 0, r_next: core::ptr::null_mut() };
+pub static _r_debug: SyncCell<RDebug> = SyncCell::new(RDebug { version: 1, map: core::ptr::null_mut(), brk: 0, state: 0, ldbase: 0, r_next: core::ptr::null_mut() });
 
-static mut R_DEBUG_ARRAY: [RDebug; DL_NNS - 1] =
-    [const { RDebug { version: 0, map: core::ptr::null_mut(), brk: 0, state: 0, ldbase: 0, r_next: core::ptr::null_mut() } }; DL_NNS - 1];
+static R_DEBUG_ARRAY: SyncCell<[RDebug; DL_NNS - 1]> =
+    SyncCell::new([const { RDebug { version: 0, map: core::ptr::null_mut(), brk: 0, state: 0, ldbase: 0, r_next: core::ptr::null_mut() } }; DL_NNS - 1]);
 
-static mut R_DEBUG_MAIN: *mut RDebug = core::ptr::null_mut();
+static R_DEBUG_MAIN: AtomicPtr<RDebug> = AtomicPtr::new(core::ptr::null_mut());
 
-pub unsafe fn rdebug(ns: usize) -> *mut RDebug {
-    if ns == 0 { &raw mut _r_debug } else { &raw mut R_DEBUG_ARRAY[ns - 1] }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RDebugRef(*mut RDebug);
+
+impl RDebugRef {
+    fn with<R>(self, f: impl FnOnce(&mut RDebug) -> R) -> R {
+        f(unsafe { &mut *self.0 })
+    }
 }
 
-pub unsafe fn debug_update(ns: usize) -> *mut RDebug {
+pub fn rdebug(ns: usize) -> RDebugRef {
+    if ns == 0 { RDebugRef(_r_debug.as_ptr()) } else { RDebugRef((R_DEBUG_ARRAY.as_ptr() as *mut RDebug).wrapping_add(ns - 1)) }
+}
+
+pub fn rdebug_set_map(ns: usize, head: Option<Map>) {
+    rdebug(ns).with(|r| r.map = Map::opt_ptr(head));
+}
+
+pub fn debug_update(ns: usize) -> RDebugRef {
     let r = rdebug(ns);
-    if (*r).map.is_null() {
-        (*r).map = map::ns(ns).head;
-    }
+    r.with(|d| {
+        if d.map.is_null() {
+            d.map = Map::opt_ptr(map::ns(ns).head);
+        }
+    });
     r
 }
 
-pub unsafe fn debug_change_state(r: *mut RDebug, state: i32) {
-    (*r).state = state;
-    if r == &raw mut _r_debug && !R_DEBUG_MAIN.is_null() {
-        (*R_DEBUG_MAIN).state = state;
+fn with_main_copy(f: impl FnOnce(&mut RDebug)) {
+    let p = R_DEBUG_MAIN.load(Relaxed);
+    if !p.is_null() {
+        f(unsafe { &mut *p });
+    }
+}
+
+pub fn debug_change_state(r: RDebugRef, state: i32) {
+    r.with(|d| d.state = state);
+    if r == rdebug(0) {
+        with_main_copy(|c| c.state = state);
     }
     _dl_debug_state();
 }
 
-pub unsafe fn debug_initialize(ns: usize) -> *mut RDebug {
+pub fn debug_initialize(ns: usize) -> RDebugRef {
     let r = rdebug(ns);
-    if (*r).brk == 0 {
-        (*r).ldbase = (*st().ldso_map).l_addr;
-        (*r).brk = _dl_debug_state as usize;
+    if r.with(|d| d.brk) == 0 {
+        let ldbase = ldso_map().l_addr();
+        r.with(|d| {
+            d.ldbase = ldbase;
+            d.brk = _dl_debug_state as *const () as usize;
+        });
         if ns != 0 {
-            (*r).version = 2;
+            r.with(|d| d.version = 2);
             if ns == 1 {
-                _r_debug.r_next = r;
-                _r_debug.version = 2;
+                rdebug(0).with(|d| {
+                    d.r_next = r.0;
+                    d.version = 2;
+                });
             } else {
-                R_DEBUG_ARRAY[ns - 2].r_next = r;
+                rdebug(ns - 1).with(|d| d.r_next = r.0);
             }
         } else {
-            (*r).version = 1;
+            r.with(|d| d.version = 1);
         }
     }
-    if (*r).map.is_null() {
-        (*r).map = map::ns(ns).head;
-        if ns == 0 && !R_DEBUG_MAIN.is_null() {
-            (*R_DEBUG_MAIN).map = (*r).map;
+    if r.with(|d| d.map.is_null()) {
+        let head = Map::opt_ptr(map::ns(ns).head);
+        r.with(|d| d.map = head);
+        if ns == 0 {
+            with_main_copy(|c| c.map = head);
         }
     }
     r
 }
 
 #[unsafe(no_mangle)]
-pub static mut __libc_stack_end: usize = 0;
+pub static __libc_stack_end: AtomicUsize = AtomicUsize::new(0);
 
 #[repr(C, align(64))]
 pub struct Zeros<const N: usize>([u8; N]);
 #[unsafe(no_mangle)]
-pub static mut _rtld_global_ro: Zeros<928> = Zeros([0; 928]);
+pub static _rtld_global_ro: SyncCell<Zeros<928>> = SyncCell::new(Zeros([0; 928]));
 #[unsafe(no_mangle)]
-pub static mut _rtld_global: Zeros<2120> = Zeros([0; 2120]);
+pub static _rtld_global: SyncCell<Zeros<2120>> = SyncCell::new(Zeros([0; 2120]));
 #[unsafe(no_mangle)]
-pub static mut __libc_enable_secure: u32 = 0;
+pub static __libc_enable_secure: AtomicU32 = AtomicU32::new(0);
 #[unsafe(no_mangle)]
-pub static mut _dl_argv: *mut *mut u8 = core::ptr::null_mut();
+pub static _dl_argv: AtomicPtr<*mut u8> = AtomicPtr::new(core::ptr::null_mut());
 #[unsafe(no_mangle)]
-pub static mut __rseq_flags: u32 = 0;
+pub static __rseq_flags: AtomicU32 = AtomicU32::new(0);
 #[unsafe(no_mangle)]
-pub static mut __rseq_offset: isize = 0;
+pub static __rseq_offset: AtomicIsize = AtomicIsize::new(0);
 #[unsafe(no_mangle)]
-pub static mut __rseq_size: u32 = 0;
+pub static __rseq_size: AtomicU32 = AtomicU32::new(0);
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _dl_x86_get_cpu_features() -> *mut u8 {
-    (&raw mut _rtld_global_ro) as *mut u8
+pub extern "C" fn _dl_x86_get_cpu_features() -> *mut u8 {
+    _rtld_global_ro.as_ptr() as *mut u8
 }
 
 #[unsafe(no_mangle)]
@@ -951,25 +1062,37 @@ pub extern "C" fn _dl_debug_state() {
     unsafe { core::arch::asm!("", options(nostack, preserves_flags)) }
 }
 
-unsafe fn preload_names(list: &[u8], from: &[u8]) {
+fn secure_names(list: &[u8], seps: &[u8]) -> *const u8 {
+    let mut out: *const u8 = core::ptr::null();
+    for name in list.split(|c| seps.contains(c)) {
+        if !name.is_empty() && name.len() < 255 && !name.contains(&b'/') {
+            out = join_names(out, name);
+        }
+    }
+    out
+}
+
+fn preload_names(list: &[u8], from: &[u8]) {
     for name in list.split(|&c| c == b':' || c == b' ' || c == b'\t' || c == b'\n') {
         if name.is_empty() {
             continue;
         }
-        let d = load_library(0, name, core::ptr::null_mut());
-        if d.is_null() {
+        let Some(d) = load_library(0, name, None) else {
             let e = error_str();
             let e = e.strip_prefix(name).and_then(|r| r.strip_prefix(b": ")).unwrap_or(e);
             let reason: &[u8] = if e.starts_with(b"cannot open shared object file") { b"cannot open shared object file" } else { e };
             eprint!("ERROR: ld.so: object '{}' from {} cannot be preloaded ({}): ignored.\n", Bytes(name), Bytes(from), Bytes(reason));
             continue;
-        }
+        };
         add_global(d);
     }
 }
 
-unsafe fn preload_file() {
-    let fd = sys::open(c"/etc/ld.so.preload".as_ptr() as *const u8);
+fn preload_file() {
+    if sys::access_read(c"/etc/ld.so.preload") != 0 {
+        return;
+    }
+    let fd = sys::open(c"/etc/ld.so.preload");
     if fd < 0 {
         return;
     }
@@ -979,16 +1102,18 @@ unsafe fn preload_file() {
         return;
     }
     let buf = alloc_perm(size + 1, 1);
+    let text: &'static mut [u8] = unsafe { ffi::slice_mut(buf, size + 1) };
     let mut got = 0usize;
     while got < size {
-        let n = sys::pread(fd, buf.add(got), size - got, got);
+        let dst = unsafe { ffi::slice_mut(text[got..size].as_mut_ptr() as *mut core::mem::MaybeUninit<u8>, size - got) };
+        let n = sys::pread(fd, dst, got);
         if n <= 0 {
             break;
         }
         got += n as usize;
     }
     sys::close(fd);
-    let text = core::slice::from_raw_parts_mut(buf, got);
+    let text = &mut text[..got];
     let mut in_comment = false;
     for c in text.iter_mut() {
         if *c == b'#' {
@@ -1004,72 +1129,176 @@ unsafe fn preload_file() {
     preload_names(text, b"/etc/ld.so.preload");
 }
 
-unsafe fn print_usage() -> ! {
-    let me = cstr(*st().argv);
+fn print_usage() -> ! {
+    let a0 = unsafe { *st().argv };
+    let me = unsafe { ffi::cstr(a0) };
     let mut o = Out::new(1);
     use core::fmt::Write;
-    let _ = write!(o, "Usage: {} [OPTION]... EXECUTABLE-FILE [ARGS-FOR-PROGRAM...]\n", Bytes(me));
+    let _ = writeln!(o, "Usage: {} [OPTION]... EXECUTABLE-FILE [ARGS-FOR-PROGRAM...]", Bytes(me));
     o.bytes(b"You have invoked 'ld.so', the program interpreter for dynamically-linked\nELF programs.  Usually, the program interpreter is invoked automatically\nwhen a dynamically-linked executable is started.\n\nYou may invoke the program interpreter program directly from the command\nline to load and run an ELF executable file; this is like executing that\nfile itself, but always uses the program interpreter you invoked,\ninstead of the program interpreter specified in the executable file you\nrun.  Invoking the program interpreter directly provides access to\nadditional diagnostics, and changing the dynamic linker behavior without\nsetting environment variables (which would be inherited by subprocesses).\n\n  --list                list all dependencies and how they are resolved\n  --verify              verify that given object really is a dynamically linked\n                        object we can handle\n  --library-path PATH   use given PATH instead of content of the environment\n                        variable LD_LIBRARY_PATH\n  --preload LIST        preload objects named in LIST\n  --argv0 STRING        set argv[0] to STRING before running\n  --audit LIST          use objects named in LIST as auditors\n  (accepted and ignored: --inhibit-cache --inhibit-rpath\n   --glibc-hwcaps-prepend --glibc-hwcaps-mask --list-tunables --list-diagnostics)\n");
     drop(o);
     sys::exit(0)
 }
 
+#[inline(always)]
+fn rdtsc() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+#[inline(always)]
+unsafe fn stack_word(p: *const usize, i: usize) -> usize {
+    unsafe { *p.wrapping_add(i) }
+}
+
+#[inline(always)]
+unsafe fn set_stack_word(p: *mut usize, i: usize, v: usize) {
+    unsafe { *p.wrapping_add(i) = v }
+}
+
+#[inline(always)]
+unsafe fn proc_str(p: *const u8) -> &'static [u8] {
+    unsafe { ffi::cstr(p) }
+}
+
+unsafe fn fix_auxv(auxv: *mut usize, at_phdr: usize, at_phnum: usize, at_entry: usize, main_path: *const u8) {
+    let mut i = 0;
+    loop {
+        let t = unsafe { stack_word(auxv, i) };
+        if t == AT_NULL {
+            break;
+        }
+        let v = match t {
+            AT_PHDR => Some(at_phdr),
+            AT_PHNUM => Some(at_phnum),
+            AT_ENTRY => Some(at_entry),
+            AT_EXECFN => Some(main_path as usize),
+            _ => None,
+        };
+        if let Some(v) = v {
+            unsafe { set_stack_word(auxv, i + 1, v) };
+        }
+        i += 2;
+    }
+}
+
+fn die_with_error() -> ! {
+    let msg = error_str();
+    let mut tmp = [0u8; 500];
+    let l = msg.len().min(499);
+    tmp[..l].copy_from_slice(&msg[..l]);
+    die(format_args!("{}", Bytes(&tmp[..l])));
+}
+
+#[inline(never)]
+fn explicit_origin(open_path: &core::ffi::CStr) -> &'static core::ffi::CStr {
+    let mut canon = [0u8; 4096];
+    let mut clen = 0usize;
+    let fd = sys::open(open_path);
+    if fd >= 0 {
+        let mut link = *b"/proc/self/fd/\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let mut digits = [0u8; 12];
+        let (mut v, mut nd) = (fd as usize, 0usize);
+        loop {
+            digits[nd] = b'0' + (v % 10) as u8;
+            v /= 10;
+            nd += 1;
+            if v == 0 {
+                break;
+            }
+        }
+        for k in 0..nd {
+            link[14 + k] = digits[nd - 1 - k];
+        }
+        link[14 + nd] = 0;
+        let lp = core::ffi::CStr::from_bytes_until_nul(&link).unwrap_or(c"");
+        let cl = canon.len() - 1;
+        let dst = unsafe { ffi::slice_mut(canon.as_mut_ptr() as *mut core::mem::MaybeUninit<u8>, cl) };
+        let n = sys::readlink(lp, dst);
+        if n > 0 && canon[0] == b'/' {
+            clen = n as usize;
+        }
+        sys::close(fd);
+    }
+    let path: &[u8] = if clen > 0 { &canon[..clen] } else { open_path.to_bytes() };
+    let end = path.iter().rposition(|&c| c == b'/');
+    match end {
+        Some(0) => dup(b"/"),
+        Some(i) => dup(&path[..i]),
+        None => dup(b"."),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn die_load_error(msg: &[u8]) -> ! {
+    let mut tmp = [0u8; 400];
+    let l = msg.len().min(399);
+    tmp[..l].copy_from_slice(&msg[..l]);
+    die(format_args!("error while loading shared libraries: {}", Bytes(&tmp[..l])));
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
     let mut marks = [0u64; 8];
-    marks[0] = core::arch::x86_64::_rdtsc();
-    let base = relocate_self();
-    marks[1] = core::arch::x86_64::_rdtsc();
+    marks[0] = rdtsc();
+    let base = unsafe { relocate_self() };
+    marks[1] = rdtsc();
     let s = st();
     s.ldso_base = base;
-    __libc_stack_end = sp as usize;
-    let mut argc = *sp;
-    let mut argv = sp.add(1) as *mut *mut u8;
-    let envp = argv.add(argc + 1);
+    __libc_stack_end.store(sp as usize, Relaxed);
+    let mut argc = unsafe { stack_word(sp, 0) };
+    let mut argv = sp.wrapping_add(1) as *mut *mut u8;
+    let envp = argv.wrapping_add(argc + 1);
     let mut p = envp;
-    while !(*p).is_null() {
-        p = p.add(1);
+    while !unsafe { *p }.is_null() {
+        p = p.wrapping_add(1);
     }
-    let auxv = p.add(1) as *mut usize;
+    let auxv = p.wrapping_add(1) as *mut usize;
     s.argc = argc;
     s.argv = argv;
     s.envp = envp;
     s.auxv = auxv;
-    _dl_argv = argv;
-    s.prog_name = if argc > 0 { *argv } else { c"ld.so".as_ptr() as *const u8 };
+    _dl_argv.store(argv, Relaxed);
+    s.prog_name = if argc > 0 { unsafe { *argv } } else { c"ld.so".as_ptr() as *const u8 };
 
     let mut sysinfo = 0usize;
     let (mut at_phdr, mut at_phnum, mut at_entry, mut at_base, mut random) = (0usize, 0usize, 0usize, 0usize, core::ptr::null::<usize>());
-    let mut a = auxv;
-    while *a != AT_NULL {
-        match *a {
-            AT_PHDR => at_phdr = *a.add(1),
-            AT_PHNUM => at_phnum = *a.add(1),
-            AT_ENTRY => at_entry = *a.add(1),
-            AT_BASE => at_base = *a.add(1),
+    let mut ai = 0;
+    loop {
+        let t = unsafe { stack_word(auxv, ai) };
+        let v = unsafe { stack_word(auxv, ai + 1) };
+        if t == AT_NULL {
+            break;
+        }
+        match t {
+            AT_PHDR => at_phdr = v,
+            AT_PHNUM => at_phnum = v,
+            AT_ENTRY => at_entry = v,
+            AT_BASE => at_base = v,
             AT_SECURE => {
-                s.secure = *a.add(1) != 0;
-                __libc_enable_secure = s.secure as u32;
+                s.secure = v != 0;
+                __libc_enable_secure.store(s.secure as u32, Relaxed);
             }
-            AT_RANDOM => random = *a.add(1) as *const usize,
-            33 => sysinfo = *a.add(1),
-            AT_PAGESZ => s.page_size = *a.add(1),
+            AT_RANDOM => random = v as *const usize,
+            33 => sysinfo = v,
+            AT_PAGESZ => s.page_size = v,
             _ => {}
         }
-        a = a.add(2);
+        ai += 2;
     }
     let _ = at_base;
-    s.stack_exec = (0..at_phnum).map(|i| &*(at_phdr as *const Phdr).add(i)).find(|p| p.typ == PT_GNU_STACK).is_none_or(|p| p.flags & PF_X != 0);
+    let kphdrs = unsafe { ffi::slice(at_phdr as *const Phdr, at_phnum) };
+    s.stack_exec = kphdrs.iter().find(|p| p.typ == PT_GNU_STACK).is_none_or(|p| p.flags & PF_X != 0);
 
     let mut tunables_env = false;
     let mut tvals = tunables::Values::default();
     if !s.secure {
-        if let Some(v) = tunables::find_env(envp) {
+        if let Some(v) = unsafe { tunables::find_env(envp) } {
             tunables_env = true;
             let t = tunables::parse(v, &mut |w| tunables::warning_text(&w, v, &mut |b| Out::new(2).bytes(b)));
             if t.enable_secure {
                 s.secure = true;
-                __libc_enable_secure = 1;
+                __libc_enable_secure.store(1, Relaxed);
             }
             s.map32 = t.prefer_map_32bit_exec;
             s.execstack_mode = t.execstack;
@@ -1079,56 +1308,57 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
         }
     }
     if !s.secure {
-        let mut alias: [Option<&[u8]>; tunables::COUNT] = [None; tunables::COUNT];
-        let mut e = envp;
-        while !(*e).is_null() {
-            let v = cstr(*e);
-            if let Some(i) = tunables::LIST.iter().position(|d| !d.alias.is_empty() && env_value(v, d.alias).is_some()) {
-                alias[i] = env_value(v, tunables::LIST[i].alias);
-            }
-            e = e.add(1);
-        }
-        for (i, a) in alias.iter().enumerate() {
-            if let Some(v) = *a
-                && !tvals.0[i].initialized
-                && !tvals.initialize(i, v)
-            {
-                tunables::warning_text(&tunables::Warning::BadValue(v, tunables::LIST[i].name), v, &mut |b| Out::new(2).bytes(b));
-            }
+        unsafe {
+            tunables::apply_aliases(&mut tvals, envp, &mut |w| {
+                if let tunables::Warning::BadValue(v, _) = w {
+                    tunables::warning_text(&w, v, &mut |b| Out::new(2).bytes(b));
+                }
+            });
         }
     }
     tunable_api::store(&tvals);
+    if s.secure {
+        sys::check_standard_fds();
+    }
 
     let mut e = envp;
     let mut debug_libs = false;
     let mut debug_output: Option<&[u8]> = None;
     let mut stats = false;
-    let mut prof_name: *const u8 = core::ptr::null();
-    let mut prof_out: *const u8 = core::ptr::null();
+    let mut prof_name: Option<&'static [u8]> = None;
+    let mut prof_out: Option<&'static [u8]> = None;
     let mut force_fxsave = false;
-    while !(*e).is_null() {
-        let v = cstr(*e);
+    loop {
+        let ep = unsafe { *e };
+        if ep.is_null() {
+            break;
+        }
+        let v = unsafe { proc_str(ep) };
         if env_value(v, b"LD_RL_FORCE_FXSAVE").is_some_and(|x| !x.is_empty()) {
             force_fxsave = true;
         }
         if !s.secure {
             if let Some(x) = env_value(v, b"LD_LIBRARY_PATH") {
-                s.library_path = dup(x);
+                s.library_path = dup(x).as_ptr() as *const u8;
             } else if let Some(x) = env_value(v, b"LD_PRELOAD") {
-                s.preload = dup(x);
+                s.preload = dup(x).as_ptr() as *const u8;
             } else if let Some(x) = env_value(v, b"LD_AUDIT") {
-                s.audit = dup(x);
+                s.audit = dup(x).as_ptr() as *const u8;
             }
+        } else if let Some(x) = env_value(v, b"LD_PRELOAD") {
+            s.preload = secure_names(x, b" :");
+        } else if let Some(x) = env_value(v, b"LD_AUDIT") {
+            s.audit = secure_names(x, b":");
         }
         if !s.secure {
             if let Some(x) = env_value(v, b"LD_PROFILE") {
                 if !x.is_empty() {
-                    prof_name = dup(x);
+                    prof_name = Some(dup(x).to_bytes());
                 }
-            } else if let Some(x) = env_value(v, b"LD_PROFILE_OUTPUT") {
-                if !x.is_empty() {
-                    prof_out = dup(x);
-                }
+            } else if let Some(x) = env_value(v, b"LD_PROFILE_OUTPUT")
+                && !x.is_empty()
+            {
+                prof_out = Some(dup(x).to_bytes());
             }
         }
         if !s.secure && env_value(v, b"LD_PREFER_MAP_32BIT_EXEC").is_some_and(|x| !x.is_empty()) {
@@ -1160,7 +1390,7 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
         if !s.secure && let Some(x) = env_value(v, b"LD_DEBUG_OUTPUT") {
             debug_output = Some(x);
         }
-        e = e.add(1);
+        e = e.wrapping_add(1);
     }
     plt::init_xsave(force_fxsave);
     s.debug = debug_libs;
@@ -1169,28 +1399,30 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
     }
     profile::configure(prof_name, prof_out);
     if s.secure {
-        tunables::scrub_unsecure_env(envp);
+        unsafe { tunables::scrub_unsecure_env(envp) };
     }
 
-    marks[2] = core::arch::x86_64::_rdtsc();
-    let ldso = make_ldso_map(base);
-    s.ldso_map = ldso;
+    marks[2] = rdtsc();
+    let ldso = unsafe { make_ldso_map(base) };
+    s.ldso_map = Some(ldso);
     link_map(ldso);
 
-    let direct = at_entry == (*ldso).entry;
+    let direct = at_entry == ldso.entry();
     let mut main_path: *const u8 = core::ptr::null();
     let mut argv0_override: *const u8 = core::ptr::null();
     let mut verify = false;
     let mut skip = 0usize;
     if direct {
-        let me = cstr(*argv);
+        let a0 = unsafe { *argv };
+        let me = unsafe { proc_str(a0) };
         let usage_error = |msg: core::fmt::Arguments| -> ! {
             eprint!("{}: {}\nTry '{} --help' for more information.\n", Bytes(me), msg, Bytes(me));
             sys::exit(1)
         };
+        let arg = |i: usize| -> *mut u8 { unsafe { *argv.wrapping_add(i) } };
         let mut i = 1usize;
         while i < argc {
-            let full = cstr(*argv.add(i));
+            let full = unsafe { proc_str(arg(i)) };
             if full.first() != Some(&b'-') || full == b"-" {
                 break;
             }
@@ -1210,28 +1442,24 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
             let mut value: *const u8 = core::ptr::null();
             if takes_arg {
                 match inline_val {
-                    Some(v) => value = full.as_ptr().add(full.len() - v.len()),
+                    Some(v) => value = full.as_ptr().wrapping_add(full.len() - v.len()),
                     None => {
                         if i + 1 >= argc {
                             usage_error(format_args!("option '{}' requires an argument", Bytes(name)));
                         }
                         i += 1;
-                        value = *argv.add(i);
+                        value = arg(i);
                     }
                 }
             }
             match name {
                 b"--list" => s.trace = true,
                 b"--verify" => verify = true,
-                b"--library-path" => {
-                    if !s.secure {
-                        s.library_path = value;
-                    }
-                }
+                b"--library-path" => s.library_path = value,
                 b"--preload" => s.preload = value,
                 b"--audit" => {
                     if !s.secure {
-                        s.audit = join_names(s.audit, cstr(value));
+                        s.audit = join_names(s.audit, unsafe { proc_str(value) });
                     }
                 }
                 b"--argv0" => argv0_override = value,
@@ -1249,16 +1477,35 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
         if i >= argc {
             usage_error(format_args!("missing program name"));
         }
-        main_path = *argv.add(i);
+        main_path = arg(i);
         skip = i;
         s.prog_name = main_path;
     }
 
-    let main: *mut LinkMap;
+    let main: Map;
     if direct {
-        let fd = if verify { -1 } else { sys::open(main_path) };
+        let main_str = unsafe { ffi::cstr_nul(main_path) };
+        let open_path: &'static core::ffi::CStr = if main_str.to_bytes().contains(&b'/') {
+            main_str
+        } else {
+            match map::cache_lookup(main_str.to_bytes()) {
+                Some(p) => {
+                    unsafe { ffi::cstr_nul(p.as_ptr()) }
+                }
+                None => {
+                    if verify {
+                        sys::exit(1);
+                    }
+                    match map::cache_open_error() {
+                        Some(e) => die(format_args!("error while loading shared libraries: {}: cannot open shared object file: {}", Bytes(main_str.to_bytes()), e)),
+                        None => die(format_args!("error while loading shared libraries: {}: cannot open shared object file", Bytes(main_str.to_bytes()))),
+                    }
+                }
+            }
+        };
+        let fd = if verify { -1 } else { sys::open(open_path) };
         if fd >= 0 {
-            let me = sys::open(c"/proc/self/exe".as_ptr() as *const u8);
+            let me = sys::open(c"/proc/self/exe");
             if me >= 0 {
                 let (a, b) = (sys::fstat_id(fd), sys::fstat_id(me));
                 sys::close(me);
@@ -1269,103 +1516,42 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
             }
             sys::close(fd);
         }
-        let m = map_file(0, main_path, main_path, core::ptr::null_mut());
+        let m = map_file(0, open_path, main_str, None);
         if verify {
-            if m.is_null() {
-                sys::exit(1);
-            }
-            let mut interp = false;
-            for i in 0..(*m).phnum {
-                if (*(*m).phdr.add(i)).typ == PT_INTERP {
-                    interp = true;
-                }
-            }
-            sys::exit(if interp { 0 } else if (*m).typ == ET_DYN { 2 } else { 1 });
+            let Some(m) = m else { sys::exit(1) };
+            let interp = m.phdrs().iter().any(|p| p.typ == PT_INTERP);
+            sys::exit(if interp { 0 } else if m.typ() == ET_DYN { 2 } else { 1 });
         }
-        if m.is_null() {
-            let msg = error_str();
-            let mut tmp = [0u8; 400];
-            let l = msg.len().min(399);
-            tmp[..l].copy_from_slice(&msg[..l]);
-            die(format_args!("error while loading shared libraries: {}: {}", Bytes(cstr(main_path)), Bytes(&tmp[..l])));
-        }
-        main = m;
-        let mut canon = [0u8; 4096];
-        let mut clen = 0usize;
-        let fd = sys::open(main_path);
-        if fd >= 0 {
-            let mut link = *b"/proc/self/fd/\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-            let mut digits = [0u8; 12];
-            let (mut v, mut nd) = (fd as usize, 0usize);
-            loop {
-                digits[nd] = b'0' + (v % 10) as u8;
-                v /= 10;
-                nd += 1;
-                if v == 0 {
-                    break;
-                }
-            }
-            for k in 0..nd {
-                link[14 + k] = digits[nd - 1 - k];
-            }
-            link[14 + nd] = 0;
-            let n = sys::readlink(link.as_ptr(), canon.as_mut_ptr(), canon.len() - 1);
-            if n > 0 && canon[0] == b'/' {
-                clen = n as usize;
-            }
-            sys::close(fd);
-        }
-        let path: &[u8] = if clen > 0 { &canon[..clen] } else { cstr(main_path) };
-        let end = path.iter().rposition(|&c| c == b'/');
-        (*m).origin = match end {
-            Some(0) => dup(b"/"),
-            Some(i) => dup(&path[..i]),
-            None => dup(b"."),
+        let Some(m) = m else {
+            set_error_obj(main_str.to_bytes());
+            die_load_error(error_str());
         };
-        (*m).l_name = c"".as_ptr() as *const u8;
+        main = m;
+        let origin = explicit_origin(open_path);
+        unsafe { m.set_origin(origin.as_ptr() as *const u8) };
+        unsafe { m.set_l_name(c"".as_ptr() as *const u8) };
         link_map(m);
-        at_entry = (*m).entry;
-        at_phdr = (*m).phdr as usize;
-        at_phnum = (*m).phnum;
-        let mut has_interp = false;
-        for i in 0..(*m).phnum {
-            if (*(*m).phdr.add(i)).typ == PT_INTERP {
-                has_interp = true;
-            }
-        }
-        if s.trace && !has_interp && (*m).typ == ET_DYN && (*m).flags_1 & 0x0800_0000 != 0 {
+        at_entry = m.entry();
+        at_phdr = m.phdr() as usize;
+        at_phnum = m.phnum();
+        let has_interp = m.phdrs().iter().any(|p| p.typ == PT_INTERP);
+        if s.trace && !has_interp && m.typ() == ET_DYN && m.flags_1() & 0x0800_0000 != 0 {
             let mut o = Out::new(1);
             o.bytes(b"\tstatically linked\n");
             drop(o);
             sys::exit(0);
         }
-        if !has_interp && (*m).typ == ET_DYN {
-            if (*m).dyn_adjusted {
-                let mut d = (*m).l_ld;
-                while (*d).tag != DT_NULL {
-                    if matches!((*d).tag, DT_HASH | DT_PLTGOT | DT_STRTAB | DT_SYMTAB | DT_RELA | DT_JMPREL | DT_VERSYM | DT_GNU_HASH | DT_RELR) {
-                        (*d).val = (*d).val.wrapping_sub((*m).l_addr as u64);
-                    }
-                    d = d.add(1);
-                }
+        if !has_interp && m.typ() == ET_DYN {
+            if m.dyn_adjusted() {
+                map::dyn_rebase(m, m.l_addr() as u64, false);
             }
-            let new_sp = sp.add(skip);
-            *new_sp = argc - skip;
-            let argv = new_sp.add(1) as *mut *mut u8;
+            let new_sp = sp.wrapping_add(skip);
+            unsafe { set_stack_word(new_sp, 0, argc - skip) };
+            let argv = new_sp.wrapping_add(1) as *mut *mut u8;
             if !argv0_override.is_null() {
-                *argv = argv0_override as *mut u8;
+                unsafe { *argv = argv0_override as *mut u8 };
             }
-            let mut a = auxv;
-            while *a != AT_NULL {
-                match *a {
-                    AT_PHDR => *a.add(1) = at_phdr,
-                    AT_PHNUM => *a.add(1) = at_phnum,
-                    AT_ENTRY => *a.add(1) = at_entry,
-                    AT_EXECFN => *a.add(1) = main_path as usize,
-                    _ => {}
-                }
-                a = a.add(2);
-            }
+            unsafe { fix_auxv(auxv, at_phdr, at_phnum, at_entry, main_path) };
             return Pair(new_sp as usize, at_entry);
         }
     } else {
@@ -1374,8 +1560,7 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
         let mut bias = 0usize;
         let mut have_dyn = false;
         let mut interp = None;
-        for i in 0..at_phnum {
-            let ph = &*phdr.add(i);
+        for ph in kphdrs {
             if ph.typ == PT_PHDR {
                 bias = at_phdr.wrapping_sub(ph.vaddr as usize);
             }
@@ -1387,24 +1572,24 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
             }
         }
         if let Some(v) = interp {
-            (*ldso).l_name = bias.wrapping_add(v) as *const u8;
+            unsafe { ldso.set_l_name(bias.wrapping_add(v) as *const u8) };
         }
         if !have_dyn {
-            die(format_args!("error while loading shared libraries: {}: cannot dynamically load executable", Bytes(cstr(s.prog_name))));
+            die(format_args!("error while loading shared libraries: {}: cannot dynamically load executable", Bytes(reloc::prog_name())));
         }
-        (*main).l_addr = bias;
-        (*main).l_name = c"".as_ptr() as *const u8;
-        (*main).phdr = phdr;
-        (*main).phnum = at_phnum;
-        (*main).entry = at_entry;
-        (*main).typ = ET_EXEC;
-        scan_phdrs(main);
-        parse_dynamic(main);
+        main.set_l_addr(bias);
+        unsafe { main.set_l_name(c"".as_ptr() as *const u8) };
+        unsafe { main.set_phdr(phdr) };
+        unsafe { main.set_phnum(at_phnum) };
+        main.set_entry(at_entry);
+        main.set_typ(ET_EXEC);
+        unsafe { scan_phdrs(main) };
+        unsafe { parse_dynamic(main) };
         link_map(main);
     }
-    (*main).is_main = true;
-    (*main).refcount = 1;
-    s.main_map = main;
+    main.set_is_main(true);
+    main.set_refcount(1);
+    s.main_map = Some(main);
     match s.execstack_mode {
         0 if s.stack_exec => {
             Out::new(2).bytes(b"Fatal glibc error: executable stack is not allowed\n");
@@ -1418,17 +1603,18 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
     }
     add_global(main);
     if sysinfo != 0 {
-        let v = make_vdso_map(sysinfo);
-        if !v.is_null() {
+        if let Some(v) = unsafe { make_vdso_map(sysinfo) } {
             link_map(v);
         }
     }
 
+    map::SECURE_SEARCH.store(s.secure, Relaxed);
     if !s.preload.is_null() {
-        preload_names(cstr(s.preload), b"LD_PRELOAD");
+        preload_names(unsafe { proc_str(s.preload) }, b"LD_PRELOAD");
     }
     preload_file();
-    marks[3] = core::arch::x86_64::_rdtsc();
+    map::SECURE_SEARCH.store(false, Relaxed);
+    marks[3] = rdtsc();
     if !load_closure(0) {
         let msg = error_str();
         let mut tmp = [0u8; 500];
@@ -1438,23 +1624,25 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
     }
     add_global(ldso);
     order_chain();
-    for off in [(*main).audit_str, (*main).depaudit_str] {
+    for off in [main.audit_str(), main.depaudit_str()] {
         if off != 0 {
-            let name = cstr((*main).strtab.add(off as usize - 1));
+            let name = unsafe { main.str_at(off as usize - 1) };
             if !name.is_empty() && !(s.secure && name.contains(&b'/')) {
                 s.audit = join_names(s.audit, name);
             }
         }
     }
     if !s.audit.is_null() {
-        audit::load(cstr(s.audit), false);
+        map::SECURE_SEARCH.store(s.secure, Relaxed);
+        audit::load(unsafe { proc_str(s.audit) }, false);
+        map::SECURE_SEARCH.store(false, Relaxed);
     }
-    for i in 0..ns(0).nglobal {
-        (*ns(0).scope()[i]).nodelete = true;
-        (*ns(0).scope()[i]).refcount += 1;
+    for &g in ns(0).scope() {
+        g.set_nodelete(true);
+        g.set_refcount(g.refcount() + 1);
     }
     if !check_versions() {
-        eprint!("{}: {}\n", Bytes(cstr(s.prog_name)), Bytes(error_str()));
+        eprint!("{}: {}\n", Bytes(reloc::prog_name()), Bytes(error_str()));
         sys::exit(1);
     }
 
@@ -1472,143 +1660,122 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
         sys::exit(0);
     }
 
-    for i in 0..ns(0).nglobal {
-        tls::add_module(ns(0).scope()[i], true);
+    for &g in ns(0).scope() {
+        tls::add_module(g, true);
     }
-    for i in 0..audit::au().nmaps {
-        tls::add_module(audit::au().maps[i], true);
+    for m in audit::au().maps() {
+        tls::add_module(m, true);
     }
-    marks[4] = core::arch::x86_64::_rdtsc();
-    tls::setup_main_thread(random);
-    marks[5] = core::arch::x86_64::_rdtsc();
+    marks[4] = rdtsc();
+    unsafe { tls::setup_main_thread(random) };
+    marks[5] = rdtsc();
 
     let mut new_sp = sp;
     if direct {
-        new_sp = sp.add(skip);
-        *new_sp = argc - skip;
+        new_sp = sp.wrapping_add(skip);
+        unsafe { set_stack_word(new_sp, 0, argc - skip) };
         argc -= skip;
-        argv = new_sp.add(1) as *mut *mut u8;
+        argv = new_sp.wrapping_add(1) as *mut *mut u8;
         if !argv0_override.is_null() {
-            *argv = argv0_override as *mut u8;
+            unsafe { *argv = argv0_override as *mut u8 };
         }
-        let mut a = auxv;
-        while *a != AT_NULL {
-            match *a {
-                AT_PHDR => *a.add(1) = at_phdr,
-                AT_PHNUM => *a.add(1) = at_phnum,
-                AT_ENTRY => *a.add(1) = at_entry,
-                AT_EXECFN => *a.add(1) = main_path as usize,
-                _ => {}
-            }
-            a = a.add(2);
-        }
+        unsafe { fix_auxv(auxv, at_phdr, at_phnum, at_entry, main_path) };
         s.argc = argc;
         s.argv = argv;
-        _dl_argv = argv;
+        _dl_argv.store(argv, Relaxed);
     }
     if audit::au().n != 0 {
-        let mut i = audit::au().nmaps;
-        while i > 0 {
-            i -= 1;
-            let m = audit::au().maps[i];
-            if !reloc::relocate(m) {
+        for m in audit::au().maps().rev() {
+            if !unsafe { reloc::relocate(m) } {
                 let msg = error_str();
                 die(format_args!("{}", Bytes(msg)));
             }
         }
         for i in 0..audit::au().n {
-            let lm = ns((*audit::au().libs[i].map).l_ns as usize).libc_map;
-            if !lm.is_null() && !(*lm).init_called {
+            let Some(am) = audit::au().libs[i].map else { continue };
+            if let Some(lm) = ns(am.l_ns() as usize).libc_map
+                && !lm.init_called()
+            {
                 dl::call_libc_early_init(lm, false);
             }
-            init_tree(audit::au().libs[i].map, false);
+            init_tree(am, false);
         }
-        audit::announce_open();
+        unsafe { audit::announce_open() };
     }
 
     if tunables_env && !s.secure {
-        let fl = lookup::Flags { plt: false, skip: core::ptr::null_mut(), newest: false };
-        for i in 0..ns(0).nglobal {
-            let one = [ns(0).scope()[i]];
-            if let Some(f) = lookup::lookup(b"environ", None, &[&one], &fl) {
-                if (*f.sym).info & 0xf == STT_OBJECT {
-                    *(lookup::sym_addr(&f) as *mut *mut *mut u8) = envp;
-                }
+        let fl = lookup::Flags { plt: false, skip: None, newest: false };
+        for &g in ns(0).scope() {
+            let one = [g];
+            if let Some(f) = lookup::lookup(b"environ", None, &[&one], &fl)
+                && f.sym.info & 0xf == STT_OBJECT
+            {
+                unsafe { *(lookup::sym_addr(&f) as *mut *mut *mut u8) = envp };
             }
         }
     }
-    let mut i = ns(0).nglobal;
-    while i > 0 {
-        i -= 1;
-        let m = ns(0).scope()[i];
-        if (*m).is_ldso {
+    for &m in ns(0).scope().iter().rev() {
+        if m.is_ldso() {
             continue;
         }
-        if !reloc::relocate(m) {
-            let msg = error_str();
-            let mut tmp = [0u8; 500];
-            let l = msg.len().min(499);
-            tmp[..l].copy_from_slice(&msg[..l]);
-            die(format_args!("{}", Bytes(&tmp[..l])));
+        if !unsafe { reloc::relocate(m) } {
+            die_with_error();
         }
     }
-    let mut i = audit::au().nmaps;
-    while i > 0 {
-        i -= 1;
-        let m = audit::au().maps[i];
-        if !reloc::relocate(m) {
-            let msg = error_str();
-            let mut tmp = [0u8; 500];
-            let l = msg.len().min(499);
-            tmp[..l].copy_from_slice(&msg[..l]);
-            die(format_args!("{}", Bytes(&tmp[..l])));
+    for m in audit::au().maps().rev() {
+        if !unsafe { reloc::relocate(m) } {
+            die_with_error();
         }
     }
     rtld_malloc_arm();
     profile::start();
-    marks[6] = core::arch::x86_64::_rdtsc();
-    _r_debug.map = ns(0).head;
-    _r_debug.ldbase = base;
-    _r_debug.brk = _dl_debug_state as usize;
-    _r_debug.state = RT_CONSISTENT;
+    marks[6] = rdtsc();
+    rdebug(0).with(|r| {
+        r.map = Map::opt_ptr(ns(0).head);
+        r.ldbase = base;
+        r.brk = _dl_debug_state as *const () as usize;
+        r.state = RT_CONSISTENT;
+    });
     {
-        let fl = lookup::Flags { plt: false, skip: core::ptr::null_mut(), newest: false };
+        let fl = lookup::Flags { plt: false, skip: None, newest: false };
         if let Some(f) = lookup::lookup(b"_r_debug", None, &[ns(0).scope()], &fl) {
             let a = lookup::sym_addr(&f) as *mut RDebug;
-            if (*f.sym).size as usize >= core::mem::offset_of!(RDebug, r_next) && a != &raw mut _r_debug {
-                (*a).version = 1;
-                (*a).map = _r_debug.map;
-                (*a).brk = _r_debug.brk;
-                (*a).state = _r_debug.state;
-                (*a).ldbase = _r_debug.ldbase;
-                R_DEBUG_MAIN = a;
+            if f.sym.size as usize >= core::mem::offset_of!(RDebug, r_next) && a != _r_debug.as_ptr() {
+                let (map, brk, state, ldbase) = rdebug(0).with(|r| (r.map, r.brk, r.state, r.ldbase));
+                R_DEBUG_MAIN.store(a, Relaxed);
+                with_main_copy(|c| {
+                    c.version = 1;
+                    c.map = map;
+                    c.brk = brk;
+                    c.state = state;
+                    c.ldbase = ldbase;
+                });
             }
         }
     }
-    let mut d = (*main).l_ld;
-    while (*d).tag != DT_NULL {
-        if (*d).tag == DT_DEBUG {
-            (*d).val = (&raw mut _r_debug) as u64;
+    let mut d = main.l_ld();
+    for e in main.dynamic() {
+        if e.tag == DT_DEBUG {
+            unsafe { (*d).val = _r_debug.as_ptr() as u64 };
         }
-        d = d.add(1);
+        d = d.wrapping_add(1);
     }
     _dl_debug_state();
 
-    for i in 0..ns(0).nglobal {
-        protect_relro(ns(0).scope()[i]);
+    for &g in ns(0).scope() {
+        protect_relro(g);
     }
-    for i in 0..audit::au().nmaps {
-        protect_relro(audit::au().maps[i]);
+    for m in audit::au().maps() {
+        protect_relro(m);
     }
 
-    for i in 0..(*main).preinit_arraysz / 8 {
-        let f: InitFn = core::mem::transmute(*(*main).preinit_array.add(i));
-        f(argc as i32, argv, envp);
+    for &a in main.preinit_array() {
+        let f: InitFn = unsafe { core::mem::transmute(a) };
+        unsafe { f(argc as i32, argv, envp) };
     }
     audit::announce_preinit();
     init_global();
-
-    marks[7] = core::arch::x86_64::_rdtsc();
+    marks[7] = rdtsc();
     if stats {
         eprint!("\ntotal startup time in dynamic loader: {} cycles\n", marks[7] - marks[0]);
         eprint!("  relocate the loader itself:  {} cycles\n", marks[1] - marks[0]);
@@ -1618,188 +1785,144 @@ unsafe extern "C" fn rtld_start(sp: *mut usize) -> Pair {
         eprint!("  set up TLS:                  {} cycles\n", marks[5] - marks[4]);
         eprint!("  relocation:                  {} cycles\n", marks[6] - marks[5]);
         eprint!("  constructors etc.:           {} cycles\n", marks[7] - marks[6]);
-        eprint!("  (relocation: RELR {}, RELA+PLT {} cycles)\n", reloc::PHASE_CYCLES[1], reloc::PHASE_CYCLES[2]);
+        eprint!("  (relocation: RELR {}, RELA+PLT {} cycles)\n", reloc::PHASE_CYCLES[1].load(Relaxed), reloc::PHASE_CYCLES[2].load(Relaxed));
     }
     s.started = true;
     Pair(new_sp as usize, at_entry)
 }
 
-unsafe fn check_versions() -> bool {
+fn check_versions() -> bool {
+    ns(0).scope().iter().all(|&m| check_map_versions(m))
+}
+
+fn shown_name(m: Map) -> &'static [u8] {
+    if m.is_main() || m.name().is_empty() { reloc::prog_name() } else { m.name() }
+}
+
+pub(crate) fn check_map_versions(m: Map) -> bool {
     let s = st();
-    for i in 0..ns(0).nglobal {
-        let m = ns(0).scope()[i];
-        let mut vn = (*m).verneed;
-        for _ in 0..(*m).verneednum {
-            let file = cstr((*m).strtab.add((*vn).file as usize));
-            let lib = find_loaded(0, file);
-            if !lib.is_null() && !(*lib).is_ldso {
-                let mut aux = (vn as *const u8).add((*vn).aux as usize) as *const Vernaux;
-                for _ in 0..(*vn).cnt {
-                    let name = cstr((*m).strtab.add((*aux).name as usize));
-                    let mut found = false;
-                    let mut vd = (*lib).verdef;
-                    for _ in 0..(*lib).verdefnum {
-                        let da = (vd as *const u8).add((*vd).aux as usize) as *const Verdaux;
-                        if (*vd).hash == (*aux).hash && cstr((*lib).strtab.add((*da).name as usize)) == name {
-                            found = true;
-                            break;
-                        }
-                        vd = (vd as *const u8).add((*vd).next as usize) as *const Verdef;
-                    }
-                    if !found && (*aux).flags & 2 == 0 && !s.lenient {
-                        let who = if (*m).is_main { cstr(s.prog_name) } else { cstr((*m).l_name) };
-                        set_error(format_args!("{}: version `{}' not found (required by {})", Bytes(cstr((*lib).l_name)), Bytes(name), Bytes(who)));
-                        return false;
-                    }
-                    aux = (aux as *const u8).add((*aux).next as usize) as *const Vernaux;
+    let nsid = m.l_ns() as usize;
+    for (_, file, auxes) in m.verneeds() {
+        let file = file.bytes();
+        let mut lib = find_loaded(nsid, file);
+        if lib.is_none() {
+            for &d in m.needed() {
+                if d.soname() == Some(file) {
+                    lib = Some(d);
                 }
             }
-            vn = (vn as *const u8).add((*vn).next as usize) as *const Verneed;
+        }
+        let Some(lib) = lib else { continue };
+        if lib.is_ldso() || lib.verdefnum() == 0 {
+            continue;
+        }
+        for (aux, name) in auxes {
+            let found = lib.verdefs().any(|(vd, vname)| vd.hash == aux.hash && vname.eq_str(name));
+            if !found && aux.flags & 2 == 0 && !s.lenient {
+                let libname = if lib.name().is_empty() { reloc::prog_name() } else { lib.name() };
+                set_error_at(libname, 0, format_args!("version `{}' not found (required by {})", Bytes(name.bytes()), Bytes(shown_name(m))));
+                return false;
+            }
         }
     }
     true
 }
 
 pub(crate) unsafe fn bind_rtld_malloc() {
-    unsafe {
-        let g = ns(0).scope();
-        let fl = lookup::Flags { plt: false, skip: core::ptr::null_mut(), newest: true };
-        let mut addr = [0usize; 3];
-        for (i, name) in [&b"malloc"[..], &b"calloc"[..], &b"free"[..]].iter().enumerate() {
-            match lookup::lookup(name, None, &[g], &fl) {
-                Some(f) if (*f.sym).info & 0xf != STT_TLS => {
-                    let a = lookup::sym_addr(&f);
-                    addr[i] = if (*f.sym).info & 0xf == STT_GNU_IFUNC { reloc::call_resolver(a) } else { a };
-                }
-                _ => return,
+    let g = ns(0).scope();
+    let fl = lookup::Flags { plt: false, skip: None, newest: true };
+    let mut addr = [0usize; 3];
+    for (i, name) in [&b"malloc"[..], &b"calloc"[..], &b"free"[..]].iter().enumerate() {
+        match lookup::lookup(name, None, &[g], &fl) {
+            Some(f) if f.sym.info & 0xf != STT_TLS => {
+                let a = lookup::sym_addr(&f);
+                addr[i] = if f.sym.info & 0xf == STT_GNU_IFUNC { unsafe { reloc::call_resolver(a) } } else { a };
             }
+            _ => return,
         }
-        rtld_malloc_init(addr[0], addr[1], addr[2]);
     }
+    unsafe { rtld_malloc_init(addr[0], addr[1], addr[2]) };
 }
 
-unsafe fn trace_loaded(main: *mut LinkMap, ldso: *mut LinkMap, base: usize) {
+fn trace_loaded(main: Map, ldso: Map, base: usize) {
     let mut o = Out::new(1);
     use core::fmt::Write;
-    let mut c = ns(0).head;
-    while !c.is_null() {
-        if (*c).is_vdso {
-            let _ = write!(o, "\tlinux-vdso.so.1 (0x{:016x})\n", (*c).map_start);
+    for c in ns(0).maps() {
+        if c.is_vdso() {
+            let _ = writeln!(o, "\tlinux-vdso.so.1 (0x{:016x})", c.map_start());
         }
-        c = (*c).l_next;
     }
-    for i in 0..ns(0).nglobal {
-        let m = ns(0).scope()[i];
+    for &m in ns(0).scope() {
         if m == main {
             continue;
         }
         if m == ldso {
-            let _ = write!(o, "\t{} (0x{:016x})\n", Bytes(cstr((*ldso).l_name)), base);
+            let _ = writeln!(o, "\t{} (0x{:016x})", Bytes(ldso.name()), base);
             continue;
         }
-        match (*m).soname.is_null() {
-            true => {
-                let _ = write!(o, "\t{} (0x{:016x})\n", Bytes(cstr((*m).l_name)), (*m).map_start);
+        match m.soname() {
+            None => {
+                let _ = writeln!(o, "\t{} (0x{:016x})", Bytes(m.name()), m.map_start());
             }
-            false => {
-                let _ = write!(o, "\t{} => {} (0x{:016x})\n", Bytes(cstr((*m).soname)), Bytes(cstr((*m).l_name)), (*m).map_start);
+            Some(so) => {
+                let _ = writeln!(o, "\t{} => {} (0x{:016x})", Bytes(so), Bytes(m.name()), m.map_start());
             }
         }
     }
 }
 
-unsafe fn find_needed_map(name: &[u8]) -> *mut LinkMap {
-    let s = st();
-    let mut i = ns(0).nglobal;
-    while i > 0 {
-        i -= 1;
-        let m = ns(0).scope()[i];
-        if (!(*m).soname.is_null() && cstr((*m).soname) == name) || cstr((*m).l_name) == name {
-            return m;
-        }
+fn find_needed_map(name: &[u8]) -> Option<Map> {
+    if let Some(&m) = ns(0).scope().iter().rev().find(|m| m.soname() == Some(name) || m.name() == name) {
+        return Some(m);
     }
-    let ld = s.ldso_map;
-    if !ld.is_null() {
-        let p = cstr((*ld).l_name);
-        let base = p.rsplit(|&c| c == b'/').next().unwrap_or(p);
-        if base == name {
-            return ld;
-        }
-    }
-    core::ptr::null_mut()
+    let ld = st().ldso_map?;
+    let p = ld.name();
+    let base = p.rsplit(|&c| c == b'/').next().unwrap_or(p);
+    if base == name { Some(ld) } else { None }
 }
 
-unsafe fn defines_version(lib: *mut LinkMap, name: &[u8]) -> bool {
-    if (*lib).is_ldso {
+fn defines_version(lib: Map, name: &[u8]) -> bool {
+    if lib.is_ldso() {
         return true;
     }
-    let mut vd = (*lib).verdef;
-    if vd.is_null() {
+    if lib.verdef().is_null() {
         return false;
     }
-    for _ in 0..(*lib).verdefnum {
-        let da = (vd as *const u8).add((*vd).aux as usize) as *const Verdaux;
-        if cstr((*lib).strtab.add((*da).name as usize)) == name {
-            return true;
-        }
-        vd = (vd as *const u8).add((*vd).next as usize) as *const Verdef;
-    }
-    false
+    lib.verdefs().any(|(_, vname)| vname.bytes() == name)
 }
 
-unsafe fn trace_versions() {
+fn trace_versions() {
     use core::fmt::Write;
-    let s = st();
     let mut o = Out::new(1);
     let mut first = true;
-    let mut m = ns(0).head;
-    while !m.is_null() {
-        if (*m).verneed.is_null() || (*m).verneednum == 0 {
-            m = (*m).l_next;
+    for m in ns(0).maps() {
+        if m.verneed().is_null() || m.verneednum() == 0 {
             continue;
         }
         if first {
             let _ = write!(o, "\n\tVersion information:\n");
             first = false;
         }
-        let shown = if (*m).is_main || cstr((*m).l_name).is_empty() { cstr(s.prog_name) } else { cstr((*m).l_name) };
-        let _ = write!(o, "\t{}:\n", Bytes(shown));
-        let mut vn = (*m).verneed;
-        for _ in 0..(*m).verneednum {
-            let file = cstr((*m).strtab.add((*vn).file as usize));
+        let _ = writeln!(o, "\t{}:", Bytes(shown_name(m)));
+        for (_, file, auxes) in m.verneeds() {
+            let file = file.bytes();
             let needed = find_needed_map(file);
-            let mut aux = (vn as *const u8).add((*vn).aux as usize) as *const Vernaux;
-            for _ in 0..(*vn).cnt {
-                let vname = cstr((*m).strtab.add((*aux).name as usize));
-                let found = if !needed.is_null() && defines_version(needed, vname) { Some(cstr((*needed).l_name)) } else { None };
-                let _ = write!(
-                    o,
-                    "\t\t{} ({}) {}=> {}\n",
-                    Bytes(file),
-                    Bytes(vname),
-                    if (*aux).flags & 2 != 0 { "[WEAK] " } else { "" },
-                    Bytes(found.unwrap_or(b"not found"))
-                );
-                aux = (aux as *const u8).add((*aux).next as usize) as *const Vernaux;
+            for (aux, vname) in auxes {
+                let vname = vname.bytes();
+                let found = match needed {
+                    Some(n) if defines_version(n, vname) => Some(n.name()),
+                    _ => None,
+                };
+                let _ = writeln!(o, "\t\t{} ({}) {}=> {}", Bytes(file), Bytes(vname), if aux.flags & 2 != 0 { "[WEAK] " } else { "" }, Bytes(found.unwrap_or(b"not found")));
             }
-            vn = (vn as *const u8).add((*vn).next as usize) as *const Verneed;
         }
-        m = (*m).l_next;
     }
 }
 
-unsafe fn scan_symbols(m: *mut LinkMap, plt: bool, report: bool) {
-    use crate::reloc::bind;
-    let mut tables: [(*const Rela, usize); 2] = [((*m).rela, (*m).relasz), (core::ptr::null(), 0)];
-    if plt {
-        tables[1] = ((*m).jmprel, (*m).pltrelsz);
-    }
-    for (base, size) in tables {
-        if base.is_null() {
-            continue;
-        }
-        for i in 0..size / core::mem::size_of::<Rela>() {
-            let r = &*base.add(i);
+fn scan_symbols(m: Map, plt: bool, report: bool) {
+    let tables: [&[Rela]; 2] = [m.relas(), if plt { m.jmprels() } else { &[] }];
+    for table in tables {
+        for r in table {
             let ty = (r.info & 0xffff_ffff) as u32;
             let idx = (r.info >> 32) as usize;
             if idx == 0 {
@@ -1809,15 +1932,14 @@ unsafe fn scan_symbols(m: *mut LinkMap, plt: bool, report: bool) {
             if !matches!(ty, R_X86_64_64 | R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT | R_X86_64_COPY | R_X86_64_DTPMOD64 | R_X86_64_DTPOFF64 | R_X86_64_TPOFF64 | R_X86_64_SIZE64 | R_X86_64_TLSDESC) {
                 continue;
             }
-            if bind(m, idx, ty == R_X86_64_JUMP_SLOT, copy).is_none() {
+            if unsafe { reloc::bind(m, idx, ty == R_X86_64_JUMP_SLOT, copy) }.is_none() {
                 if report {
                     let e = error_str();
                     let msg = match e.windows(17).position(|w| w == b"undefined symbol:") {
                         Some(p) => &e[p..],
                         None => e,
                     };
-                    let who = if (*m).is_main || cstr((*m).l_name).is_empty() { cstr(st().prog_name) } else { cstr((*m).l_name) };
-                    eprint!("{}\t({})\n", Bytes(msg), Bytes(who));
+                    eprint!("{}\t({})\n", Bytes(msg), Bytes(shown_name(m)));
                 }
                 set_error(format_args!(""));
             }
@@ -1825,39 +1947,35 @@ unsafe fn scan_symbols(m: *mut LinkMap, plt: bool, report: bool) {
     }
 }
 
-unsafe fn trace_warn(main: *mut LinkMap) {
+fn trace_warn(main: Map) {
     let s = st();
-    reloc::NOIFUNC = true;
+    reloc::NOIFUNC.store(true, Relaxed);
     let plt = s.bind_now_env;
     scan_symbols(main, plt, true);
-    let mut i = ns(0).nglobal;
-    while i > 0 {
-        i -= 1;
-        let m = ns(0).scope()[i];
-        if m != main && !(*m).is_ldso {
+    for &m in ns(0).scope().iter().rev() {
+        if m != main && !m.is_ldso() {
             scan_symbols(m, plt, true);
         }
     }
-    reloc::NOIFUNC = false;
+    reloc::NOIFUNC.store(false, Relaxed);
 }
 
-unsafe fn trace_unused(main: *mut LinkMap) -> ! {
+fn trace_unused(main: Map) -> ! {
     use core::fmt::Write;
-    reloc::NOIFUNC = true;
+    reloc::NOIFUNC.store(true, Relaxed);
     scan_symbols(main, true, false);
-    reloc::NOIFUNC = false;
+    reloc::NOIFUNC.store(false, Relaxed);
     let mut o = Out::new(1);
     let mut first = true;
-    for k in 0..(*main).nneeded {
-        let l = *(*main).needed.add(k);
-        if l.is_null() || (*l).used || (*l).is_vdso {
+    for &l in main.needed() {
+        if l.used() || l.is_vdso() {
             continue;
         }
         if first {
-            let _ = write!(o, "Unused direct dependencies:\n");
+            let _ = writeln!(o, "Unused direct dependencies:");
             first = false;
         }
-        let _ = write!(o, "\t{}\n", Bytes(cstr((*l).l_name)));
+        let _ = writeln!(o, "\t{}", Bytes(l.name()));
     }
     drop(o);
     sys::exit(!first as i32)

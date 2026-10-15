@@ -8,9 +8,28 @@ use hooks::ACTIVE as HOOK_ACTIVE;
 pub mod hooks {
     use super::*;
 
-    pub type ToLower = fn(c: i32, loc: usize) -> i32;
-    pub type Coll = unsafe fn(a: *const u8, b: *const u8, loc: usize) -> c_int;
-    pub type Xfrm = unsafe fn(dest: *mut u8, src: *const u8, n: usize, loc: usize) -> usize;
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[repr(transparent)]
+    pub struct Loc(usize);
+
+    impl Loc {
+        pub const CURRENT: Loc = Loc(0);
+        pub const GLOBAL: Loc = Loc(usize::MAX);
+
+        #[inline(always)]
+        pub const unsafe fn from_raw(loc: usize) -> Loc {
+            Loc(loc)
+        }
+
+        #[inline(always)]
+        pub const fn raw(self) -> usize {
+            self.0
+        }
+    }
+
+    pub type ToLower = fn(c: i32, loc: Loc) -> i32;
+    pub type Coll = unsafe fn(a: *const u8, b: *const u8, loc: Loc) -> c_int;
+    pub type Xfrm = unsafe fn(dest: *mut u8, src: *const u8, n: usize, loc: Loc) -> usize;
 
     pub(crate) static ACTIVE: AtomicBool = AtomicBool::new(false);
     static TOLOWER: AtomicUsize = AtomicUsize::new(0);
@@ -31,11 +50,11 @@ pub mod hooks {
     }
 
     unsafe extern "C" fn hooked_strcasecmp(a: *const u8, b: *const u8) -> c_int {
-        unsafe { super::casecmp_hooked(a, b, usize::MAX, 0) }
+        unsafe { super::casecmp_hooked(a, b, usize::MAX, core::ptr::null()) }
     }
 
     unsafe extern "C" fn hooked_strncasecmp(a: *const u8, b: *const u8, n: usize) -> c_int {
-        unsafe { super::casecmp_hooked(a, b, n, 0) }
+        unsafe { super::casecmp_hooked(a, b, n, core::ptr::null()) }
     }
 
     #[inline(always)]
@@ -43,7 +62,7 @@ pub mod hooks {
         ACTIVE.load(Ordering::Relaxed)
     }
 
-    pub(super) fn tolower(c: u8, loc: usize) -> i32 {
+    pub(super) fn tolower(c: u8, loc: Loc) -> i32 {
         let f = TOLOWER.load(Ordering::Acquire);
         if f == 0 {
             return i32::from(super::lower(c));
@@ -63,27 +82,32 @@ pub mod hooks {
     }
 }
 
-unsafe fn casecmp_hooked(a: *const u8, b: *const u8, n: usize, loc: usize) -> c_int {
-    unsafe {
-        let mut i = 0;
-        while i < n {
-            let (x, y) = (*a.add(i), *b.add(i));
-            let (lx, ly) = (hooks::tolower(x, loc), hooks::tolower(y, loc));
-            if lx != ly {
-                return lx - ly;
-            }
-            if x == 0 {
-                break;
-            }
-            i += 1;
+unsafe fn casecmp_hooked(a: *const u8, b: *const u8, n: usize, loc: *const c_void) -> c_int {
+    let loc = unsafe { hooks::Loc::from_raw(loc as usize) };
+    let mut i = 0;
+    while i < n {
+        let (x, y) = (unsafe { byte(a, i) }, unsafe { byte(b, i) });
+        let (lx, ly) = (hooks::tolower(x, loc), hooks::tolower(y, loc));
+        if lx != ly {
+            return lx - ly;
         }
-        0
+        if x == 0 {
+            break;
+        }
+        i += 1;
     }
+    0
 }
 
 #[inline(always)]
 unsafe fn at(p: *const c_char, i: usize) -> u8 {
-    unsafe { p.add(i).cast::<u8>().read() }
+    unsafe { byte(p.cast::<u8>(), i) }
+}
+
+#[inline(always)]
+pub(crate) unsafe fn byte(p: *const u8, i: usize) -> u8 {
+    let q = unsafe { p.add(i) };
+    unsafe { q.read() }
 }
 
 #[inline(always)]
@@ -93,65 +117,59 @@ pub(crate) fn lower(c: u8) -> u8 {
 
 #[inline(always)]
 unsafe fn first_block<V: Vector>(s: *const u8, test: impl Fn(V) -> V) -> (u32, *const u8) {
-    unsafe {
-        let base = (s as usize & !(V::W - 1)) as *const u8;
-        let skip = s as usize - base as usize;
-        (V::mask(test(V::load(base))) >> skip, base)
-    }
+    let base = (s as usize & !(V::W - 1)) as *const u8;
+    let skip = s as usize - base as usize;
+    (V::mask(test(unsafe { V::load(base) })) >> skip, base)
 }
 
 #[inline(always)]
 unsafe fn scan_from<V: Vector>(s: *const u8, mut p: *const u8, hit: impl Fn(V) -> V) -> usize {
-    unsafe {
-        let w = V::W;
-        let z = V::zero();
-        for _ in 0..4 {
-            let m = V::mask(V::eq(hit(V::load(p)), z));
+    let w = V::W;
+    let z = unsafe { V::zero() };
+    for _ in 0..4 {
+        let m = V::mask(V::eq(hit(unsafe { V::load(p) }), z));
+        if m != 0 {
+            return p as usize - s as usize + m.trailing_zeros() as usize;
+        }
+        p = p.wrapping_add(w);
+    }
+    loop {
+        if (p as usize & (PAGE - 1)) <= PAGE - 4 * w {
+            let (t0, t1, t2, t3) = (hit(unsafe { V::load(p) }), hit(unsafe { V::load_at(p, w) }), hit(unsafe { V::load_at(p, 2 * w) }), hit(unsafe { V::load_at(p, 3 * w) }));
+            if V::mask(V::eq(V::min(V::min(t0, t1), V::min(t2, t3)), z)) != 0 {
+                for (k, t) in [t0, t1, t2, t3].into_iter().enumerate() {
+                    let m = V::mask(V::eq(t, z));
+                    if m != 0 {
+                        return p as usize - s as usize + k * w + m.trailing_zeros() as usize;
+                    }
+                }
+            }
+            p = p.wrapping_add(4 * w);
+        } else {
+            let m = V::mask(V::eq(hit(unsafe { V::load(p) }), z));
             if m != 0 {
                 return p as usize - s as usize + m.trailing_zeros() as usize;
             }
-            p = p.add(w);
-        }
-        loop {
-            if (p as usize & (PAGE - 1)) <= PAGE - 4 * w {
-                let (t0, t1, t2, t3) = (hit(V::load(p)), hit(V::load(p.add(w))), hit(V::load(p.add(2 * w))), hit(V::load(p.add(3 * w))));
-                if V::mask(V::eq(V::min(V::min(t0, t1), V::min(t2, t3)), z)) != 0 {
-                    for (k, t) in [t0, t1, t2, t3].into_iter().enumerate() {
-                        let m = V::mask(V::eq(t, z));
-                        if m != 0 {
-                            return p as usize - s as usize + k * w + m.trailing_zeros() as usize;
-                        }
-                    }
-                }
-                p = p.add(4 * w);
-            } else {
-                let m = V::mask(V::eq(hit(V::load(p)), z));
-                if m != 0 {
-                    return p as usize - s as usize + m.trailing_zeros() as usize;
-                }
-                p = p.add(w);
-            }
+            p = p.wrapping_add(w);
         }
     }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn strlen_impl<V: Vector>(s: *const u8) -> usize {
-    unsafe {
-        let z = V::zero();
-        if crate::simd::same_page(s, V::W) {
-            let m = V::mask(V::eq(V::loadu(s), z));
-            if m != 0 {
-                return m.trailing_zeros() as usize;
-            }
-            return scan_from::<V>(s, ((s as usize | (V::W - 1)) + 1) as *const u8, |v| v);
-        }
-        let (m, base) = first_block::<V>(s, |v| V::eq(v, z));
+    let z = unsafe { V::zero() };
+    if crate::simd::same_page(s, V::W) {
+        let m = V::mask(V::eq(unsafe { V::loadu(s) }, z));
         if m != 0 {
             return m.trailing_zeros() as usize;
         }
-        scan_from::<V>(s, base.add(V::W), |v| v)
+        return unsafe { scan_from::<V>(s, ((s as usize | (V::W - 1)) + 1) as *const u8, |v| v) };
     }
+    let (m, base) = unsafe { first_block::<V>(s, |v| V::eq(v, z)) };
+    if m != 0 {
+        return m.trailing_zeros() as usize;
+    }
+    unsafe { scan_from::<V>(s, base.wrapping_add(V::W), |v| v) }
 }
 
 pair!(strlen_sse2, strlen_avx2, strlen_impl, (s: *const u8) -> usize);
@@ -317,54 +335,52 @@ pub unsafe extern "C" fn strlen(s: *const c_char) -> usize {
 
 #[inline(always)]
 pub(crate) unsafe fn strnlen_impl<V: Vector>(s: *const u8, n: usize) -> usize {
-    unsafe {
-        let w = V::W;
-        if n == 0 {
-            return 0;
+    let w = V::W;
+    if n == 0 {
+        return 0;
+    }
+    let z = unsafe { V::zero() };
+    let mut p;
+    if crate::simd::same_page(s, w) {
+        let m = V::mask(V::eq(unsafe { V::loadu(s) }, z));
+        if n <= w {
+            return (u64::from(m) | (1u64 << n)).trailing_zeros() as usize;
         }
-        let z = V::zero();
-        let mut p;
-        if crate::simd::same_page(s, w) {
-            let m = V::mask(V::eq(V::loadu(s), z));
-            if n <= w {
-                return (u64::from(m) | (1u64 << n)).trailing_zeros() as usize;
+        if m != 0 {
+            return m.trailing_zeros() as usize;
+        }
+        p = ((s as usize | (w - 1)) + 1) as *const u8;
+    } else {
+        let (m, base) = unsafe { first_block::<V>(s, |v| V::eq(v, z)) };
+        if m != 0 {
+            return core::cmp::min(m.trailing_zeros() as usize, n);
+        }
+        p = base.wrapping_add(w);
+    }
+    if p as usize - s as usize >= n {
+        return n;
+    }
+    loop {
+        if (p as usize & (PAGE - 1)) <= PAGE - 4 * w {
+            let (v0, v1, v2, v3) = (unsafe { V::load(p) }, unsafe { V::load_at(p, w) }, unsafe { V::load_at(p, 2 * w) }, unsafe { V::load_at(p, 3 * w) });
+            if V::mask(V::eq(V::min(V::min(v0, v1), V::min(v2, v3)), z)) != 0 {
+                for (k, v) in [v0, v1, v2, v3].into_iter().enumerate() {
+                    let m = V::mask(V::eq(v, z));
+                    if m != 0 {
+                        return core::cmp::min(p as usize - s as usize + k * w + m.trailing_zeros() as usize, n);
+                    }
+                }
             }
-            if m != 0 {
-                return m.trailing_zeros() as usize;
-            }
-            p = ((s as usize | (w - 1)) + 1) as *const u8;
+            p = p.wrapping_add(4 * w);
         } else {
-            let (m, base) = first_block::<V>(s, |v| V::eq(v, z));
+            let m = V::mask(V::eq(unsafe { V::load(p) }, z));
             if m != 0 {
-                return core::cmp::min(m.trailing_zeros() as usize, n);
+                return core::cmp::min(p as usize - s as usize + m.trailing_zeros() as usize, n);
             }
-            p = base.add(w);
+            p = p.wrapping_add(w);
         }
         if p as usize - s as usize >= n {
             return n;
-        }
-        loop {
-            if (p as usize & (PAGE - 1)) <= PAGE - 4 * w {
-                let (v0, v1, v2, v3) = (V::load(p), V::load(p.add(w)), V::load(p.add(2 * w)), V::load(p.add(3 * w)));
-                if V::mask(V::eq(V::min(V::min(v0, v1), V::min(v2, v3)), z)) != 0 {
-                    for (k, v) in [v0, v1, v2, v3].into_iter().enumerate() {
-                        let m = V::mask(V::eq(v, z));
-                        if m != 0 {
-                            return core::cmp::min(p as usize - s as usize + k * w + m.trailing_zeros() as usize, n);
-                        }
-                    }
-                }
-                p = p.add(4 * w);
-            } else {
-                let m = V::mask(V::eq(V::load(p), z));
-                if m != 0 {
-                    return core::cmp::min(p as usize - s as usize + m.trailing_zeros() as usize, n);
-                }
-                p = p.add(w);
-            }
-            if p as usize - s as usize >= n {
-                return n;
-            }
         }
     }
 }
@@ -656,68 +672,66 @@ pub unsafe extern "C" fn strnlen(s: *const c_char, n: usize) -> usize {
 
 #[inline(always)]
 unsafe fn stpcpy_impl<V: Vector>(d: *mut u8, s: *const u8) -> *mut u8 {
-    unsafe {
-        let w = V::W;
-        let z = V::zero();
-        if !crate::simd::same_page(s, w) {
-            let len = strlen_impl::<V>(s);
-            memcpy_impl::<V>(d, s, len + 1);
-            return d.add(len);
-        }
-        let v0 = V::loadu(s);
-        let m = V::mask(V::eq(v0, z));
-        if m != 0 {
-            let len = m.trailing_zeros() as usize;
-            crate::mem::copy_upto_8w::<V>(d, s, len + 1);
-            return d.add(len);
-        }
-        V::storeu(d, v0);
-        let mut p = ((s as usize & !(w - 1)) + w) as *const u8;
-        loop {
-            if (p as usize & (PAGE - 1)) <= PAGE - 4 * w {
-                let (a, b, c, e) = (V::load(p), V::load(p.add(w)), V::load(p.add(2 * w)), V::load(p.add(3 * w)));
-                if V::mask(V::eq(V::min(V::min(a, b), V::min(c, e)), z)) == 0 {
-                    let off = p as usize - s as usize;
-                    V::storeu(d.add(off), a);
-                    V::storeu(d.add(off + w), b);
-                    V::storeu(d.add(off + 2 * w), c);
-                    V::storeu(d.add(off + 3 * w), e);
-                    p = p.add(4 * w);
-                    continue;
-                }
-                for v in [a, b, c, e] {
-                    let m = V::mask(V::eq(v, z));
-                    let off = p as usize - s as usize;
-                    if m != 0 {
-                        let len = off + m.trailing_zeros() as usize;
-                        V::storeu(d.add(len + 1 - w), V::loadu(s.add(len + 1 - w)));
-                        return d.add(len);
-                    }
-                    V::storeu(d.add(off), v);
-                    p = p.add(w);
-                }
-            } else {
-                let v = V::load(p);
+    let w = V::W;
+    let z = unsafe { V::zero() };
+    if !crate::simd::same_page(s, w) {
+        let len = unsafe { strlen_impl::<V>(s) };
+        unsafe { memcpy_impl::<V>(d, s, len + 1) };
+        return d.wrapping_add(len);
+    }
+    let v0 = unsafe { V::loadu(s) };
+    let m = V::mask(V::eq(v0, z));
+    if m != 0 {
+        let len = m.trailing_zeros() as usize;
+        unsafe { crate::mem::copy_upto_8w::<V>(d, s, len + 1) };
+        return d.wrapping_add(len);
+    }
+    unsafe { V::storeu(d, v0) };
+    let mut p = ((s as usize & !(w - 1)) + w) as *const u8;
+    loop {
+        if (p as usize & (PAGE - 1)) <= PAGE - 4 * w {
+            let (a, b, c, e) = (unsafe { V::load(p) }, unsafe { V::load_at(p, w) }, unsafe { V::load_at(p, 2 * w) }, unsafe { V::load_at(p, 3 * w) });
+            if V::mask(V::eq(V::min(V::min(a, b), V::min(c, e)), z)) == 0 {
+                let off = p as usize - s as usize;
+                unsafe { V::storeu_at(d, off, a) };
+                unsafe { V::storeu_at(d, off + w, b) };
+                unsafe { V::storeu_at(d, off + 2 * w, c) };
+                unsafe { V::storeu_at(d, off + 3 * w, e) };
+                p = p.wrapping_add(4 * w);
+                continue;
+            }
+            for v in [a, b, c, e] {
                 let m = V::mask(V::eq(v, z));
                 let off = p as usize - s as usize;
                 if m != 0 {
                     let len = off + m.trailing_zeros() as usize;
-                    V::storeu(d.add(len + 1 - w), V::loadu(s.add(len + 1 - w)));
-                    return d.add(len);
+                    let t = unsafe { V::loadu_at(s, len + 1 - w) };
+                    unsafe { V::storeu_at(d, len + 1 - w, t) };
+                    return d.wrapping_add(len);
                 }
-                V::storeu(d.add(off), v);
-                p = p.add(w);
+                unsafe { V::storeu_at(d, off, v) };
+                p = p.wrapping_add(w);
             }
+        } else {
+            let v = unsafe { V::load(p) };
+            let m = V::mask(V::eq(v, z));
+            let off = p as usize - s as usize;
+            if m != 0 {
+                let len = off + m.trailing_zeros() as usize;
+                let t = unsafe { V::loadu_at(s, len + 1 - w) };
+                unsafe { V::storeu_at(d, len + 1 - w, t) };
+                return d.wrapping_add(len);
+            }
+            unsafe { V::storeu_at(d, off, v) };
+            p = p.wrapping_add(w);
         }
     }
 }
 
 #[inline(always)]
 unsafe fn strcpy_impl<V: Vector>(d: *mut u8, s: *const u8) -> *mut u8 {
-    unsafe {
-        stpcpy_impl::<V>(d, s);
-        d
-    }
+    unsafe { stpcpy_impl::<V>(d, s) };
+    d
 }
 
 pair!(strcpy_sse2, strcpy_avx2, strcpy_impl, (d: *mut u8, s: *const u8) -> *mut u8);
@@ -1159,33 +1173,29 @@ static PREFIX_MASK: [u8; 64] = {
 
 #[inline(always)]
 unsafe fn stpncpy_impl<V: Vector>(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
-    unsafe {
-        let w = V::W;
-        if n <= w && crate::simd::same_page(s, w) {
-            let v = V::loadu(s);
-            let m = u64::from(V::mask(V::eq(v, V::zero()))) | (1u64 << n);
-            let len = m.trailing_zeros() as usize;
-            let keep = V::loadu(PREFIX_MASK.as_ptr().add(32 - len));
-            let mut tmp = [0u8; 32];
-            V::storeu(tmp.as_mut_ptr(), V::and(v, keep));
-            crate::mem::copy_upto_8w::<V>(d, tmp.as_ptr(), n);
-            return d.add(len);
-        }
-        let len = strnlen_impl::<V>(s, n);
-        memcpy_impl::<V>(d, s, len);
-        if len < n {
-            memset_impl::<V>(d.add(len), 0, n - len);
-        }
-        d.add(len)
+    let w = V::W;
+    if n <= w && crate::simd::same_page(s, w) {
+        let v = unsafe { V::loadu(s) };
+        let m = u64::from(V::mask(V::eq(v, unsafe { V::zero() }))) | (1u64 << n);
+        let len = m.trailing_zeros() as usize;
+        let keep = unsafe { V::loadu_at(PREFIX_MASK.as_ptr(), 32 - len) };
+        let mut tmp = [0u8; 32];
+        unsafe { V::storeu(tmp.as_mut_ptr(), V::and(v, keep)) };
+        unsafe { crate::mem::copy_upto_8w::<V>(d, tmp.as_ptr(), n) };
+        return d.wrapping_add(len);
     }
+    let len = unsafe { strnlen_impl::<V>(s, n) };
+    unsafe { memcpy_impl::<V>(d, s, len) };
+    if len < n {
+        unsafe { memset_impl::<V>(d.wrapping_add(len), 0, n - len) };
+    }
+    d.wrapping_add(len)
 }
 
 #[inline(always)]
 unsafe fn strncpy_impl<V: Vector>(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
-    unsafe {
-        stpncpy_impl::<V>(d, s, n);
-        d
-    }
+    unsafe { stpncpy_impl::<V>(d, s, n) };
+    d
 }
 
 pair!(strncpy_sse2, strncpy_avx2, strncpy_impl, (d: *mut u8, s: *const u8, n: usize) -> *mut u8);
@@ -2030,7 +2040,8 @@ pub unsafe extern "C" fn strncpy(dest: *mut c_char, src: *const c_char, n: usize
 }
 
 pub(crate) unsafe extern "C" fn strcat_generic(dest: *mut c_char, src: *const c_char) -> *mut c_char {
-    unsafe { stpcpy(dest.add(strlen(dest)), src) };
+    let dl = unsafe { strlen(dest) };
+    unsafe { stpcpy(dest.wrapping_add(dl), src) };
     dest
 }
 
@@ -2260,12 +2271,10 @@ pub unsafe extern "C" fn strcat(dest: *mut c_char, src: *const c_char) -> *mut c
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strncat(dest: *mut c_char, src: *const c_char, n: usize) -> *mut c_char {
-    unsafe {
-        let d = dest.add(strlen(dest));
-        let len = strnlen(src, n);
-        super::mem::memcpy(d.cast::<c_void>(), src.cast::<c_void>(), len);
-        d.add(len).cast::<u8>().write(0);
-    }
+    let d = dest.wrapping_add(unsafe { strlen(dest) });
+    let len = unsafe { strnlen(src, n) };
+    unsafe { super::mem::memcpy(d.cast::<c_void>(), src.cast::<c_void>(), len) };
+    unsafe { d.cast::<u8>().wrapping_add(len).write(0) };
     dest
 }
 
@@ -2274,10 +2283,8 @@ pub unsafe extern "C" fn strlcpy(dest: *mut c_char, src: *const c_char, size: us
     let len = unsafe { strlen(src) };
     if size > 0 {
         let n = if len < size { len } else { size - 1 };
-        unsafe {
-            super::mem::memcpy(dest.cast::<c_void>(), src.cast::<c_void>(), n);
-            dest.add(n).cast::<u8>().write(0);
-        }
+        unsafe { super::mem::memcpy(dest.cast::<c_void>(), src.cast::<c_void>(), n) };
+        unsafe { dest.cast::<u8>().wrapping_add(n).write(0) };
     }
     len
 }
@@ -2291,127 +2298,119 @@ pub unsafe extern "C" fn strlcat(dest: *mut c_char, src: *const c_char, size: us
     }
     let room = size - dl - 1;
     let n = if sl < room { sl } else { room };
-    unsafe {
-        super::mem::memcpy(dest.add(dl).cast::<c_void>(), src.cast::<c_void>(), n);
-        dest.add(dl + n).cast::<u8>().write(0);
-    }
+    unsafe { super::mem::memcpy(dest.wrapping_add(dl).cast::<c_void>(), src.cast::<c_void>(), n) };
+    unsafe { dest.cast::<u8>().wrapping_add(dl + n).write(0) };
     dl + sl
 }
 
 #[inline(always)]
-unsafe fn lower_v<V: Vector>(v: V) -> V {
-    unsafe {
-        let upper = V::gt(V::splat(0x80 + 26), V::add(v, V::splat(0x80 - b'A')));
-        V::or(v, V::and(upper, V::splat(0x20)))
-    }
+fn lower_v<V: Vector>(v: V) -> V {
+    let upper = V::gt(unsafe { V::splat(0x80 + 26) }, V::add(v, unsafe { V::splat(0x80 - b'A') }));
+    V::or(v, V::and(upper, unsafe { V::splat(0x20) }))
 }
 
 #[inline(always)]
 unsafe fn cmp_one<V: Vector, const CI: bool>(a: *const u8, b: *const u8, left: usize, z: V) -> Option<c_int> {
-    unsafe {
-        let w = V::W;
-        let a0 = V::loadu(a);
-        let b0 = V::loadu(b);
-        let mut m = if CI {
-            V::mask(V::eq(V::min(V::eq(lower_v(a0), lower_v(b0)), a0), z))
-        } else {
-            V::mask(V::eq(V::min(V::eq(a0, b0), a0), z))
-        };
-        if left < w {
-            m &= low_bits(left);
-        }
-        if m != 0 {
-            let i = m.trailing_zeros() as usize;
-            let (x, y) = (*a.add(i), *b.add(i));
-            let (x, y) = if CI { (lower(x), lower(y)) } else { (x, y) };
-            return Some(c_int::from(x) - c_int::from(y));
-        }
-        if left <= w { Some(0) } else { None }
+    let w = V::W;
+    let a0 = unsafe { V::loadu(a) };
+    let b0 = unsafe { V::loadu(b) };
+    let mut m = if CI {
+        V::mask(V::eq(V::min(V::eq(lower_v(a0), lower_v(b0)), a0), z))
+    } else {
+        V::mask(V::eq(V::min(V::eq(a0, b0), a0), z))
+    };
+    if left < w {
+        m &= low_bits(left);
     }
+    if m != 0 {
+        let i = m.trailing_zeros() as usize;
+        let (x, y) = (unsafe { byte(a, i) }, unsafe { byte(b, i) });
+        let (x, y) = if CI { (lower(x), lower(y)) } else { (x, y) };
+        return Some(c_int::from(x) - c_int::from(y));
+    }
+    if left <= w { Some(0) } else { None }
 }
 
 #[inline(always)]
 unsafe fn cmp_impl<V: Vector, const CI: bool>(mut a: *const u8, mut b: *const u8, n: usize) -> c_int {
-    unsafe {
-        let w = V::W;
-        let z = V::zero();
-        let mut left = n;
-        let prep = |v: V| if CI { lower_v(v) } else { v };
-        let byte = |p: *const u8, i: usize| if CI { lower(*p.add(i)) } else { *p.add(i) };
-        if core::cmp::max(a as usize & (PAGE - 1), b as usize & (PAGE - 1)) <= PAGE - w {
-            if let Some(r) = cmp_one::<V, CI>(a, b, left, z) {
+    let w = V::W;
+    let z = unsafe { V::zero() };
+    let mut left = n;
+    let prep = |v: V| if CI { lower_v(v) } else { v };
+    let byte = |p: *const u8, i: usize| if CI { lower(unsafe { byte(p, i) }) } else { unsafe { byte(p, i) } };
+    if core::cmp::max(a as usize & (PAGE - 1), b as usize & (PAGE - 1)) <= PAGE - w {
+        if let Some(r) = unsafe { cmp_one::<V, CI>(a, b, left, z) } {
+            return r;
+        }
+        a = a.wrapping_add(w);
+        b = b.wrapping_add(w);
+        left -= w;
+        for _ in 0..3 {
+            if core::cmp::max(a as usize & (PAGE - 1), b as usize & (PAGE - 1)) > PAGE - w {
+                break;
+            }
+            if let Some(r) = unsafe { cmp_one::<V, CI>(a, b, left, z) } {
                 return r;
             }
-            a = a.add(w);
-            b = b.add(w);
+            a = a.wrapping_add(w);
+            b = b.wrapping_add(w);
             left -= w;
-            for _ in 0..3 {
-                if core::cmp::max(a as usize & (PAGE - 1), b as usize & (PAGE - 1)) > PAGE - w {
-                    break;
-                }
-                if let Some(r) = cmp_one::<V, CI>(a, b, left, z) {
-                    return r;
-                }
-                a = a.add(w);
-                b = b.add(w);
-                left -= w;
-            }
         }
-        loop {
-            if left == 0 {
-                return 0;
-            }
-            let worst = core::cmp::max(a as usize & (PAGE - 1), b as usize & (PAGE - 1));
-            if left >= 4 * w && worst <= PAGE - 4 * w {
-                let a0 = V::loadu(a);
-                let a1 = V::loadu(a.add(w));
-                let a2 = V::loadu(a.add(2 * w));
-                let a3 = V::loadu(a.add(3 * w));
-                let t0 = V::min(V::eq(prep(a0), prep(V::loadu(b))), a0);
-                let t1 = V::min(V::eq(prep(a1), prep(V::loadu(b.add(w)))), a1);
-                let t2 = V::min(V::eq(prep(a2), prep(V::loadu(b.add(2 * w)))), a2);
-                let t3 = V::min(V::eq(prep(a3), prep(V::loadu(b.add(3 * w)))), a3);
-                if V::mask(V::eq(V::min(V::min(t0, t1), V::min(t2, t3)), z)) != 0 {
-                    for (k, t) in [t0, t1, t2, t3].into_iter().enumerate() {
-                        let m = V::mask(V::eq(t, z));
-                        if m != 0 {
-                            let i = k * w + m.trailing_zeros() as usize;
-                            return c_int::from(byte(a, i)) - c_int::from(byte(b, i));
-                        }
+    }
+    loop {
+        if left == 0 {
+            return 0;
+        }
+        let worst = core::cmp::max(a as usize & (PAGE - 1), b as usize & (PAGE - 1));
+        if left >= 4 * w && worst <= PAGE - 4 * w {
+            let a0 = unsafe { V::loadu(a) };
+            let a1 = unsafe { V::loadu_at(a, w) };
+            let a2 = unsafe { V::loadu_at(a, 2 * w) };
+            let a3 = unsafe { V::loadu_at(a, 3 * w) };
+            let t0 = V::min(V::eq(prep(a0), prep(unsafe { V::loadu(b) })), a0);
+            let t1 = V::min(V::eq(prep(a1), prep(unsafe { V::loadu_at(b, w) })), a1);
+            let t2 = V::min(V::eq(prep(a2), prep(unsafe { V::loadu_at(b, 2 * w) })), a2);
+            let t3 = V::min(V::eq(prep(a3), prep(unsafe { V::loadu_at(b, 3 * w) })), a3);
+            if V::mask(V::eq(V::min(V::min(t0, t1), V::min(t2, t3)), z)) != 0 {
+                for (k, t) in [t0, t1, t2, t3].into_iter().enumerate() {
+                    let m = V::mask(V::eq(t, z));
+                    if m != 0 {
+                        let i = k * w + m.trailing_zeros() as usize;
+                        return c_int::from(byte(a, i)) - c_int::from(byte(b, i));
                     }
                 }
-                a = a.add(4 * w);
-                b = b.add(4 * w);
-                left -= 4 * w;
-            } else if left >= w && worst <= PAGE - w {
-                let a0 = V::loadu(a);
-                let t = V::min(V::eq(prep(a0), prep(V::loadu(b))), a0);
-                let m = V::mask(V::eq(t, z));
-                if m != 0 {
-                    let i = m.trailing_zeros() as usize;
-                    return c_int::from(byte(a, i)) - c_int::from(byte(b, i));
-                }
-                a = a.add(w);
-                b = b.add(w);
-                left -= w;
-            } else if left < w && worst <= PAGE - w {
-                let a0 = V::loadu(a);
-                let t = V::min(V::eq(prep(a0), prep(V::loadu(b))), a0);
-                let m = V::mask(V::eq(t, z)) & low_bits(left);
-                if m != 0 {
-                    let i = m.trailing_zeros() as usize;
-                    return c_int::from(byte(a, i)) - c_int::from(byte(b, i));
-                }
-                return 0;
-            } else {
-                let (x, y) = (byte(a, 0), byte(b, 0));
-                if x != y || x == 0 {
-                    return c_int::from(x) - c_int::from(y);
-                }
-                a = a.add(1);
-                b = b.add(1);
-                left -= 1;
             }
+            a = a.wrapping_add(4 * w);
+            b = b.wrapping_add(4 * w);
+            left -= 4 * w;
+        } else if left >= w && worst <= PAGE - w {
+            let a0 = unsafe { V::loadu(a) };
+            let t = V::min(V::eq(prep(a0), prep(unsafe { V::loadu(b) })), a0);
+            let m = V::mask(V::eq(t, z));
+            if m != 0 {
+                let i = m.trailing_zeros() as usize;
+                return c_int::from(byte(a, i)) - c_int::from(byte(b, i));
+            }
+            a = a.wrapping_add(w);
+            b = b.wrapping_add(w);
+            left -= w;
+        } else if left < w && worst <= PAGE - w {
+            let a0 = unsafe { V::loadu(a) };
+            let t = V::min(V::eq(prep(a0), prep(unsafe { V::loadu(b) })), a0);
+            let m = V::mask(V::eq(t, z)) & low_bits(left);
+            if m != 0 {
+                let i = m.trailing_zeros() as usize;
+                return c_int::from(byte(a, i)) - c_int::from(byte(b, i));
+            }
+            return 0;
+        } else {
+            let (x, y) = (byte(a, 0), byte(b, 0));
+            if x != y || x == 0 {
+                return c_int::from(x) - c_int::from(y);
+            }
+            a = a.wrapping_add(1);
+            b = b.wrapping_add(1);
+            left -= 1;
         }
     }
 }
@@ -3187,58 +3186,49 @@ pub unsafe extern "C" fn strncasecmp(a: *const c_char, b: *const c_char, n: usiz
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strcasecmp_l(a: *const c_char, b: *const c_char, loc: *mut c_void) -> c_int {
-    unsafe {
-        if hooks::active() {
-            return casecmp_hooked(a.cast(), b.cast(), usize::MAX, loc as usize);
-        }
-        strcasecmp(a, b)
+    if hooks::active() {
+        return unsafe { casecmp_hooked(a.cast(), b.cast(), usize::MAX, loc) };
     }
+    unsafe { strcasecmp(a, b) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strncasecmp_l(a: *const c_char, b: *const c_char, n: usize, loc: *mut c_void) -> c_int {
-    unsafe {
-        if hooks::active() {
-            return casecmp_hooked(a.cast(), b.cast(), n, loc as usize);
-        }
-        strncasecmp(a, b, n)
+    if hooks::active() {
+        return unsafe { casecmp_hooked(a.cast(), b.cast(), n, loc) };
     }
+    unsafe { strncasecmp(a, b, n) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strcoll(a: *const c_char, b: *const c_char) -> c_int {
-    unsafe {
-        if hooks::active()
-            && let Some(f) = hooks::coll()
-        {
-            return f(a.cast(), b.cast(), 0);
-        }
-        strcmp(a, b)
+    if hooks::active()
+        && let Some(f) = hooks::coll()
+    {
+        return unsafe { f(a.cast(), b.cast(), hooks::Loc::CURRENT) };
     }
+    unsafe { strcmp(a, b) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strcoll_l(a: *const c_char, b: *const c_char, loc: *mut c_void) -> c_int {
-    unsafe {
-        if hooks::active()
-            && let Some(f) = hooks::coll()
-        {
-            return f(a.cast(), b.cast(), loc as usize);
-        }
-        strcmp(a, b)
+    if hooks::active()
+        && let Some(f) = hooks::coll()
+    {
+        let loc = unsafe { hooks::Loc::from_raw(loc as usize) };
+        return unsafe { f(a.cast(), b.cast(), loc) };
     }
+    unsafe { strcmp(a, b) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strxfrm(dest: *mut c_char, src: *const c_char, n: usize) -> usize {
-    unsafe {
-        if hooks::active()
-            && let Some(f) = hooks::xfrm()
-        {
-            return f(dest.cast(), src.cast(), n, 0);
-        }
-        strxfrm_c(dest, src, n)
+    if hooks::active()
+        && let Some(f) = hooks::xfrm()
+    {
+        return unsafe { f(dest.cast(), src.cast(), n, hooks::Loc::CURRENT) };
     }
+    unsafe { strxfrm_c(dest, src, n) }
 }
 
 unsafe fn strxfrm_c(dest: *mut c_char, src: *const c_char, n: usize) -> usize {
@@ -3252,44 +3242,39 @@ unsafe fn strxfrm_c(dest: *mut c_char, src: *const c_char, n: usize) -> usize {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strxfrm_l(dest: *mut c_char, src: *const c_char, n: usize, loc: *mut c_void) -> usize {
-    unsafe {
-        if hooks::active()
-            && let Some(f) = hooks::xfrm()
-        {
-            return f(dest.cast(), src.cast(), n, loc as usize);
-        }
-        strxfrm_c(dest, src, n)
+    if hooks::active()
+        && let Some(f) = hooks::xfrm()
+    {
+        let loc = unsafe { hooks::Loc::from_raw(loc as usize) };
+        return unsafe { f(dest.cast(), src.cast(), n, loc) };
     }
+    unsafe { strxfrm_c(dest, src, n) }
 }
 
 #[inline(always)]
 unsafe fn strchrnul_impl<V: Vector>(s: *const u8, c: c_int) -> *const u8 {
-    unsafe {
-        let c = c as u8;
-        let vc = V::splat(c);
-        let z = V::zero();
-        let hit = |v: V| V::min(v, V::xor(v, vc));
-        if crate::simd::same_page(s, V::W) {
-            let m = V::mask(V::eq(hit(V::loadu(s)), z));
-            if m != 0 {
-                return s.add(m.trailing_zeros() as usize);
-            }
-            return s.add(scan_from::<V>(s, ((s as usize | (V::W - 1)) + 1) as *const u8, hit));
-        }
-        let (m, base) = first_block::<V>(s, |v| V::eq(hit(v), z));
+    let c = c as u8;
+    let vc = unsafe { V::splat(c) };
+    let z = unsafe { V::zero() };
+    let hit = |v: V| V::min(v, V::xor(v, vc));
+    if crate::simd::same_page(s, V::W) {
+        let m = V::mask(V::eq(hit(unsafe { V::loadu(s) }), z));
         if m != 0 {
-            return s.add(m.trailing_zeros() as usize);
+            return s.wrapping_add(m.trailing_zeros() as usize);
         }
-        s.add(scan_from::<V>(s, base.add(V::W), hit))
+        return s.wrapping_add(unsafe { scan_from::<V>(s, ((s as usize | (V::W - 1)) + 1) as *const u8, hit) });
     }
+    let (m, base) = unsafe { first_block::<V>(s, |v| V::eq(hit(v), z)) };
+    if m != 0 {
+        return s.wrapping_add(m.trailing_zeros() as usize);
+    }
+    s.wrapping_add(unsafe { scan_from::<V>(s, base.wrapping_add(V::W), hit) })
 }
 
 #[inline(always)]
 unsafe fn strchr_impl<V: Vector>(s: *const u8, c: c_int) -> *const u8 {
-    unsafe {
-        let p = strchrnul_impl::<V>(s, c);
-        if p.read() == c as u8 { p } else { core::ptr::null() }
-    }
+    let p = unsafe { strchrnul_impl::<V>(s, c) };
+    if unsafe { p.read() } == c as u8 { p } else { core::ptr::null() }
 }
 
 pair!(strchrnul_sse2, strchrnul_avx2, strchrnul_impl, (s: *const u8, c: c_int) -> *const u8);
@@ -3655,78 +3640,74 @@ pub unsafe extern "C" fn strchr(s: *const c_char, c: c_int) -> *mut c_char {
 
 #[inline(always)]
 unsafe fn strrchr_block<V: Vector>(p: *const u8, vc: V, hi: u32, last: &mut (*const u8, u32)) -> Option<*const u8> {
-    unsafe {
-        let v = V::load(p);
-        let mz = V::mask(V::eq(v, V::zero())) & hi;
-        let mc = V::mask(V::eq(v, vc)) & hi;
-        if mz != 0 {
-            let before = mc & (mz.isolate_lowest_one() - 1);
-            let (base, m) = if before != 0 { (p, before) } else { *last };
-            return Some(if m != 0 { base.add(31 - m.leading_zeros() as usize) } else { core::ptr::null() });
-        }
-        if mc != 0 {
-            *last = (p, mc);
-        }
-        None
+    let v = unsafe { V::load(p) };
+    let mz = V::mask(V::eq(v, unsafe { V::zero() })) & hi;
+    let mc = V::mask(V::eq(v, vc)) & hi;
+    if mz != 0 {
+        let before = mc & (mz.isolate_lowest_one() - 1);
+        let (base, m) = if before != 0 { (p, before) } else { *last };
+        return Some(if m != 0 { base.wrapping_add(31 - m.leading_zeros() as usize) } else { core::ptr::null() });
     }
+    if mc != 0 {
+        *last = (p, mc);
+    }
+    None
 }
 
 #[inline(always)]
 unsafe fn strrchr_impl<V: Vector>(s: *const u8, c: c_int) -> *const u8 {
-    unsafe {
-        let c = c as u8;
-        let w = V::W;
-        if c == 0 {
-            return s.add(strlen_impl::<V>(s));
+    let c = c as u8;
+    let w = V::W;
+    if c == 0 {
+        return s.wrapping_add(unsafe { strlen_impl::<V>(s) });
+    }
+    let vc = unsafe { V::splat(c) };
+    let hit = |v: V| V::min(v, V::xor(v, vc));
+    let mut last: (*const u8, u32) = (core::ptr::null(), 0);
+    let mut p;
+    if crate::simd::same_page(s, w) {
+        let v = unsafe { V::loadu(s) };
+        let mz = V::mask(V::eq(v, unsafe { V::zero() }));
+        let mc = V::mask(V::eq(v, vc));
+        if mz != 0 {
+            let before = mc & (mz.isolate_lowest_one() - 1);
+            return if before != 0 { s.wrapping_add(31 - before.leading_zeros() as usize) } else { core::ptr::null() };
         }
-        let vc = V::splat(c);
-        let hit = |v: V| V::min(v, V::xor(v, vc));
-        let mut last: (*const u8, u32) = (core::ptr::null(), 0);
-        let mut p;
-        if crate::simd::same_page(s, w) {
-            let v = V::loadu(s);
-            let mz = V::mask(V::eq(v, V::zero()));
-            let mc = V::mask(V::eq(v, vc));
-            if mz != 0 {
-                let before = mc & (mz.isolate_lowest_one() - 1);
-                return if before != 0 { s.add(31 - before.leading_zeros() as usize) } else { core::ptr::null() };
-            }
-            if mc != 0 {
-                last = (s, mc);
-            }
-            p = ((s as usize | (w - 1)) + 1) as *const u8;
-        } else {
-            let base = (s as usize & !(w - 1)) as *const u8;
-            let hi = low_bits(w) << (s as usize - base as usize);
-            if let Some(r) = strrchr_block::<V>(base, vc, hi, &mut last) {
-                return r;
-            }
-            p = base.add(w);
+        if mc != 0 {
+            last = (s, mc);
         }
-        for _ in 0..3 {
-            if let Some(r) = strrchr_block::<V>(p, vc, low_bits(w), &mut last) {
-                return r;
-            }
-            p = p.add(w);
+        p = ((s as usize | (w - 1)) + 1) as *const u8;
+    } else {
+        let base = (s as usize & !(w - 1)) as *const u8;
+        let hi = low_bits(w) << (s as usize - base as usize);
+        if let Some(r) = unsafe { strrchr_block::<V>(base, vc, hi, &mut last) } {
+            return r;
         }
-        let z = V::zero();
-        loop {
-            if (p as usize & (PAGE - 1)) <= PAGE - 4 * w {
-                let (t0, t1, t2, t3) = (hit(V::load(p)), hit(V::load(p.add(w))), hit(V::load(p.add(2 * w))), hit(V::load(p.add(3 * w))));
-                if V::mask(V::eq(V::min(V::min(t0, t1), V::min(t2, t3)), z)) != 0 {
-                    for k in 0..4 {
-                        if let Some(r) = strrchr_block::<V>(p.add(k * w), vc, low_bits(w), &mut last) {
-                            return r;
-                        }
+        p = base.wrapping_add(w);
+    }
+    for _ in 0..3 {
+        if let Some(r) = unsafe { strrchr_block::<V>(p, vc, low_bits(w), &mut last) } {
+            return r;
+        }
+        p = p.wrapping_add(w);
+    }
+    let z = unsafe { V::zero() };
+    loop {
+        if (p as usize & (PAGE - 1)) <= PAGE - 4 * w {
+            let (t0, t1, t2, t3) = (hit(unsafe { V::load(p) }), hit(unsafe { V::load_at(p, w) }), hit(unsafe { V::load_at(p, 2 * w) }), hit(unsafe { V::load_at(p, 3 * w) }));
+            if V::mask(V::eq(V::min(V::min(t0, t1), V::min(t2, t3)), z)) != 0 {
+                for k in 0..4 {
+                    if let Some(r) = unsafe { strrchr_block::<V>(p.wrapping_add(k * w), vc, low_bits(w), &mut last) } {
+                        return r;
                     }
                 }
-                p = p.add(4 * w);
-            } else {
-                if let Some(r) = strrchr_block::<V>(p, vc, low_bits(w), &mut last) {
-                    return r;
-                }
-                p = p.add(w);
             }
+            p = p.wrapping_add(4 * w);
+        } else {
+            if let Some(r) = unsafe { strrchr_block::<V>(p, vc, low_bits(w), &mut last) } {
+                return r;
+            }
+            p = p.wrapping_add(w);
         }
     }
 }
@@ -4080,76 +4061,70 @@ pub unsafe extern "C" fn rindex(s: *const c_char, c: c_int) -> *mut c_char {
 }
 
 #[inline(always)]
-unsafe fn span_stop<V: Vector, const ACCEPT: bool, const K: usize>(v: V, sp: &[V; K], z: V) -> u32 {
-    unsafe {
-        let mut inset = V::eq(v, sp[0]);
-        for x in &sp[1..] {
-            inset = V::or(inset, V::eq(v, *x));
-        }
-        if ACCEPT { !V::mask(inset) & low_bits(V::W) } else { V::mask(V::or(inset, V::eq(v, z))) }
+fn span_stop<V: Vector, const ACCEPT: bool, const K: usize>(v: V, sp: &[V; K], z: V) -> u32 {
+    let mut inset = V::eq(v, sp[0]);
+    for x in &sp[1..] {
+        inset = V::or(inset, V::eq(v, *x));
     }
+    if ACCEPT { !V::mask(inset) & low_bits(V::W) } else { V::mask(V::or(inset, V::eq(v, z))) }
 }
 
 #[inline(always)]
 unsafe fn span_k<V: Vector, const ACCEPT: bool, const K: usize, const N: usize>(s: *const u8, bytes: [u8; N]) -> usize {
-    unsafe {
-        let w = V::W;
-        let z = V::zero();
-        let sp: [V; K] = core::array::from_fn(|i| V::splat(bytes[i]));
-        let base = (s as usize & !(w - 1)) as *const u8;
-        let m = span_stop::<V, ACCEPT, K>(V::load(base), &sp, z) >> (s as usize - base as usize);
-        if m != 0 {
-            return m.trailing_zeros() as usize;
-        }
-        let mut p = base.add(w);
-        let m = span_stop::<V, ACCEPT, K>(V::load(p), &sp, z);
-        if m != 0 {
-            return p as usize - s as usize + m.trailing_zeros() as usize;
-        }
-        p = p.add(w);
-        loop {
-            if (p as usize & (PAGE - 1)) <= PAGE - 2 * w {
-                let (m0, m1) = (span_stop::<V, ACCEPT, K>(V::load(p), &sp, z), span_stop::<V, ACCEPT, K>(V::load(p.add(w)), &sp, z));
-                if m0 | m1 != 0 {
-                    let (off, m) = if m0 != 0 { (0, m0) } else { (w, m1) };
-                    return p as usize - s as usize + off + m.trailing_zeros() as usize;
-                }
-                p = p.add(2 * w);
-            } else {
-                let m = span_stop::<V, ACCEPT, K>(V::load(p), &sp, z);
-                if m != 0 {
-                    return p as usize - s as usize + m.trailing_zeros() as usize;
-                }
-                p = p.add(w);
+    let w = V::W;
+    let z = unsafe { V::zero() };
+    let sp: [V; K] = core::array::from_fn(|i| unsafe { V::splat(bytes[i]) });
+    let base = (s as usize & !(w - 1)) as *const u8;
+    let m = span_stop::<V, ACCEPT, K>(unsafe { V::load(base) }, &sp, z) >> (s as usize - base as usize);
+    if m != 0 {
+        return m.trailing_zeros() as usize;
+    }
+    let mut p = base.wrapping_add(w);
+    let m = span_stop::<V, ACCEPT, K>(unsafe { V::load(p) }, &sp, z);
+    if m != 0 {
+        return p as usize - s as usize + m.trailing_zeros() as usize;
+    }
+    p = p.wrapping_add(w);
+    loop {
+        if (p as usize & (PAGE - 1)) <= PAGE - 2 * w {
+            let (m0, m1) = (span_stop::<V, ACCEPT, K>(unsafe { V::load(p) }, &sp, z), span_stop::<V, ACCEPT, K>(unsafe { V::load_at(p, w) }, &sp, z));
+            if m0 | m1 != 0 {
+                let (off, m) = if m0 != 0 { (0, m0) } else { (w, m1) };
+                return p as usize - s as usize + off + m.trailing_zeros() as usize;
             }
+            p = p.wrapping_add(2 * w);
+        } else {
+            let m = span_stop::<V, ACCEPT, K>(unsafe { V::load(p) }, &sp, z);
+            if m != 0 {
+                return p as usize - s as usize + m.trailing_zeros() as usize;
+            }
+            p = p.wrapping_add(w);
         }
     }
 }
 
 #[inline(always)]
 unsafe fn span_wide<V: Vector, const ACCEPT: bool>(s: *const u8, set: *const u8) -> usize {
-    unsafe {
-        let mut bytes = [0u8; 16];
-        let mut k = 0;
-        while k < 17 {
-            let b = *set.add(k);
-            if b == 0 {
-                break;
-            }
-            if k < 16 {
-                bytes[k] = b;
-            }
-            k += 1;
+    let mut bytes = [0u8; 16];
+    let mut k = 0;
+    while k < 17 {
+        let b = unsafe { byte(set, k) };
+        if b == 0 {
+            break;
         }
-        if k > 16 {
-            return span_map::<ACCEPT>(s, set);
+        if k < 16 {
+            bytes[k] = b;
         }
-        let first = bytes[0];
-        for slot in bytes.iter_mut().skip(k) {
-            *slot = first;
-        }
-        if k <= 8 { span_k::<V, ACCEPT, 8, 16>(s, bytes) } else { span_k::<V, ACCEPT, 16, 16>(s, bytes) }
+        k += 1;
     }
+    if k > 16 {
+        return unsafe { span_map::<ACCEPT>(s, set) };
+    }
+    let first = bytes[0];
+    for slot in bytes.iter_mut().skip(k) {
+        *slot = first;
+    }
+    if k <= 8 { unsafe { span_k::<V, ACCEPT, 8, 16>(s, bytes) } } else { unsafe { span_k::<V, ACCEPT, 16, 16>(s, bytes) } }
 }
 
 unsafe fn span_wide_sse2<const ACCEPT: bool>(s: *const u8, set: *const u8) -> usize {
@@ -4162,35 +4137,33 @@ unsafe fn span_wide_avx2<const ACCEPT: bool>(s: *const u8, set: *const u8) -> us
 
 #[inline(always)]
 unsafe fn span_impl<V: Vector, const ACCEPT: bool>(s: *const u8, set: *const u8) -> usize {
-    unsafe {
-        let b0 = *set;
-        if b0 == 0 {
-            return if ACCEPT { 0 } else { strlen_impl::<V>(s) };
-        }
-        let b1 = *set.add(1);
-        if b1 == 0 {
-            return span_k::<V, ACCEPT, 1, 4>(s, [b0, b0, b0, b0]);
-        }
-        let b2 = *set.add(2);
-        if b2 == 0 {
-            return span_k::<V, ACCEPT, 2, 4>(s, [b0, b1, b0, b0]);
-        }
-        let b3 = *set.add(3);
-        if b3 == 0 {
-            return span_k::<V, ACCEPT, 3, 4>(s, [b0, b1, b2, b0]);
-        }
-        if *set.add(4) == 0 {
-            return span_k::<V, ACCEPT, 4, 4>(s, [b0, b1, b2, b3]);
-        }
-        if V::W == 32 { span_wide_avx2::<ACCEPT>(s, set) } else { span_wide_sse2::<ACCEPT>(s, set) }
+    let b0 = unsafe { *set };
+    if b0 == 0 {
+        return if ACCEPT { 0 } else { unsafe { strlen_impl::<V>(s) } };
     }
+    let b1 = unsafe { byte(set, 1) };
+    if b1 == 0 {
+        return unsafe { span_k::<V, ACCEPT, 1, 4>(s, [b0, b0, b0, b0]) };
+    }
+    let b2 = unsafe { byte(set, 2) };
+    if b2 == 0 {
+        return unsafe { span_k::<V, ACCEPT, 2, 4>(s, [b0, b1, b0, b0]) };
+    }
+    let b3 = unsafe { byte(set, 3) };
+    if b3 == 0 {
+        return unsafe { span_k::<V, ACCEPT, 3, 4>(s, [b0, b1, b2, b0]) };
+    }
+    if unsafe { byte(set, 4) } == 0 {
+        return unsafe { span_k::<V, ACCEPT, 4, 4>(s, [b0, b1, b2, b3]) };
+    }
+    if V::W == 32 { unsafe { span_wide_avx2::<ACCEPT>(s, set) } } else { unsafe { span_wide_sse2::<ACCEPT>(s, set) } }
 }
 
 unsafe fn span_map<const ACCEPT: bool>(s: *const u8, set: *const u8) -> usize {
     let map = unsafe { byte_set(set.cast()) };
     let mut i = 0;
     loop {
-        let b = unsafe { *s.add(i) };
+        let b = unsafe { byte(s, i) };
         if b == 0 || map.has(b) != ACCEPT {
             return i;
         }
@@ -4228,7 +4201,7 @@ pub unsafe extern "C" fn strcspn(s: *const c_char, reject: *const c_char) -> usi
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strpbrk(s: *const c_char, accept: *const c_char) -> *mut c_char {
     let i = unsafe { strcspn(s, accept) };
-    if unsafe { at(s, i) } == 0 { null_mut() } else { unsafe { s.add(i) as *mut c_char } }
+    if unsafe { at(s, i) } == 0 { null_mut() } else { s.wrapping_add(i) as *mut c_char }
 }
 
 pub(crate) struct ByteSet([u64; 4]);
@@ -4260,13 +4233,11 @@ pub unsafe extern "C" fn strsep(stringp: *mut *mut c_char, delim: *const c_char)
         return null_mut();
     }
     let i = unsafe { strcspn(s, delim) };
-    unsafe {
-        if at(s, i) == 0 {
-            *stringp = null_mut();
-        } else {
-            s.add(i).cast::<u8>().write(0);
-            *stringp = s.add(i + 1);
-        }
+    if unsafe { at(s, i) } == 0 {
+        unsafe { *stringp = null_mut() };
+    } else {
+        unsafe { s.cast::<u8>().wrapping_add(i).write(0) };
+        unsafe { *stringp = s.wrapping_add(i + 1) };
     }
     s
 }
@@ -4281,19 +4252,17 @@ pub unsafe extern "C" fn strtok_r(s: *mut c_char, delim: *const c_char, saveptr:
         unsafe { *saveptr = s };
         return null_mut();
     }
-    s = unsafe { s.add(strspn(s, delim)) };
+    s = s.wrapping_add(unsafe { strspn(s, delim) });
     if unsafe { at(s, 0) } == 0 {
         unsafe { *saveptr = s };
         return null_mut();
     }
-    let end = unsafe { s.add(strcspn(s, delim)) };
-    unsafe {
-        if at(end, 0) == 0 {
-            *saveptr = end;
-        } else {
-            end.cast::<u8>().write(0);
-            *saveptr = end.add(1);
-        }
+    let end = s.wrapping_add(unsafe { strcspn(s, delim) });
+    if unsafe { at(end, 0) } == 0 {
+        unsafe { *saveptr = end };
+    } else {
+        unsafe { end.cast::<u8>().write(0) };
+        unsafe { *saveptr = end.wrapping_add(1) };
     }
     s
 }
@@ -4311,12 +4280,7 @@ pub unsafe extern "C" fn strtok(s: *mut c_char, delim: *const c_char) -> *mut c_
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn basename(path: *const c_char) -> *mut c_char {
     let p = unsafe { strrchr(path, c_int::from(b'/')) };
-    if p.is_null() { path as *mut c_char } else { unsafe { p.add(1) } }
-}
-
-#[inline(always)]
-fn is_digit(c: u8) -> bool {
-    c.is_ascii_digit()
+    if p.is_null() { path as *mut c_char } else { p.wrapping_add(1) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -4341,7 +4305,7 @@ pub unsafe extern "C" fn strverscmp(s1: *const c_char, s2: *const c_char) -> c_i
     let mut c1 = unsafe { at(s1, 0) };
     let mut c2 = unsafe { at(s2, 0) };
     i += 1;
-    let mut state = S_N + usize::from(c1 == b'0') + usize::from(is_digit(c1));
+    let mut state = S_N + usize::from(c1 == b'0') + usize::from(c1.is_ascii_digit());
     while c1 == c2 {
         if c1 == 0 {
             return 0;
@@ -4350,24 +4314,24 @@ pub unsafe extern "C" fn strverscmp(s1: *const c_char, s2: *const c_char) -> c_i
         c1 = unsafe { at(s1, i) };
         c2 = unsafe { at(s2, i) };
         i += 1;
-        state += usize::from(c1 == b'0') + usize::from(is_digit(c1));
+        state += usize::from(c1 == b'0') + usize::from(c1.is_ascii_digit());
     }
     let diff = c_int::from(c1) - c_int::from(c2);
-    let kind = RESULT_TYPE[state * 3 + usize::from(c2 == b'0') + usize::from(is_digit(c2))];
+    let kind = RESULT_TYPE[state * 3 + usize::from(c2 == b'0') + usize::from(c2.is_ascii_digit())];
     match kind {
         CMP => diff,
         LEN => {
             let mut j = i;
             loop {
-                if !is_digit(unsafe { at(s1, j) }) {
+                if !unsafe { at(s1, j) }.is_ascii_digit() {
                     break;
                 }
-                if !is_digit(unsafe { at(s2, j) }) {
+                if !unsafe { at(s2, j) }.is_ascii_digit() {
                     return 1;
                 }
                 j += 1;
             }
-            if is_digit(unsafe { at(s2, j) }) { -1 } else { diff }
+            if unsafe { at(s2, j) }.is_ascii_digit() { -1 } else { diff }
         }
         other => c_int::from(other),
     }

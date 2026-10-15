@@ -156,16 +156,11 @@ pub const REG_OLDMASK: usize = 21;
 pub const REG_CR2: usize = 22;
 pub const NGREG: usize = 23;
 
-pub(crate) const SYS_KILL: usize = 62;
-pub(crate) const SYS_GETPID: usize = 39;
-pub(crate) const SYS_GETUID: usize = 102;
 pub(crate) const SYS_RT_SIGPENDING: usize = 127;
 pub(crate) const SYS_RT_SIGTIMEDWAIT: usize = 128;
 pub(crate) const SYS_RT_SIGQUEUEINFO: usize = 129;
 pub(crate) const SYS_RT_SIGSUSPEND: usize = 130;
 pub(crate) const SYS_SIGALTSTACK: usize = 131;
-pub(crate) const SYS_GETTID: usize = 186;
-pub(crate) const SYS_TGKILL: usize = 234;
 pub(crate) const KSIGSET_BYTES: usize = 8;
 
 pub(crate) const EINVAL: i32 = 22;

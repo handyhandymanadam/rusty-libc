@@ -12,13 +12,11 @@ pub unsafe extern "C" fn __rl_compat_regexec(preg: *const rusty_libc_regex::cabi
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rl_compat_realpath(path: *const c_char, resolved: *mut c_char) -> *mut c_char {
-    unsafe {
-        if resolved.is_null() {
-            errno::set(EINVAL);
-            return core::ptr::null_mut();
-        }
-        rusty_libc_stdlib::misc::realpath(path, resolved)
+    if resolved.is_null() {
+        errno::set(EINVAL);
+        return core::ptr::null_mut();
     }
+    unsafe { rusty_libc_stdlib::misc::realpath(path, resolved) }
 }
 
 const FTW_OLD_FLAGS: c_int = 1  | 2  | 4  | 8 ;
@@ -107,35 +105,31 @@ fn old_timer(id: c_int) -> rusty_libc_time::clock::TimerId {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rl_compat_timer_create(clock: rusty_libc_time::clock::ClockId, evp: *mut rusty_libc_time::clock::Sigevent, timerid: *mut c_int) -> c_int {
-    unsafe {
-        let mut newp: rusty_libc_time::clock::TimerId = core::ptr::null_mut();
-        let res = rusty_libc_time::clock::timer_create(clock, evp, &mut newp);
-        if res != 0 {
-            return res;
-        }
-        for (i, slot) in TIMER_COMPAT_LIST.iter().enumerate() {
-            if slot.compare_exchange(core::ptr::null_mut(), newp, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                *timerid = i as c_int;
-                return 0;
-            }
-        }
-        rusty_libc_time::clock::timer_delete(newp);
-        errno::set(EINVAL);
-        -1
+    let mut newp: rusty_libc_time::clock::TimerId = core::ptr::null_mut();
+    let res = unsafe { rusty_libc_time::clock::timer_create(clock, evp, &mut newp) };
+    if res != 0 {
+        return res;
     }
+    for (i, slot) in TIMER_COMPAT_LIST.iter().enumerate() {
+        if slot.compare_exchange(core::ptr::null_mut(), newp, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            unsafe { *timerid = i as c_int };
+            return 0;
+        }
+    }
+    unsafe { rusty_libc_time::clock::timer_delete(newp) };
+    errno::set(EINVAL);
+    -1
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rl_compat_timer_delete(timerid: c_int) -> c_int {
-    unsafe {
-        let res = rusty_libc_time::clock::timer_delete(old_timer(timerid));
-        if res == 0
-            && let Some(s) = TIMER_COMPAT_LIST.get(timerid as usize)
-        {
-            s.store(core::ptr::null_mut(), Ordering::Release);
-        }
-        res
+    let res = unsafe { rusty_libc_time::clock::timer_delete(old_timer(timerid)) };
+    if res == 0
+        && let Some(s) = TIMER_COMPAT_LIST.get(timerid as usize)
+    {
+        s.store(core::ptr::null_mut(), Ordering::Release);
     }
+    res
 }
 
 #[unsafe(no_mangle)]
@@ -158,82 +152,75 @@ pub struct OldCond {
     cond: AtomicPtr<rusty_libc_pthread::cond::Cond>,
 }
 
-unsafe fn real_cond(old: *mut OldCond) -> Result<*mut rusty_libc_pthread::cond::Cond, c_int> {
-    unsafe {
-        let cur = (*old).cond.load(Ordering::Acquire);
-        if !cur.is_null() {
-            return Ok(cur);
-        }
-        let newcond = rusty_libc_malloc::calloc(core::mem::size_of::<rusty_libc_pthread::cond::Cond>(), 1) as *mut rusty_libc_pthread::cond::Cond;
-        if newcond.is_null() {
-            return Err(ENOMEM);
-        }
-        match (*old).cond.compare_exchange(core::ptr::null_mut(), newcond, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => Ok(newcond),
-            Err(other) => {
-                rusty_libc_malloc::free(newcond.cast());
-                Ok(other)
-            }
+fn real_cond(old: &OldCond) -> Result<*mut rusty_libc_pthread::cond::Cond, c_int> {
+    let cur = old.cond.load(Ordering::Acquire);
+    if !cur.is_null() {
+        return Ok(cur);
+    }
+    let newcond = unsafe { rusty_libc_malloc::calloc(core::mem::size_of::<rusty_libc_pthread::cond::Cond>(), 1) } as *mut rusty_libc_pthread::cond::Cond;
+    if newcond.is_null() {
+        return Err(ENOMEM);
+    }
+    match old.cond.compare_exchange(core::ptr::null_mut(), newcond, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Ok(newcond),
+        Err(other) => {
+            unsafe { rusty_libc_malloc::free(newcond.cast()) };
+            Ok(other)
         }
     }
+}
+
+unsafe fn old_cond<'a>(cond: *mut OldCond) -> &'a OldCond {
+    unsafe { &*cond }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rl_compat_pthread_cond_init(cond: *mut OldCond, attr: *const rusty_libc_pthread::cond::CondAttr) -> c_int {
-    unsafe {
-        (*cond).cond.store(core::ptr::null_mut(), Ordering::Release);
-        if !attr.is_null() && (*attr).value != 0 {
-            return EINVAL;
-        }
-        0
+    unsafe { old_cond(cond) }.cond.store(core::ptr::null_mut(), Ordering::Release);
+    if let Some(a) = unsafe { attr.as_ref() }
+        && a.value != 0
+    {
+        return EINVAL;
     }
+    0
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rl_compat_pthread_cond_destroy(cond: *mut OldCond) -> c_int {
-    unsafe {
-        rusty_libc_malloc::free((*cond).cond.load(Ordering::Acquire).cast());
-        0
-    }
+    let real = unsafe { old_cond(cond) }.cond.load(Ordering::Acquire);
+    unsafe { rusty_libc_malloc::free(real.cast()) };
+    0
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rl_compat_pthread_cond_wait(cond: *mut OldCond, mutex: *mut rusty_libc_pthread::mutex::Mutex) -> c_int {
-    unsafe {
-        match real_cond(cond) {
-            Ok(c) => rusty_libc_pthread::pthread_cond_wait(c, mutex),
-            Err(e) => e,
-        }
+    match real_cond(unsafe { old_cond(cond) }) {
+        Ok(c) => unsafe { rusty_libc_pthread::pthread_cond_wait(c, mutex) },
+        Err(e) => e,
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rl_compat_pthread_cond_timedwait(cond: *mut OldCond, mutex: *mut rusty_libc_pthread::mutex::Mutex, abstime: *const rusty_libc_pthread::Timespec) -> c_int {
-    unsafe {
-        match real_cond(cond) {
-            Ok(c) => rusty_libc_pthread::pthread_cond_timedwait(c, mutex, abstime),
-            Err(e) => e,
-        }
+    match real_cond(unsafe { old_cond(cond) }) {
+        Ok(c) => unsafe { rusty_libc_pthread::pthread_cond_timedwait(c, mutex, abstime) },
+        Err(e) => e,
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rl_compat_pthread_cond_signal(cond: *mut OldCond) -> c_int {
-    unsafe {
-        match real_cond(cond) {
-            Ok(c) => rusty_libc_pthread::pthread_cond_signal(c),
-            Err(e) => e,
-        }
+    match real_cond(unsafe { old_cond(cond) }) {
+        Ok(c) => unsafe { rusty_libc_pthread::pthread_cond_signal(c) },
+        Err(e) => e,
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rl_compat_pthread_cond_broadcast(cond: *mut OldCond) -> c_int {
-    unsafe {
-        match real_cond(cond) {
-            Ok(c) => rusty_libc_pthread::pthread_cond_broadcast(c),
-            Err(e) => e,
-        }
+    match real_cond(unsafe { old_cond(cond) }) {
+        Ok(c) => unsafe { rusty_libc_pthread::pthread_cond_broadcast(c) },
+        Err(e) => e,
     }
 }
 

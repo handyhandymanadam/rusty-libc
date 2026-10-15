@@ -2,6 +2,7 @@ use crate::sys::*;
 use crate::thread;
 use core::ffi::{c_int, c_void};
 use rusty_libc_core::lock::RawMutex;
+use rusty_libc_core::sync_cell::SyncCell;
 
 type Handler = Option<unsafe extern "C" fn()>;
 
@@ -16,131 +17,124 @@ struct Entry {
 pub const MAX_HANDLERS: usize = 512;
 
 static LOCK: RawMutex = RawMutex::new();
-static mut TABLE: [Entry; MAX_HANDLERS] = [Entry { prepare: None, parent: None, child: None, dso: 0 }; MAX_HANDLERS];
-static mut COUNT: usize = 0;
+
+struct Table {
+    entries: [Entry; MAX_HANDLERS],
+    count: usize,
+}
+
+static TABLE: SyncCell<Table> = SyncCell::new(Table { entries: [Entry { prepare: None, parent: None, child: None, dso: 0 }; MAX_HANDLERS], count: 0 });
 static FORKING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn with_table<R>(f: impl FnOnce(&mut Table) -> R) -> R {
+    LOCK.lock_always();
+    let r = unsafe { TABLE.with_unsync(f) };
+    LOCK.unlock_always();
+    r
+}
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_atfork(prepare: Option<unsafe extern "C" fn()>, parent: Option<unsafe extern "C" fn()>, child: Option<unsafe extern "C" fn()>) -> c_int {
-    unsafe { register(prepare, parent, child, 0) }
+    register(prepare, parent, child, 0)
 }
 
-unsafe fn register(prepare: Handler, parent: Handler, child: Handler, dso: usize) -> c_int {
-    unsafe {
-        install_fork_hook();
-        LOCK.lock_always();
-        if COUNT >= MAX_HANDLERS && FORKING.load(core::sync::atomic::Ordering::Relaxed) == 0 {
-            squeeze();
+pub fn register(prepare: Handler, parent: Handler, child: Handler, dso: usize) -> c_int {
+    install_fork_hook();
+    with_table(|t| {
+        if t.count >= MAX_HANDLERS && FORKING.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+            squeeze(t);
         }
-        let n = COUNT;
+        let n = t.count;
         if n >= MAX_HANDLERS {
-            LOCK.unlock_always();
             return ENOMEM;
         }
-        (*(&raw mut TABLE))[n] = Entry { prepare, parent, child, dso };
-        COUNT = n + 1;
-        LOCK.unlock_always();
+        t.entries[n] = Entry { prepare, parent, child, dso };
+        t.count = n + 1;
         0
-    }
+    })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __register_atfork(prepare: Option<unsafe extern "C" fn()>, parent: Option<unsafe extern "C" fn()>, child: Option<unsafe extern "C" fn()>, dso: *mut c_void) -> c_int {
-    unsafe { register(prepare, parent, child, dso as usize) }
+    register(prepare, parent, child, dso as usize)
 }
 
-unsafe extern "C" fn unregister_dso(dso: usize) {
-    unsafe {
-        if dso == 0 {
-            return;
-        }
-        LOCK.lock_always();
-        let t = &mut *(&raw mut TABLE);
-        for e in t.iter_mut().take(COUNT) {
+extern "C" fn unregister_dso(dso: usize) {
+    if dso == 0 {
+        return;
+    }
+    with_table(|t| {
+        let n = t.count;
+        for e in t.entries.iter_mut().take(n) {
             if e.dso == dso {
                 *e = Entry { prepare: None, parent: None, child: None, dso: 0 };
             }
         }
-        LOCK.unlock_always();
-    }
+    })
 }
 
-unsafe fn squeeze() {
-    unsafe {
-        let t = &mut *(&raw mut TABLE);
-        let mut keep = 0;
-        for i in 0..COUNT {
-            if t[i].prepare.is_some() || t[i].parent.is_some() || t[i].child.is_some() {
-                t[keep] = t[i];
-                keep += 1;
-            }
+fn squeeze(t: &mut Table) {
+    let mut keep = 0;
+    for i in 0..t.count {
+        let e = t.entries[i];
+        if e.prepare.is_some() || e.parent.is_some() || e.child.is_some() {
+            t.entries[keep] = e;
+            keep += 1;
         }
-        COUNT = keep;
     }
+    t.count = keep;
 }
 
-unsafe fn entry(i: usize) -> Entry {
-    unsafe {
-        LOCK.lock_always();
-        let e = (*(&raw const TABLE))[i];
-        LOCK.unlock_always();
-        e
-    }
+fn entry(i: usize) -> Entry {
+    with_table(|t| t.entries[i])
 }
 
-unsafe fn count() -> usize {
-    unsafe {
-        LOCK.lock_always();
-        let n = COUNT;
-        LOCK.unlock_always();
-        n
+fn count() -> usize {
+    with_table(|t| t.count)
+}
+
+unsafe fn call(h: Handler) {
+    if let Some(f) = h {
+        unsafe { f() };
     }
 }
 
 pub unsafe fn fork_with_handlers(raw: impl FnOnce() -> c_int) -> c_int {
-    unsafe {
-        FORKING.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-        let n = count();
-        for i in (0..n).rev() {
-            if let Some(f) = entry(i).prepare {
-                f();
-            }
-        }
-        rusty_libc_core::process::run_fork_prepare();
-        rusty_libc_malloc::atfork_prepare();
-        let old = sigprocmask_set(2, u64::MAX);
-        let pid = raw();
-        if pid == 0 {
-            rusty_libc_core::tls::loader_fork_child();
-            rusty_libc_malloc::atfork_child();
-            thread::after_fork_child();
-            crate::sync::once_fork_child();
-            core::ptr::write(&raw const LOCK as *mut RawMutex, RawMutex::new());
-            rusty_libc_core::process::run_fork_child();
-            sigprocmask_set(2, old);
-            for i in 0..n {
-                if let Some(f) = entry(i).child {
-                    f();
-                }
-            }
-        } else {
-            rusty_libc_malloc::atfork_parent();
-            rusty_libc_core::process::run_fork_parent();
-            sigprocmask_set(2, old);
-            for i in 0..n {
-                if let Some(f) = entry(i).parent {
-                    f();
-                }
-            }
-        }
-        FORKING.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
-        pid
+    FORKING.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let n = count();
+    for i in (0..n).rev() {
+        unsafe { call(entry(i).prepare) };
     }
+    unsafe { rusty_libc_core::process::run_fork_prepare() };
+    rusty_libc_malloc::atfork_prepare();
+    let old = sigprocmask_set(2, u64::MAX);
+    let pid = raw();
+    if pid == 0 {
+        unsafe { rusty_libc_core::tls::loader_fork_child() };
+        rusty_libc_malloc::atfork_child();
+        unsafe { thread::after_fork_child() };
+        crate::sync::once_fork_child();
+        unsafe { core::ptr::write(&raw const LOCK as *mut RawMutex, RawMutex::new()) };
+        unsafe { rusty_libc_core::process::run_fork_child() };
+        sigprocmask_set(2, old);
+        for i in 0..n {
+            unsafe { call(entry(i).child) };
+        }
+    } else {
+        rusty_libc_malloc::atfork_parent();
+        unsafe { rusty_libc_core::process::run_fork_parent() };
+        sigprocmask_set(2, old);
+        for i in 0..n {
+            unsafe { call(entry(i).parent) };
+        }
+    }
+    FORKING.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    pid
 }
 
 pub fn install_fork_hook() {
     rusty_libc_core::process::FORK_HOOK.store(__rlibc_fork as unsafe extern "C" fn() -> c_int as usize, core::sync::atomic::Ordering::Relaxed);
-    rusty_libc_core::process::ATFORK_UNREGISTER.store(unregister_dso as unsafe extern "C" fn(usize) as usize, core::sync::atomic::Ordering::Relaxed);
+    rusty_libc_core::process::ATFORK_UNREGISTER.with(|h| *h = Some(unregister_dso));
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -149,13 +143,14 @@ pub unsafe extern "C" fn __rlibc_fork() -> c_int {
 }
 
 pub unsafe fn fork() -> c_int {
-    unsafe {
-        fork_with_handlers(|| match rusty_libc_core::unistd::fork() {
+    let raw = || {
+        match unsafe { rusty_libc_core::unistd::fork() } {
             Ok(pid) => pid,
             Err(e) => {
                 rusty_libc_core::errno::set(e.0);
                 -1
             }
-        })
-    }
+        }
+    };
+    unsafe { fork_with_handlers(raw) }
 }

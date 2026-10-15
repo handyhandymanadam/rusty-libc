@@ -1,7 +1,10 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::types::*;
 use crate::util::{Buf, is_space};
 use core::ffi::{c_char, c_int, c_void};
 use rusty_libc_core::errno;
+use rusty_libc_core::ffi;
+use rusty_libc_core::sync_cell::SyncCell;
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn htons(x: u16) -> u16 {
@@ -88,11 +91,11 @@ pub fn parse_aton(s: &[u8]) -> Option<([u8; 4], usize)> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_aton(cp: *const c_char, addr: *mut in_addr) -> c_int {
-    let s = unsafe { crate::util::cbytes(cp) };
+    let s = unsafe { ffi::cstr_bytes(cp) };
     match parse_aton(s) {
         Some((a, _)) => {
-            if !addr.is_null() {
-                unsafe { (*addr).s_addr = u32::from_ne_bytes(a) };
+            if let Some(addr) = unsafe { ffi::out(addr) } {
+                addr.s_addr = u32::from_ne_bytes(a);
             }
             1
         }
@@ -102,7 +105,7 @@ pub unsafe extern "C" fn inet_aton(cp: *const c_char, addr: *mut in_addr) -> c_i
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_addr(cp: *const c_char) -> in_addr_t {
-    let s = unsafe { crate::util::cbytes(cp) };
+    let s = unsafe { ffi::cstr_bytes(cp) };
     match parse_aton(s) {
         Some((a, _)) => u32::from_ne_bytes(a),
         None => INADDR_NONE,
@@ -111,11 +114,11 @@ pub unsafe extern "C" fn inet_addr(cp: *const c_char) -> in_addr_t {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_network(cp: *const c_char) -> in_addr_t {
-    let s = unsafe { crate::util::cbytes(cp) };
+    let s = unsafe { ffi::cstr_bytes(cp) };
     network_parse(s).unwrap_or(INADDR_NONE)
 }
 
-fn network_parse(s: &[u8]) -> Option<u32> {
+pub(crate) fn network_parse(s: &[u8]) -> Option<u32> {
     let mut parts = [0u32; 4];
     let mut np = 0usize;
     let mut i = 0usize;
@@ -377,7 +380,7 @@ pub fn parse_ipv6(s: &[u8]) -> Option<[u8; 16]> {
 }
 
 #[inline]
-fn ipv4_text(a: &[u8; 4], out: &mut [u8; 16]) -> usize {
+pub(crate) fn ipv4_text(a: &[u8; 4], out: &mut [u8; 16]) -> usize {
     let mut n = 0;
     for (i, &v) in a.iter().enumerate() {
         if i > 0 {
@@ -410,14 +413,15 @@ pub fn format_ipv4(a: &[u8; 4]) -> Buf<48> {
 }
 
 pub fn format_ipv6(a: &[u8; 16]) -> Buf<48> {
-    let mut t = [0u8; 48];
+    let mut t = [0u8; 64];
     let n = ipv6_text(a, &mut t);
     let mut o = Buf::<48>::new();
     o.push_all(&t[..n]);
     o
 }
 
-fn ipv6_text(a: &[u8; 16], out: &mut [u8; 48]) -> usize {
+#[inline]
+fn ipv6_text(a: &[u8; 16], out: &mut [u8; 64]) -> usize {
     const D: &[u8; 16] = b"0123456789abcdef";
     let w = |i: usize| ((a[2 * i] as u16) << 8) | a[2 * i + 1] as u16;
     let (mut best_base, mut best_len) = (-1i32, 0i32);
@@ -445,103 +449,153 @@ fn ipv6_text(a: &[u8; 16], out: &mut [u8; 48]) -> usize {
     if best_base != -1 && best_len < 2 {
         best_base = -1;
     }
-    let o = out.as_mut_ptr();
     let mut n = 0usize;
-    unsafe {
-        let mut i = 0i32;
-        while i < 8 {
-            if best_base != -1 && i >= best_base && i < best_base + best_len {
-                if i == best_base {
-                    *o.add(n) = b':';
-                    n += 1;
-                }
-                i += 1;
-                continue;
-            }
-            if i != 0 {
-                *o.add(n) = b':';
+    let mut i = 0i32;
+    while i < 8 {
+        if best_base != -1 && i >= best_base && i < best_base + best_len {
+            if i == best_base {
+                out[n & 63] = b':';
                 n += 1;
             }
-            if i == 6 && best_base == 0 && (best_len == 6 || (best_len == 5 && w(5) == 0xffff)) {
-                let mut t = [0u8; 16];
-                let m = ipv4_text(&[a[12], a[13], a[14], a[15]], &mut t);
-                core::ptr::copy_nonoverlapping(t.as_ptr(), o.add(n), m);
-                n += m;
-                break;
-            }
-            let v = w(i as usize);
-            if v >= 0x1000 {
-                *o.add(n) = D[(v >> 12) as usize & 15];
-                n += 1;
-            }
-            if v >= 0x100 {
-                *o.add(n) = D[(v >> 8) as usize & 15];
-                n += 1;
-            }
-            if v >= 0x10 {
-                *o.add(n) = D[(v >> 4) as usize & 15];
-                n += 1;
-            }
-            *o.add(n) = D[v as usize & 15];
-            n += 1;
             i += 1;
+            continue;
         }
-        if best_base != -1 && best_base + best_len == 8 {
-            *o.add(n) = b':';
+        if i != 0 {
+            out[n & 63] = b':';
             n += 1;
         }
+        if i == 6 && best_base == 0 && (best_len == 6 || (best_len == 5 && w(5) == 0xffff)) {
+            let mut t = [0u8; 16];
+            let m = ipv4_text(&[a[12], a[13], a[14], a[15]], &mut t);
+            out[n..n + m].copy_from_slice(&t[..m]);
+            n += m;
+            break;
+        }
+        let v = w(i as usize);
+        if v >= 0x1000 {
+            out[n & 63] = D[(v >> 12) as usize & 15];
+            n += 1;
+        }
+        if v >= 0x100 {
+            out[n & 63] = D[(v >> 8) as usize & 15];
+            n += 1;
+        }
+        if v >= 0x10 {
+            out[n & 63] = D[(v >> 4) as usize & 15];
+            n += 1;
+        }
+        out[n & 63] = D[v as usize & 15];
+        n += 1;
+        i += 1;
+    }
+    if best_base != -1 && best_base + best_len == 8 {
+        out[n & 63] = b':';
+        n += 1;
     }
     n
 }
 
+pub fn ntop(af: c_int, src: &[u8], dst: &mut [u8]) -> Result<usize, c_int> {
+    let mut t = [0u8; 64];
+    let n = match af {
+        AF_INET => {
+            let a: &[u8; 4] = src.try_into().map_err(|_| EAFNOSUPPORT)?;
+            if let Some(d) = dst.first_chunk_mut::<16>() {
+                return Ok(ntop4_in_place(a, d));
+            }
+            ipv4_text(a, t.first_chunk_mut::<16>().unwrap())
+        }
+        AF_INET6 => ipv6_text(src.try_into().map_err(|_| EAFNOSUPPORT)?, &mut t),
+        _ => return Err(EAFNOSUPPORT),
+    };
+    copy_text(&t[..n], dst)
+}
+
+#[inline]
+fn ntop4_in_place(a: &[u8; 4], d: &mut [u8; 16]) -> usize {
+    let n = ipv4_text(a, d);
+    d[n & 15] = 0;
+    n
+}
+
+#[inline]
+fn copy_text(text: &[u8], dst: &mut [u8]) -> Result<usize, c_int> {
+    let n = text.len();
+    if n + 1 > dst.len() {
+        return Err(ENOSPC);
+    }
+    dst[..n].copy_from_slice(text);
+    dst[n] = 0;
+    Ok(n)
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_ntop(af: c_int, src: *const c_void, dst: *mut c_char, size: socklen_t) -> *const c_char {
-    unsafe {
-        let mut t = [0u8; 48];
-        let n = match af {
-            AF_INET => {
-                if size >= 16 {
-                    let n = ipv4_text(&*(src as *const [u8; 4]), &mut *(dst as *mut [u8; 16]));
-                    *dst.add(n) = 0;
-                    return dst;
-                }
-                ipv4_text(&*(src as *const [u8; 4]), (&mut t[..16]).try_into().unwrap())
+    let mut t = [0u8; 64];
+    let n = match af {
+        AF_INET => {
+            let a = unsafe { &*src.cast::<[u8; 4]>() };
+            if size >= 16 {
+                ntop4_in_place(a, unsafe { &mut *dst.cast::<[u8; 16]>() });
+                return dst;
             }
-            AF_INET6 => ipv6_text(&*(src as *const [u8; 16]), &mut t),
-            _ => {
-                errno::set(EAFNOSUPPORT);
-                return core::ptr::null();
+            ipv4_text(a, t.first_chunk_mut::<16>().unwrap())
+        }
+        AF_INET6 => {
+            let a = unsafe { &*src.cast::<[u8; 16]>() };
+            if size >= 64 {
+                let d = unsafe { &mut *dst.cast::<[u8; 64]>() };
+                let n = ipv6_text(a, d);
+                d[n & 63] = 0;
+                return dst;
             }
-        };
-        if n + 1 > size as usize {
-            errno::set(ENOSPC);
+            ipv6_text(a, &mut t)
+        }
+        _ => {
+            errno::set(EAFNOSUPPORT);
             return core::ptr::null();
         }
-        core::ptr::copy_nonoverlapping(t.as_ptr(), dst as *mut u8, n);
-        *dst.add(n) = 0;
-        dst
+    };
+    let d = unsafe { ffi::bytes_mut(dst.cast::<u8>(), (size as usize).min(64)) };
+    match copy_text(&t[..n], d) {
+        Ok(_) => dst,
+        Err(e) => {
+            errno::set(e);
+            core::ptr::null()
+        }
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_pton(af: c_int, src: *const c_char, dst: *mut c_void) -> c_int {
-    unsafe { __inet_pton_length(af, src, crate::util::cstrlen(src), dst) }
+    let s = unsafe { ffi::cstr_bytes(src) };
+    unsafe { pton_raw(af, s, dst) }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn __inet_pton_length(af: c_int, src: *const c_char, len: usize, dst: *mut c_void) -> c_int {
-    let s = unsafe { core::slice::from_raw_parts(src as *const u8, len) };
+pub fn pton(af: c_int, s: &[u8]) -> Result<Option<([u8; 16], usize)>, c_int> {
+    match af {
+        AF_INET => Ok(parse_ipv4(s).map(|a| {
+            let mut r = [0u8; 16];
+            r[..4].copy_from_slice(&a);
+            (r, 4)
+        })),
+        AF_INET6 => Ok(parse_ipv6(s).map(|a| (a, 16))),
+        _ => Err(EAFNOSUPPORT),
+    }
+}
+
+unsafe fn pton_raw(af: c_int, s: &[u8], dst: *mut c_void) -> c_int {
     match af {
         AF_INET => match parse_ipv4(s) {
             Some(a) => {
-                unsafe { core::ptr::copy_nonoverlapping(a.as_ptr(), dst as *mut u8, 4) };
+                unsafe { dst.cast::<[u8; 4]>().write_unaligned(a) };
                 1
             }
             None => 0,
         },
         AF_INET6 => match parse_ipv6(s) {
             Some(a) => {
-                unsafe { core::ptr::copy_nonoverlapping(a.as_ptr(), dst as *mut u8, 16) };
+                unsafe { dst.cast::<[u8; 16]>().write_unaligned(a) };
                 1
             }
             None => 0,
@@ -553,18 +607,25 @@ pub unsafe extern "C" fn __inet_pton_length(af: c_int, src: *const c_char, len: 
     }
 }
 
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn __inet_pton_length(af: c_int, src: *const c_char, len: usize, dst: *mut c_void) -> c_int {
+    let s = unsafe { ffi::bytes(src.cast::<u8>(), len) };
+    unsafe { pton_raw(af, s, dst) }
+}
+
 #[thread_local]
-static mut NTOA_BUF: [u8; 16] = [0; 16];
+static NTOA_BUF: SyncCell<[u8; 16]> = SyncCell::new([0; 16]);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn inet_ntoa(i: in_addr) -> *mut c_char {
-    let t = format_ipv4(&i.s_addr.to_ne_bytes());
+    let a = i.s_addr.to_ne_bytes();
     unsafe {
-        let b = &mut *(&raw mut NTOA_BUF);
-        b[..t.len].copy_from_slice(t.as_bytes());
-        b[t.len] = 0;
-        b.as_mut_ptr() as *mut c_char
-    }
+        NTOA_BUF.with_unsync(|b| {
+            let n = ipv4_text(&a, b.first_chunk_mut::<16>().unwrap());
+            b[n] = 0;
+        })
+    };
+    NTOA_BUF.as_ptr().cast::<c_char>()
 }
 
 fn xtob(c: u8) -> u8 {
@@ -573,10 +634,16 @@ fn xtob(c: u8) -> u8 {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_nsap_addr(ascii: *const c_char, binary: *mut u8, maxlen: c_int) -> u32 {
-    let s = unsafe { crate::util::cbytes(ascii) };
-    let mut len = 0u32;
+    let s = unsafe { ffi::cstr_bytes(ascii) };
+    let n = (maxlen as u32 as usize).min(s.len() / 2 + 1);
+    let out = unsafe { ffi::bytes_mut(binary, n) };
+    nsap_addr(s, out) as u32
+}
+
+pub fn nsap_addr(s: &[u8], out: &mut [u8]) -> usize {
+    let mut len = 0usize;
     let mut i = 0usize;
-    while i < s.len() && (len as i64) < maxlen as u32 as i64 {
+    while i < s.len() && len < out.len() {
         let c = s[i];
         i += 1;
         if c == b'.' || c == b'+' || c == b'/' {
@@ -596,7 +663,7 @@ pub unsafe extern "C" fn inet_nsap_addr(ascii: *const c_char, binary: *mut u8, m
         if c2 >= 128 || !c2.is_ascii_hexdigit() {
             return 0;
         }
-        unsafe { *binary.add(len as usize) = (nib << 4) | xtob(c2) };
+        out[len] = (nib << 4) | xtob(c2);
         len += 1;
     }
     len
@@ -606,23 +673,34 @@ static NSAP_BUF: crate::util::Spin<[u8; 255 * 2 + 128]> = crate::util::Spin::new
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_nsap_ntoa(binlen: c_int, binary: *const u8, ascii: *mut c_char) -> *mut c_char {
-    let mut guard = NSAP_BUF.lock();
-    let start: *mut u8 = if ascii.is_null() { guard.as_mut_ptr() } else { ascii as *mut u8 };
-    let binlen = binlen.min(255);
-    let mut o = 0usize;
+    let n = binlen.clamp(0, 255) as usize;
+    let bin = unsafe { ffi::bytes(binary, n) };
+    let need = nsap_ntoa_len(n);
+    if ascii.is_null() {
+        let mut guard = NSAP_BUF.lock();
+        nsap_ntoa(bin, &mut guard[..need]);
+        guard.as_mut_ptr().cast::<c_char>()
+    } else {
+        nsap_ntoa(bin, unsafe { ffi::bytes_mut(ascii.cast::<u8>(), need) });
+        ascii
+    }
+}
+
+fn nsap_ntoa_len(n: usize) -> usize {
+    2 * n + n / 2 + 1
+}
+
+pub fn nsap_ntoa(bin: &[u8], out: &mut [u8]) {
     let hexd = |n: u8| n + if n < 10 { b'0' } else { b'7' };
-    for i in 0..binlen.max(0) as usize {
-        let b = unsafe { *binary.add(i) };
-        unsafe {
-            *start.add(o) = hexd(b >> 4);
-            *start.add(o + 1) = hexd(b & 15);
-        }
+    let mut o = 0usize;
+    for (i, &b) in bin.iter().enumerate() {
+        out[o] = hexd(b >> 4);
+        out[o + 1] = hexd(b & 15);
         o += 2;
-        if i % 2 == 0 && (i as c_int + 1) < binlen {
-            unsafe { *start.add(o) = b'.' };
+        if i % 2 == 0 && i + 1 < bin.len() {
+            out[o] = b'.';
             o += 1;
         }
     }
-    unsafe { *start.add(o) = 0 };
-    start as *mut c_char
+    out[o] = 0;
 }

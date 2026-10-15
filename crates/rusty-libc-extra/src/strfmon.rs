@@ -1,28 +1,29 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use crate::consts::*;
 use core::ffi::{VaList, c_char, c_int, c_long};
+use rusty_libc_core::locale::Loc;
 use rusty_libc_locale::{LocaleStruct, Lconv};
 use rusty_libc_stdio::rust_api::{Arg, snprintf};
 
 const E2BIG_: c_int = E2BIG;
 
-struct Out {
-    buf: *mut u8,
-    cap: usize,
+struct Out<'a> {
+    buf: &'a mut [u8],
     pos: usize,
     failed: bool,
 }
 
-impl Out {
+impl Out<'_> {
     fn put(&mut self, b: u8) {
         if self.failed {
             return;
         }
-        if self.pos >= self.cap {
+        let Some(slot) = self.buf.get_mut(self.pos) else {
             self.failed = true;
             rusty_libc_core::errno::set(E2BIG_);
             return;
-        }
-        unsafe { *self.buf.add(self.pos) = b };
+        };
+        *slot = b;
         self.pos += 1;
     }
     fn puts(&mut self, s: &[u8]) {
@@ -46,7 +47,53 @@ impl Out {
 }
 
 unsafe fn cbytes<'a>(p: *const c_char) -> &'a [u8] {
-    if p.is_null() { b"" } else { unsafe { core::slice::from_raw_parts(p as *const u8, rusty_libc_mem::strlen(p)) } }
+    unsafe { rusty_libc_core::ffi::cstr(p) }.map_or(b"", core::ffi::CStr::to_bytes)
+}
+
+struct Mon<'a> {
+    decimal_point: &'a [u8],
+    thousands_sep: &'a [u8],
+    grouping: &'a [u8],
+    int_curr_symbol: &'a [u8],
+    currency_symbol: &'a [u8],
+    negative_sign: &'a [u8],
+    positive_sign: &'a [u8],
+}
+
+fn mon_strings(lc: &Lconv) -> Mon<'_> {
+    let [decimal_point, thousands_sep, grouping, int_curr_symbol, currency_symbol, negative_sign, positive_sign] =
+        [lc.mon_decimal_point, lc.mon_thousands_sep, lc.mon_grouping, lc.int_curr_symbol, lc.currency_symbol, lc.negative_sign, lc.positive_sign]
+            .map(|p| unsafe { cbytes(p) });
+    Mon { decimal_point, thousands_sep, grouping, int_curr_symbol, currency_symbol, negative_sign, positive_sign }
+}
+
+struct Scratch {
+    p: core::ptr::NonNull<u8>,
+    len: usize,
+    init: usize,
+}
+
+impl Scratch {
+    fn new(len: usize) -> Option<Scratch> {
+        let p = unsafe { rusty_libc_malloc::malloc(len) }.cast::<u8>();
+        let p = core::ptr::NonNull::new(p)?;
+        Some(Scratch { p, len, init: 0 })
+    }
+
+    fn prefix_mut(&mut self, n: usize) -> &mut [u8] {
+        let n = n.min(self.len);
+        if n > self.init {
+            unsafe { core::ptr::write_bytes(self.p.as_ptr().wrapping_add(self.init), 0, n - self.init) };
+            self.init = n;
+        }
+        unsafe { core::slice::from_raw_parts_mut(self.p.as_ptr(), n) }
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        unsafe { rusty_libc_malloc::free(self.p.as_ptr().cast()) };
+    }
 }
 
 fn unspec(v: i32) -> bool {
@@ -124,15 +171,12 @@ impl BitSet {
 }
 
 unsafe fn read_long_double(va: &mut VaList) -> [u8; 16] {
-    unsafe {
-        let rec = va as *mut VaList as *mut [usize; 3];
-        let area = (*rec)[1];
-        let aligned = (area + 15) & !15;
-        let mut out = [0u8; 16];
-        core::ptr::copy_nonoverlapping(aligned as *const u8, out.as_mut_ptr(), 16);
-        (*rec)[1] = aligned + 16;
-        out
-    }
+    let rec = (va as *mut VaList).cast::<[usize; 3]>();
+    let area = unsafe { (*rec)[1] };
+    let aligned = (area + 15) & !15;
+    let out = unsafe { (aligned as *const [u8; 16]).read() };
+    unsafe { (*rec)[1] = aligned + 16 };
+    out
 }
 
 fn ld_class(b: &[u8; 16]) -> (bool, bool, bool) {
@@ -144,35 +188,34 @@ fn ld_class(b: &[u8; 16]) -> (bool, bool, bool) {
     (sign, special && !inf, inf)
 }
 
-fn number(out: &mut Out, value: Num, prec: usize, width: i64, pad: u8, group: bool, lc: &Lconv) {
+fn number(out: &mut Out, value: Num, prec: usize, width: i64, pad: u8, group: bool, mon: &Mon) {
     let cap = prec + 5200;
-    let buf = unsafe { rusty_libc_malloc::malloc(cap) } as *mut u8;
-    if buf.is_null() {
+    let Some(mut scratch) = Scratch::new(cap) else {
         out.fail(ENOMEM);
         return;
-    }
-    let tmp = unsafe { core::slice::from_raw_parts_mut(buf, cap) };
+    };
     let (len, special, is_neg_fp) = match value {
         Num::D(d) => {
             if d.is_nan() || d.is_infinite() {
                 let w: &[u8] = if d.is_nan() { b"nan" } else { b"inf" };
-                tmp[..3].copy_from_slice(w);
+                scratch.prefix_mut(3)[..3].copy_from_slice(w);
                 (3, true, d.is_sign_negative())
             } else {
-                (fixed(tmp, Arg::Double(d), prec, false), false, false)
+                (fixed(&mut scratch, Arg::Double(d), prec, false), false, false)
             }
         }
         Num::L(b) => {
             let (neg, nan, inf) = ld_class(&b);
             if nan || inf {
                 let w: &[u8] = if nan { b"nan" } else { b"inf" };
-                tmp[..3].copy_from_slice(w);
+                scratch.prefix_mut(3)[..3].copy_from_slice(w);
                 (3, true, neg)
             } else {
-                (fixed(tmp, Arg::LongDouble(b), prec, true), false, false)
+                (fixed(&mut scratch, Arg::LongDouble(b), prec, true), false, false)
             }
         }
     };
+    let tmp = scratch.prefix_mut(len + 1);
     let mut text = &tmp[..len];
     let mut sign_in_text = false;
     if !special && text.first() == Some(&b'-') {
@@ -190,13 +233,11 @@ fn number(out: &mut Out, value: Num, prec: usize, width: i64, pad: u8, group: bo
             out.put(b'-');
         }
         out.puts(text);
-        unsafe { rusty_libc_malloc::free(buf.cast()) };
         return;
     }
-    let decimal_src = unsafe { cbytes(lc.mon_decimal_point) };
-    let decimal: &[u8] = if decimal_src.is_empty() { b"." } else { decimal_src };
-    let sep = unsafe { cbytes(lc.mon_thousands_sep) };
-    let grp = unsafe { cbytes(lc.mon_grouping) };
+    let decimal: &[u8] = if mon.decimal_point.is_empty() { b"." } else { mon.decimal_point };
+    let sep = mon.thousands_sep;
+    let grp = mon.grouping;
     let radix_len = rusty_libc_core::locale::numeric().decimal_point.len();
     let int_len = if prec > 0 { text.len().saturating_sub(prec + radix_len) } else { text.len() };
     let (digits, rest) = text.split_at(int_len);
@@ -221,7 +262,6 @@ fn number(out: &mut Out, value: Num, prec: usize, width: i64, pad: u8, group: bo
         out.puts(decimal);
         out.puts(&rest[radix_len.min(rest.len())..]);
     }
-    unsafe { rusty_libc_malloc::free(buf.cast()) };
 }
 
 enum Num {
@@ -229,25 +269,36 @@ enum Num {
     L([u8; 16]),
 }
 
-fn fixed(out: &mut [u8], arg: Arg, prec: usize, long: bool) -> usize {
+const SMALL: usize = 512;
+
+fn fixed(scratch: &mut Scratch, arg: Arg, prec: usize, long: bool) -> usize {
     let fmt: &core::ffi::CStr = if long { c"%.*Lf" } else { c"%.*f" };
-    let n = snprintf(out, fmt, &[Arg::Int(prec as i64), arg]);
-    (n.max(0) as usize).min(out.len() - 1)
+    let args = [Arg::Int(prec as i64), arg];
+    let small = scratch.prefix_mut(SMALL);
+    let n = snprintf(small, fmt, &args);
+    if n >= 0 && (n as usize) < small.len() {
+        return n as usize;
+    }
+    let all = scratch.prefix_mut(usize::MAX);
+    let n = snprintf(all, fmt, &args);
+    (n.max(0) as usize).min(all.len() - 1)
 }
 
-unsafe fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: *const c_char, ap: &mut VaList) {
-    unsafe {
-        let mut f = fmt as *const u8;
-        while *f != 0 && !out.failed {
-            if *f != b'%' {
-                out.put(*f);
-                f = f.add(1);
+fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) -> Num) {
+    {
+        let mon = mon_strings(lc);
+        let c = |i: usize| fmt.get(i).copied().unwrap_or(0);
+        let mut f = 0usize;
+        while c(f) != 0 && !out.failed {
+            if c(f) != b'%' {
+                out.put(c(f));
+                f += 1;
                 continue;
             }
-            if *f.add(1) == b'%' {
-                f = f.add(1);
-                out.put(*f);
-                f = f.add(1);
+            if c(f + 1) == b'%' {
+                f += 1;
+                out.put(c(f));
+                f += 1;
                 continue;
             }
             let mut left_prec: i64 = -1;
@@ -261,11 +312,11 @@ unsafe fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: *const c_char, ap: &mut VaLis
             let mut left = false;
             let mut is_long_double = false;
             loop {
-                f = f.add(1);
-                match *f {
+                f += 1;
+                match c(f) {
                     b'=' => {
-                        f = f.add(1);
-                        pad = *f;
+                        f += 1;
+                        pad = c(f);
                         if pad == 0 {
                             out.fail(EINVAL);
                             return;
@@ -293,14 +344,14 @@ unsafe fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: *const c_char, ap: &mut VaLis
                     _ => break,
                 }
             }
-            if is_digit(*f) {
-                width = (*f - b'0') as i64;
+            if is_digit(c(f)) {
+                width = (c(f) - b'0') as i64;
                 loop {
-                    f = f.add(1);
-                    if !is_digit(*f) {
+                    f += 1;
+                    if !is_digit(c(f)) {
                         break;
                     }
-                    let val = (*f - b'0') as i64;
+                    let val = (c(f) - b'0') as i64;
                     if width > c_long::MAX / 10 || (width == c_long::MAX && val > c_long::MAX % 10) {
                         out.fail(E2BIG_);
                         return;
@@ -308,38 +359,38 @@ unsafe fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: *const c_char, ap: &mut VaLis
                     width = width * 10 + val;
                 }
             }
-            if *f == b'#' {
-                f = f.add(1);
-                if !is_digit(*f) {
+            if c(f) == b'#' {
+                f += 1;
+                if !is_digit(c(f)) {
                     out.fail(EINVAL);
                     return;
                 }
-                left_prec = (*f - b'0') as i64;
+                left_prec = (c(f) - b'0') as i64;
                 loop {
-                    f = f.add(1);
-                    if !is_digit(*f) {
+                    f += 1;
+                    if !is_digit(c(f)) {
                         break;
                     }
-                    left_prec = left_prec.wrapping_mul(10).wrapping_add((*f - b'0') as i64);
+                    left_prec = left_prec.wrapping_mul(10).wrapping_add((c(f) - b'0') as i64);
                 }
             }
-            if *f == b'.' {
-                f = f.add(1);
-                if !is_digit(*f) {
+            if c(f) == b'.' {
+                f += 1;
+                if !is_digit(c(f)) {
                     out.fail(EINVAL);
                     return;
                 }
-                right_prec = (*f - b'0') as i64;
+                right_prec = (c(f) - b'0') as i64;
                 loop {
-                    f = f.add(1);
-                    if !is_digit(*f) {
+                    f += 1;
+                    if !is_digit(c(f)) {
                         break;
                     }
-                    right_prec = right_prec.wrapping_mul(10).wrapping_add((*f - b'0') as i64);
+                    right_prec = right_prec.wrapping_mul(10).wrapping_add((c(f) - b'0') as i64);
                 }
             }
-            if *f == b'L' {
-                f = f.add(1);
+            if c(f) == b'L' {
+                f += 1;
                 is_long_double = true;
             }
             let int_format;
@@ -347,10 +398,10 @@ unsafe fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: *const c_char, ap: &mut VaLis
             let currency_symbol: &[u8];
             let currency_symbol_len: usize;
             let space_char: u8;
-            match *f {
+            match c(f) {
                 b'i' => {
-                    f = f.add(1);
-                    let ics = cbytes(lc.int_curr_symbol);
+                    f += 1;
+                    let ics = mon.int_curr_symbol;
                     for (i, d) in int_symbol.iter_mut().enumerate().take(3) {
                         *d = ics.get(i).copied().unwrap_or(0);
                     }
@@ -360,8 +411,8 @@ unsafe fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: *const c_char, ap: &mut VaLis
                     int_format = true;
                 }
                 b'n' => {
-                    f = f.add(1);
-                    currency_symbol = cbytes(lc.currency_symbol);
+                    f += 1;
+                    currency_symbol = mon.currency_symbol;
                     currency_symbol_len = currency_symbol.len();
                     space_char = b' ';
                     int_format = false;
@@ -384,28 +435,29 @@ unsafe fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: *const c_char, ap: &mut VaLis
                 }
             }
             if group && left_prec != -1 {
-                let (nsep, _) = grouping(cbytes(lc.mon_grouping), left_prec as usize);
+                let (nsep, _) = grouping(mon.grouping, left_prec as usize);
                 left_prec += nsep as i64;
             }
-            let (num, is_negative): (Num, bool) = if is_long_double {
-                let mut b = read_long_double(ap);
-                let (neg, nan, _inf) = ld_class(&b);
-                let negative = neg && !nan && !is_zero_ld(&b);
-                if negative {
-                    b[9] &= 0x7f;
+            let (num, is_negative): (Num, bool) = match next(is_long_double) {
+                Num::L(mut b) => {
+                    let (neg, nan, _inf) = ld_class(&b);
+                    let negative = neg && !nan && !is_zero_ld(&b);
+                    if negative {
+                        b[9] &= 0x7f;
+                    }
+                    (Num::L(b), negative)
                 }
-                (Num::L(b), negative)
-            } else {
-                let d: f64 = ap.next_arg::<f64>();
-                let negative = d < 0.0;
-                (Num::D(if negative { -d } else { d }), negative)
+                Num::D(d) => {
+                    let negative = d < 0.0;
+                    (Num::D(if negative { -d } else { d }), negative)
+                }
             };
             let (sign_string, cs_precedes, sep_by_space, sign_posn, other_sign_string, other_cs_precedes, other_sep_by_space, other_sign_posn);
             let neg_sign = {
-                let s = cbytes(lc.negative_sign);
+                let s = mon.negative_sign;
                 if s.is_empty() { &b"-"[..] } else { s }
             };
-            let pos_sign = cbytes(lc.positive_sign);
+            let pos_sign = mon.positive_sign;
             let pick = |a: c_char, b: c_char| if int_format { b } else { a };
             if is_negative {
                 sign_string = neg_sign;
@@ -502,7 +554,7 @@ unsafe fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: *const c_char, ap: &mut VaLis
                 out.puts(sign_string);
             }
             let w = left_prec + if right_prec != 0 { right_prec + 1 } else { 0 };
-            number(out, num, right_prec.max(0) as usize, w, pad, group, lc);
+            number(out, num, right_prec.max(0) as usize, w, pad, group, &mon);
             if out.failed {
                 return;
             }
@@ -544,10 +596,10 @@ unsafe fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: *const c_char, ap: &mut VaLis
                     return;
                 }
                 if !left {
-                    let s = out.buf.add(start);
-                    let len = (out.pos - start) - pad_width as usize;
-                    core::ptr::copy(s, s.add(pad_width as usize), len);
-                    core::ptr::write_bytes(s, b' ', pad_width as usize);
+                    let pw = pad_width as usize;
+                    let len = (out.pos - start) - pw;
+                    out.buf.copy_within(start..start + len, start + pw);
+                    out.buf[start..start + pw].fill(b' ');
                 }
             }
         }
@@ -559,41 +611,54 @@ fn is_zero_ld(b: &[u8; 16]) -> bool {
     exp == 0 && u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) == 0
 }
 
-unsafe fn strfmon_body(s: *mut c_char, maxsize: usize, lc: &Lconv, fmt: *const c_char, ap: &mut VaList) -> isize {
-    unsafe {
-        let mut out = Out { buf: s as *mut u8, cap: maxsize, pos: 0, failed: false };
-        vstrfmon(&mut out, lc, fmt, ap);
-        if out.pos < out.cap {
-            *out.buf.add(out.pos) = 0;
-            out.pos += 1;
-        } else if !out.failed {
-            out.failed = true;
-            rusty_libc_core::errno::set(E2BIG_);
-        }
-        if out.failed { -1 } else { out.pos as isize - 1 }
+pub fn strfmon_r(buf: &mut [u8], lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) -> MonArg) -> isize {
+    let mut out = Out { buf, pos: 0, failed: false };
+    vstrfmon(&mut out, lc, fmt, &mut |l| match next(l) {
+        MonArg::Double(d) => Num::D(d),
+        MonArg::LongDouble(b) => Num::L(b),
+    });
+    if let Some(slot) = out.buf.get_mut(out.pos) {
+        *slot = 0;
+        out.pos += 1;
+    } else if !out.failed {
+        out.failed = true;
+        rusty_libc_core::errno::set(E2BIG_);
     }
+    if out.failed { -1 } else { out.pos as isize - 1 }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum MonArg {
+    Double(f64),
+    LongDouble([u8; 16]),
+}
+
+unsafe fn strfmon_body(s: *mut c_char, maxsize: usize, lc: &Lconv, fmt: *const c_char, ap: &mut VaList) -> isize {
+    let buf = unsafe { rusty_libc_core::ffi::bytes_mut(s.cast::<u8>(), maxsize.min(isize::MAX as usize)) };
+    let fmt = unsafe { rusty_libc_core::ffi::cstr_bytes(fmt) };
+    strfmon_r(buf, lc, fmt, &mut |long| {
+        if long {
+            MonArg::LongDouble(unsafe { read_long_double(ap) })
+        } else {
+            MonArg::Double(unsafe { ap.next_arg::<f64>() })
+        }
+    })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strfmon(s: *mut c_char, maxsize: usize, format: *const c_char, mut args: ...) -> isize {
-    unsafe {
-        let lc = rusty_libc_locale::lconv_of(0);
-        strfmon_body(s, maxsize, &lc, format, &mut args)
-    }
+    let lc = rusty_libc_locale::lconv_of(Loc::CURRENT);
+    unsafe { strfmon_body(s, maxsize, &lc, format, &mut args) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strfmon_l(s: *mut c_char, maxsize: usize, loc: *mut LocaleStruct, format: *const c_char, mut args: ...) -> isize {
-    unsafe {
-        let lc = rusty_libc_locale::lconv_of(loc as usize);
-        strfmon_body(s, maxsize, &lc, format, &mut args)
-    }
+    let lc = rusty_libc_locale::lconv_of(unsafe { Loc::from_raw(loc as usize) });
+    unsafe { strfmon_body(s, maxsize, &lc, format, &mut args) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __strfmon_l(s: *mut c_char, maxsize: usize, loc: *mut LocaleStruct, format: *const c_char, mut args: ...) -> isize {
-    unsafe {
-        let lc = rusty_libc_locale::lconv_of(loc as usize);
-        strfmon_body(s, maxsize, &lc, format, &mut args)
-    }
+    let lc = rusty_libc_locale::lconv_of(unsafe { Loc::from_raw(loc as usize) });
+    unsafe { strfmon_body(s, maxsize, &lc, format, &mut args) }
 }

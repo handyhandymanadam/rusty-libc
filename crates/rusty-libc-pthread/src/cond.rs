@@ -93,9 +93,19 @@ fn switch_g1(c: &Cond, wseq_in: u64, g1index: &mut u32) -> bool {
     c.g_size[g1].load(Ordering::Relaxed) != 0
 }
 
+macro_rules! cond_ref {
+    ($p:expr) => {{
+        unsafe { arg($p as *const Cond) }
+    }};
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_cond_signal(cond: *mut Cond) -> c_int {
-    let c = unsafe { &*cond };
+    signal(cond_ref!(cond))
+}
+
+#[inline(always)]
+pub fn signal(c: &Cond) -> c_int {
     let wrefs = c.wrefs.load(Ordering::Relaxed);
     if wrefs >> 3 == 0 {
         return 0;
@@ -127,7 +137,11 @@ fn signal_waiters(c: &Cond, wrefs: u32) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_cond_broadcast(cond: *mut Cond) -> c_int {
-    let c = unsafe { &*cond };
+    broadcast(cond_ref!(cond))
+}
+
+#[inline(always)]
+pub fn broadcast(c: &Cond) -> c_int {
     let wrefs = c.wrefs.load(Ordering::Relaxed);
     if wrefs >> 3 == 0 {
         return 0;
@@ -170,8 +184,7 @@ fn confirm_wakeup(c: &Cond, private: bool) {
     }
 }
 
-fn cancel_waiting(cond: *mut Cond, seq: u64, g: usize, private: bool) {
-    let c = unsafe { &*cond };
+fn cancel_waiting(c: &Cond, seq: u64, g: usize, private: bool) {
     let mut consumed_signal = false;
     acquire_lock(c, private);
     let g1_start = c.g1_start.load(Ordering::Relaxed);
@@ -183,7 +196,7 @@ fn cancel_waiting(cond: *mut Cond, seq: u64, g: usize, private: bool) {
             c.g_size[g].store(sz.wrapping_sub(1), Ordering::Relaxed);
         } else {
             release_lock(c, private);
-            unsafe { pthread_cond_broadcast(cond) };
+            broadcast(c);
             return;
         }
     } else {
@@ -196,123 +209,123 @@ fn cancel_waiting(cond: *mut Cond, seq: u64, g: usize, private: bool) {
     }
     release_lock(c, private);
     if consumed_signal {
-        unsafe { pthread_cond_signal(cond) };
+        signal(c);
     }
 }
 
 struct CleanupArg {
     wseq: u64,
-    cond: *mut Cond,
+    cond: *const Cond,
     mutex: *mut Mutex,
     private: bool,
 }
 
 unsafe extern "C" fn cleanup_waiting(arg: *mut c_void) {
-    unsafe {
-        let a = &*(arg as *const CleanupArg);
-        let g = (a.wseq & 1) as usize;
-        cancel_waiting(a.cond, a.wseq >> 1, g, a.private);
-        futex_wake(&(*a.cond).g_signals[g], 1, a.private);
-        confirm_wakeup(&*a.cond, a.private);
-        mutex_cond_lock(a.mutex);
-    }
+    let a = unsafe { &*(arg as *const CleanupArg) };
+    let c = unsafe { &*a.cond };
+    let g = (a.wseq & 1) as usize;
+    cancel_waiting(c, a.wseq >> 1, g, a.private);
+    futex_wake(&c.g_signals[g], 1, a.private);
+    confirm_wakeup(c, a.private);
+    unsafe { mutex_cond_lock(a.mutex) };
 }
 
-unsafe fn wait_common(cond: *mut Cond, mutex: *mut Mutex, clock: c_int, abs: *const Timespec) -> c_int {
-    unsafe {
-        let c = &*cond;
-        let mut result = 0;
-        let wseq = c.wseq.fetch_add(2, Ordering::Acquire);
-        let g = (wseq & 1) as usize;
-        let seq = wseq >> 1;
-        let flags = c.wrefs.fetch_add(8, Ordering::Relaxed);
-        let private = is_private(flags);
-        let err = mutex_unlock_usercnt(mutex, false);
-        if err != 0 {
-            cancel_waiting(cond, seq, g, private);
-            confirm_wakeup(c, private);
-            return err;
-        }
-        loop {
-            let signals = c.g_signals[g].load(Ordering::Acquire);
-            let g1_start = c.g1_start.load(Ordering::Relaxed);
-            if seq < g1_start {
-                break;
-            }
-            if (signals.wrapping_sub(g1_start as u32)) as i32 > 0 {
-                if c.g_signals[g].compare_exchange_weak(signals, signals - 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-                    break;
-                }
-                continue;
-            }
-            let mut arg = CleanupArg { wseq, cond, mutex, private };
-            let e = crate::cancel::with_cleanup(cleanup_waiting, &mut arg as *mut CleanupArg as *mut c_void, || {
-                if abs.is_null() { futex_wait_cp(&c.g_signals[g], signals, private) } else { futex_wait_abs_cp(&c.g_signals[g], signals, clock, abs, private) }
-            });
-            if e == ETIMEDOUT || e == EOVERFLOW {
-                cancel_waiting(cond, seq, g, private);
-                result = e;
-                break;
-            }
-        }
+pub unsafe fn wait_common(c: &Cond, mutex: *mut Mutex, clock: c_int, abs: Option<&Timespec>) -> c_int {
+    let mut result = 0;
+    let wseq = c.wseq.fetch_add(2, Ordering::Acquire);
+    let g = (wseq & 1) as usize;
+    let seq = wseq >> 1;
+    let flags = c.wrefs.fetch_add(8, Ordering::Relaxed);
+    let private = is_private(flags);
+    let err = unsafe { mutex_unlock_usercnt(mutex, false) };
+    if err != 0 {
+        cancel_waiting(c, seq, g, private);
         confirm_wakeup(c, private);
-        let err = mutex_cond_lock(mutex);
-        if err != 0 { err } else { result }
+        return err;
     }
+    loop {
+        let signals = c.g_signals[g].load(Ordering::Acquire);
+        let g1_start = c.g1_start.load(Ordering::Relaxed);
+        if seq < g1_start {
+            break;
+        }
+        if (signals.wrapping_sub(g1_start as u32)) as i32 > 0 {
+            if c.g_signals[g].compare_exchange_weak(signals, signals - 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                break;
+            }
+            continue;
+        }
+        let mut arg = CleanupArg { wseq, cond: c, mutex, private };
+        let e = unsafe {
+            crate::cancel::with_cleanup(cleanup_waiting, &mut arg as *mut CleanupArg as *mut c_void, || match abs {
+                None => futex_wait_cp(&c.g_signals[g], signals, private),
+                Some(_) => futex_wait_abs_cp(&c.g_signals[g], signals, clock, abs, private),
+            })
+        };
+        if e == ETIMEDOUT || e == EOVERFLOW {
+            cancel_waiting(c, seq, g, private);
+            result = e;
+            break;
+        }
+    }
+    confirm_wakeup(c, private);
+    let err = unsafe { mutex_cond_lock(mutex) };
+    if err != 0 { err } else { result }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_cond_wait(cond: *mut Cond, mutex: *mut Mutex) -> c_int {
-    unsafe { wait_common(cond, mutex, 0, core::ptr::null()) }
+    let c = cond_ref!(cond);
+    unsafe { wait_common(c, mutex, 0, None) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_cond_timedwait(cond: *mut Cond, mutex: *mut Mutex, abstime: *const Timespec) -> c_int {
-    unsafe {
-        if !valid_nsec(&*abstime) {
-            return EINVAL;
-        }
-        let flags = (*cond).wrefs.load(Ordering::Relaxed);
-        let clock = if flags & CLOCK_MONOTONIC_MASK != 0 { CLOCK_MONOTONIC } else { CLOCK_REALTIME };
-        wait_common(cond, mutex, clock, abstime)
+    let abs = unsafe { arg(abstime) };
+    if !valid_nsec(abs) {
+        return EINVAL;
     }
+    let c = cond_ref!(cond);
+    let flags = c.wrefs.load(Ordering::Relaxed);
+    let clock = if flags & CLOCK_MONOTONIC_MASK != 0 { CLOCK_MONOTONIC } else { CLOCK_REALTIME };
+    unsafe { wait_common(c, mutex, clock, Some(abs)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_cond_clockwait(cond: *mut Cond, mutex: *mut Mutex, clockid: c_int, abstime: *const Timespec) -> c_int {
-    unsafe {
-        if !valid_nsec(&*abstime) {
-            return EINVAL;
+    let abs = unsafe { arg(abstime) };
+    if !valid_nsec(abs) {
+        return EINVAL;
+    }
+    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
+        return EINVAL;
+    }
+    let c = cond_ref!(cond);
+    unsafe { wait_common(c, mutex, clockid, Some(abs)) }
+}
+
+impl Cond {
+    pub const fn with_attr(value: c_int) -> Cond {
+        let mut w = 0u32;
+        if value & 1 != 0 {
+            w |= SHARED_MASK;
         }
-        if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
-            return EINVAL;
+        if (value >> 1) & 1 != CLOCK_REALTIME {
+            w |= CLOCK_MONOTONIC_MASK;
         }
-        wait_common(cond, mutex, clockid, abstime)
+        Cond {
+            wseq: AtomicU64::new(0),
+            g1_start: AtomicU64::new(0),
+            g_size: [AtomicU32::new(0), AtomicU32::new(0)],
+            g1_orig_size: AtomicU32::new(0),
+            wrefs: AtomicU32::new(w),
+            g_signals: [AtomicU32::new(0), AtomicU32::new(0)],
+            unused: [0; 2],
+        }
     }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_cond_init(cond: *mut Cond, attr: *const CondAttr) -> c_int {
-    unsafe {
-        core::ptr::write_bytes(cond as *mut u8, 0, core::mem::size_of::<Cond>());
-        if !attr.is_null() {
-            let v = (*attr).value;
-            let mut w = 0u32;
-            if v & 1 != 0 {
-                w |= SHARED_MASK;
-            }
-            if (v >> 1) & 1 != CLOCK_REALTIME {
-                w |= CLOCK_MONOTONIC_MASK;
-            }
-            (*cond).wrefs = AtomicU32::new(w);
-        }
-        0
-    }
-}
-
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_cond_destroy(cond: *mut Cond) -> c_int {
-    let c = unsafe { &*cond };
+pub fn destroy(c: &Cond) -> c_int {
     let mut wrefs = c.wrefs.fetch_or(4, Ordering::Acquire);
     let private = is_private(wrefs);
     while wrefs >> 3 != 0 {
@@ -323,11 +336,55 @@ pub unsafe extern "C" fn pthread_cond_destroy(cond: *mut Cond) -> c_int {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_condattr_init(a: *mut CondAttr) -> c_int {
-    unsafe {
-        (*a).value = 0;
+pub unsafe extern "C" fn pthread_cond_init(cond: *mut Cond, attr: *const CondAttr) -> c_int {
+    let v = unsafe { attr.as_ref() }.map_or(0, |a| a.value);
+    unsafe { core::ptr::write(cond, Cond::with_attr(v)) };
+    0
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_cond_destroy(cond: *mut Cond) -> c_int {
+    destroy(cond_ref!(cond))
+}
+
+impl CondAttr {
+    pub fn set_pshared(&mut self, pshared: c_int) -> c_int {
+        if pshared != 0 && pshared != 1 {
+            return EINVAL;
+        }
+        self.value = (self.value & !1) | pshared;
         0
     }
+
+    pub fn set_clock(&mut self, clock: c_int) -> c_int {
+        if clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC {
+            return EINVAL;
+        }
+        self.value = (self.value & !(1 << 1)) | (clock << 1);
+        0
+    }
+}
+
+macro_rules! attr_mut {
+    ($p:expr) => {{
+        unsafe { arg_mut($p) }
+    }};
+}
+macro_rules! attr_ref {
+    ($p:expr) => {{
+        unsafe { arg($p) }
+    }};
+}
+macro_rules! out {
+    ($p:expr) => {{
+        unsafe { arg_mut($p) }
+    }};
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_condattr_init(a: *mut CondAttr) -> c_int {
+    unsafe { core::ptr::write(a, CondAttr { value: 0 }) };
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -337,39 +394,23 @@ pub unsafe extern "C" fn pthread_condattr_destroy(_a: *mut CondAttr) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_condattr_getpshared(a: *const CondAttr, pshared: *mut c_int) -> c_int {
-    unsafe {
-        *pshared = (*a).value & 1;
-        0
-    }
+    *out!(pshared) = attr_ref!(a).value & 1;
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_condattr_setpshared(a: *mut CondAttr, pshared: c_int) -> c_int {
-    unsafe {
-        if pshared != 0 && pshared != 1 {
-            return EINVAL;
-        }
-        (*a).value = ((*a).value & !1) | pshared;
-        0
-    }
+    attr_mut!(a).set_pshared(pshared)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_condattr_getclock(a: *const CondAttr, clock: *mut c_int) -> c_int {
-    unsafe {
-        *clock = ((*a).value >> 1) & 1;
-        0
-    }
+    *out!(clock) = (attr_ref!(a).value >> 1) & 1;
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_condattr_setclock(a: *mut CondAttr, clock: c_int) -> c_int {
-    unsafe {
-        if clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC {
-            return EINVAL;
-        }
-        (*a).value = ((*a).value & !(1 << 1)) | (clock << 1);
-        0
-    }
+    attr_mut!(a).set_clock(clock)
 }
 

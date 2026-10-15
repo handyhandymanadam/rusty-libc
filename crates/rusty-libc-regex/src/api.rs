@@ -100,10 +100,7 @@ pub fn run(
         let hay = &text[start as usize..stop];
         let lit = &c.lit[..c.lit_len as usize];
         let at: usize = match c.lit_anchor {
-            0 => {
-                let at = unsafe { rusty_libc_mem::memmem(hay.as_ptr().cast(), hay.len(), lit.as_ptr().cast(), lit.len()) };
-                if at.is_null() { usize::MAX } else { at as usize - hay.as_ptr() as usize }
-            }
+            0 => rusty_libc_core::string::memmem(hay, lit).unwrap_or(usize::MAX),
             1 => if hay.starts_with(lit) { 0 } else { usize::MAX },
             2 => if hay.ends_with(lit) { hay.len() - lit.len() } else { usize::MAX },
             _ => if hay == lit { 0 } else { usize::MAX },

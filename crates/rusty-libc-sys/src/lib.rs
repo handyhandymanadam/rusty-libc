@@ -1,6 +1,8 @@
 #![no_std]
 #![allow(clippy::missing_safety_doc)]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 
+mod kernel;
 pub mod unistd;
 pub mod fcntl;
 pub mod stat;

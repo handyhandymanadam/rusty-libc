@@ -70,6 +70,28 @@ fn time_src() -> Vec<String> {
     ["clock.rs", "calendar.rs", "tz.rs", "strftime.rs"].iter().map(|f| format!("crates/rusty-libc-time/src/{f}")).collect()
 }
 
+fn time_objects(t: Spec) -> Spec {
+    t.subst(Subst::Lit("pub static __tzname: [AtomicPtr<c_char>; 2]", "pub static mut __tzname: [*mut c_char; 2]"))
+        .subst(Subst::Lit("pub static __daylight: AtomicI32", "pub static mut __daylight: c_int"))
+        .subst(Subst::Lit("pub static __timezone: AtomicI64", "pub static mut __timezone: c_long"))
+        .subst(Subst::Lit("pub static getdate_err: AtomicI32", "pub static mut getdate_err: c_int"))
+}
+
+fn ctype_objects(t: Spec) -> Spec {
+    t.subst(Subst::Lit("pub static __ctype32_b: AtomicPtr<u32>", "pub static mut __ctype32_b: *const u32"))
+        .subst(Subst::Lit("pub static __ctype32_tolower: AtomicPtr<u32>", "pub static mut __ctype32_tolower: *const u32"))
+        .subst(Subst::Lit("pub static __ctype32_toupper: AtomicPtr<u32>", "pub static mut __ctype32_toupper: *const u32"))
+        .subst(Subst::Lit("pub static __ctype_b: AtomicPtr<c_ushort>", "pub static mut __ctype_b: *const c_ushort"))
+        .subst(Subst::Lit("pub static __ctype_tolower: AtomicPtr<c_int>", "pub static mut __ctype_tolower: *const c_int"))
+        .subst(Subst::Lit("pub static __ctype_toupper: AtomicPtr<c_int>", "pub static mut __ctype_toupper: *const c_int"))
+}
+
+fn stdio_objects(t: Spec) -> Spec {
+    t.subst(Subst::Lit("pub static stdin: SyncCell<*mut FILE>", "pub static mut stdin: *mut FILE"))
+        .subst(Subst::Lit("pub static stdout: SyncCell<*mut FILE>", "pub static mut stdout: *mut FILE"))
+        .subst(Subst::Lit("pub static stderr: SyncCell<*mut FILE>", "pub static mut stderr: *mut FILE"))
+}
+
 pub fn build_specs() -> Vec<Spec> {
     let mut h: Vec<Spec> = Vec::new();
     let time_other = w("gettimeofday settimeofday adjtime getitimer setitimer utimes lutimes futimes futimesat ftime utime stime");
@@ -79,20 +101,20 @@ pub fn build_specs() -> Vec<Spec> {
     h.push(spec("stdlib", "stdlib")
         .files(&["crates/rusty-libc-cabi/src/stdlib.rs", "crates/rusty-libc-malloc/src/stdlib_api.rs", "crates/rusty-libc-stdlib/src/num.rs", "crates/rusty-libc-stdlib/src/sort.rs", "crates/rusty-libc-stdlib/src/rand.rs", "crates/rusty-libc-stdlib/src/env.rs", "crates/rusty-libc-stdlib/src/misc.rs", "crates/rusty-libc-stdio/src/numconv.rs"])
         .fns("mblen mbtowc wctomb mbstowcs wcstombs __ctype_get_mb_cur_max"));
-    h.push(spec("stdio", "stdio")
+    h.push(stdio_objects(spec("stdio", "stdio")
         .files(&["crates/rusty-libc-stdio/src/file_api.rs", "crates/rusty-libc-stdio/src/file_extra.rs", "crates/rusty-libc-stdio/src/printf_api.rs"])
         .pick("crates/rusty-libc-extra/src/obstack.rs", "obstack_printf obstack_vprintf")
-        .pick("crates/rusty-libc-util/src/pwd.rs", "cuserid"));
+        .pick("crates/rusty-libc-util/src/pwd.rs", "cuserid")));
     h.push(spec("wchar", "wchar")
         .files(&["crates/rusty-libc-wchar/src/wstring.rs", "crates/rusty-libc-wchar/src/wconv.rs", "crates/rusty-libc-stdio/src/wfile.rs", "crates/rusty-libc-stdio/src/wprintf_api.rs", "crates/rusty-libc-stdio/src/wscan_api.rs"])
         .fns("btowc wctob mbsinit mbrlen mbrtowc wcrtomb mbsrtowcs mbsnrtowcs wcsrtombs wcsnrtombs wcwidth wcswidth"));
     h.push(spec("wctype", "wctype").fns("towlower towupper towlower_l towupper_l wctype wctype_l iswctype iswctype_l wctrans wctrans_l towctrans towctrans_l"));
     h.push(spec("uchar", "uchar").fns("mbrtoc8 c8rtomb mbrtoc16 c16rtomb mbrtoc32 c32rtomb"));
     h.push(spec("stdio_ext", "stdio_ext").files(&["crates/rusty-libc-stdio/src/stdio_ext.rs"]));
-    h.push(spec("ctype", "ctype").files(&["crates/rusty-libc-ctype/src/lib.rs"]).pick("crates/rusty-libc-extra/src/misc.rs", "__isascii_l __toascii_l"));
+    h.push(ctype_objects(spec("ctype", "ctype").files(&["crates/rusty-libc-ctype/src/lib.rs"]).pick("crates/rusty-libc-extra/src/misc.rs", "__isascii_l __toascii_l")));
     h.push(spec("errno", "errno").files(&["crates/rusty-libc-cabi/src/errno.rs"]));
     h.push(spec("malloc", "malloc").files(&["crates/rusty-libc-malloc/src/malloc_api.rs", "crates/rusty-libc-stdio/src/malloc_info.rs"]));
-    h.push(spec("unistd", "unistd").files(&["crates/rusty-libc-cabi/src/unistd.rs"]).fns("swab").pick("crates/rusty-libc-extra/src/gmon.rs", "profil"));
+    h.push(spec("unistd", "unistd").files(&["crates/rusty-libc-cabi/src/unistd.rs"]).fns("swab").pick("crates/rusty-libc-extra/src/gmon.rs", "profil").pick("crates/rusty-libc-extra/src/getpass.rs", "getpass"));
     h.push(spec("string", "string")
         .files(&["crates/rusty-libc-malloc/src/string_alloc.rs", "crates/rusty-libc-cabi/src/strerror.rs"])
         .fns("memcpy memmove memset memcmp memchr memrchr rawmemchr memccpy mempcpy memfrob memmem memset_explicit explicit_bzero strcpy stpcpy strncpy stpncpy strcat strncat strlcpy strlcat strcmp strncmp strcoll strcoll_l strxfrm strxfrm_l strchr strrchr strchrnul strspn strcspn strpbrk strstr strcasestr strtok strtok_r strsep strlen strnlen strverscmp basename")
@@ -115,10 +137,10 @@ pub fn build_specs() -> Vec<Spec> {
     h.push(spec("shadow", "shadow").pick("crates/rusty-libc-util/src/pwd.rs", "getspnam_r getspnam setspent endspent getspent_r getspent fgetspent_r fgetspent sgetspent_r sgetspent putspent lckpwdf ulckpwdf"));
     h.push(spec("bits/rlibc_util_unistd", "util_unistd").pick("crates/rusty-libc-util/src/pwd.rs", "getlogin getlogin_r getusershell setusershell endusershell"));
 
-    let mut t = spec("time", "time"); t.files = time_src(); t = t.skip(time_other.clone()); h.push(t);
-    let mut t = spec("sys/time", "systime"); t.files = time_src(); t = t.only("gettimeofday settimeofday adjtime getitimer setitimer utimes lutimes futimes futimesat"); h.push(t);
-    let mut t = spec("sys/timeb", "timeb"); t.files = time_src(); t = t.only("ftime"); h.push(t);
-    let mut t = spec("utime", "utime"); t.files = time_src(); t = t.only("utime"); h.push(t);
+    let mut t = time_objects(spec("time", "time")); t.files = time_src(); t = t.skip(time_other.clone()); h.push(t);
+    let mut t = time_objects(spec("sys/time", "systime")); t.files = time_src(); t = t.only("gettimeofday settimeofday adjtime getitimer setitimer utimes lutimes futimes futimesat"); h.push(t);
+    let mut t = time_objects(spec("sys/timeb", "timeb")); t.files = time_src(); t = t.only("ftime"); h.push(t);
+    let mut t = time_objects(spec("utime", "utime")); t.files = time_src(); t = t.only("utime"); h.push(t);
 
     let mut m = spec("bits/rlibc-mathcalls", "mathcalls");
     m.tiers = true;

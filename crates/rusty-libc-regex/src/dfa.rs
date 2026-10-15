@@ -3,8 +3,8 @@ use crate::consts::*;
 use crate::exec::Env;
 use crate::nfa::*;
 use crate::vec::V;
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use rusty_libc_core::sync_cell::SyncCell;
 
 const PURE: u32 = 1 << 31;
 const ACC: u32 = 1 << 30;
@@ -38,7 +38,7 @@ pub enum Loc {
 pub struct Dfa {
     lock: AtomicBool,
     short_calls: AtomicU32,
-    inner: UnsafeCell<Both>,
+    inner: SyncCell<Both>,
 }
 
 struct Both {
@@ -46,12 +46,9 @@ struct Both {
     anch: Inner,
 }
 
-unsafe impl Sync for Dfa {}
-unsafe impl Send for Dfa {}
-
 impl Dfa {
     pub const fn new() -> Dfa {
-        Dfa { lock: AtomicBool::new(false), short_calls: AtomicU32::new(0), inner: UnsafeCell::new(Both { fwd: Inner::new(false), anch: Inner::new(true) }) }
+        Dfa { lock: AtomicBool::new(false), short_calls: AtomicU32::new(0), inner: SyncCell::new(Both { fwd: Inner::new(false), anch: Inner::new(true) }) }
     }
 
     pub fn locate(&self, env: &Env, start0: usize, need_longest: bool) -> Loc {
@@ -67,8 +64,7 @@ impl Dfa {
         if self.lock.swap(true, Ordering::Acquire) {
             return Loc::Unavailable;
         }
-        let both = unsafe { &mut *self.inner.get() };
-        let r = match both.fwd.scan(env, start0) {
+        let run = |both: &mut Both| match both.fwd.scan(env, start0) {
             Pre::NoMatch => Loc::NoMatch,
             Pre::Unavailable => Loc::Unavailable,
             Pre::Window { q, p1 } => {
@@ -79,6 +75,7 @@ impl Dfa {
                 }
             }
         };
+        let r = unsafe { self.inner.with_unsync(run) };
         self.lock.store(false, Ordering::Release);
         r
     }
@@ -282,7 +279,7 @@ impl Inner {
         let fr = &self.first_raw;
         let mut i = from;
         while i < text.len() {
-            if unsafe { *fr.get_unchecked(*text.get_unchecked(i) as usize) } != 0 {
+            if fr[text[i] as usize] != 0 {
                 break;
             }
             i += 1;
@@ -621,14 +618,11 @@ impl Inner {
 
 #[inline]
 fn same_table(a: &[u8; 256], b: &[u8; 256]) -> bool {
-    unsafe {
-        let (pa, pb) = (a.as_ptr() as *const u64, b.as_ptr() as *const u64);
-        let mut diff = 0u64;
-        for i in 0..32 {
-            diff |= pa.add(i).read_unaligned() ^ pb.add(i).read_unaligned();
-        }
-        diff == 0
+    let mut diff = 0u64;
+    for (x, y) in a.as_chunks::<8>().0.iter().zip(b.as_chunks::<8>().0) {
+        diff |= u64::from_ne_bytes(*x) ^ u64::from_ne_bytes(*y);
     }
+    diff == 0
 }
 
 fn trans_ctx(b: u8) -> u8 {
@@ -652,14 +646,12 @@ fn has_avx2() -> bool {
         _ => {}
     }
     let mut ok = false;
-    unsafe {
-        let leaf1 = core::arch::x86_64::__cpuid(1);
-        if leaf1.ecx >> 27 & 1 != 0 && leaf1.ecx >> 28 & 1 != 0 {
-            let (eax, _edx): (u32, u32);
-            core::arch::asm!("xgetbv", in("ecx") 0u32, out("eax") eax, out("edx") _edx, options(nomem, nostack, preserves_flags));
-            if eax & 6 == 6 && core::arch::x86_64::__cpuid_count(7, 0).ebx >> 5 & 1 != 0 {
-                ok = true;
-            }
+    let leaf1 = core::arch::x86_64::__cpuid(1);
+    if leaf1.ecx >> 27 & 1 != 0 && leaf1.ecx >> 28 & 1 != 0 {
+        let (eax, _edx): (u32, u32);
+        unsafe { core::arch::asm!("xgetbv", in("ecx") 0u32, out("eax") eax, out("edx") _edx, options(nomem, nostack, preserves_flags)) };
+        if eax & 6 == 6 && core::arch::x86_64::__cpuid_count(7, 0).ebx >> 5 & 1 != 0 {
+            ok = true;
         }
     }
     AVX2.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
@@ -670,37 +662,37 @@ fn has_avx2() -> bool {
 #[target_feature(enable = "avx2")]
 unsafe fn skip_avx2(text: &[u8], from: usize, lo: &[u8; 16], hi: &[u8; 16]) -> usize {
     use core::arch::x86_64::*;
-    unsafe {
-        let len = text.len();
-        let base = text.as_ptr();
-        let lo_t = _mm256_broadcastsi128_si256(_mm_loadu_si128(lo.as_ptr() as *const __m128i));
-        let hi_t = _mm256_broadcastsi128_si256(_mm_loadu_si128(hi.as_ptr() as *const __m128i));
-        let nib = _mm256_set1_epi8(0x0f);
-        let zero = _mm256_setzero_si256();
-        let probe = |at: usize| -> u32 {
-            let v = _mm256_loadu_si256(base.add(at) as *const __m256i);
-            let l = _mm256_and_si256(v, nib);
-            let h = _mm256_and_si256(_mm256_srli_epi16(v, 4), nib);
-            let m = _mm256_and_si256(_mm256_shuffle_epi8(lo_t, l), _mm256_shuffle_epi8(hi_t, h));
-            !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(m, zero)) as u32)
-        };
-        let mut i = from;
-        while i + 32 <= len {
-            let hit = probe(i);
-            if hit != 0 {
-                return i + hit.trailing_zeros() as usize;
-            }
-            i += 32;
+    let len = text.len();
+    let base = text.as_ptr();
+    let lo_v = unsafe { _mm_loadu_si128(lo.as_ptr().cast::<__m128i>()) };
+    let hi_v = unsafe { _mm_loadu_si128(hi.as_ptr().cast::<__m128i>()) };
+    let lo_t = _mm256_broadcastsi128_si256(lo_v);
+    let hi_t = _mm256_broadcastsi128_si256(hi_v);
+    let nib = _mm256_set1_epi8(0x0f);
+    let zero = _mm256_setzero_si256();
+    let probe = |at: usize| -> u32 {
+        let v = unsafe { _mm256_loadu_si256(base.wrapping_add(at).cast::<__m256i>()) };
+        let l = _mm256_and_si256(v, nib);
+        let h = _mm256_and_si256(_mm256_srli_epi16(v, 4), nib);
+        let m = _mm256_and_si256(_mm256_shuffle_epi8(lo_t, l), _mm256_shuffle_epi8(hi_t, h));
+        !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(m, zero)) as u32)
+    };
+    let mut i = from;
+    while i + 32 <= len {
+        let hit = probe(i);
+        if hit != 0 {
+            return i + hit.trailing_zeros() as usize;
         }
-        if i < len {
-            let at = len - 32;
-            let hit = probe(at);
-            if hit != 0 {
-                return at + hit.trailing_zeros() as usize;
-            }
-        }
-        len
+        i += 32;
     }
+    if i < len {
+        let at = len - 32;
+        let hit = probe(at);
+        if hit != 0 {
+            return at + hit.trailing_zeros() as usize;
+        }
+    }
+    len
 }
 
 fn nibble_tables(set: &[u8; 256]) -> Option<([u8; 16], [u8; 16])> {

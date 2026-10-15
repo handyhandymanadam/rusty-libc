@@ -1,4 +1,4 @@
-use crate::charsets_gen::{ALIASES, SBS, SPECIAL_NAMES};
+use crate::charsets_gen::{ALIASES, SBS, SPECIAL_CODES, SPECIAL_STRS};
 use crate::unicode::Sb;
 
 #[derive(Clone, Copy)]
@@ -99,6 +99,39 @@ pub fn parse(name: &[u8]) -> Option<Parsed> {
     Some(Parsed { buf, len: n, translit, ignore })
 }
 
+pub fn ccs_key(name: &[u8]) -> Option<Parsed> {
+    let mut buf = [0u8; 128];
+    let mut n = 0;
+    let mut slashes = 0;
+    for &c in name {
+        let out = if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b',' | b':') {
+            c.to_ascii_uppercase()
+        } else if c == b'/' {
+            slashes += 1;
+            if slashes == 3 {
+                break;
+            }
+            b'/'
+        } else {
+            continue;
+        };
+        if n + 2 >= buf.len() {
+            return None;
+        }
+        buf[n] = out;
+        n += 1;
+    }
+    while slashes < 2 {
+        buf[n] = b'/';
+        n += 1;
+        slashes += 1;
+    }
+    if n == 2 {
+        return None;
+    }
+    Some(Parsed { buf, len: n, translit: false, ignore: false })
+}
+
 pub fn lookup_key(key: &[u8]) -> Option<Cs> {
     let i = ALIASES.find(key)?;
     Some(code_cs(ALIASES.code(i)))
@@ -110,7 +143,7 @@ fn code_cs(code: u16) -> Cs {
 
 pub fn cs_name(cs: Cs) -> &'static str {
     match cs {
-        Cs::Special(k) => SPECIAL_NAMES.iter().find(|e| e.0 == k).map_or("?", |e| e.1),
+        Cs::Special(k) => SPECIAL_CODES.iter().position(|&c| c == k).map_or("?", |i| SPECIAL_STRS.get(i)),
         Cs::Sb(t) => t.name(),
     }
 }

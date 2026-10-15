@@ -7,7 +7,7 @@ struct Out(*mut FILE);
 
 impl Sink for Out {
     fn put(&mut self, bytes: &[u8]) -> bool {
-        unsafe { file::write_bytes(self.0, bytes.as_ptr(), bytes.len()) == bytes.len() }
+        file::write_bytes(unsafe { file::stream(self.0) }, bytes) == bytes.len()
     }
 }
 

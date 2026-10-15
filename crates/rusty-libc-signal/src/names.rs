@@ -1,7 +1,8 @@
 use crate::consts::*;
 use crate::types::Siginfo;
 use core::ffi::{CStr, c_char, c_int};
-use rusty_libc_core::{messages, syscall};
+use rusty_libc_core::{ffi, i18n, messages};
+use rusty_libc_core::unistd::write_nocancel;
 
 const ABBREV: [&CStr; 32] = [
     c"", c"HUP", c"INT", c"QUIT", c"ILL", c"TRAP", c"ABRT", c"BUS", c"FPE", c"KILL", c"USR1", c"SEGV", c"USR2", c"PIPE", c"ALRM",
@@ -12,6 +13,11 @@ const ABBREV: [&CStr; 32] = [
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sigabbrev_np(sig: c_int) -> *const c_char {
     if (1..=31).contains(&sig) { ABBREV[sig as usize].as_ptr() } else { core::ptr::null() }
+}
+
+#[inline]
+pub fn sigdescr_text(sig: c_int) -> Option<&'static CStr> {
+    if (1..=31).contains(&sig) { messages::signal_message(sig) } else { None }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -33,11 +39,6 @@ impl Buf {
         let k = s.len().min(self.cap - self.n);
         self.b[self.n..self.n + k].copy_from_slice(&s[..k]);
         self.n += k;
-    }
-    fn cstr(&mut self, p: *const c_char) {
-        if !p.is_null() {
-            self.bytes(unsafe { CStr::from_ptr(p) }.to_bytes());
-        }
     }
     fn dec(&mut self, v: i64) {
         let mut tmp = [0u8; 20];
@@ -73,85 +74,112 @@ impl Buf {
         self.bytes(&tmp[i..]);
     }
     fn flush_stderr(&self) {
-        unsafe { syscall::syscall3(syscall::SYS_WRITE, 2, self.b.as_ptr() as usize, self.n) };
+        write_stderr(&self.b[..self.n]);
     }
 }
 
 fn write_stderr(s: &[u8]) {
-    unsafe { syscall::syscall3(syscall::SYS_WRITE, 2, s.as_ptr() as usize, s.len()) };
+    let _ = write_nocancel(2, s);
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn psignal(sig: c_int, s: *const c_char) {
-    unsafe {
-        let (s, colon): (*const c_char, &[u8]) = if s.is_null() || *s == 0 { (c"".as_ptr(), b"") } else { (s, b": ") };
-        let prefix = CStr::from_ptr(s).to_bytes();
-        let desc = if (1..=31).contains(&sig) { messages::signal_message(sig) } else { None };
-        let mut buf = Buf::new(1024);
-        if prefix.len() + colon.len() + 40 + desc.map_or(0, |d| d.to_bytes().len()) > buf.cap {
-            write_stderr(prefix);
-            write_stderr(colon);
-            let mut tail = Buf::new(100);
-            match desc {
-                Some(d) => tail.bytes(d.to_bytes()),
-                None => {
-                    tail.bytes(b"Unknown signal ");
-                    tail.dec(i64::from(sig));
-                }
-            }
-            tail.bytes(b"\n");
-            tail.flush_stderr();
-            return;
-        }
-        buf.bytes(prefix);
-        buf.bytes(colon);
-        match desc {
-            Some(d) => buf.bytes(d.to_bytes()),
-            None => {
-                buf.bytes(b"Unknown signal ");
-                buf.dec(i64::from(sig));
-            }
-        }
-        buf.bytes(b"\n");
-        buf.flush_stderr();
-    }
+    let s = unsafe { ffi::cstr(s) };
+    psignal_rs(sig, s);
 }
 
-const ILL_TEXT: [&str; 8] = [
-    "Illegal opcode",
-    "Illegal operand",
-    "Illegal addressing mode",
-    "Illegal trap",
-    "Privileged opcode",
-    "Privileged register",
-    "Coprocessor error",
-    "Internal stack error",
-];
-const FPE_TEXT: [&str; 8] = [
-    "Integer divide by zero",
-    "Integer overflow",
-    "Floating-point divide by zero",
-    "Floating-point overflow",
-    "Floating-point underflow",
-    "Floating-poing inexact result",
-    "Invalid floating-point operation",
-    "Subscript out of range",
-];
-const SEGV_TEXT: [&str; 2] = ["Address not mapped to object", "Invalid permissions for mapped object"];
-const BUS_TEXT: [&str; 3] = ["Invalid address alignment", "Nonexisting physical address", "Object-specific hardware error"];
-const TRAP_TEXT: [&str; 2] = ["Process breakpoint", "Process trace trap"];
-const CLD_TEXT: [&str; 6] = [
-    "Child has exited",
-    "Child has terminated abnormally and did not create a core file",
-    "Child has terminated abnormally and created a core file",
-    "Traced child has trapped",
-    "Child has stopped",
-    "Stopped child has continued",
-];
-const POLL_TEXT: [&str; 6] =
-    ["Data input available", "Output buffers available", "Input message available", "I/O error", "High priority input available", "Device disconnected"];
+#[inline]
+pub fn psignal_rs(sig: c_int, s: Option<&CStr>) {
+    let (s, colon): (&CStr, &CStr) = match s {
+        Some(s) if !s.is_empty() => (s, c": "),
+        _ => (c"", c""),
+    };
+    let prefix = s.to_bytes();
+    let desc = sigdescr_text(sig).map(i18n::tr);
+    if desc.is_none() && i18n::active() {
+        let mut buf = Buf::new(1024);
+        let done = i18n::tr_format(c"%s%sUnknown signal %d\n", &[s.as_ptr() as u64, colon.as_ptr() as u64, sig as u32 as u64], &mut |b: &[u8]| {
+            let mut b = b;
+            while !b.is_empty() {
+                if buf.n == buf.cap {
+                    buf.flush_stderr();
+                    buf.n = 0;
+                }
+                let k = b.len().min(buf.cap - buf.n);
+                buf.bytes(&b[..k]);
+                b = &b[k..];
+            }
+        });
+        if done {
+            buf.flush_stderr();
+            return;
+        }
+    }
+    let colon = colon.to_bytes();
+    let mut buf = Buf::new(1024);
+    if prefix.len() + colon.len() + 40 + desc.map_or(0, |d| d.to_bytes().len()) > buf.cap {
+        write_stderr(prefix);
+        write_stderr(colon);
+        let mut tail = Buf::new(100);
+        match desc {
+            Some(d) => tail.bytes(d.to_bytes()),
+            None => {
+                tail.bytes(b"Unknown signal ");
+                tail.dec(i64::from(sig));
+            }
+        }
+        tail.bytes(b"\n");
+        tail.flush_stderr();
+        return;
+    }
+    buf.bytes(prefix);
+    buf.bytes(colon);
+    match desc {
+        Some(d) => buf.bytes(d.to_bytes()),
+        None => {
+            buf.bytes(b"Unknown signal ");
+            buf.dec(i64::from(sig));
+        }
+    }
+    buf.bytes(b"\n");
+    buf.flush_stderr();
+}
 
-fn code_table(sig: i32) -> Option<&'static [&'static str]> {
+const ILL_TEXT: [&CStr; 8] = [
+    c"Illegal opcode",
+    c"Illegal operand",
+    c"Illegal addressing mode",
+    c"Illegal trap",
+    c"Privileged opcode",
+    c"Privileged register",
+    c"Coprocessor error",
+    c"Internal stack error",
+];
+const FPE_TEXT: [&CStr; 8] = [
+    c"Integer divide by zero",
+    c"Integer overflow",
+    c"Floating-point divide by zero",
+    c"Floating-point overflow",
+    c"Floating-point underflow",
+    c"Floating-poing inexact result",
+    c"Invalid floating-point operation",
+    c"Subscript out of range",
+];
+const SEGV_TEXT: [&CStr; 2] = [c"Address not mapped to object", c"Invalid permissions for mapped object"];
+const BUS_TEXT: [&CStr; 3] = [c"Invalid address alignment", c"Nonexisting physical address", c"Object-specific hardware error"];
+const TRAP_TEXT: [&CStr; 2] = [c"Process breakpoint", c"Process trace trap"];
+const CLD_TEXT: [&CStr; 6] = [
+    c"Child has exited",
+    c"Child has terminated abnormally and did not create a core file",
+    c"Child has terminated abnormally and created a core file",
+    c"Traced child has trapped",
+    c"Child has stopped",
+    c"Stopped child has continued",
+];
+const POLL_TEXT: [&CStr; 6] =
+    [c"Data input available", c"Output buffers available", c"Input message available", c"I/O error", c"High priority input available", c"Device disconnected"];
+
+fn code_table(sig: i32) -> Option<&'static [&'static CStr]> {
     match sig {
         SIGILL => Some(&ILL_TEXT),
         SIGFPE => Some(&FPE_TEXT),
@@ -164,36 +192,46 @@ fn code_table(sig: i32) -> Option<&'static [&'static str]> {
     }
 }
 
-fn generic_code_text(code: i32) -> Option<&'static str> {
+fn generic_code_text(code: i32) -> Option<&'static CStr> {
     Some(match code {
-        SI_USER => "Signal sent by kill()",
-        SI_QUEUE => "Signal sent by sigqueue()",
-        SI_TIMER => "Signal generated by the expiration of a timer",
-        SI_ASYNCIO => "Signal generated by the completion of an asynchronous I/O request",
-        SI_MESGQ => "Signal generated by the arrival of a message on an empty message queue",
-        SI_TKILL => "Signal sent by tkill()",
-        SI_ASYNCNL => "Signal generated by the completion of an asynchronous name lookup request",
-        SI_SIGIO => "Signal generated by the completion of an I/O request",
-        SI_KERNEL => "Signal sent by the kernel",
+        SI_USER => c"Signal sent by kill()",
+        SI_QUEUE => c"Signal sent by sigqueue()",
+        SI_TIMER => c"Signal generated by the expiration of a timer",
+        SI_ASYNCIO => c"Signal generated by the completion of an asynchronous I/O request",
+        SI_MESGQ => c"Signal generated by the arrival of a message on an empty message queue",
+        SI_TKILL => c"Signal sent by tkill()",
+        SI_ASYNCNL => c"Signal generated by the completion of an asynchronous name lookup request",
+        SI_SIGIO => c"Signal generated by the completion of an I/O request",
+        SI_KERNEL => c"Signal sent by the kernel",
         _ => return None,
     })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn psiginfo(pinfo: *const Siginfo, s: *const c_char) {
-    unsafe {
-        let info = &*pinfo;
+    let info = unsafe { &*pinfo };
+    let s = unsafe { ffi::cstr(s) };
+    psiginfo_rs(info, s);
+}
+
+#[inline]
+pub fn psiginfo_rs(info: &Siginfo, s: Option<&CStr>) {
+    {
         let sig = info.si_signo;
         let mut buf = Buf::new(511);
-        if !s.is_null() && *s != 0 {
-            buf.cstr(s);
+        if let Some(s) = s.filter(|s| !s.is_empty()) {
+            buf.bytes(s.to_bytes());
             buf.bytes(b": ");
         }
-        let desc = if (0..NSIG).contains(&sig) { messages::signal_message(sig).filter(|_| sig <= 31) } else { None };
+        let desc = if (0..NSIG).contains(&sig) { sigdescr_text(sig).map(i18n::tr) } else { None };
         let rtmin = crate::rt::__libc_current_sigrtmin();
         let rtmax = crate::rt::__libc_current_sigrtmax();
         let in_rt = sig >= rtmin && sig < rtmax;
         if desc.is_none() && !in_rt {
+            if i18n::tr_format(c"Unknown signal %d\n", &[sig as u32 as u64], &mut |b: &[u8]| buf.bytes(b)) {
+                buf.flush_stderr();
+                return;
+            }
             buf.bytes(b"Unknown signal ");
             buf.dec(i64::from(sig));
             buf.bytes(b"\n");
@@ -225,7 +263,7 @@ pub unsafe extern "C" fn psiginfo(pinfo: *const Siginfo, s: *const c_char) {
             _ => generic_code_text(code),
         };
         match text {
-            Some(t) => buf.bytes(t.as_bytes()),
+            Some(t) => buf.bytes(i18n::tr(t).to_bytes()),
             None => buf.dec(i64::from(code)),
         }
         buf.bytes(b" ");

@@ -20,9 +20,16 @@ impl Default for FLock {
     }
 }
 
+#[cfg(not(all(test, miri)))]
 #[inline(always)]
 fn me() -> usize {
     rusty_libc_core::tls::current() as usize
+}
+
+#[cfg(all(test, miri))]
+fn me() -> usize {
+    std::thread_local!(static ME: u8 = const { 0 });
+    ME.with(|m| m as *const u8 as usize)
 }
 
 impl FLock {
@@ -73,7 +80,7 @@ impl FLock {
         }
         let start = unsafe { core::arch::x86_64::_rdtsc() };
         loop {
-            unsafe { rusty_libc_core::syscall::syscall0(24) };
+            self.m.wait_held(1_000_000);
             if self.try_lock() {
                 return true;
             }
@@ -88,11 +95,8 @@ impl FLock {
         if self.owner.load(Ordering::Relaxed) != me() {
             return false;
         }
-        let c = unsafe {
-            let c = *self.count.get() - 1;
-            *self.count.get() = c;
-            c
-        };
+        let c = unsafe { *self.count.get() } - 1;
+        unsafe { *self.count.get() = c };
         if c == 0 {
             self.owner.store(0, Ordering::Relaxed);
             self.m.unlock_fast();
@@ -105,10 +109,8 @@ impl FLock {
     }
 
     pub unsafe fn reset(&self) {
-        unsafe {
-            core::ptr::write(&self.m as *const RawMutex as *mut RawMutex, RawMutex::new());
-            *self.count.get() = 0;
-        }
+        unsafe { core::ptr::write(&self.m as *const RawMutex as *mut RawMutex, RawMutex::new()) };
+        unsafe { *self.count.get() = 0 };
         self.owner.store(0, Ordering::Relaxed);
     }
 }
@@ -118,13 +120,24 @@ macro_rules! locked {
         let stream: *mut $crate::file::File = $f;
         if !rusty_libc_core::lock::multithreaded() { $body } else { $crate::flock::locked_mt(stream, move || $body) }
     }};
+    ($f:expr, |$s:ident| $body:expr) => {{
+        let stream: *mut $crate::file::File = $f;
+        if !rusty_libc_core::lock::multithreaded() {
+            let $s = unsafe { $crate::file::stream(stream) };
+            $body
+        } else {
+            let op = move || {
+                let $s = unsafe { $crate::file::stream(stream) };
+                $body
+            };
+            unsafe { $crate::flock::locked_mt(stream, op) }
+        }
+    }};
 }
 pub(crate) use locked;
 
 unsafe extern "C" fn unlock_on_cancel(arg: *mut c_void) {
-    unsafe {
-        (*(arg as *mut File)).lock.unlock();
-    }
+    unsafe { crate::file::lock_of(arg.cast()) }.unlock();
 }
 
 pub struct LockCleanup {
@@ -163,20 +176,20 @@ impl Drop for LockCleanup {
 #[inline(never)]
 #[cold]
 pub unsafe fn locked_mt<R, F: FnOnce() -> R>(f: *mut File, op: F) -> R {
-    unsafe {
-        let real = !(*f).nolock;
-        let mut cg = LockCleanup::idle();
-        if real {
-            (*f).lock.lock();
-            cg.arm(f);
-        }
-        let r = op();
-        if real {
-            cg.disarm();
-            (*f).lock.unlock();
-        }
-        r
+    let sh = unsafe { crate::file::shared_of(f) };
+    let real = !sh.nolock.load(Ordering::Relaxed);
+    let l = &sh.lock;
+    let mut cg = LockCleanup::idle();
+    if real {
+        l.lock();
+        unsafe { cg.arm(f) };
     }
+    let r = op();
+    if real {
+        cg.disarm();
+        l.unlock();
+    }
+    r
 }
 
 #[inline(always)]
@@ -184,19 +197,18 @@ pub unsafe fn lock_file(f: *mut File) -> bool {
     if !multithreaded() {
         return false;
     }
-    unsafe {
-        if (*f).nolock {
-            return false;
-        }
-        (*f).lock.lock();
+    let sh = unsafe { crate::file::shared_of(f) };
+    if sh.nolock.load(Ordering::Relaxed) {
+        return false;
     }
+    sh.lock.lock();
     true
 }
 
 #[inline(always)]
 pub unsafe fn unlock_file(f: *mut File, token: bool) {
     if token {
-        unsafe { (*f).lock.unlock() };
+        unsafe { crate::file::lock_of(f) }.unlock();
     }
 }
 
@@ -215,11 +227,9 @@ impl StreamGuard {
     #[inline(always)]
     pub unsafe fn lock(&mut self, f: *mut File) {
         self.f = f;
-        unsafe {
-            self.token = lock_file(f);
-            if self.token {
-                self.cleanup.arm(f);
-            }
+        self.token = unsafe { lock_file(f) };
+        if self.token {
+            unsafe { self.cleanup.arm(f) };
         }
     }
 }

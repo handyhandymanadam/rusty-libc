@@ -1,4 +1,7 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
+
 use crate::vars::*;
+use rusty_libc_core::ffi::{bytes, bytes_mut, cstr_bytes};
 use core::ffi::{c_char, c_int, c_uint};
 
 pub const DES_MAXDATA: c_uint = 8192;
@@ -152,55 +155,86 @@ pub fn crypt_in_place(key: &[u8; 8], buf: &mut [u8], decrypt: bool, ivec: Option
     }
 }
 
-unsafe fn common_crypt(key: *const c_char, buf: *mut c_char, len: c_uint, mode: c_uint, ivec: Option<&mut [u8; 8]>) -> c_int {
-    if len % 8 != 0 || len > DES_MAXDATA {
+pub fn crypt(key: &[u8; 8], buf: &mut [u8], mode: c_uint, ivec: Option<&mut [u8; 8]>) -> c_int {
+    let len = buf.len();
+    if len % 8 != 0 || len > DES_MAXDATA as usize {
         return DESERR_BADPARAM;
     }
     let decrypt = mode & DES_DIRMASK != DES_ENCRYPT;
     let desdev = mode & DES_DEVMASK;
-    let mut k = [0u8; 8];
-    core::ptr::copy_nonoverlapping(key as *const u8, k.as_mut_ptr(), 8);
-    let b = core::slice::from_raw_parts_mut(buf as *mut u8, len as usize);
-    crypt_in_place(&k, b, decrypt, ivec);
+    crypt_in_place(key, buf, decrypt, ivec);
     if desdev == DES_SW { DESERR_NONE } else { DESERR_NOHWDEVICE }
+}
+
+pub fn cbc(key: &[u8; 8], buf: &mut [u8], mode: c_uint, ivec: &mut [u8; 8]) -> c_int {
+    crypt(key, buf, mode, Some(ivec))
+}
+
+pub fn ecb(key: &[u8; 8], buf: &mut [u8], mode: c_uint) -> c_int {
+    crypt(key, buf, mode, None)
+}
+
+#[inline]
+unsafe fn read8(p: *const c_char) -> [u8; 8] {
+    let mut k = [0u8; 8];
+    k.copy_from_slice(unsafe { bytes(p.cast(), 8) });
+    k
+}
+
+unsafe fn common_crypt(key: *const c_char, buf: *mut c_char, len: c_uint, mode: c_uint, ivec: Option<&mut [u8; 8]>) -> c_int {
+    if len % 8 != 0 || len > DES_MAXDATA {
+        return DESERR_BADPARAM;
+    }
+    let k = unsafe { read8(key) };
+    let b = unsafe { bytes_mut(buf.cast(), len as usize) };
+    crypt(&k, b, mode, ivec)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn cbc_crypt(key: *mut c_char, buf: *mut c_char, len: c_uint, mode: c_uint, ivec: *mut c_char) -> c_int {
-    let mut iv = [0u8; 8];
-    core::ptr::copy_nonoverlapping(ivec as *const u8, iv.as_mut_ptr(), 8);
-    let err = common_crypt(key, buf, len, mode, Some(&mut iv));
-    core::ptr::copy_nonoverlapping(iv.as_ptr(), ivec as *mut u8, 8);
+    let iv = unsafe { bytes_mut(ivec.cast(), 8) };
+    let mut v = [0u8; 8];
+    v.copy_from_slice(iv);
+    let err = unsafe { common_crypt(key, buf, len, mode, Some(&mut v)) };
+    iv.copy_from_slice(&v);
     err
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ecb_crypt(key: *mut c_char, buf: *mut c_char, len: c_uint, mode: c_uint) -> c_int {
-    common_crypt(key, buf, len, mode, None)
+    unsafe { common_crypt(key, buf, len, mode, None) }
+}
+
+pub fn setparity(key: &mut [u8; 8]) {
+    for k in key.iter_mut() {
+        let b = *k & 0x7e;
+        *k = if b.count_ones() % 2 == 0 { b | 1 } else { b };
+    }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn des_setparity(p: *mut c_char) {
-    for i in 0..8 {
-        let b = (*p.add(i) as u8) & 0x7e;
-        *p.add(i) = (if b.count_ones() % 2 == 0 { b | 1 } else { b }) as c_char;
-    }
+    let k = unsafe { bytes_mut(p.cast(), 8) };
+    let mut v = [0u8; 8];
+    v.copy_from_slice(k);
+    setparity(&mut v);
+    k.copy_from_slice(&v);
 }
 
-pub unsafe fn passwd2des_internal(mut pw: *const c_char, key: *mut c_char) {
-    core::ptr::write_bytes(key, 0, 8);
-    let mut i = 0;
-    while *pw != 0 && i < 8 {
-        *key.add(i) = (*key.add(i) as c_int ^ ((*pw as c_int) << 1)) as c_char;
-        pw = pw.add(1);
-        i += 1;
+pub fn passwd_key(pw: &[u8]) -> [u8; 8] {
+    let mut key = [0u8; 8];
+    for (k, &c) in key.iter_mut().zip(pw) {
+        *k = (*k as c_char as c_int ^ ((c as c_char as c_int) << 1)) as u8;
     }
-    des_setparity(key);
+    setparity(&mut key);
+    key
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn passwd2des(pw: *mut c_char, key: *mut c_char) {
-    passwd2des_internal(pw, key)
+    unsafe { bytes_mut(key.cast(), 8) }.fill(0);
+    let k = passwd_key(unsafe { cstr_bytes(pw) });
+    unsafe { bytes_mut(key.cast(), 8) }.copy_from_slice(&k);
 }
 
 fn hexval(c: c_char) -> c_int {
@@ -213,45 +247,50 @@ fn hexval(c: c_char) -> c_int {
     }
 }
 
-unsafe fn hex2bin(len: usize, hexnum: *const c_char, binnum: *mut c_char) {
-    for i in 0..len {
-        *binnum.add(i) = (16 * hexval(*hexnum.add(2 * i)) + hexval(*hexnum.add(2 * i + 1))) as c_char;
+fn hex2bin(hexnum: &[u8], binnum: &mut [u8]) {
+    for (i, b) in binnum.iter_mut().enumerate() {
+        *b = (16 * hexval(hexnum[2 * i] as c_char) + hexval(hexnum[2 * i + 1] as c_char)) as u8;
     }
 }
 
-unsafe fn bin2hex(len: usize, binnum: *const u8, hexnum: *mut c_char) {
+fn bin2hex(binnum: &[u8], hexnum: &mut [u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    for i in 0..len {
-        let val = *binnum.add(i) as usize;
-        *hexnum.add(i * 2) = HEX[val >> 4] as c_char;
-        *hexnum.add(i * 2 + 1) = HEX[val & 0xf] as c_char;
+    for (i, &val) in binnum.iter().enumerate() {
+        hexnum[i * 2] = HEX[(val >> 4) as usize];
+        hexnum[i * 2 + 1] = HEX[(val & 0xf) as usize];
     }
-    *hexnum.add(len * 2) = 0;
+    hexnum[binnum.len() * 2] = 0;
+}
+
+fn xcrypt_with(secret: &mut [u8], key: &[u8; 8], buf: &mut [u8], mode: c_uint) -> c_int {
+    hex2bin(secret, buf);
+    let mut ivec = [0u8; 8];
+    let err = cbc(key, buf, mode | DES_HW, &mut ivec);
+    if des_failed(err) {
+        return 0;
+    }
+    bin2hex(buf, secret);
+    1
 }
 
 unsafe fn xcrypt(secret: *mut c_char, passwd: *mut c_char, mode: c_uint) -> c_int {
-    let len = strlen(secret) / 2;
-    let buf = mem_alloc(len) as *mut c_char;
-    hex2bin(len, secret, buf);
-    let mut key = [0 as c_char; 8];
-    passwd2des_internal(passwd, key.as_mut_ptr());
-    let mut ivec = [0 as c_char; 8];
-    let err = cbc_crypt(key.as_mut_ptr(), buf, len as c_uint, mode | DES_HW, ivec.as_mut_ptr());
-    if des_failed(err) {
-        mem_free(buf.cast());
-        return 0;
-    }
-    bin2hex(len, buf as *const u8, secret);
-    mem_free(buf.cast());
-    1
+    let slen = unsafe { strlen(secret) };
+    let len = slen / 2;
+    let buf = alloc(len) as *mut u8;
+    let key = passwd_key(unsafe { cstr_bytes(passwd) });
+    let s = unsafe { bytes_mut(secret.cast(), slen + 1) };
+    let b = unsafe { bytes_mut(buf, len) };
+    let r = xcrypt_with(s, &key, b, mode);
+    unsafe { mem_free(buf.cast()) };
+    r
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn xencrypt(secret: *mut c_char, passwd: *mut c_char) -> c_int {
-    xcrypt(secret, passwd, DES_ENCRYPT)
+    unsafe { xcrypt(secret, passwd, DES_ENCRYPT) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn xdecrypt(secret: *mut c_char, passwd: *mut c_char) -> c_int {
-    xcrypt(secret, passwd, DES_DECRYPT)
+    unsafe { xcrypt(secret, passwd, DES_DECRYPT) }
 }

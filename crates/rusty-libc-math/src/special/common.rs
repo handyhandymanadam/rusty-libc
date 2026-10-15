@@ -143,17 +143,15 @@ pub(crate) fn have_fma() -> bool {
 #[inline(never)]
 fn detect_fma(state: &AtomicU8) -> bool {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
-    let ok = unsafe {
-        let max = __cpuid(0).eax;
-        if max < 1 {
-            false
-        } else {
-            let c = __cpuid_count(1, 0).ecx;
-            let fma = c & (1 << 12) != 0;
-            let osxsave = c & (1 << 27) != 0;
-            let avx = c & (1 << 28) != 0;
-            fma && osxsave && avx && xcr0_has_ymm() && !crate::rounding::fp::force_nofma()
-        }
+    let max = __cpuid(0).eax;
+    let ok = if max < 1 {
+        false
+    } else {
+        let c = __cpuid_count(1, 0).ecx;
+        let fma = c & (1 << 12) != 0;
+        let osxsave = c & (1 << 27) != 0;
+        let avx = c & (1 << 28) != 0;
+        fma && osxsave && avx && unsafe { xcr0_has_ymm() } && !crate::rounding::fp::force_nofma()
     };
     state.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
     ok

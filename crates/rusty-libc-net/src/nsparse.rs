@@ -1,10 +1,10 @@
-use crate::inet::{format_ipv4, format_ipv6};
-use crate::resolv::{skip_name, uncompress_name};
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
+use crate::inet::format_ipv6;
+use crate::resolv::{msg_slice, skip_name, uncompress_name};
 use crate::types::{EINVAL, EMSGSIZE, ENODEV, ENOSPC};
 use crate::util::Buf;
 use core::ffi::{CStr, c_char, c_int, c_uchar, c_ulong};
-use core::marker::PhantomData;
-use rusty_libc_core::errno;
+use rusty_libc_core::{errno, ffi};
 
 pub const NS_INT16SZ: usize = 2;
 pub const NS_INT32SZ: usize = 4;
@@ -129,6 +129,14 @@ pub struct res_sym {
 }
 unsafe impl Sync for res_sym {}
 
+fn sym_name(s: &res_sym) -> &'static [u8] {
+    sym_text(s.name)
+}
+
+pub(crate) fn sym_text(p: *const c_char) -> &'static [u8] {
+    unsafe { CStr::from_ptr(p) }.to_bytes()
+}
+
 const fn sym(number: c_int, name: &'static CStr, human: Option<&'static CStr>) -> res_sym {
     res_sym { number, name: name.as_ptr(), humanname: match human { Some(h) => h.as_ptr(), None => core::ptr::null() } }
 }
@@ -202,8 +210,7 @@ fn sym_or_number(syms: &[res_sym], number: c_int, prefix: &[u8]) -> Buf<24> {
             break;
         }
         if s.number == number {
-            let name = unsafe { CStr::from_ptr(s.name) };
-            b.push_all(name.to_bytes());
+            b.push_all(sym_name(s));
             return b;
         }
     }
@@ -258,208 +265,230 @@ fn put_num<const N: usize>(b: &mut Buf<N>, v: i64, mindigits: usize) {
     put_unum(b, v.unsigned_abs(), mindigits);
 }
 
-unsafe fn rd16(p: *const u8) -> u16 {
-    unsafe { ((*p as u16) << 8) | *p.add(1) as u16 }
+#[inline(always)]
+fn rd16(m: &[u8], i: usize) -> u16 {
+    u16::from_be_bytes(*m[i..].first_chunk().unwrap_or_else(|| oob()))
 }
 
-unsafe fn rd32(p: *const u8) -> u32 {
-    unsafe { ((*p as u32) << 24) | ((*p.add(1) as u32) << 16) | ((*p.add(2) as u32) << 8) | *p.add(3) as u32 }
+#[inline(always)]
+fn rd32(m: &[u8], i: usize) -> u32 {
+    u32::from_be_bytes(*m[i..].first_chunk().unwrap_or_else(|| oob()))
+}
+
+#[cold]
+#[inline(never)]
+fn oob() -> ! {
+    panic!("read past the message")
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_get16(src: *const c_uchar) -> u32 {
-    unsafe { rd16(src) as u32 }
+    rd16(unsafe { ffi::bytes(src, 2) }, 0) as u32
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_get32(src: *const c_uchar) -> c_ulong {
-    unsafe { rd32(src) as c_ulong }
+    rd32(unsafe { ffi::bytes(src, 4) }, 0) as c_ulong
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_put16(src: u32, dst: *mut c_uchar) {
-    unsafe {
-        *dst = (src >> 8) as u8;
-        *dst.add(1) = src as u8;
-    }
+    unsafe { ffi::bytes_mut(dst, 2) }.copy_from_slice(&(src as u16).to_be_bytes());
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_put32(src: c_ulong, dst: *mut c_uchar) {
-    unsafe {
-        let l = src as u32;
-        *dst = (l >> 24) as u8;
-        *dst.add(1) = (l >> 16) as u8;
-        *dst.add(2) = (l >> 8) as u8;
-        *dst.add(3) = l as u8;
+    unsafe { ffi::bytes_mut(dst, 4) }.copy_from_slice(&(src as u32).to_be_bytes());
+}
+
+#[inline]
+fn setsection(h: &mut ns_msg, sect: c_int) {
+    h._sect = sect;
+    if sect == ns_s_max {
+        h._rrnum = -1;
+        h._msg_ptr = core::ptr::null();
+    } else {
+        h._rrnum = 0;
+        h._msg_ptr = h._sections[sect as usize];
     }
 }
 
-fn gt(p: *const u8, q: *const u8) -> bool {
-    p as usize > q as usize
+#[inline(always)]
+fn skiprr(m: &[u8], section: c_int, count: c_int) -> R<usize> {
+    let eom = m.len();
+    let mut ptr = 0usize;
+    let mut count = count;
+    while count > 0 {
+        let Some(b) = skip_name(m.get(ptr..).unwrap_or(&[])) else { return Err(EMSGSIZE) };
+        ptr += b + NS_INT16SZ + NS_INT16SZ;
+        if section != ns_s_qd {
+            if ptr + NS_INT32SZ + NS_INT16SZ > eom {
+                return Err(EMSGSIZE);
+            }
+            ptr += NS_INT32SZ;
+            let rdlength = rd16(m, ptr) as usize;
+            ptr += NS_INT16SZ + rdlength;
+        }
+        count -= 1;
+    }
+    if ptr > eom {
+        return Err(EMSGSIZE);
+    }
+    Ok(ptr)
 }
 
-unsafe fn setsection(h: *mut ns_msg, sect: c_int) {
-    unsafe {
-        (*h)._sect = sect;
-        if sect == ns_s_max {
-            (*h)._rrnum = -1;
-            (*h)._msg_ptr = core::ptr::null();
+#[inline]
+fn initparse(h: &mut ns_msg, msg: *const u8, eom: *const u8, m: &[u8]) -> R<()> {
+    h._msg = msg;
+    h._eom = eom;
+    let len = m.len();
+    let mut pos = 0usize;
+    if pos + NS_INT16SZ > len {
+        return Err(EMSGSIZE);
+    }
+    h._id = rd16(m, pos);
+    pos += NS_INT16SZ;
+    if pos + NS_INT16SZ > len {
+        return Err(EMSGSIZE);
+    }
+    h._flags = rd16(m, pos);
+    pos += NS_INT16SZ;
+    for i in 0..4 {
+        if pos + NS_INT16SZ > len {
+            return Err(EMSGSIZE);
+        }
+        h._counts[i] = rd16(m, pos);
+        pos += NS_INT16SZ;
+    }
+    for i in 0..4usize {
+        if h._counts[i] == 0 {
+            h._sections[i] = core::ptr::null();
         } else {
-            (*h)._rrnum = 0;
-            (*h)._msg_ptr = (*h)._sections[sect as usize];
+            let b = skiprr(&m[pos..], i as c_int, h._counts[i] as c_int)?;
+            h._sections[i] = msg.wrapping_add(pos);
+            pos += b;
         }
     }
+    if pos != len {
+        return Err(EMSGSIZE);
+    }
+    setsection(h, ns_s_max);
+    Ok(())
 }
 
-unsafe fn skiprr(ptr: *const u8, eom: *const u8, section: c_int, count: c_int) -> R<usize> {
-    unsafe {
-        let optr = ptr;
-        let mut ptr = ptr;
-        let mut count = count;
-        while count > 0 {
-            let Some(b) = skip_name(ptr, eom) else { return Err(EMSGSIZE) };
-            ptr = ptr.wrapping_add(b + NS_INT16SZ + NS_INT16SZ);
-            if section != ns_s_qd {
-                if gt(ptr.wrapping_add(NS_INT32SZ + NS_INT16SZ), eom) {
-                    return Err(EMSGSIZE);
-                }
-                ptr = ptr.wrapping_add(NS_INT32SZ);
-                let rdlength = rd16(ptr) as usize;
-                ptr = ptr.wrapping_add(NS_INT16SZ);
-                ptr = ptr.wrapping_add(rdlength);
-            }
-            count -= 1;
-        }
-        if gt(ptr, eom) {
-            return Err(EMSGSIZE);
-        }
-        Ok(ptr as usize - optr as usize)
+#[inline]
+fn expand(m: &[u8], off: Option<usize>, dst: &mut [u8]) -> Option<usize> {
+    let n = uncompress_name(m, off?, dst)?;
+    if dst[0] == b'.' {
+        dst[0] = 0;
     }
+    Some(n)
 }
 
-unsafe fn initparse(msg: *const u8, msglen: c_int, h: *mut ns_msg) -> R<()> {
-    unsafe {
-        let eom = msg.wrapping_offset(msglen as isize);
-        core::ptr::write_bytes(h as *mut u8, 0x5e, core::mem::size_of::<ns_msg>());
-        (*h)._msg = msg;
-        (*h)._eom = eom;
-        let mut m = msg;
-        if gt(m.wrapping_add(NS_INT16SZ), eom) {
-            return Err(EMSGSIZE);
-        }
-        (*h)._id = rd16(m);
-        m = m.add(NS_INT16SZ);
-        if gt(m.wrapping_add(NS_INT16SZ), eom) {
-            return Err(EMSGSIZE);
-        }
-        (*h)._flags = rd16(m);
-        m = m.add(NS_INT16SZ);
-        for i in 0..4 {
-            if gt(m.wrapping_add(NS_INT16SZ), eom) {
-                return Err(EMSGSIZE);
-            }
-            (*h)._counts[i] = rd16(m);
-            m = m.add(NS_INT16SZ);
-        }
-        for i in 0..4usize {
-            if (*h)._counts[i] == 0 {
-                (*h)._sections[i] = core::ptr::null();
-            } else {
-                let b = skiprr(m, eom, i as c_int, (*h)._counts[i] as c_int)?;
-                (*h)._sections[i] = m;
-                m = m.add(b);
-            }
-        }
-        if m != eom {
-            return Err(EMSGSIZE);
-        }
-        setsection(h, ns_s_max);
-        Ok(())
-    }
+fn name_bytes(n: &[c_char; NS_MAXDNAME]) -> &[u8; NS_MAXDNAME] {
+    unsafe { &*(n as *const [c_char; NS_MAXDNAME]).cast::<[u8; NS_MAXDNAME]>() }
 }
 
-unsafe fn expand(msg: *const u8, eom: *const u8, src: *const u8, dst: *mut u8, dstsiz: usize) -> Option<usize> {
-    unsafe {
-        let n = uncompress_name(msg, eom, src, dst, dstsiz)?;
-        if *dst == b'.' {
-            *dst = 0;
-        }
-        Some(n)
-    }
+fn name_bytes_mut(n: &mut [c_char; NS_MAXDNAME]) -> &mut [u8; NS_MAXDNAME] {
+    unsafe { &mut *(n as *mut [c_char; NS_MAXDNAME]).cast::<[u8; NS_MAXDNAME]>() }
 }
 
-unsafe fn parserr(h: *mut ns_msg, section: c_int, rrnum: c_int, rr: *mut ns_rr) -> R<()> {
-    unsafe {
-        if !(0..ns_s_max).contains(&section) {
-            return Err(ENODEV);
-        }
-        if section != (*h)._sect {
-            setsection(h, section);
-        }
-        let mut rrnum = rrnum;
-        if rrnum == -1 {
-            rrnum = (*h)._rrnum;
-        }
-        if rrnum < 0 || rrnum >= (*h)._counts[section as usize] as c_int {
-            return Err(ENODEV);
-        }
-        if rrnum < (*h)._rrnum {
-            setsection(h, section);
-        }
-        if rrnum > (*h)._rrnum {
-            let b = skiprr((*h)._msg_ptr, (*h)._eom, section, rrnum - (*h)._rrnum)?;
-            (*h)._msg_ptr = (*h)._msg_ptr.add(b);
-            (*h)._rrnum = rrnum;
-        }
-        let Some(b) = expand((*h)._msg, (*h)._eom, (*h)._msg_ptr, (*rr).name.as_mut_ptr() as *mut u8, NS_MAXDNAME) else { return Err(EMSGSIZE) };
-        (*h)._msg_ptr = (*h)._msg_ptr.add(b);
-        if gt((*h)._msg_ptr.wrapping_add(NS_INT16SZ + NS_INT16SZ), (*h)._eom) {
+pub(crate) fn name_text(n: &[c_char; NS_MAXDNAME]) -> &[u8] {
+    let b = name_bytes(n);
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    &b[..end]
+}
+
+fn parserr(h: &mut ns_msg, m: &[u8], section: c_int, rrnum: c_int, rr: &mut ns_rr) -> R<()> {
+    if !(0..ns_s_max).contains(&section) {
+        return Err(ENODEV);
+    }
+    if section != h._sect {
+        setsection(h, section);
+    }
+    let mut rrnum = rrnum;
+    if rrnum == -1 {
+        rrnum = h._rrnum;
+    }
+    if rrnum < 0 || rrnum >= h._counts[section as usize] as c_int {
+        return Err(ENODEV);
+    }
+    if rrnum < h._rrnum {
+        setsection(h, section);
+    }
+    let base = h._msg;
+    let at = |p: usize| base.wrapping_add(p);
+    let mut p = (h._msg_ptr as usize).wrapping_sub(base as usize);
+    if rrnum > h._rrnum {
+        let b = skiprr(m.get(p..).unwrap_or(&[]), section, rrnum - h._rrnum)?;
+        p += b;
+        h._msg_ptr = at(p);
+        h._rrnum = rrnum;
+    }
+    let Some(b) = expand(m, Some(p), name_bytes_mut(&mut rr.name)) else { return Err(EMSGSIZE) };
+    p += b;
+    h._msg_ptr = at(p);
+    if p + NS_INT16SZ + NS_INT16SZ > m.len() {
+        return Err(EMSGSIZE);
+    }
+    rr.type_ = rd16(m, p);
+    p += NS_INT16SZ;
+    rr.rr_class = rd16(m, p);
+    p += NS_INT16SZ;
+    h._msg_ptr = at(p);
+    if section == ns_s_qd {
+        rr.ttl = 0;
+        rr.rdlength = 0;
+        rr.rdata = core::ptr::null();
+    } else {
+        if p + NS_INT32SZ + NS_INT16SZ > m.len() {
             return Err(EMSGSIZE);
         }
-        (*rr).type_ = rd16((*h)._msg_ptr);
-        (*h)._msg_ptr = (*h)._msg_ptr.add(NS_INT16SZ);
-        (*rr).rr_class = rd16((*h)._msg_ptr);
-        (*h)._msg_ptr = (*h)._msg_ptr.add(NS_INT16SZ);
-        if section == ns_s_qd {
-            (*rr).ttl = 0;
-            (*rr).rdlength = 0;
-            (*rr).rdata = core::ptr::null();
-        } else {
-            if gt((*h)._msg_ptr.wrapping_add(NS_INT32SZ + NS_INT16SZ), (*h)._eom) {
-                return Err(EMSGSIZE);
-            }
-            (*rr).ttl = rd32((*h)._msg_ptr);
-            (*h)._msg_ptr = (*h)._msg_ptr.add(NS_INT32SZ);
-            (*rr).rdlength = rd16((*h)._msg_ptr);
-            (*h)._msg_ptr = (*h)._msg_ptr.add(NS_INT16SZ);
-            if gt((*h)._msg_ptr.wrapping_add((*rr).rdlength as usize), (*h)._eom) {
-                return Err(EMSGSIZE);
-            }
-            (*rr).rdata = (*h)._msg_ptr;
-            (*h)._msg_ptr = (*h)._msg_ptr.add((*rr).rdlength as usize);
+        rr.ttl = rd32(m, p);
+        p += NS_INT32SZ;
+        rr.rdlength = rd16(m, p);
+        p += NS_INT16SZ;
+        h._msg_ptr = at(p);
+        if p + rr.rdlength as usize > m.len() {
+            return Err(EMSGSIZE);
         }
-        (*h)._rrnum += 1;
-        if (*h)._rrnum > (*h)._counts[section as usize] as c_int {
-            setsection(h, section + 1);
-        }
-        Ok(())
+        rr.rdata = at(p);
+        p += rr.rdlength as usize;
+        h._msg_ptr = at(p);
     }
+    h._rrnum += 1;
+    if h._rrnum > h._counts[section as usize] as c_int {
+        setsection(h, section + 1);
+    }
+    Ok(())
+}
+
+unsafe fn handle_msg<'a>(h: &ns_msg) -> &'a [u8] {
+    unsafe { msg_slice(h._msg, h._eom) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_skiprr(ptr: *const c_uchar, eom: *const c_uchar, section: ns_sect, count: c_int) -> c_int {
-    unsafe { cret(skiprr(ptr, eom, section, count)) }
+    if (eom as usize) < (ptr as usize) {
+        return cret(Err(EMSGSIZE));
+    }
+    cret(skiprr(unsafe { msg_slice(ptr, eom) }, section, count))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_initparse(msg: *const c_uchar, msglen: c_int, handle: *mut ns_msg) -> c_int {
-    unsafe { cret(initparse(msg, msglen, handle).map(|_| 0)) }
+    unsafe { core::ptr::write_bytes(handle.cast::<u8>(), 0x5e, core::mem::size_of::<ns_msg>()) };
+    let h = unsafe { &mut *handle };
+    let m = unsafe { ffi::bytes(msg, msglen.max(0) as usize) };
+    cret(initparse(h, msg, msg.wrapping_offset(msglen as isize), m).map(|_| 0))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_parserr(handle: *mut ns_msg, section: ns_sect, rrnum: c_int, rr: *mut ns_rr) -> c_int {
-    unsafe { cret(parserr(handle, section, rrnum, rr).map(|_| 0)) }
+    let h = unsafe { &mut *handle };
+    let rr = unsafe { &mut *rr };
+    let m = unsafe { handle_msg(h) };
+    cret(parserr(h, m, section, rrnum, rr).map(|_| 0))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -470,89 +499,87 @@ pub extern "C" fn ns_msg_getflag(handle: ns_msg, flag: c_int) -> c_int {
     }
 }
 
-unsafe fn fmt1(t: i32, unit: u8, dst: &mut *mut u8, dstlen: &mut usize) -> bool {
-    unsafe {
-        let mut tmp = Buf::<50>::new();
-        put_num(&mut tmp, t as i64, 1);
-        tmp.push(unit);
-        let len = tmp.len;
-        if len + 1 > *dstlen {
-            return false;
+#[inline]
+fn fmt1(t: i32, unit: u8, dst: &mut [u8], pos: &mut usize) -> bool {
+    let mut tmp = [0u8; 16];
+    let mut i = 15;
+    tmp[15] = unit;
+    let mut v = (t as i64).unsigned_abs();
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
         }
-        core::ptr::copy_nonoverlapping(tmp.b.as_ptr(), *dst, len);
-        *(*dst).add(len) = 0;
-        *dst = (*dst).add(len);
-        *dstlen -= len;
-        true
     }
+    if t < 0 {
+        i -= 1;
+        tmp[i] = b'-';
+    }
+    let text = &tmp[i..];
+    let len = text.len();
+    if len + 1 > dst.len() - *pos {
+        return false;
+    }
+    dst[*pos..*pos + len].copy_from_slice(text);
+    dst[*pos + len] = 0;
+    *pos += len;
+    true
 }
 
-unsafe fn format_ttl_raw(src: u64, dst: *mut u8, dstlen: usize) -> R<usize> {
-    unsafe {
-        let odst = dst;
-        let mut dst = dst;
-        let mut dstlen = dstlen;
-        let mut s = src;
-        let secs = (s % 60) as i32;
-        s /= 60;
-        let mins = (s % 60) as i32;
-        s /= 60;
-        let hours = (s % 24) as i32;
-        s /= 24;
-        let days = (s % 7) as i32;
-        s /= 7;
-        let weeks = s as i32;
-        let mut x = 0;
-        if weeks != 0 {
-            if !fmt1(weeks, b'W', &mut dst, &mut dstlen) {
-                return Err(0);
-            }
-            x += 1;
+pub fn format_ttl(src: u64, out: &mut [u8]) -> Result<usize, c_int> {
+    let mut pos = 0usize;
+    let mut s = src;
+    let secs = (s % 60) as i32;
+    s /= 60;
+    let mins = (s % 60) as i32;
+    s /= 60;
+    let hours = (s % 24) as i32;
+    s /= 24;
+    let days = (s % 7) as i32;
+    s /= 7;
+    let weeks = s as i32;
+    let mut x = 0;
+    if weeks != 0 {
+        if !fmt1(weeks, b'W', out, &mut pos) {
+            return Err(0);
         }
-        if days != 0 {
-            if !fmt1(days, b'D', &mut dst, &mut dstlen) {
-                return Err(0);
-            }
-            x += 1;
-        }
-        if hours != 0 {
-            if !fmt1(hours, b'H', &mut dst, &mut dstlen) {
-                return Err(0);
-            }
-            x += 1;
-        }
-        if mins != 0 {
-            if !fmt1(mins, b'M', &mut dst, &mut dstlen) {
-                return Err(0);
-            }
-            x += 1;
-        }
-        if secs != 0 || !(weeks != 0 || days != 0 || hours != 0 || mins != 0) {
-            if !fmt1(secs, b'S', &mut dst, &mut dstlen) {
-                return Err(0);
-            }
-            x += 1;
-        }
-        if x > 1 {
-            let mut p = odst;
-            while p < dst {
-                if (*p).is_ascii_uppercase() {
-                    *p = (*p).to_ascii_lowercase();
-                }
-                p = p.add(1);
-            }
-        }
-        Ok(dst as usize - odst as usize)
+        x += 1;
     }
-}
-
-pub fn format_ttl(secs: u64, out: &mut [u8]) -> Result<usize, c_int> {
-    unsafe { format_ttl_raw(secs, out.as_mut_ptr(), out.len()) }
+    if days != 0 {
+        if !fmt1(days, b'D', out, &mut pos) {
+            return Err(0);
+        }
+        x += 1;
+    }
+    if hours != 0 {
+        if !fmt1(hours, b'H', out, &mut pos) {
+            return Err(0);
+        }
+        x += 1;
+    }
+    if mins != 0 {
+        if !fmt1(mins, b'M', out, &mut pos) {
+            return Err(0);
+        }
+        x += 1;
+    }
+    if secs != 0 || !(weeks != 0 || days != 0 || hours != 0 || mins != 0) {
+        if !fmt1(secs, b'S', out, &mut pos) {
+            return Err(0);
+        }
+        x += 1;
+    }
+    if x > 1 {
+        out[..pos].make_ascii_lowercase();
+    }
+    Ok(pos)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_format_ttl(src: c_ulong, dst: *mut c_char, dstlen: usize) -> c_int {
-    unsafe { cret(format_ttl_raw(src, dst as *mut u8, dstlen)) }
+    cret(format_ttl(src, unsafe { ffi::bytes_mut(dst.cast::<u8>(), dstlen) }))
 }
 
 pub fn parse_ttl(src: &[u8]) -> Result<u64, c_int> {
@@ -598,16 +625,14 @@ pub fn parse_ttl(src: &[u8]) -> Result<u64, c_int> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_parse_ttl(src: *const c_char, dst: *mut c_ulong) -> c_int {
-    unsafe {
-        match parse_ttl(crate::util::cbytes(src)) {
-            Ok(v) => {
-                *dst = v as c_ulong;
-                0
-            }
-            Err(e) => {
-                errno::set(e);
-                -1
-            }
+    match parse_ttl(unsafe { ffi::cstr_bytes(src) }) {
+        Ok(v) => {
+            unsafe { *dst = v as c_ulong };
+            0
+        }
+        Err(e) => {
+            errno::set(e);
+            -1
         }
     }
 }
@@ -666,18 +691,12 @@ pub fn datetosecs(cp: &[u8]) -> Result<u32, ()> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_datetosecs(cp: *const c_char, errp: *mut c_int) -> u32 {
-    unsafe {
-        match datetosecs(crate::util::cbytes(cp)) {
-            Ok(v) => {
-                *errp = 0;
-                v
-            }
-            Err(()) => {
-                *errp = 1;
-                0
-            }
-        }
-    }
+    let (v, e) = match datetosecs(unsafe { ffi::cstr_bytes(cp) }) {
+        Ok(v) => (v, 0),
+        Err(()) => (0, 1),
+    };
+    unsafe { *errp = e };
+    v
 }
 
 fn ntol_core(get: impl Fn(usize) -> Option<u8>, dst: &mut [u8]) -> R<usize> {
@@ -721,19 +740,25 @@ pub fn name_ntol(src: &[u8], dst: &mut [u8]) -> Result<usize, c_int> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_name_ntol(src: *const c_uchar, dst: *mut c_uchar, dstsiz: usize) -> c_int {
-    unsafe { cret(ntol_core(|i| Some(*src.add(i)), core::slice::from_raw_parts_mut(dst, dstsiz))) }
+    let d = unsafe { ffi::bytes_mut(dst, dstsiz) };
+    cret(ntol_core(|i| Some(unsafe { *src.wrapping_add(i) }), d))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_name_rollback(src: *const c_uchar, dnptrs: *mut *const c_uchar, lastdnptr: *mut *const c_uchar) {
-    unsafe {
-        let mut p = dnptrs;
-        while p < lastdnptr && !(*p).is_null() {
-            if *p >= src {
-                *p = core::ptr::null();
-                break;
-            }
-            p = p.add(1);
+    let n = if lastdnptr > dnptrs { (lastdnptr as usize - dnptrs as usize) / core::mem::size_of::<*const c_uchar>() } else { 0 };
+    let table = unsafe { ffi::slice_mut(dnptrs, n) };
+    name_rollback(src, table);
+}
+
+pub fn name_rollback(src: *const c_uchar, table: &mut [*const c_uchar]) {
+    for p in table.iter_mut() {
+        if p.is_null() {
+            break;
+        }
+        if *p >= src {
+            *p = core::ptr::null();
+            break;
         }
     }
 }
@@ -833,40 +858,40 @@ pub fn subdomain(a: &[u8], b: &[u8]) -> bool {
     samename_c(a, b) != 1 && samedomain(a, b)
 }
 
+unsafe fn two_names<'a>(a: *const c_char, b: *const c_char) -> (&'a [u8], &'a [u8]) {
+    let a = unsafe { ffi::cstr_bytes(a) };
+    (a, unsafe { ffi::cstr_bytes(b) })
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_samedomain(a: *const c_char, b: *const c_char) -> c_int {
-    unsafe { samedomain(crate::util::cbytes(a), crate::util::cbytes(b)) as c_int }
+    let (a, b) = unsafe { two_names(a, b) };
+    samedomain(a, b) as c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_subdomain(a: *const c_char, b: *const c_char) -> c_int {
-    unsafe { subdomain(crate::util::cbytes(a), crate::util::cbytes(b)) as c_int }
+    let (a, b) = unsafe { two_names(a, b) };
+    subdomain(a, b) as c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_makecanon(src: *const c_char, dst: *mut c_char, dstsize: usize) -> c_int {
-    unsafe {
-        match makecanon(crate::util::cbytes(src), core::slice::from_raw_parts_mut(dst as *mut u8, dstsize)) {
-            Ok(_) => 0,
-            Err(e) => {
-                errno::set(e);
-                -1
-            }
+    let src = unsafe { ffi::cstr_bytes(src) };
+    let dst = unsafe { ffi::bytes_mut(dst.cast::<u8>(), dstsize) };
+    match makecanon(src, dst) {
+        Ok(_) => 0,
+        Err(e) => {
+            errno::set(e);
+            -1
         }
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_samename(a: *const c_char, b: *const c_char) -> c_int {
-    unsafe {
-        match samename(crate::util::cbytes(a), crate::util::cbytes(b)) {
-            Ok(v) => v as c_int,
-            Err(e) => {
-                errno::set(e);
-                -1
-            }
-        }
-    }
+    let (a, b) = unsafe { two_names(a, b) };
+    samename_errno(a, b)
 }
 
 const POWEROFTEN: [u32; 10] = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000];
@@ -956,66 +981,69 @@ static LOC_TMPBUF: crate::util::Spin<[u8; 128]> = crate::util::Spin::new([0; 128
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __loc_ntoa(binary: *const c_uchar, ascii: *mut c_char) -> *const c_char {
-    unsafe {
-        let mut rd = [0u8; 16];
-        let n = if *binary != 0 { 1 } else { 16 };
-        core::ptr::copy_nonoverlapping(binary, rd.as_mut_ptr(), n);
-        let t = loc_ntoa(&rd);
-        let mut guard = LOC_TMPBUF.lock();
-        let out: *mut u8 = if ascii.is_null() { guard.as_mut_ptr() } else { ascii as *mut u8 };
-        core::ptr::copy_nonoverlapping(t.b.as_ptr(), out, t.len);
-        *out.add(t.len) = 0;
-        out as *const c_char
-    }
+    let mut rd = [0u8; 16];
+    let n = if unsafe { *binary } != 0 { 1 } else { 16 };
+    rd[..n].copy_from_slice(unsafe { ffi::bytes(binary, n) });
+    let t = loc_ntoa(&rd);
+    let mut guard = LOC_TMPBUF.lock();
+    let out: &mut [u8] = if ascii.is_null() {
+        &mut guard[..]
+    } else {
+        unsafe { ffi::bytes_mut(ascii.cast::<u8>(), t.len + 1) }
+    };
+    out[..t.len].copy_from_slice(t.as_bytes());
+    out[t.len] = 0;
+    out.as_ptr().cast::<c_char>()
 }
 
-struct W {
-    p: *mut u8,
-    left: usize,
+struct W<'b> {
+    out: &'b mut [u8],
+    pos: usize,
 }
 
-impl W {
-    unsafe fn addlen(&mut self, n: usize) {
-        assert!(n <= self.left);
-        self.p = unsafe { self.p.add(n) };
-        self.left -= n;
+impl W<'_> {
+    fn left(&self) -> usize {
+        self.out.len() - self.pos
     }
 
-    unsafe fn addstr(&mut self, s: &[u8]) -> R<()> {
-        unsafe {
-            if s.len() >= self.left {
-                return Err(ENOSPC);
-            }
-            core::ptr::copy_nonoverlapping(s.as_ptr(), self.p, s.len());
-            self.addlen(s.len());
-            *self.p = 0;
-            Ok(())
+    #[inline]
+    fn addlen(&mut self, n: usize) {
+        debug_assert!(n <= self.left());
+        self.pos += n;
+    }
+
+    #[inline]
+    fn addstr(&mut self, s: &[u8]) -> R<()> {
+        if s.len() >= self.left() {
+            return Err(ENOSPC);
         }
+        self.out[self.pos..self.pos + s.len()].copy_from_slice(s);
+        self.addlen(s.len());
+        self.out[self.pos] = 0;
+        Ok(())
     }
 
-    unsafe fn addtab(&mut self, len: usize, target: usize, spaced: bool) -> R<bool> {
-        unsafe {
-            let (sp, sl) = (self.p, self.left);
-            if spaced || len >= target - 1 {
-                self.addstr(b"  ")?;
-                Ok(true)
-            } else {
-                let mut t = ((target - len - 1) / 8) as isize;
-                while t >= 0 {
-                    if let Err(e) = self.addstr(b"\t") {
-                        self.p = sp;
-                        self.left = sl;
-                        return Err(e);
-                    }
-                    t -= 1;
+    fn addtab(&mut self, len: usize, target: usize, spaced: bool) -> R<bool> {
+        let sp = self.pos;
+        if spaced || len >= target - 1 {
+            self.addstr(b"  ")?;
+            Ok(true)
+        } else {
+            let mut t = ((target - len - 1) / 8) as isize;
+            while t >= 0 {
+                if let Err(e) = self.addstr(b"\t") {
+                    self.pos = sp;
+                    return Err(e);
                 }
-                Ok(false)
+                t -= 1;
             }
+            Ok(false)
         }
     }
 }
 
 fn prune_origin(name: &[u8], origin: Option<&[u8]>) -> usize {
+    let Some(_) = origin else { return name.iter().position(|&c| c == 0).unwrap_or(name.len()) };
     let at = |j: usize| name.get(j).copied().unwrap_or(0);
     let mut i = 0usize;
     while at(i) != 0 {
@@ -1047,13 +1075,25 @@ fn needs_dot(name: &[u8], len: usize, origin: Option<&[u8]>) -> bool {
     (no_origin || (o(0) != b'.' && o(1) != 0 && at(len) == 0)) && at(len - 1) != b'.'
 }
 
+fn nsap_text(b: &[u8], binlen: c_int, out: &mut Buf<{ 2 + 255 * 3 }>) {
+    let binlen = binlen.min(255);
+    let hexd = |n: u8| n + if n < 10 { b'0' } else { b'7' };
+    for (i, &c) in b.iter().take(binlen.max(0) as usize).enumerate() {
+        out.push(hexd(c >> 4));
+        out.push(hexd(c & 15));
+        if i % 2 == 0 && (i as c_int + 1) < binlen {
+            out.push(b'.');
+        }
+    }
+}
+
 struct Ctx<'a> {
-    w: W,
-    msg: *const u8,
-    msglen: usize,
+    w: W<'a>,
+    msg: &'a [u8],
     origin: Option<&'a [u8]>,
-    rdata: *const u8,
-    edata: *const u8,
+    rd: &'a [u8],
+    pos: usize,
+    rd_base: isize,
     spaced: bool,
 }
 
@@ -1064,495 +1104,534 @@ enum Fin {
 }
 
 impl Ctx<'_> {
-    unsafe fn charstr(&mut self) -> R<usize> {
-        unsafe {
-            let odata = self.rdata;
-            let mut rd = self.rdata;
-            let edata = self.edata;
-            let (sb, sl) = (self.w.p, self.w.left);
-            let r = (|| -> R<()> {
-                self.w.addstr(b"\"")?;
-                if (rd as usize) < edata as usize {
-                    let n = *rd as usize;
-                    if n < edata as usize - rd as usize {
-                        rd = rd.add(1);
-                        for _ in 0..n {
-                            let c = *rd;
-                            if matches!(c, b'\n' | b'"' | b'\\' | 0) {
-                                self.w.addstr(b"\\")?;
-                            }
-                            self.w.addstr(&[c])?;
-                            rd = rd.add(1);
+    fn remaining(&self) -> isize {
+        self.rd.len() as isize - self.pos as isize
+    }
+
+    fn charstr(&mut self) -> R<usize> {
+        let data = self.rd;
+        let odata = self.pos;
+        let mut rd = self.pos;
+        let edata = data.len();
+        let sb = self.w.pos;
+        let w = &mut self.w;
+        let r = (|| -> R<()> {
+            w.addstr(b"\"")?;
+            if rd < edata {
+                let n = data[rd] as usize;
+                if n < edata - rd {
+                    rd += 1;
+                    for &c in &data[rd..rd + n] {
+                        if matches!(c, b'\n' | b'"' | b'\\' | 0) {
+                            w.addstr(b"\\")?;
                         }
+                        w.addstr(&[c])?;
+                        rd += 1;
                     }
                 }
-                self.w.addstr(b"\"")
-            })();
-            match r {
-                Ok(()) => Ok(rd as usize - odata as usize),
-                Err(_) => {
-                    self.w.p = sb;
-                    self.w.left = sl;
-                    Err(ENOSPC)
-                }
+            }
+            w.addstr(b"\"")
+        })();
+        match r {
+            Ok(()) => Ok(rd - odata),
+            Err(_) => {
+                self.w.pos = sb;
+                Err(ENOSPC)
             }
         }
     }
 
-    unsafe fn addname(&mut self) -> R<usize> {
-        unsafe {
-            let w = &mut self.w;
-            let eom = self.msg.wrapping_add(self.msglen);
-            let Some(n) = expand(self.msg, eom, self.rdata, w.p, w.left.min(i32::MAX as usize)) else { return Err(ENOSPC) };
-            let slen = {
-                let mut l = 0;
-                while *w.p.add(l) != 0 {
-                    l += 1;
-                }
-                l
-            };
-            let name = core::slice::from_raw_parts(w.p, slen);
-            let mut newlen = prune_origin(name, self.origin);
-            let mut root = false;
-            if slen == 0 {
-                root = true;
-            } else if newlen == 0 {
-                if newlen + 2 > w.left {
-                    return Err(ENOSPC);
-                }
-                *w.p = b'@';
-                *w.p.add(1) = 0;
-                newlen = 1;
-            } else if needs_dot(name, newlen, self.origin) {
-                root = true;
-            }
-            if root {
-                if newlen + 2 > w.left {
-                    return Err(ENOSPC);
-                }
-                *w.p.add(newlen) = b'.';
-                newlen += 1;
-                *w.p.add(newlen) = 0;
-            }
-            self.rdata = self.rdata.add(n);
-            w.addlen(newlen);
-            *w.p = 0;
-            Ok(newlen)
-        }
-    }
-
-    unsafe fn add_ntop(&mut self, p: *const u8, v6: bool) -> R<()> {
-        unsafe {
-            let text = if v6 { format_ipv6(&*(p as *const [u8; 16])) } else { format_ipv4(&*(p as *const [u8; 4])) };
-            if text.len + 1 > (self.w.left as u32) as usize {
+    fn addname(&mut self) -> R<usize> {
+        let off = self.rd_base.wrapping_add(self.pos as isize);
+        let w = &mut self.w;
+        let left = w.left();
+        let cap = left.min(i32::MAX as usize);
+        let dst = &mut w.out[w.pos..w.pos + cap];
+        let Some(n) = expand(self.msg, if off < 0 { None } else { Some(off as usize) }, dst) else { return Err(ENOSPC) };
+        let slen = dst.iter().position(|&c| c == 0).unwrap_or(cap);
+        let name = &dst[..slen];
+        let mut newlen = prune_origin(name, self.origin);
+        let mut root = false;
+        if slen == 0 {
+            root = true;
+        } else if newlen == 0 {
+            if newlen + 2 > left {
                 return Err(ENOSPC);
             }
-            core::ptr::copy_nonoverlapping(text.b.as_ptr(), self.w.p, text.len);
-            *self.w.p.add(text.len) = 0;
-            self.w.addlen(text.len);
-            Ok(())
+            dst[0] = b'@';
+            dst[1] = 0;
+            newlen = 1;
+        } else if needs_dot(name, newlen, self.origin) {
+            root = true;
         }
+        if root {
+            if newlen + 2 > left {
+                return Err(ENOSPC);
+            }
+            dst[newlen] = b'.';
+            newlen += 1;
+            dst[newlen] = 0;
+        }
+        self.pos += n;
+        w.addlen(newlen);
+        w.out[w.pos] = 0;
+        Ok(newlen)
     }
 
-    unsafe fn add_sym(&mut self, syms: &[res_sym], number: c_int, prefix: &[u8]) -> R<()> {
-        unsafe {
-            for s in syms {
-                if s.name.is_null() {
-                    break;
+    fn add_ntop(&mut self, text: Buf<48>) -> R<()> {
+        self.add_text(text.as_bytes())
+    }
+
+    #[inline]
+    fn add_text(&mut self, text: &[u8]) -> R<()> {
+        if text.len() + 1 > (self.w.left() as u32) as usize {
+            return Err(ENOSPC);
+        }
+        let p = self.w.pos;
+        self.w.out[p..p + text.len()].copy_from_slice(text);
+        self.w.out[p + text.len()] = 0;
+        self.w.addlen(text.len());
+        Ok(())
+    }
+
+    fn add_ipv4(&mut self) -> R<()> {
+        let a: [u8; 4] = self.rd[self.pos..self.pos + 4].try_into().unwrap();
+        let mut t = [0u8; 16];
+        let n = crate::inet::ipv4_text(&a, &mut t);
+        self.add_text(&t[..n])
+    }
+
+    fn add_sym(&mut self, syms: &[res_sym], number: c_int, prefix: &[u8]) -> R<()> {
+        for s in syms {
+            if s.name.is_null() {
+                break;
+            }
+            if s.number == number {
+                self.w.addstr(b" ")?;
+                return self.w.addstr(sym_name(s));
+            }
+        }
+        let mut b = Buf::<24>::new();
+        b.push(b' ');
+        b.push_all(prefix);
+        put_num(&mut b, number as i64, 1);
+        self.w.addstr(b.as_bytes())
+    }
+
+    fn u16_at(&mut self) -> u32 {
+        let v = rd16(self.rd, self.pos) as u32;
+        self.pos += 2;
+        v
+    }
+
+    fn u32_at(&mut self) -> u64 {
+        let v = rd32(self.rd, self.pos) as u64;
+        self.pos += 4;
+        v
+    }
+
+    fn byte(&self) -> u8 {
+        self.rd[self.pos]
+    }
+
+    fn word(&mut self) -> R<bool> {
+        let len = self.charstr()?;
+        if len == 0 {
+            return Ok(false);
+        }
+        self.pos += len;
+        Ok(true)
+    }
+
+    fn rdata_body(&mut self, ty: c_int, class: c_int, rdlen: usize) -> R<Fin> {
+        let mut tmp = Buf::<100>::new();
+        match ty {
+            T_A => {
+                if rdlen != 4 {
+                    return Ok(Fin::Formerr);
                 }
-                if s.number == number {
-                    self.w.addstr(b" ")?;
-                    return self.w.addstr(CStr::from_ptr(s.name).to_bytes());
+                self.add_ipv4()?;
+            }
+            T_CNAME | T_MB | T_MG | T_MR | T_NS | T_PTR | T_DNAME => {
+                self.addname()?;
+            }
+            T_HINFO | T_ISDN => {
+                if !self.word()? {
+                    return Ok(Fin::Formerr);
+                }
+                self.w.addstr(b" ")?;
+                if ty == T_ISDN && self.pos == self.rd.len() {
+                    return Ok(Fin::Done);
+                }
+                if !self.word()? {
+                    return Ok(Fin::Formerr);
                 }
             }
-            let mut b = Buf::<24>::new();
-            b.push(b' ');
-            b.push_all(prefix);
-            put_num(&mut b, number as i64, 1);
-            self.w.addstr(b.as_bytes())
-        }
-    }
-
-    unsafe fn u16_at(&mut self) -> u32 {
-        unsafe {
-            let v = rd16(self.rdata) as u32;
-            self.rdata = self.rdata.add(2);
-            v
-        }
-    }
-
-    fn remaining(&self) -> isize {
-        self.edata as isize - self.rdata as isize
-    }
-
-    unsafe fn word(&mut self) -> R<bool> {
-        unsafe {
-            let len = self.charstr()?;
-            if len == 0 {
-                return Ok(false);
-            }
-            self.rdata = self.rdata.add(len);
-            Ok(true)
-        }
-    }
-
-    unsafe fn rdata_body(&mut self, ty: c_int, class: c_int, rdlen: usize) -> R<Fin> {
-        unsafe {
-            let mut tmp = Buf::<100>::new();
-            match ty {
-                T_A => {
-                    if rdlen != 4 {
-                        return Ok(Fin::Formerr);
-                    }
-                    self.add_ntop(self.rdata, false)?;
+            T_SOA => {
+                self.addname()?;
+                self.w.addstr(b" ")?;
+                self.addname()?;
+                self.w.addstr(b" (\n")?;
+                self.spaced = false;
+                if self.remaining() != 5 * NS_INT32SZ as isize {
+                    return Ok(Fin::Formerr);
                 }
-                T_CNAME | T_MB | T_MG | T_MR | T_NS | T_PTR | T_DNAME => {
-                    self.addname()?;
-                }
-                T_HINFO | T_ISDN => {
-                    if !self.word()? {
-                        return Ok(Fin::Formerr);
-                    }
-                    self.w.addstr(b" ")?;
-                    if ty == T_ISDN && self.rdata == self.edata {
-                        return Ok(Fin::Done);
-                    }
-                    if !self.word()? {
-                        return Ok(Fin::Formerr);
-                    }
-                }
-                T_SOA => {
-                    self.addname()?;
-                    self.w.addstr(b" ")?;
-                    self.addname()?;
-                    self.w.addstr(b" (\n")?;
-                    self.spaced = false;
-                    if self.remaining() != 5 * NS_INT32SZ as isize {
-                        return Ok(Fin::Formerr);
-                    }
-                    let t = rd32(self.rdata) as u64;
-                    self.rdata = self.rdata.add(4);
+                let t = self.u32_at();
+                self.w.addstr(b"\t\t\t\t\t")?;
+                tmp.len = 0;
+                put_unum(&mut tmp, t, 1);
+                self.w.addstr(tmp.as_bytes())?;
+                self.spaced = self.w.addtab(tmp.len, 16, self.spaced)?;
+                self.w.addstr(b"; serial\n")?;
+                self.spaced = false;
+                for (i, label) in [&b"; refresh\n"[..], b"; retry\n", b"; expiry\n", b"; minimum\n"].iter().enumerate() {
+                    let t = self.u32_at();
                     self.w.addstr(b"\t\t\t\t\t")?;
-                    tmp.len = 0;
-                    put_unum(&mut tmp, t, 1);
-                    self.w.addstr(tmp.as_bytes())?;
-                    self.spaced = self.w.addtab(tmp.len, 16, self.spaced)?;
-                    self.w.addstr(b"; serial\n")?;
-                    self.spaced = false;
-                    for (i, label) in [&b"; refresh\n"[..], b"; retry\n", b"; expiry\n", b"; minimum\n"].iter().enumerate() {
-                        let t = rd32(self.rdata) as u64;
-                        self.rdata = self.rdata.add(4);
-                        self.w.addstr(b"\t\t\t\t\t")?;
-                        let len = format_ttl_raw(t, self.w.p, self.w.left)?;
-                        self.w.addlen(len);
-                        if i == 3 {
-                            self.w.addstr(b" )")?;
-                        }
-                        self.spaced = self.w.addtab(len, 16, self.spaced)?;
-                        self.w.addstr(label)?;
-                        if i < 3 {
-                            self.spaced = false;
-                        }
+                    let p = self.w.pos;
+                    let len = format_ttl(t, &mut self.w.out[p..])?;
+                    self.w.addlen(len);
+                    if i == 3 {
+                        self.w.addstr(b" )")?;
+                    }
+                    self.spaced = self.w.addtab(len, 16, self.spaced)?;
+                    self.w.addstr(label)?;
+                    if i < 3 {
+                        self.spaced = false;
                     }
                 }
-                T_MX | T_AFSDB | T_RT => {
-                    if rdlen < NS_INT16SZ {
-                        return Ok(Fin::Formerr);
-                    }
-                    let t = self.u16_at();
-                    tmp.len = 0;
-                    put_unum(&mut tmp, t as u64, 1);
-                    tmp.push(b' ');
-                    self.w.addstr(tmp.as_bytes())?;
-                    self.addname()?;
+            }
+            T_MX | T_AFSDB | T_RT => {
+                if rdlen < NS_INT16SZ {
+                    return Ok(Fin::Formerr);
                 }
-                T_PX => {
-                    if rdlen < NS_INT16SZ {
-                        return Ok(Fin::Formerr);
-                    }
-                    let t = self.u16_at();
-                    tmp.len = 0;
-                    put_unum(&mut tmp, t as u64, 1);
-                    tmp.push(b' ');
-                    self.w.addstr(tmp.as_bytes())?;
-                    self.addname()?;
-                    self.w.addstr(b" ")?;
-                    self.addname()?;
+                let t = self.u16_at();
+                tmp.len = 0;
+                put_unum(&mut tmp, t as u64, 1);
+                tmp.push(b' ');
+                self.w.addstr(tmp.as_bytes())?;
+                self.addname()?;
+            }
+            T_PX => {
+                if rdlen < NS_INT16SZ {
+                    return Ok(Fin::Formerr);
                 }
-                T_X25 => {
+                let t = self.u16_at();
+                tmp.len = 0;
+                put_unum(&mut tmp, t as u64, 1);
+                tmp.push(b' ');
+                self.w.addstr(tmp.as_bytes())?;
+                self.addname()?;
+                self.w.addstr(b" ")?;
+                self.addname()?;
+            }
+            T_X25 => {
+                if !self.word()? {
+                    return Ok(Fin::Formerr);
+                }
+            }
+            T_TXT => {
+                while self.pos < self.rd.len() {
                     if !self.word()? {
                         return Ok(Fin::Formerr);
                     }
-                }
-                T_TXT => {
-                    while (self.rdata as usize) < self.edata as usize {
-                        if !self.word()? {
-                            return Ok(Fin::Formerr);
-                        }
-                        if (self.rdata as usize) < self.edata as usize {
-                            self.w.addstr(b" ")?;
-                        }
-                    }
-                }
-                T_NSAP => {
-                    let mut t = [0 as c_char; 2 + 255 * 3];
-                    crate::inet::inet_nsap_ntoa(rdlen as c_int, self.rdata, t.as_mut_ptr());
-                    let s = CStr::from_ptr(t.as_ptr());
-                    self.w.addstr(s.to_bytes())?;
-                }
-                T_AAAA => {
-                    if rdlen != 16 {
-                        return Ok(Fin::Formerr);
-                    }
-                    self.add_ntop(self.rdata, true)?;
-                }
-                T_LOC => {
-                    if rdlen != 16 {
-                        return Ok(Fin::Formerr);
-                    }
-                    let rd = *(self.rdata as *const [u8; 16]);
-                    let t = loc_ntoa(&rd);
-                    self.w.addstr(t.as_bytes())?;
-                }
-                T_NAPTR => {
-                    if rdlen < 2 * NS_INT16SZ {
-                        return Ok(Fin::Formerr);
-                    }
-                    let order = self.u16_at();
-                    let preference = self.u16_at();
-                    tmp.len = 0;
-                    put_unum(&mut tmp, order as u64, 1);
-                    tmp.push(b' ');
-                    put_unum(&mut tmp, preference as u64, 1);
-                    tmp.push(b' ');
-                    self.w.addstr(tmp.as_bytes())?;
-                    for _ in 0..3 {
-                        if !self.word()? {
-                            return Ok(Fin::Formerr);
-                        }
+                    if self.pos < self.rd.len() {
                         self.w.addstr(b" ")?;
                     }
-                    self.addname()?;
-                }
-                T_SRV => {
-                    if rdlen < 3 * NS_INT16SZ {
-                        return Ok(Fin::Formerr);
-                    }
-                    let priority = self.u16_at();
-                    let weight = self.u16_at();
-                    let port = self.u16_at();
-                    tmp.len = 0;
-                    for v in [priority, weight, port] {
-                        put_unum(&mut tmp, v as u64, 1);
-                        tmp.push(b' ');
-                    }
-                    self.w.addstr(tmp.as_bytes())?;
-                    self.addname()?;
-                }
-                T_MINFO | T_RP => {
-                    self.addname()?;
-                    self.w.addstr(b" ")?;
-                    self.addname()?;
-                }
-                T_WKS => {
-                    if rdlen < 1 + NS_INT32SZ {
-                        return Ok(Fin::Formerr);
-                    }
-                    self.add_ntop(self.rdata, false)?;
-                    self.rdata = self.rdata.add(4);
-                    tmp.len = 0;
-                    tmp.push(b' ');
-                    put_unum(&mut tmp, *self.rdata as u64, 1);
-                    tmp.push_all(b" ( ");
-                    self.w.addstr(tmp.as_bytes())?;
-                    self.rdata = self.rdata.add(1);
-                    let mut n: i32 = 0;
-                    let mut lcnt = 0;
-                    while (self.rdata as usize) < self.edata as usize {
-                        let mut c = *self.rdata as u32;
-                        self.rdata = self.rdata.add(1);
-                        loop {
-                            if c & 0o200 != 0 {
-                                if lcnt == 0 {
-                                    self.w.addstr(b"\n\t\t\t\t")?;
-                                    lcnt = 10;
-                                    self.spaced = false;
-                                }
-                                tmp.len = 0;
-                                put_unum(&mut tmp, n as u64, 1);
-                                tmp.push(b' ');
-                                self.w.addstr(tmp.as_bytes())?;
-                                lcnt -= 1;
-                            }
-                            c <<= 1;
-                            n += 1;
-                            if n & 7 == 0 {
-                                break;
-                            }
-                        }
-                    }
-                    self.w.addstr(b")")?;
-                }
-                T_A6 => {
-                    if rdlen == 0 {
-                        return Ok(Fin::Formerr);
-                    }
-                    let pbit = *self.rdata as usize;
-                    tmp.len = 0;
-                    put_unum(&mut tmp, pbit as u64, 1);
-                    tmp.push(b' ');
-                    self.w.addstr(tmp.as_bytes())?;
-                    if pbit > 128 {
-                        return Ok(Fin::Formerr);
-                    }
-                    let pbyte = (pbit & !7) / 8;
-                    self.rdata = self.rdata.add(1);
-                    if pbit < 128 {
-                        let bytelen = 16 - pbyte;
-                        if self.remaining() < bytelen as isize {
-                            return Ok(Fin::Formerr);
-                        }
-                        let mut a = [0u8; 16];
-                        core::ptr::copy_nonoverlapping(self.rdata, a.as_mut_ptr().add(pbyte), bytelen);
-                        self.add_ntop(a.as_ptr(), true)?;
-                        self.rdata = self.rdata.add(bytelen);
-                    }
-                    if pbit == 0 {
-                        return Ok(Fin::Done);
-                    }
-                    if self.rdata as usize >= self.edata as usize {
-                        return Ok(Fin::Formerr);
-                    }
-                    self.w.addstr(b" ")?;
-                    self.addname()?;
-                }
-                _ => {
-                    let _ = class;
-                    return Ok(Fin::Hex);
                 }
             }
-            Ok(Fin::Done)
-        }
-    }
-}
-
-unsafe fn sprintrrf(msg: *const u8, msglen: usize, name: &[u8], class: c_int, ty: c_int, ttl: u64, rdata: *const u8, rdlen: usize, name_ctx: Option<&[u8]>, origin: Option<&[u8]>, buf: *mut u8, buflen: usize) -> R<usize> {
-    unsafe {
-        let obuf = buf;
-        let mut c = Ctx { w: W { p: buf, left: buflen }, msg, msglen, origin, rdata, edata: rdata.wrapping_add(rdlen), spaced: false };
-
-        let same = match name_ctx {
-            Some(nc) => samename_c(nc, name) == 1,
-            None => false,
-        };
-        if same {
-            c.w.addstr(b"\t\t\t")?;
-        } else {
-            let mut len = prune_origin(name, origin);
-            let mut add_root = false;
-            let mut tab = true;
-            if name.is_empty() {
-                add_root = true;
-            } else if len == 0 {
-                c.w.addstr(b"@\t\t\t")?;
-                tab = false;
-            } else {
-                c.w.addstr(&name[..len])?;
-                if needs_dot(name, len, origin) {
-                    add_root = true;
+            T_NSAP => {
+                let mut t = Buf::<{ 2 + 255 * 3 }>::new();
+                nsap_text(&self.rd[self.pos..], rdlen as c_int, &mut t);
+                self.w.addstr(t.as_bytes())?;
+            }
+            T_AAAA => {
+                if rdlen != 16 {
+                    return Ok(Fin::Formerr);
                 }
+                let a: [u8; 16] = self.rd[self.pos..self.pos + 16].try_into().unwrap();
+                self.add_ntop(format_ipv6(&a))?;
             }
-            if add_root {
-                c.w.addstr(b".")?;
-                len += 1;
+            T_LOC => {
+                if rdlen != 16 {
+                    return Ok(Fin::Formerr);
+                }
+                let rd: [u8; 16] = self.rd[self.pos..self.pos + 16].try_into().unwrap();
+                let t = loc_ntoa(&rd);
+                self.w.addstr(t.as_bytes())?;
             }
-            if tab {
-                c.spaced = c.w.addtab(len, 24, c.spaced)?;
-            }
-        }
-
-        let start = c.w.p;
-        let x = format_ttl_raw(ttl, c.w.p, c.w.left)?;
-        c.w.addlen(x);
-        c.add_sym(&__p_class_syms, class, b"CLASS")?;
-        if ty == T_A6 {
-            c.w.addstr(b" A6")?;
-        } else {
-            c.add_sym(&__p_type_syms, ty, b"TYPE")?;
-        }
-        c.spaced = c.w.addtab(c.w.p as usize - start as usize, 16, c.spaced)?;
-
-        let comment: &[u8] = match c.rdata_body(ty, class, rdlen)? {
-            Fin::Done => return Ok(c.w.p as usize - obuf as usize),
-            Fin::Formerr => b" ; RR format error",
-            Fin::Hex => b"",
-        };
-        let mut tmp = Buf::<100>::new();
-        tmp.push_all(b"\\# ");
-        put_unum(&mut tmp, (c.edata as isize - c.rdata as isize) as u32 as u64, 1);
-        if rdlen != 0 {
-            tmp.push_all(b" (");
-        }
-        tmp.push_all(comment);
-        c.w.addstr(tmp.as_bytes())?;
-        while (c.rdata as usize) < c.edata as usize {
-            tmp.len = 0;
-            tmp.push_all(b"\n\t");
-            c.spaced = false;
-            let n = 16.min(c.edata as usize - c.rdata as usize);
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            for m in 0..n {
-                let b = *c.rdata.add(m);
-                tmp.push(HEX[(b >> 4) as usize]);
-                tmp.push(HEX[(b & 15) as usize]);
+            T_NAPTR => {
+                if rdlen < 2 * NS_INT16SZ {
+                    return Ok(Fin::Formerr);
+                }
+                let order = self.u16_at();
+                let preference = self.u16_at();
+                tmp.len = 0;
+                put_unum(&mut tmp, order as u64, 1);
                 tmp.push(b' ');
+                put_unum(&mut tmp, preference as u64, 1);
+                tmp.push(b' ');
+                self.w.addstr(tmp.as_bytes())?;
+                for _ in 0..3 {
+                    if !self.word()? {
+                        return Ok(Fin::Formerr);
+                    }
+                    self.w.addstr(b" ")?;
+                }
+                self.addname()?;
             }
-            c.w.addstr(tmp.as_bytes())?;
-            if n < 16 {
-                c.w.addstr(b")")?;
-                c.w.addtab(tmp.len + 1, 48, c.spaced)?;
+            T_SRV => {
+                if rdlen < 3 * NS_INT16SZ {
+                    return Ok(Fin::Formerr);
+                }
+                let priority = self.u16_at();
+                let weight = self.u16_at();
+                let port = self.u16_at();
+                tmp.len = 0;
+                for v in [priority, weight, port] {
+                    put_unum(&mut tmp, v as u64, 1);
+                    tmp.push(b' ');
+                }
+                self.w.addstr(tmp.as_bytes())?;
+                self.addname()?;
             }
-            tmp.len = 0;
-            tmp.push_all(b"; ");
-            for m in 0..n {
-                let b = *c.rdata.add(m);
-                tmp.push(if (0x20..0x7f).contains(&b) { b } else { b'.' });
+            T_MINFO | T_RP => {
+                self.addname()?;
+                self.w.addstr(b" ")?;
+                self.addname()?;
             }
-            c.w.addstr(tmp.as_bytes())?;
-            c.rdata = c.rdata.add(n);
+            T_WKS => {
+                if rdlen < 1 + NS_INT32SZ {
+                    return Ok(Fin::Formerr);
+                }
+                self.add_ipv4()?;
+                self.pos += 4;
+                tmp.len = 0;
+                tmp.push(b' ');
+                put_unum(&mut tmp, self.byte() as u64, 1);
+                tmp.push_all(b" ( ");
+                self.w.addstr(tmp.as_bytes())?;
+                self.pos += 1;
+                let mut n: i32 = 0;
+                let mut lcnt = 0;
+                while self.pos < self.rd.len() {
+                    let mut c = self.byte() as u32;
+                    self.pos += 1;
+                    loop {
+                        if c & 0o200 != 0 {
+                            if lcnt == 0 {
+                                self.w.addstr(b"\n\t\t\t\t")?;
+                                lcnt = 10;
+                                self.spaced = false;
+                            }
+                            tmp.len = 0;
+                            put_unum(&mut tmp, n as u64, 1);
+                            tmp.push(b' ');
+                            self.w.addstr(tmp.as_bytes())?;
+                            lcnt -= 1;
+                        }
+                        c <<= 1;
+                        n += 1;
+                        if n & 7 == 0 {
+                            break;
+                        }
+                    }
+                }
+                self.w.addstr(b")")?;
+            }
+            T_A6 => {
+                if rdlen == 0 {
+                    return Ok(Fin::Formerr);
+                }
+                let pbit = self.byte() as usize;
+                tmp.len = 0;
+                put_unum(&mut tmp, pbit as u64, 1);
+                tmp.push(b' ');
+                self.w.addstr(tmp.as_bytes())?;
+                if pbit > 128 {
+                    return Ok(Fin::Formerr);
+                }
+                let pbyte = (pbit & !7) / 8;
+                self.pos += 1;
+                if pbit < 128 {
+                    let bytelen = 16 - pbyte;
+                    if self.remaining() < bytelen as isize {
+                        return Ok(Fin::Formerr);
+                    }
+                    let mut a = [0u8; 16];
+                    a[pbyte..].copy_from_slice(&self.rd[self.pos..self.pos + bytelen]);
+                    self.add_ntop(format_ipv6(&a))?;
+                    self.pos += bytelen;
+                }
+                if pbit == 0 {
+                    return Ok(Fin::Done);
+                }
+                if self.pos >= self.rd.len() {
+                    return Ok(Fin::Formerr);
+                }
+                self.w.addstr(b" ")?;
+                self.addname()?;
+            }
+            _ => {
+                let _ = class;
+                return Ok(Fin::Hex);
+            }
         }
-        Ok(c.w.p as usize - obuf as usize)
+        Ok(Fin::Done)
     }
 }
 
-unsafe fn opt_bytes<'a>(p: *const c_char) -> Option<&'a [u8]> {
-    if p.is_null() { None } else { Some(unsafe { crate::util::cbytes(p) }) }
+fn sprintrrf(msg: &[u8], rd: &[u8], rd_base: isize, name: &[u8], class: c_int, ty: c_int, ttl: u64, name_ctx: Option<&[u8]>, origin: Option<&[u8]>, buf: &mut [u8]) -> R<usize> {
+    let rdlen = rd.len();
+    let mut c = Ctx { w: W { out: buf, pos: 0 }, msg, origin, rd, pos: 0, rd_base, spaced: false };
+
+    let same = match name_ctx {
+        Some(nc) => samename_c(nc, name) == 1,
+        None => false,
+    };
+    if same {
+        c.w.addstr(b"\t\t\t")?;
+    } else {
+        let mut len = prune_origin(name, origin);
+        let mut add_root = false;
+        let mut tab = true;
+        if name.is_empty() {
+            add_root = true;
+        } else if len == 0 {
+            c.w.addstr(b"@\t\t\t")?;
+            tab = false;
+        } else {
+            c.w.addstr(&name[..len])?;
+            if needs_dot(name, len, origin) {
+                add_root = true;
+            }
+        }
+        if add_root {
+            c.w.addstr(b".")?;
+            len += 1;
+        }
+        if tab {
+            c.spaced = c.w.addtab(len, 24, c.spaced)?;
+        }
+    }
+
+    let start = c.w.pos;
+    let x = format_ttl(ttl, &mut c.w.out[start..])?;
+    c.w.addlen(x);
+    c.add_sym(&__p_class_syms, class, b"CLASS")?;
+    if ty == T_A6 {
+        c.w.addstr(b" A6")?;
+    } else {
+        c.add_sym(&__p_type_syms, ty, b"TYPE")?;
+    }
+    c.spaced = c.w.addtab(c.w.pos - start, 16, c.spaced)?;
+
+    let comment: &[u8] = match c.rdata_body(ty, class, rdlen)? {
+        Fin::Done => return Ok(c.w.pos),
+        Fin::Formerr => b" ; RR format error",
+        Fin::Hex => b"",
+    };
+    let mut tmp = Buf::<100>::new();
+    tmp.push_all(b"\\# ");
+    put_unum(&mut tmp, c.remaining() as u32 as u64, 1);
+    if rdlen != 0 {
+        tmp.push_all(b" (");
+    }
+    tmp.push_all(comment);
+    c.w.addstr(tmp.as_bytes())?;
+    while c.pos < c.rd.len() {
+        tmp.len = 0;
+        tmp.push_all(b"\n\t");
+        c.spaced = false;
+        let n = 16.min(c.rd.len() - c.pos);
+        let chunk = &c.rd[c.pos..c.pos + n];
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for &b in chunk {
+            tmp.push(HEX[(b >> 4) as usize]);
+            tmp.push(HEX[(b & 15) as usize]);
+            tmp.push(b' ');
+        }
+        c.w.addstr(tmp.as_bytes())?;
+        if n < 16 {
+            c.w.addstr(b")")?;
+            c.w.addtab(tmp.len + 1, 48, c.spaced)?;
+        }
+        tmp.len = 0;
+        tmp.push_all(b"; ");
+        for &b in chunk {
+            tmp.push(if (0x20..0x7f).contains(&b) { b } else { b'.' });
+        }
+        c.w.addstr(tmp.as_bytes())?;
+        c.pos += n;
+    }
+    Ok(c.w.pos)
+}
+
+unsafe fn print_args<'a>(name_ctx: *const c_char, origin: *const c_char, buf: *mut c_char, buflen: usize) -> (Option<&'a [u8]>, Option<&'a [u8]>, &'a mut [u8]) {
+    let name_ctx = unsafe { ffi::cstr(name_ctx) }.map(CStr::to_bytes);
+    let origin = unsafe { ffi::cstr(origin) }.map(CStr::to_bytes);
+    (name_ctx, origin, unsafe { ffi::bytes_mut(buf.cast::<u8>(), buflen) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_sprintrrf(msg: *const c_uchar, msglen: usize, name: *const c_char, class: ns_class, ty: ns_type, ttl: c_ulong, rdata: *const c_uchar, rdlen: usize, name_ctx: *const c_char, origin: *const c_char, buf: *mut c_char, buflen: usize) -> c_int {
-    unsafe { cret(sprintrrf(msg, msglen, crate::util::cbytes(name), class, ty, ttl, rdata, rdlen, opt_bytes(name_ctx), opt_bytes(origin), buf as *mut u8, buflen)) }
+    let m = unsafe { ffi::bytes(msg, msglen) };
+    let rd = unsafe { ffi::bytes(rdata, rdlen) };
+    let name = unsafe { ffi::cstr_bytes(name) };
+    let (name_ctx, origin, out) = unsafe { print_args(name_ctx, origin, buf, buflen) };
+    let rd_base = (rdata as isize).wrapping_sub(msg as isize);
+    cret(sprintrrf(m, rd, rd_base, name, class, ty, ttl, name_ctx, origin, out))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_sprintrr(handle: *const ns_msg, rr: *const ns_rr, name_ctx: *const c_char, origin: *const c_char, buf: *mut c_char, buflen: usize) -> c_int {
-    unsafe {
-        let h = &*handle;
-        let r = &*rr;
-        let name: &[u8] = if r.name[0] != 0 { crate::util::cbytes(r.name.as_ptr()) } else { b"." };
-        let msglen = (h._eom as usize).wrapping_sub(h._msg as usize);
-        cret(sprintrrf(h._msg, msglen, name, r.rr_class as c_int, r.type_ as c_int, r.ttl as u64, r.rdata, r.rdlength as usize, opt_bytes(name_ctx), opt_bytes(origin), buf as *mut u8, buflen))
+    let h = unsafe { &*handle };
+    let r = unsafe { &*rr };
+    let m = unsafe { handle_msg(h) };
+    let rd = unsafe { ffi::bytes(r.rdata, r.rdlength as usize) };
+    let name: &[u8] = if r.name[0] != 0 { name_text(&r.name) } else { b"." };
+    let (name_ctx, origin, out) = unsafe { print_args(name_ctx, origin, buf, buflen) };
+    let rd_base = (r.rdata as isize).wrapping_sub(h._msg as isize);
+    cret(sprintrrf(m, rd, rd_base, name, r.rr_class as c_int, r.type_ as c_int, r.ttl as u64, name_ctx, origin, out))
+}
+
+pub(crate) fn initparse_c(h: &mut ns_msg, m: &[u8]) -> c_int {
+    cret(initparse(h, m.as_ptr(), m.as_ptr().wrapping_add(m.len()), m).map(|_| 0))
+}
+
+pub(crate) fn parserr_c(h: &mut ns_msg, m: &[u8], section: c_int, rrnum: c_int, rr: &mut ns_rr) -> c_int {
+    cret(parserr(h, m, section, rrnum, rr).map(|_| 0))
+}
+
+pub(crate) fn sprintrr_c(h: &ns_msg, m: &[u8], r: &ns_rr, out: &mut [u8]) -> c_int {
+    let rd: &[u8] = if r.rdata.is_null() {
+        &[]
+    } else {
+        let off = r.rdata as usize - m.as_ptr() as usize;
+        &m[off..off + r.rdlength as usize]
+    };
+    let name: &[u8] = if r.name[0] != 0 { name_text(&r.name) } else { b"." };
+    let rd_base = (r.rdata as isize).wrapping_sub(h._msg as isize);
+    cret(sprintrrf(m, rd, rd_base, name, r.rr_class as c_int, r.type_ as c_int, r.ttl as u64, None, None, out))
+}
+
+pub(crate) fn samename_errno(a: &[u8], b: &[u8]) -> c_int {
+    match samename(a, b) {
+        Ok(v) => v as c_int,
+        Err(e) => {
+            errno::set(e);
+            -1
+        }
     }
 }
 
 pub struct Msg<'a> {
     h: ns_msg,
-    _m: PhantomData<&'a [u8]>,
+    m: &'a [u8],
 }
 
 pub struct Rr<'a> {
     raw: ns_rr,
-    _m: PhantomData<&'a [u8]>,
+    rd: &'a [u8],
 }
 
 impl<'a> Msg<'a> {
@@ -1561,8 +1640,8 @@ impl<'a> Msg<'a> {
             return Err(EMSGSIZE);
         }
         let mut h = ns_msg::zero();
-        unsafe { initparse(msg.as_ptr(), msg.len() as c_int, &mut h)? };
-        Ok(Msg { h, _m: PhantomData })
+        initparse(&mut h, msg.as_ptr(), msg.as_ptr().wrapping_add(msg.len()), msg)?;
+        Ok(Msg { h, m: msg })
     }
 
     pub fn id(&self) -> u16 {
@@ -1582,7 +1661,7 @@ impl<'a> Msg<'a> {
     }
 
     pub fn message(&self) -> &'a [u8] {
-        unsafe { core::slice::from_raw_parts(self.h._msg, self.h._eom as usize - self.h._msg as usize) }
+        self.m
     }
 
     pub fn parse_rr(&mut self, section: c_int, index: usize) -> Result<Rr<'a>, c_int> {
@@ -1597,21 +1676,28 @@ impl<'a> Msg<'a> {
     }
 
     fn parse(&mut self, section: c_int, rrnum: c_int) -> Result<Rr<'a>, c_int> {
-        let mut rr = Rr { raw: ns_rr::zero(), _m: PhantomData };
-        unsafe { parserr(&mut self.h, section, rrnum, &mut rr.raw)? };
-        Ok(rr)
+        let mut raw = ns_rr::zero();
+        parserr(&mut self.h, self.m, section, rrnum, &mut raw)?;
+        let rd: &'a [u8] = if raw.rdata.is_null() {
+            &[]
+        } else {
+            let off = raw.rdata as usize - self.m.as_ptr() as usize;
+            &self.m[off..off + raw.rdlength as usize]
+        };
+        Ok(Rr { raw, rd })
     }
 
     pub fn sprint_rr(&self, rr: &Rr<'_>, name_ctx: Option<&CStr>, origin: Option<&CStr>, out: &mut [u8]) -> Result<usize, c_int> {
         let r = &rr.raw;
-        let name: &[u8] = if r.name[0] != 0 { unsafe { crate::util::cbytes(r.name.as_ptr()) } } else { b"." };
-        unsafe { sprintrrf(self.h._msg, self.h._eom as usize - self.h._msg as usize, name, r.rr_class as c_int, r.type_ as c_int, r.ttl as u64, r.rdata, r.rdlength as usize, name_ctx.map(CStr::to_bytes), origin.map(CStr::to_bytes), out.as_mut_ptr(), out.len()) }
+        let name: &[u8] = if r.name[0] != 0 { name_text(&r.name) } else { b"." };
+        let rd_base = (rr.rd.as_ptr() as isize).wrapping_sub(self.m.as_ptr() as isize);
+        sprintrrf(self.m, rr.rd, rd_base, name, r.rr_class as c_int, r.type_ as c_int, r.ttl as u64, name_ctx.map(CStr::to_bytes), origin.map(CStr::to_bytes), out)
     }
 }
 
 impl<'a> Rr<'a> {
     pub fn name(&self) -> &[u8] {
-        unsafe { crate::util::cbytes(self.raw.name.as_ptr()) }
+        name_text(&self.raw.name)
     }
     pub fn rtype(&self) -> u16 {
         self.raw.type_
@@ -1623,10 +1709,11 @@ impl<'a> Rr<'a> {
         self.raw.ttl
     }
     pub fn rdata(&self) -> &'a [u8] {
-        if self.raw.rdata.is_null() { &[] } else { unsafe { core::slice::from_raw_parts(self.raw.rdata, self.raw.rdlength as usize) } }
+        self.rd
     }
 }
 
 pub fn sprint_rrf(msg: &[u8], name: &CStr, class: c_int, ty: c_int, ttl: u64, rdata: &[u8], name_ctx: Option<&CStr>, origin: Option<&CStr>, out: &mut [u8]) -> Result<usize, c_int> {
-    unsafe { sprintrrf(msg.as_ptr(), msg.len(), name.to_bytes(), class, ty, ttl, rdata.as_ptr(), rdata.len(), name_ctx.map(CStr::to_bytes), origin.map(CStr::to_bytes), out.as_mut_ptr(), out.len()) }
+    let rd_base = (rdata.as_ptr() as isize).wrapping_sub(msg.as_ptr() as isize);
+    sprintrrf(msg, rdata, rd_base, name.to_bytes(), class, ty, ttl, name_ctx.map(CStr::to_bytes), origin.map(CStr::to_bytes), out)
 }

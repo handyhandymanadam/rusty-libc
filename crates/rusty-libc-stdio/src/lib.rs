@@ -1,5 +1,20 @@
 #![no_std]
 #![allow(clippy::missing_safety_doc)]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
+
+macro_rules! fmt_at {
+    ($p:expr, $i:expr) => {{
+        let (p, i) = ($p, $i);
+        unsafe { $crate::fmt::FmtChar::at(p, i) }
+    }};
+}
+
+macro_rules! fmt_raw {
+    ($p:expr, $i:expr) => {{
+        let (p, i) = ($p, $i);
+        unsafe { $crate::fmt::FmtChar::raw(p, i) }
+    }};
+}
 
 pub mod float;
 pub mod file;

@@ -1,5 +1,5 @@
 use crate::sys::*;
-use crate::thread::{Thread, current_thread};
+use crate::thread::{Thread, current_thread, field_of, shared_field, tid_word};
 use core::arch::global_asm;
 use rusty_libc_core::cleanup;
 use core::ffi::{c_int, c_void};
@@ -61,44 +61,14 @@ global_asm!(
     "ud2",
     ".cfi_endproc",
     ".size rl_syscall_cancel_arch, . - rl_syscall_cancel_arch",
-    ".globl rl_sigreturn",
-    ".type rl_sigreturn, @function",
-    "rl_sigreturn:",
-    "mov eax, 15",
-    "syscall",
-    ".size rl_sigreturn, . - rl_sigreturn",
     docancel = sym do_cancel_c,
 );
+
+global_asm!(rusty_libc_core::restorer_asm!("rl_sigreturn"));
 
 extern "C" fn do_cancel_c() -> ! {
     do_cancel()
 }
-
-#[cfg(feature = "unwind")]
-unsafe extern "C" {
-    fn rl_cancel_here() -> !;
-}
-#[cfg(feature = "unwind")]
-global_asm!(
-    ".text",
-    ".globl rl_cancel_here",
-    ".type rl_cancel_here, @function",
-    "rl_cancel_here:",
-    ".cfi_startproc",
-    ".cfi_def_cfa rsp, 8",
-    ".cfi_offset rip, -8",
-    "push rbp",
-    ".cfi_def_cfa_offset 16",
-    ".cfi_offset rbp, -16",
-    "mov rbp, rsp",
-    ".cfi_def_cfa_register rbp",
-    "and rsp, -16",
-    "call {docancel}",
-    "ud2",
-    ".cfi_endproc",
-    ".size rl_cancel_here, . - rl_cancel_here",
-    docancel = sym do_cancel_c,
-);
 
 pub fn restorer() -> usize {
     rl_sigreturn as *const () as usize
@@ -106,7 +76,13 @@ pub fn restorer() -> usize {
 
 #[inline(always)]
 fn word() -> &'static AtomicU32 {
-    unsafe { &*(&raw const (*rusty_libc_core::tls::current()).cancelhandling as *const AtomicU32) }
+    let p = rusty_libc_core::tls::current().cast::<u8>().wrapping_add(core::mem::offset_of!(rusty_libc_core::tls::Tcb, cancelhandling));
+    unsafe { &*p.cast::<AtomicU32>() }
+}
+
+#[inline(always)]
+pub(crate) unsafe fn word_of<'a>(t: *mut Thread) -> &'a AtomicU32 {
+    unsafe { shared_field(field_of!(t, tcb.cancelhandling: AtomicU32)) }
 }
 
 pub fn ensure_init() {
@@ -115,7 +91,7 @@ pub fn ensure_init() {
         return;
     }
     if DONE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-        let act = KSigaction { handler: sigcancel_handler as *const () as usize, flags: SA_SIGINFO | SA_RESTART | SA_RESTORER, restorer: rl_sigreturn as *const () as usize, mask: u64::MAX };
+        let act = KSigaction { handler: sigcancel_handler as *const () as usize, flags: SA_SIGINFO | SA_RESTART | SA_RESTORER, restorer: rl_sigreturn as *const () as usize, mask: 0 };
         let _ = sigaction(SIGCANCEL, Some(&act));
         rusty_libc_core::tls::CANCEL_SYSCALL.store(hook as *const () as usize, Ordering::Release);
         DONE.store(2, Ordering::Release);
@@ -131,58 +107,41 @@ extern "C" fn hook(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: us
 }
 
 pub unsafe fn syscall_cp(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> usize {
-    unsafe {
-        let r = rl_syscall_cancel_arch(word(), nr, a1, a2, a3, a4, a5, a6);
-        if r == (-(EINTR as isize)) as usize {
-            testcancel();
-        }
-        r
+    let r = unsafe { rl_syscall_cancel_arch(word(), nr, a1, a2, a3, a4, a5, a6) };
+    if r == (-(EINTR as isize)) as usize {
+        testcancel();
     }
+    r
 }
 
 extern "C" fn sigcancel_handler(sig: c_int, info: *const u8, uc: *mut u8) {
     if sig != SIGCANCEL {
         return;
     }
-    unsafe {
-        let si_code = *(info.add(8) as *const i32);
-        let si_pid = *(info.add(16) as *const i32);
-        if si_code != -6 || si_pid != getpid() {
-            return;
-        }
-        let h = word().load(Ordering::Acquire);
-        if h & CANCELED_BIT == 0 || h & (DISABLE_BIT | EXITING_BIT) != 0 {
-            return;
-        }
-        let rip = *(uc.add(40 + 16 * 8) as *const usize);
-        let start = &raw const rl_cancel_start as usize;
-        let end = &raw const rl_cancel_end as usize;
-        if h & ASYNC_BIT != 0 || (rip >= start && rip < end) {
-            #[cfg(feature = "unwind")]
-            if crate::unwind::available() {
-                let rsp_slot = uc.add(40 + 15 * 8) as *mut usize;
-                let rip_slot = uc.add(40 + 16 * 8) as *mut usize;
-                let new_rsp = *rsp_slot - 8;
-                *(new_rsp as *mut usize) = if rip == start { start + 1 } else { rip };
-                *rsp_slot = new_rsp;
-                *rip_slot = rl_cancel_here as *const () as usize;
-                return;
-            }
-            let saved = *(uc.add(40 + 256) as *const u64);
-            sigprocmask_set(2, saved);
-            do_cancel();
-        }
+    let si_code = unsafe { *(info.wrapping_add(8) as *const i32) };
+    let si_pid = unsafe { *(info.wrapping_add(16) as *const i32) };
+    if si_code != -6 || si_pid != getpid() {
+        return;
+    }
+    let h = word().load(Ordering::Acquire);
+    if h & CANCELED_BIT == 0 || h & (DISABLE_BIT | EXITING_BIT) != 0 {
+        return;
+    }
+    let rip = unsafe { *(uc.wrapping_add(40 + 16 * 8) as *const usize) };
+    let start = &raw const rl_cancel_start as usize;
+    let end = &raw const rl_cancel_end as usize;
+    if h & ASYNC_BIT != 0 || (rip >= start && rip < end) {
+        do_cancel();
     }
 }
 
 pub fn do_cancel() -> ! {
-    unsafe {
-        let t = current_thread();
-        word().fetch_or(EXITING_BIT | DISABLE_BIT, Ordering::AcqRel);
-        word().fetch_and(!ASYNC_BIT, Ordering::AcqRel);
-        (*t).exit_value = PTHREAD_CANCELED as *mut c_void;
-        unwind_continue()
-    }
+    let t = current_thread();
+    word().fetch_or(EXITING_BIT | DISABLE_BIT, Ordering::AcqRel);
+    word().fetch_and(!ASYNC_BIT, Ordering::AcqRel);
+    unsafe { crate::setxid::set_exiting(t) };
+    unsafe { *field_of!(t, exit_value: *mut c_void) = PTHREAD_CANCELED as *mut c_void };
+    unsafe { unwind_continue() }
 }
 
 #[repr(C)]
@@ -241,71 +200,69 @@ impl Default for UnwindException {
 }
 
 pub(crate) unsafe fn unwind_continue() -> ! {
+    let t = current_thread();
+    #[cfg(feature = "unwind")]
     unsafe {
-        let t = current_thread();
-        #[cfg(feature = "unwind")]
-        crate::unwind::forced_unwind();
-        {
-            let top = (*t).unwind;
-            let stop = if top.is_null() { core::ptr::null_mut() } else { (*top).cleanup };
-            while !cleanup::head().is_null() && cleanup::head() != stop {
-                let b = cleanup::head();
-                cleanup::set_head((*b).prev);
-                ((*b).routine)((*b).arg);
-            }
-            if top.is_null() {
-                crate::thread::thread_exit((*t).exit_value)
-            }
-            (*t).unwind = (*top).prev;
-            rl_unwind_longjmp(top, 1);
-        }
+        crate::unwind::forced_unwind()
+    };
+    let unwind = field_of!(t, unwind: *mut UnwindBuf);
+    let top = unsafe { *unwind };
+    let stop = if top.is_null() { core::ptr::null_mut() } else { unsafe { (*top).cleanup } };
+    while !cleanup::head().is_null() && cleanup::head() != stop {
+        unsafe { run_cleanup(cleanup::head()) };
     }
+    if top.is_null() {
+        crate::thread::thread_exit(unsafe { *field_of!(t, exit_value: *mut c_void) })
+    }
+    let prev = unsafe { (*top).prev };
+    unsafe { *unwind = prev };
+    unsafe { rl_unwind_longjmp(top, 1) }
+}
+
+pub(crate) unsafe fn run_cleanup(b: *mut CleanupBuf) {
+    let b = unsafe { &*b };
+    cleanup::set_head(b.prev);
+    unsafe { (b.routine)(b.arg) };
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __pthread_register_cancel(buf: *mut c_void) {
-    unsafe {
-        let b = buf as *mut UnwindBuf;
-        let t = current_thread();
-        (*b).prev = (*t).unwind;
-        (*b).cleanup = cleanup::head();
-        (*t).unwind = b;
-    }
+    let b = unsafe { arg_mut(buf as *mut UnwindBuf) };
+    let unwind = field_of!(current_thread(), unwind: *mut UnwindBuf);
+    b.prev = unsafe { *unwind };
+    b.cleanup = cleanup::head();
+    unsafe { *unwind = b };
+}
+
+unsafe fn unregister(buf: *mut c_void) -> &'static mut UnwindBuf {
+    let b = unsafe { arg_mut(buf as *mut UnwindBuf) };
+    unsafe { *field_of!(current_thread(), unwind: *mut UnwindBuf) = b.prev };
+    b
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __pthread_unregister_cancel(buf: *mut c_void) {
-    unsafe {
-        let b = buf as *mut UnwindBuf;
-        (*current_thread()).unwind = (*b).prev;
-    }
+    unsafe { unregister(buf) };
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __pthread_register_cancel_defer(buf: *mut c_void) {
-    unsafe {
-        let mut old = 0;
-        pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &mut old);
-        __pthread_register_cancel(buf);
-        (*(buf as *mut UnwindBuf)).canceltype = old;
-    }
+    let mut old = 0;
+    setcanceltype(PTHREAD_CANCEL_DEFERRED, Some(&mut old));
+    unsafe { __pthread_register_cancel(buf) };
+    unsafe { arg_mut(buf as *mut UnwindBuf) }.canceltype = old;
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __pthread_unregister_cancel_restore(buf: *mut c_void) {
-    unsafe {
-        let b = buf as *mut UnwindBuf;
-        (*current_thread()).unwind = (*b).prev;
-        pthread_setcanceltype((*b).canceltype, core::ptr::null_mut());
-    }
+    let b = unsafe { unregister(buf) };
+    setcanceltype(b.canceltype, None);
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __pthread_unwind_next(buf: *mut c_void) -> ! {
-    unsafe {
-        (*current_thread()).unwind = (*(buf as *mut UnwindBuf)).prev;
-        unwind_continue()
-    }
+    unsafe { unregister(buf) };
+    unsafe { unwind_continue() }
 }
 
 #[repr(C)]
@@ -318,12 +275,10 @@ pub struct CleanupFrame {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __pthread_cleanup_routine(frame: *mut c_void) {
-    unsafe {
-        let frame = frame as *mut CleanupFrame;
-        if (*frame).do_it != 0 {
-            if let Some(f) = (*frame).cancel_routine {
-                f((*frame).cancel_arg);
-            }
+    let frame = unsafe { arg(frame as *const CleanupFrame) };
+    if frame.do_it != 0 {
+        if let Some(f) = frame.cancel_routine {
+            unsafe { f(frame.cancel_arg) };
         }
     }
 }
@@ -341,8 +296,7 @@ pub extern "C" fn pthread_testcancel() {
     testcancel();
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_setcancelstate(state: c_int, oldstate: *mut c_int) -> c_int {
+pub fn setcancelstate(state: c_int, oldstate: Option<&mut c_int>) -> c_int {
     if state != PTHREAD_CANCEL_ENABLE && state != PTHREAD_CANCEL_DISABLE {
         return EINVAL;
     }
@@ -359,8 +313,8 @@ pub unsafe extern "C" fn pthread_setcancelstate(state: c_int, oldstate: *mut c_i
             Err(x) => old = x,
         }
     }
-    if !oldstate.is_null() {
-        unsafe { *oldstate = if old & DISABLE_BIT != 0 { PTHREAD_CANCEL_DISABLE } else { PTHREAD_CANCEL_ENABLE } };
+    if let Some(o) = oldstate {
+        *o = if old & DISABLE_BIT != 0 { PTHREAD_CANCEL_DISABLE } else { PTHREAD_CANCEL_ENABLE };
     }
     if state == PTHREAD_CANCEL_ENABLE {
         let h = w.load(Ordering::Acquire);
@@ -372,7 +326,11 @@ pub unsafe extern "C" fn pthread_setcancelstate(state: c_int, oldstate: *mut c_i
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_setcanceltype(ctype: c_int, oldtype: *mut c_int) -> c_int {
+pub unsafe extern "C" fn pthread_setcancelstate(state: c_int, oldstate: *mut c_int) -> c_int {
+    setcancelstate(state, unsafe { oldstate.as_mut() })
+}
+
+pub fn setcanceltype(ctype: c_int, oldtype: Option<&mut c_int>) -> c_int {
     if ctype != PTHREAD_CANCEL_DEFERRED && ctype != PTHREAD_CANCEL_ASYNCHRONOUS {
         return EINVAL;
     }
@@ -389,8 +347,8 @@ pub unsafe extern "C" fn pthread_setcanceltype(ctype: c_int, oldtype: *mut c_int
             Err(x) => old = x,
         }
     }
-    if !oldtype.is_null() {
-        unsafe { *oldtype = if old & ASYNC_BIT != 0 { PTHREAD_CANCEL_ASYNCHRONOUS } else { PTHREAD_CANCEL_DEFERRED } };
+    if let Some(o) = oldtype {
+        *o = if old & ASYNC_BIT != 0 { PTHREAD_CANCEL_ASYNCHRONOUS } else { PTHREAD_CANCEL_DEFERRED };
     }
     if ctype == PTHREAD_CANCEL_ASYNCHRONOUS {
         let h = w.load(Ordering::Acquire);
@@ -402,79 +360,84 @@ pub unsafe extern "C" fn pthread_setcanceltype(ctype: c_int, oldtype: *mut c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_cancel(th: PthreadT) -> c_int {
+pub unsafe extern "C" fn pthread_setcanceltype(ctype: c_int, oldtype: *mut c_int) -> c_int {
+    setcanceltype(ctype, unsafe { oldtype.as_mut() })
+}
+
+#[inline]
+pub unsafe fn cancel(t: *mut Thread) -> c_int {
     ensure_init();
-    unsafe {
-        let t = th as *mut Thread;
-        if (*t).tcb.tid < 0 {
-            return ESRCH;
-        }
-        let w = &*(&raw const (*t).tcb.cancelhandling as *const AtomicU32);
-        let mut old = w.load(Ordering::Relaxed);
-        loop {
-            if old & (CANCELED_BIT | EXITING_BIT) != 0 {
-                return 0;
-            }
-            match w.compare_exchange_weak(old, old | CANCELED_BIT, Ordering::AcqRel, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(x) => old = x,
-            }
-        }
-        if old & DISABLE_BIT != 0 {
-            return 0;
-        }
-        if t == current_thread() {
-            if old & ASYNC_BIT != 0 {
-                do_cancel();
-            }
-            return 0;
-        }
-        let tid = (*t).tcb.tid;
-        if tid > 0 {
-            tgkill(getpid(), tid, SIGCANCEL);
-        }
-        0
+    let tid = unsafe { tid_word(t) };
+    if tid.load(Ordering::Relaxed) < 0 {
+        return ESRCH;
     }
+    #[cfg(feature = "unwind-dl")]
+    let _ = crate::unwind::resolve();
+    let w = unsafe { word_of(t) };
+    let mut old = w.load(Ordering::Relaxed);
+    loop {
+        if old & (CANCELED_BIT | EXITING_BIT) != 0 {
+            return 0;
+        }
+        match w.compare_exchange_weak(old, old | CANCELED_BIT, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(x) => old = x,
+        }
+    }
+    if old & DISABLE_BIT != 0 {
+        return 0;
+    }
+    if t == current_thread() {
+        if old & ASYNC_BIT != 0 {
+            do_cancel();
+        }
+        return 0;
+    }
+    let tid = tid.load(Ordering::Relaxed);
+    if tid > 0 {
+        tgkill(getpid(), tid, SIGCANCEL);
+    }
+    0
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_cancel(th: PthreadT) -> c_int {
+    unsafe { cancel(th as *mut Thread) }
 }
 
 pub use rusty_libc_core::cleanup::CleanupBuf;
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn _pthread_cleanup_push(buf: *mut CleanupBuf, routine: unsafe extern "C" fn(*mut c_void), arg: *mut c_void) {
-    unsafe {
-        cleanup::push(buf, routine, arg);
+    unsafe { cleanup::push(buf, routine, arg) };
+}
+
+unsafe fn pop_and_run(buf: *mut CleanupBuf, execute: c_int) -> &'static CleanupBuf {
+    unsafe { cleanup::pop(buf) };
+    let b = unsafe { arg(buf) };
+    if execute != 0 {
+        unsafe { (b.routine)(b.arg) };
     }
+    b
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn _pthread_cleanup_pop(buf: *mut CleanupBuf, execute: c_int) {
-    unsafe {
-        cleanup::pop(buf);
-        if execute != 0 {
-            ((*buf).routine)((*buf).arg);
-        }
-    }
+    unsafe { pop_and_run(buf, execute) };
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn _pthread_cleanup_push_defer(buf: *mut CleanupBuf, routine: unsafe extern "C" fn(*mut c_void), arg: *mut c_void) {
-    unsafe {
-        let mut old = 0;
-        pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &mut old);
-        _pthread_cleanup_push(buf, routine, arg);
-        (*buf).canceltype = old;
-    }
+    let mut old = 0;
+    setcanceltype(PTHREAD_CANCEL_DEFERRED, Some(&mut old));
+    unsafe { _pthread_cleanup_push(buf, routine, arg) };
+    unsafe { (*buf).canceltype = old };
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn _pthread_cleanup_pop_restore(buf: *mut CleanupBuf, execute: c_int) {
-    unsafe {
-        cleanup::pop(buf);
-        if execute != 0 {
-            ((*buf).routine)((*buf).arg);
-        }
-        pthread_setcanceltype((*buf).canceltype, core::ptr::null_mut());
-    }
+    let b = unsafe { pop_and_run(buf, execute) };
+    setcanceltype(b.canceltype, None);
 }
 
 pub unsafe fn with_cleanup<R>(routine: unsafe extern "C" fn(*mut c_void), arg: *mut c_void, body: impl FnOnce() -> R) -> R {

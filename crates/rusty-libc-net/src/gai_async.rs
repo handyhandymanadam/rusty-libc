@@ -1,10 +1,14 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::gai::getaddrinfo;
 use crate::types::*;
+use core::cell::Cell;
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, Ordering};
 use rusty_libc_core::errno;
-use rusty_libc_core::syscall::{self, syscall0, syscall3, syscall4};
+use crate::netdb::{CIn, OptRef, Slice};
+use rusty_libc_core::ffi;
+use rusty_libc_core::syscall::{syscall3, syscall4};
 use rusty_libc_ipc::notify::{SigEvent, SigVal, spawn, unblock_all};
 
 pub const GAI_WAIT: c_int = 0;
@@ -28,18 +32,11 @@ pub struct Gaicb {
 }
 const _: () = assert!(size_of::<Gaicb>() == 56);
 
-struct Waitlist {
-    next: *mut Waitlist,
-    counterp: *mut u32,
-    sigevp: *mut SigEvent,
-    caller_pid: c_int,
-}
-
 struct Requestlist {
-    running: bool,
-    next: *mut Requestlist,
+    running: Cell<bool>,
+    next: Cell<*mut Requestlist>,
     gaicbp: *mut Gaicb,
-    waiting: *mut Waitlist,
+    waiting: Cell<*mut Waitlist>,
 }
 
 #[repr(C)]
@@ -52,163 +49,256 @@ const MAX_THREADS: i32 = 20;
 const IDLE_SECONDS: i64 = 1;
 
 static OWNER: AtomicI32 = AtomicI32::new(0);
-static mut DEPTH: u32 = 0;
-static mut REQUESTS: *mut Requestlist = null_mut();
-static mut REQUESTS_TAIL: *mut Requestlist = null_mut();
-static mut NTHREADS: i32 = 0;
-static mut IDLE_THREADS: i32 = 0;
+static DEPTH: AtomicU32 = AtomicU32::new(0);
+static REQUESTS: AtomicPtr<Requestlist> = AtomicPtr::new(null_mut());
+static REQUESTS_TAIL: AtomicPtr<Requestlist> = AtomicPtr::new(null_mut());
+static NTHREADS: AtomicI32 = AtomicI32::new(0);
+static IDLE_THREADS: AtomicI32 = AtomicI32::new(0);
 static NEW_REQUEST: AtomicU32 = AtomicU32::new(0);
 
-fn gettid() -> i32 {
-    unsafe { syscall0(syscall::SYS_GETTID) as i32 }
-}
+static MUTEX: rusty_libc_core::lock::RawMutex = rusty_libc_core::lock::RawMutex::new();
 
 fn lock() {
-    let me = gettid();
+    let me = rusty_libc_core::tls::current_tid();
     if OWNER.load(Ordering::Relaxed) == me {
-        unsafe { DEPTH += 1 };
+        DEPTH.store(DEPTH.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
         return;
     }
-    while OWNER.compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        unsafe { syscall0(24) };
-    }
-    unsafe { DEPTH = 1 };
+    MUTEX.lock_always();
+    OWNER.store(me, Ordering::Relaxed);
+    DEPTH.store(1, Ordering::Relaxed);
 }
 
 fn unlock() {
-    unsafe {
-        DEPTH -= 1;
-        if DEPTH == 0 {
-            OWNER.store(0, Ordering::Release);
-        }
+    let d = DEPTH.load(Ordering::Relaxed) - 1;
+    DEPTH.store(d, Ordering::Relaxed);
+    if d == 0 {
+        OWNER.store(0, Ordering::Relaxed);
+        MUTEX.unlock_always();
     }
+}
+
+fn get(a: &AtomicPtr<Requestlist>) -> Req {
+    Req(a.load(Ordering::Relaxed))
+}
+fn put(a: &AtomicPtr<Requestlist>, r: Req) {
+    a.store(r.0, Ordering::Relaxed);
+}
+fn add(a: &AtomicI32, d: i32) {
+    a.store(a.load(Ordering::Relaxed) + d, Ordering::Relaxed);
 }
 
 const FUTEX_WAIT_PRIVATE: usize = 128;
-const FUTEX_WAKE_PRIVATE: usize = 129;
 
-fn futex_wake(addr: *const u32, n: usize) {
-    unsafe { syscall3(202, addr as usize, FUTEX_WAKE_PRIVATE, n) };
+fn futex_wake(addr: &AtomicU32, n: u32) {
+    rusty_libc_core::lock::futex_wake(addr, n);
 }
 
-fn futex_wait(addr: *const u32, val: u32, timeout: Option<[i64; 2]>) -> i32 {
-    unsafe {
-        let r = match timeout {
-            Some(ts) => syscall4(202, addr as usize, FUTEX_WAIT_PRIVATE, val as usize, ts.as_ptr() as usize),
-            None => syscall4(202, addr as usize, FUTEX_WAIT_PRIVATE, val as usize, 0),
-        };
-        if r > usize::MAX - 4095 { (r as isize).wrapping_neg() as i32 } else { 0 }
+fn futex_wait(addr: &AtomicU32, val: u32, timeout: Option<[i64; 2]>) -> i32 {
+    let ts = timeout.as_ref().map_or(0, |t| t.as_ptr() as usize);
+    let r = unsafe { syscall4(202, addr.as_ptr() as usize, FUTEX_WAIT_PRIVATE, val as usize, ts) };
+    if r > usize::MAX - 4095 { (r as isize).wrapping_neg() as i32 } else { 0 }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Req(*mut Requestlist);
+
+impl Req {
+    const NULL: Req = Req(null_mut());
+    fn is_null(self) -> bool {
+        self.0.is_null()
+    }
+    fn node(self) -> &'static Requestlist {
+        debug_assert!(!self.0.is_null());
+        unsafe { &*self.0 }
+    }
+    fn next(self) -> Req {
+        Req(self.node().next.get())
+    }
+    fn set_next(self, n: Req) {
+        self.node().next.set(n.0);
+    }
+    fn running(self) -> bool {
+        self.node().running.get()
+    }
+    fn set_running(self, v: bool) {
+        self.node().running.set(v);
+    }
+    fn gaicbp(self) -> *mut Gaicb {
+        self.node().gaicbp
+    }
+    fn waiting(self) -> Waiter {
+        Waiter(self.node().waiting.get())
+    }
+    fn set_waiting(self, w: Waiter) {
+        self.node().waiting.set(w.0);
+    }
+    fn free(self) {
+        unsafe { rusty_libc_malloc::free(self.0.cast()) };
     }
 }
 
-unsafe fn find_request(gaicbp: *const Gaicb) -> *mut Requestlist {
-    unsafe {
-        let mut runp = REQUESTS;
-        while !runp.is_null() {
-            if (*runp).gaicbp as *const Gaicb == gaicbp {
-                return runp;
-            }
-            runp = (*runp).next;
-        }
-        null_mut()
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Waiter(*mut Waitlist);
+
+impl Waiter {
+    unsafe fn init(p: *mut Waitlist, w: Waitlist) -> Waiter {
+        unsafe { p.write(w) };
+        Waiter(p)
+    }
+    fn is_null(self) -> bool {
+        self.0.is_null()
+    }
+    fn node(self) -> &'static Waitlist {
+        debug_assert!(!self.0.is_null());
+        unsafe { &*self.0 }
+    }
+    fn next(self) -> Waiter {
+        Waiter(self.node().next.get())
+    }
+    fn set_next(self, n: Waiter) {
+        self.node().next.set(n.0);
     }
 }
 
-unsafe fn remove_request(gaicbp: *mut Gaicb) -> c_int {
-    unsafe {
-        let mut runp = REQUESTS;
-        let mut lastp: *mut Requestlist = null_mut();
-        while !runp.is_null() {
-            if (*runp).gaicbp == gaicbp {
-                break;
-            }
-            lastp = runp;
-            runp = (*runp).next;
+unsafe fn link_waiters(reqs: &[Req], entries: *mut Waitlist, counterp: *mut u32, sigevp: *mut SigEvent, caller_pid: c_int) -> u32 {
+    let mut total = 0;
+    for (cnt, &r) in reqs.iter().enumerate() {
+        if !r.is_null() {
+            let w = unsafe { Waiter::init(entries.wrapping_add(cnt), Waitlist { next: Cell::new(r.waiting().0), counterp, sigevp, caller_pid }) };
+            r.set_waiting(w);
+            total += 1;
         }
-        if runp.is_null() {
-            return -1;
-        }
-        if (*runp).running {
-            return 1;
-        }
-        if lastp.is_null() {
-            REQUESTS = (*runp).next;
-        } else {
-            (*lastp).next = (*runp).next;
-        }
-        if runp == REQUESTS_TAIL {
-            REQUESTS_TAIL = lastp;
-        }
-        rusty_libc_malloc::free(runp.cast());
-        0
+    }
+    total
+}
+
+struct Waitlist {
+    next: Cell<*mut Waitlist>,
+    counterp: *mut u32,
+    sigevp: *mut SigEvent,
+    caller_pid: c_int,
+}
+
+struct CArray<T> {
+    p: *mut T,
+    n: usize,
+}
+
+impl<T> CArray<T> {
+    fn new(n: usize) -> Option<CArray<T>> {
+        let p = unsafe { rusty_libc_malloc::calloc(n.max(1), size_of::<T>()) } as *mut T;
+        if p.is_null() { None } else { Some(CArray { p, n }) }
+    }
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        unsafe { ffi::slice_mut(self.p, self.n) }
     }
 }
 
-unsafe fn enqueue_request(gaicbp: *mut Gaicb) -> *mut Requestlist {
-    unsafe {
-        lock();
-        let mut newp = rusty_libc_malloc::malloc(size_of::<Requestlist>()) as *mut Requestlist;
-        if newp.is_null() {
-            unlock();
-            errno::set(EAGAIN);
-            return null_mut();
+impl<T> Drop for CArray<T> {
+    fn drop(&mut self) {
+        unsafe { rusty_libc_malloc::free(self.p.cast()) };
+    }
+}
+
+fn find_request(gaicbp: *const Gaicb) -> Req {
+    let mut runp = get(&REQUESTS);
+    while !runp.is_null() {
+        if runp.gaicbp() as *const Gaicb == gaicbp {
+            return runp;
         }
-        *newp = Requestlist { running: false, next: null_mut(), gaicbp, waiting: null_mut() };
-        let lastp = REQUESTS_TAIL;
-        if REQUESTS_TAIL.is_null() {
-            REQUESTS = newp;
-            REQUESTS_TAIL = newp;
-        } else {
-            (*REQUESTS_TAIL).next = newp;
-            REQUESTS_TAIL = newp;
+        runp = runp.next();
+    }
+    Req::NULL
+}
+
+fn remove_request(gaicbp: *mut Gaicb) -> c_int {
+    let mut runp = get(&REQUESTS);
+    let mut lastp = Req::NULL;
+    while !runp.is_null() {
+        if runp.gaicbp() == gaicbp {
+            break;
         }
-        (*gaicbp).__return = EAI_INPROGRESS;
-        if NTHREADS < MAX_THREADS && IDLE_THREADS == 0 {
-            (*newp).running = true;
-            if spawn(handle_requests, newp.cast(), null_mut(), 0) == 0 {
-                NTHREADS += 1;
-            } else if NTHREADS == 0 {
-                if lastp.is_null() {
-                    REQUESTS = null_mut();
-                } else {
-                    (*lastp).next = null_mut();
-                }
-                REQUESTS_TAIL = lastp;
-                rusty_libc_malloc::free(newp.cast());
-                newp = null_mut();
-            } else {
-                (*newp).running = false;
-            }
-        }
-        if !newp.is_null() && IDLE_THREADS > 0 {
-            NEW_REQUEST.fetch_add(1, Ordering::SeqCst);
-            futex_wake(NEW_REQUEST.as_ptr(), 1);
-        }
+        lastp = runp;
+        runp = runp.next();
+    }
+    if runp.is_null() {
+        return -1;
+    }
+    if runp.running() {
+        return 1;
+    }
+    if lastp.is_null() {
+        put(&REQUESTS, runp.next());
+    } else {
+        lastp.set_next(runp.next());
+    }
+    if runp == get(&REQUESTS_TAIL) {
+        put(&REQUESTS_TAIL, lastp);
+    }
+    runp.free();
+    0
+}
+
+unsafe fn enqueue_request(gaicbp: *mut Gaicb) -> Req {
+    lock();
+    let p = crate::nss::heap_new(Requestlist { running: Cell::new(false), next: Cell::new(null_mut()), gaicbp, waiting: Cell::new(null_mut()) });
+    if p.is_null() {
         unlock();
-        newp
+        errno::set(EAGAIN);
+        return Req::NULL;
     }
-}
-
-fn getpid() -> c_int {
-    unsafe { syscall0(syscall::SYS_GETPID) as c_int }
-}
-
-unsafe fn gai_sigqueue(sig: c_int, val: SigVal, caller_pid: c_int) -> c_int {
-    unsafe {
-        let mut info = [0u8; 128];
-        info[0..4].copy_from_slice(&sig.to_ne_bytes());
-        info[8..12].copy_from_slice(&SI_ASYNCNL.to_ne_bytes());
-        info[16..20].copy_from_slice(&caller_pid.to_ne_bytes());
-        let uid = syscall0(102) as u32;
-        info[20..24].copy_from_slice(&uid.to_ne_bytes());
-        info[24..32].copy_from_slice(&(val.sival_ptr as usize).to_ne_bytes());
-        let r = syscall3(129, caller_pid as usize, sig as usize, info.as_ptr() as usize);
-        if r > usize::MAX - 4095 {
-            errno::set((r as isize).wrapping_neg() as i32);
-            -1
+    let mut newp = Req(p);
+    let lastp = get(&REQUESTS_TAIL);
+    if lastp.is_null() {
+        put(&REQUESTS, newp);
+    } else {
+        lastp.set_next(newp);
+    }
+    put(&REQUESTS_TAIL, newp);
+    unsafe { (*gaicbp).__return = EAI_INPROGRESS };
+    if NTHREADS.load(Ordering::Relaxed) < MAX_THREADS && IDLE_THREADS.load(Ordering::Relaxed) == 0 {
+        newp.set_running(true);
+        if unsafe { spawn(handle_requests, p.cast(), null_mut(), 0) } == 0 {
+            add(&NTHREADS, 1);
+        } else if NTHREADS.load(Ordering::Relaxed) == 0 {
+            if lastp.is_null() {
+                put(&REQUESTS, Req::NULL);
+            } else {
+                lastp.set_next(Req::NULL);
+            }
+            put(&REQUESTS_TAIL, lastp);
+            newp.free();
+            newp = Req::NULL;
         } else {
-            0
+            newp.set_running(false);
         }
+    }
+    if !newp.is_null() && IDLE_THREADS.load(Ordering::Relaxed) > 0 {
+        NEW_REQUEST.fetch_add(1, Ordering::SeqCst);
+        futex_wake(&NEW_REQUEST, 1);
+    }
+    unlock();
+    newp
+}
+
+use rusty_libc_core::unistd::getpid;
+
+fn gai_sigqueue(sig: c_int, val: SigVal, caller_pid: c_int) -> c_int {
+    let mut info = [0u8; 128];
+    info[0..4].copy_from_slice(&sig.to_ne_bytes());
+    info[8..12].copy_from_slice(&SI_ASYNCNL.to_ne_bytes());
+    info[16..20].copy_from_slice(&caller_pid.to_ne_bytes());
+    let uid = rusty_libc_core::unistd::getuid();
+    info[20..24].copy_from_slice(&uid.to_ne_bytes());
+    let v = unsafe { val.sival_ptr } as usize;
+    info[24..32].copy_from_slice(&v.to_ne_bytes());
+    let r = unsafe { syscall3(129, caller_pid as usize, sig as usize, info.as_ptr() as usize) };
+    if r > usize::MAX - 4095 {
+        errno::set((r as isize).wrapping_neg() as i32);
+        -1
+    } else {
+        0
     }
 }
 
@@ -218,368 +308,324 @@ struct NotifyFunc {
 }
 
 unsafe extern "C" fn notify_func_wrapper(arg: *mut c_void) -> *mut c_void {
-    unsafe {
-        unblock_all();
-        let n = arg as *mut NotifyFunc;
-        let func = (*n).func;
-        let value = (*n).value;
-        rusty_libc_malloc::free(arg);
-        if let Some(f) = func {
-            f(value);
+    unblock_all();
+    let NotifyFunc { func, value } = unsafe { (arg as *mut NotifyFunc).read() };
+    unsafe { rusty_libc_malloc::free(arg) };
+    if let Some(f) = func {
+        unsafe { f(value) };
+    }
+    null_mut()
+}
+
+fn notify_only(ev: &SigEvent, caller_pid: c_int) -> c_int {
+    if ev.sigev_notify == SIGEV_THREAD {
+        let nf = crate::nss::heap_new(NotifyFunc { func: ev.sigev_notify_function, value: ev.sigev_value });
+        if nf.is_null() {
+            return -1;
         }
-        null_mut()
+        if unsafe { spawn(notify_func_wrapper, nf.cast(), ev.sigev_notify_attributes, 0) } != 0 {
+            unsafe { rusty_libc_malloc::free(nf.cast()) };
+            return -1;
+        }
+        0
+    } else if ev.sigev_notify == SIGEV_SIGNAL {
+        gai_sigqueue(ev.sigev_signo, ev.sigev_value, caller_pid)
+    } else {
+        0
     }
 }
 
-unsafe fn notify_only(sigev: *const SigEvent, caller_pid: c_int) -> c_int {
-    unsafe {
-        let ev = &*sigev;
-        if ev.sigev_notify == SIGEV_THREAD {
-            let nf = rusty_libc_malloc::malloc(size_of::<NotifyFunc>()) as *mut NotifyFunc;
-            if nf.is_null() {
-                return -1;
+fn notify(req: Req) {
+    let mut w = req.waiting();
+    while !w.is_null() {
+        let e = w.node();
+        let next = e.next.get();
+        let c = unsafe { AtomicU32::from_ptr(e.counterp) };
+        if e.sigevp.is_null() {
+            if c.load(Ordering::SeqCst) > 0 && c.fetch_sub(1, Ordering::SeqCst) == 1 {
+                futex_wake(c, 1);
             }
-            (*nf).func = ev.sigev_notify_function;
-            (*nf).value = ev.sigev_value;
-            if spawn(notify_func_wrapper, nf.cast(), ev.sigev_notify_attributes, 0) != 0 {
-                rusty_libc_malloc::free(nf.cast());
-                return -1;
-            }
-            0
-        } else if ev.sigev_notify == SIGEV_SIGNAL {
-            gai_sigqueue(ev.sigev_signo, ev.sigev_value, caller_pid)
         } else {
-            0
-        }
-    }
-}
-
-unsafe fn notify(req: *mut Requestlist) {
-    unsafe {
-        let mut w = (*req).waiting;
-        while !w.is_null() {
-            let next = (*w).next;
-            let counter = (*w).counterp;
-            if (*w).sigevp.is_null() {
-                let c = core::sync::atomic::AtomicU32::from_ptr(counter);
-                if c.load(Ordering::SeqCst) > 0 && c.fetch_sub(1, Ordering::SeqCst) == 1 {
-                    futex_wake(counter, 1);
-                }
-            } else {
-                *counter -= 1;
-                if *counter == 0 {
-                    notify_only((*w).sigevp, (*w).caller_pid);
-                    rusty_libc_malloc::free(counter.cast());
-                }
+            let left = c.load(Ordering::Relaxed) - 1;
+            c.store(left, Ordering::Relaxed);
+            if left == 0 {
+                notify_only(unsafe { &*e.sigevp }, e.caller_pid);
+                unsafe { rusty_libc_malloc::free(e.counterp.cast()) };
             }
-            w = next;
         }
+        w = Waiter(next);
     }
 }
 
 unsafe extern "C" fn handle_requests(arg: *mut c_void) -> *mut c_void {
-    unsafe {
-        let mut runp = arg as *mut Requestlist;
-        loop {
-            if runp.is_null() {
-                lock();
+    let mut runp = Req(arg as *mut Requestlist);
+    loop {
+        if runp.is_null() {
+            lock();
+        } else {
+            let req = runp.gaicbp();
+            let g = unsafe { req.read() };
+            let result_slot = (req as *mut u8).wrapping_add(core::mem::offset_of!(Gaicb, ar_result)) as *mut *mut addrinfo;
+            let r = unsafe { getaddrinfo(g.ar_name, g.ar_service, g.ar_request, result_slot) };
+            unsafe { core::ptr::write_volatile(return_of(req) as *mut c_int, r) };
+            lock();
+            notify(runp);
+            let mut lastp = Req::NULL;
+            let mut srchp = get(&REQUESTS);
+            while srchp != runp {
+                lastp = srchp;
+                srchp = srchp.next();
+            }
+            if get(&REQUESTS_TAIL) == runp {
+                put(&REQUESTS_TAIL, lastp);
+            }
+            if lastp.is_null() {
+                put(&REQUESTS, get(&REQUESTS).next());
             } else {
-                let req = (*runp).gaicbp;
-                let r = getaddrinfo((*req).ar_name, (*req).ar_service, (*req).ar_request, &mut (*req).ar_result);
-                core::ptr::write_volatile(&mut (*req).__return, r);
-                lock();
-                notify(runp);
-                let mut lastp: *mut Requestlist = null_mut();
-                let mut srchp = REQUESTS;
-                while srchp != runp {
-                    lastp = srchp;
-                    srchp = (*srchp).next;
-                }
-                if REQUESTS_TAIL == runp {
-                    REQUESTS_TAIL = lastp;
-                }
-                if lastp.is_null() {
-                    REQUESTS = (*REQUESTS).next;
-                } else {
-                    (*lastp).next = (*runp).next;
-                }
-                rusty_libc_malloc::free(runp.cast());
+                lastp.set_next(runp.next());
             }
-            runp = REQUESTS;
-            while !runp.is_null() && (*runp).running {
-                runp = (*runp).next;
-            }
-            if runp.is_null() {
-                IDLE_THREADS += 1;
-                let seq = NEW_REQUEST.load(Ordering::SeqCst);
-                unlock();
-                futex_wait(NEW_REQUEST.as_ptr(), seq, Some([IDLE_SECONDS, 0]));
-                lock();
-                IDLE_THREADS -= 1;
-                runp = REQUESTS;
-                while !runp.is_null() && (*runp).running {
-                    runp = (*runp).next;
-                }
-            }
-            if runp.is_null() {
-                NTHREADS -= 1;
-            } else {
-                (*runp).running = true;
-                if !REQUESTS.is_null() {
-                    if IDLE_THREADS > 0 {
-                        NEW_REQUEST.fetch_add(1, Ordering::SeqCst);
-                        futex_wake(NEW_REQUEST.as_ptr(), 1);
-                    } else if NTHREADS < MAX_THREADS && spawn(handle_requests, null_mut(), null_mut(), 0) == 0 {
-                        NTHREADS += 1;
-                    }
-                }
-            }
+            runp.free();
+        }
+        runp = get(&REQUESTS);
+        while !runp.is_null() && runp.running() {
+            runp = runp.next();
+        }
+        if runp.is_null() {
+            add(&IDLE_THREADS, 1);
+            let seq = NEW_REQUEST.load(Ordering::SeqCst);
             unlock();
-            if runp.is_null() {
-                break;
+            futex_wait(&NEW_REQUEST, seq, Some([IDLE_SECONDS, 0]));
+            lock();
+            add(&IDLE_THREADS, -1);
+            runp = get(&REQUESTS);
+            while !runp.is_null() && runp.running() {
+                runp = runp.next();
             }
         }
-        null_mut()
+        if runp.is_null() {
+            add(&NTHREADS, -1);
+        } else {
+            runp.set_running(true);
+            if !get(&REQUESTS).is_null() {
+                if IDLE_THREADS.load(Ordering::Relaxed) > 0 {
+                    NEW_REQUEST.fetch_add(1, Ordering::SeqCst);
+                    futex_wake(&NEW_REQUEST, 1);
+                } else if NTHREADS.load(Ordering::Relaxed) < MAX_THREADS && {
+                    unsafe { spawn(handle_requests, null_mut(), null_mut(), 0) }
+                } == 0
+                {
+                    add(&NTHREADS, 1);
+                }
+            }
+        }
+        unlock();
+        if runp.is_null() {
+            break;
+        }
     }
+    null_mut()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getaddrinfo_a(mode: c_int, list: *mut *mut Gaicb, ent: c_int, sig: *mut SigEvent) -> c_int {
-    unsafe {
-        if mode != GAI_WAIT && mode != GAI_NOWAIT {
-            errno::set(EINVAL);
-            return EAI_SYSTEM;
-        }
-        let mut defsigev = SigEvent::none();
-        let sig: *mut SigEvent = if sig.is_null() { &mut defsigev } else { sig };
-        let ent_n = ent.max(0) as usize;
-        let requests = rusty_libc_malloc::calloc(ent_n.max(1), size_of::<*mut Requestlist>()) as *mut *mut Requestlist;
-        if requests.is_null() {
-            return EAI_AGAIN;
-        }
-        let mut total: u32 = 0;
-        let mut result = 0;
-        lock();
-        for cnt in 0..ent_n {
-            let g = *list.add(cnt);
-            if !g.is_null() {
-                let r = enqueue_request(g);
-                *requests.add(cnt) = r;
-                if !r.is_null() {
-                    total += 1;
-                } else {
-                    result = EAI_SYSTEM;
-                }
-            } else {
-                *requests.add(cnt) = null_mut();
-            }
-        }
-        if total == 0 {
-            unlock();
-            if mode == GAI_NOWAIT {
-                notify_only(sig, if (*sig).sigev_notify == SIGEV_SIGNAL { getpid() } else { 0 });
-            }
-            rusty_libc_malloc::free(requests.cast());
-            return result;
-        } else if mode == GAI_WAIT {
-            let waitlist = rusty_libc_malloc::calloc(ent_n, size_of::<Waitlist>()) as *mut Waitlist;
-            if waitlist.is_null() {
-                unlock();
-                rusty_libc_malloc::free(requests.cast());
-                return EAI_AGAIN;
-            }
-            let counter = AtomicU32::new(0);
-            total = 0;
-            for cnt in 0..ent_n {
-                let r = *requests.add(cnt);
-                if !r.is_null() {
-                    let w = waitlist.add(cnt);
-                    (*w).next = (*r).waiting;
-                    (*w).counterp = counter.as_ptr();
-                    (*w).sigevp = null_mut();
-                    (*w).caller_pid = 0;
-                    (*r).waiting = w;
-                    total += 1;
-                }
-            }
-            counter.store(total, Ordering::SeqCst);
-            let mut oldval = counter.load(Ordering::SeqCst);
-            if oldval != 0 {
-                unlock();
-                loop {
-                    let status = futex_wait(counter.as_ptr(), oldval, None);
-                    if status != EAGAIN && status != EINTR {
-                    }
-                    oldval = counter.load(Ordering::SeqCst);
-                    if oldval == 0 {
-                        break;
-                    }
-                }
-                lock();
-            }
-            rusty_libc_malloc::free(waitlist.cast());
-        } else {
-            let aw = rusty_libc_malloc::malloc(size_of::<AsyncWaitlist>() + ent_n * size_of::<Waitlist>()) as *mut AsyncWaitlist;
-            if aw.is_null() {
-                result = EAI_AGAIN;
-            } else {
-                let caller_pid = if (*sig).sigev_notify == SIGEV_SIGNAL { getpid() } else { 0 };
-                total = 0;
-                let wl = (aw as *mut u8).add(size_of::<AsyncWaitlist>()) as *mut Waitlist;
-                for cnt in 0..ent_n {
-                    let r = *requests.add(cnt);
-                    if !r.is_null() {
-                        let w = wl.add(cnt);
-                        (*w).next = (*r).waiting;
-                        (*w).counterp = &raw mut (*aw).counter;
-                        (*w).sigevp = &raw mut (*aw).sigev;
-                        (*w).caller_pid = caller_pid;
-                        (*r).waiting = w;
-                        total += 1;
-                    }
-                }
-                (*aw).counter = total;
-                (*aw).sigev = *sig;
-            }
-        }
-        unlock();
-        rusty_libc_malloc::free(requests.cast());
-        result
+    if mode != GAI_WAIT && mode != GAI_NOWAIT {
+        errno::set(EINVAL);
+        return EAI_SYSTEM;
     }
+    let defsigev = SigEvent::none();
+    let ent_n = ent.max(0) as usize;
+    let (list, sig) = unsafe { (Slice(list as *const *mut Gaicb, ent_n), OptRef(sig as *const SigEvent)).conv() };
+    let sig: &SigEvent = sig.unwrap_or(&defsigev);
+    let Some(mut requests) = CArray::<Req>::new(ent_n) else { return EAI_AGAIN };
+    let reqs = requests.as_mut_slice();
+    let mut total: u32 = 0;
+    let mut result = 0;
+    lock();
+    for (slot, &g) in reqs.iter_mut().zip(list) {
+        if !g.is_null() {
+            let r = unsafe { enqueue_request(g) };
+            *slot = r;
+            if !r.is_null() {
+                total += 1;
+            } else {
+                result = EAI_SYSTEM;
+            }
+        } else {
+            *slot = Req::NULL;
+        }
+    }
+    if total == 0 {
+        unlock();
+        if mode == GAI_NOWAIT {
+            notify_only(sig, if sig.sigev_notify == SIGEV_SIGNAL { getpid() } else { 0 });
+        }
+        drop(requests);
+        return result;
+    } else if mode == GAI_WAIT {
+        let Some(mut waitlist) = CArray::<Waitlist>::new(ent_n) else {
+            unlock();
+            drop(requests);
+            return EAI_AGAIN;
+        };
+        let counter = AtomicU32::new(0);
+        let total = unsafe { link_waiters(reqs, waitlist.as_mut_slice().as_mut_ptr(), counter.as_ptr(), null_mut(), 0) };
+        counter.store(total, Ordering::SeqCst);
+        let mut oldval = counter.load(Ordering::SeqCst);
+        if oldval != 0 {
+            unlock();
+            loop {
+                futex_wait(&counter, oldval, None);
+                oldval = counter.load(Ordering::SeqCst);
+                if oldval == 0 {
+                    break;
+                }
+            }
+            lock();
+        }
+        drop(waitlist);
+    } else {
+        let aw = unsafe { rusty_libc_malloc::malloc(size_of::<AsyncWaitlist>() + ent_n * size_of::<Waitlist>()) } as *mut AsyncWaitlist;
+        if aw.is_null() {
+            result = EAI_AGAIN;
+        } else {
+            let caller_pid = if sig.sigev_notify == SIGEV_SIGNAL { getpid() } else { 0 };
+            let wl = (aw as *mut u8).wrapping_add(size_of::<AsyncWaitlist>()) as *mut Waitlist;
+            let counterp = (aw as *mut u8).wrapping_add(core::mem::offset_of!(AsyncWaitlist, counter)) as *mut u32;
+            let sigevp = (aw as *mut u8).wrapping_add(core::mem::offset_of!(AsyncWaitlist, sigev)) as *mut SigEvent;
+            let total = unsafe { link_waiters(reqs, wl, counterp, sigevp, caller_pid) };
+            unsafe { aw.write(AsyncWaitlist { counter: total, sigev: *sig }) };
+        }
+    }
+    unlock();
+    drop(requests);
+    result
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn gai_suspend(list: *const *const Gaicb, ent: c_int, timeout: *const timespec) -> c_int {
-    unsafe {
-        let ent_n = ent.max(0) as usize;
-        let waitlist = rusty_libc_malloc::calloc(ent_n.max(1), size_of::<Waitlist>()) as *mut Waitlist;
-        let requestlist = rusty_libc_malloc::calloc(ent_n.max(1), size_of::<*mut Requestlist>()) as *mut *mut Requestlist;
-        if waitlist.is_null() || requestlist.is_null() {
-            rusty_libc_malloc::free(waitlist.cast());
-            rusty_libc_malloc::free(requestlist.cast());
-            return EAI_SYSTEM;
+    let ent_n = ent.max(0) as usize;
+    let (list, timeout) = unsafe { (Slice(list, ent_n), OptRef(timeout)).conv() };
+    let wl = CArray::<Waitlist>::new(ent_n);
+    let rl = CArray::<Req>::new(ent_n);
+    let (Some(mut wl), Some(mut rl)) = (wl, rl) else {
+        return EAI_SYSTEM;
+    };
+    let waitlist = wl.as_mut_slice().as_mut_ptr();
+    let reqs = rl.as_mut_slice();
+    let cntr = AtomicU32::new(1);
+    let mut none = true;
+    lock();
+    for (cnt, &g) in list.iter().enumerate() {
+        if g.is_null() {
+            continue;
         }
-        let cntr = AtomicU32::new(1);
-        let mut none = true;
-        lock();
-        for cnt in 0..ent_n {
-            let g = *list.add(cnt);
-            if g.is_null() {
-                continue;
-            }
-            if core::ptr::read_volatile(&(*g).__return) == EAI_INPROGRESS {
-                let r = find_request(g);
-                *requestlist.add(cnt) = r;
-                if !r.is_null() {
-                    let w = waitlist.add(cnt);
-                    (*w).next = (*r).waiting;
-                    (*w).counterp = cntr.as_ptr();
-                    (*w).sigevp = null_mut();
-                    (*w).caller_pid = 0;
-                    (*r).waiting = w;
-                    none = false;
-                }
+        if unsafe { core::ptr::read_volatile(return_of(g)) } == EAI_INPROGRESS {
+            let r = find_request(g);
+            reqs[cnt] = r;
+            if !r.is_null() {
+                let w = unsafe { Waiter::init(waitlist.wrapping_add(cnt), Waitlist { next: Cell::new(r.waiting().0), counterp: cntr.as_ptr(), sigevp: null_mut(), caller_pid: 0 }) };
+                r.set_waiting(w);
+                none = false;
             }
         }
-        let result;
-        if none {
-            result = EAI_ALLDONE;
-        } else {
-            let mut status = 0;
-            let deadline: Option<[i64; 2]> = if timeout.is_null() { None } else { Some([(*timeout).tv_sec, (*timeout).tv_nsec]) };
-            let start = {
-                let mut ts = [0i64; 2];
-                syscall::syscall2(228, 1, ts.as_mut_ptr() as usize);
-                ts
-            };
-            let oldval = cntr.load(Ordering::SeqCst);
-            if oldval != 0 {
-                unlock();
-                let mut ov = oldval;
-                loop {
-                    let remaining = match deadline {
-                        None => None,
-                        Some(d) => {
-                            let mut now = [0i64; 2];
-                            syscall::syscall2(228, 1, now.as_mut_ptr() as usize);
-                            let mut s = d[0] - (now[0] - start[0]);
-                            let mut n = d[1] - (now[1] - start[1]);
-                            if n < 0 {
-                                n += 1_000_000_000;
-                                s -= 1;
-                            }
-                            if s < 0 {
-                                status = ETIMEDOUT;
-                                break;
-                            }
-                            Some([s, n])
-                        }
-                    };
-                    let st = futex_wait(cntr.as_ptr(), ov, remaining);
-                    if st == EAGAIN {
-                        ov = cntr.load(Ordering::SeqCst);
-                        if ov == 0 {
-                            break;
-                        }
-                        continue;
-                    }
-                    if st == 0 {
-                        ov = cntr.load(Ordering::SeqCst);
-                        if ov == 0 {
-                            break;
-                        }
-                        continue;
-                    }
-                    status = st;
-                    break;
-                }
-                lock();
-            }
-            for cnt in 0..ent_n {
-                let g = *list.add(cnt);
-                if !g.is_null() && !(*requestlist.add(cnt)).is_null() && find_request(g) == *requestlist.add(cnt) {
-                    let mut listp: *mut *mut Waitlist = &raw mut (**requestlist.add(cnt)).waiting;
-                    let mine = waitlist.add(cnt);
-                    while !(*listp).is_null() && *listp != mine {
-                        listp = &raw mut (**listp).next;
-                    }
-                    if !(*listp).is_null() {
-                        *listp = (**listp).next;
-                    }
-                }
-            }
-            result = match status {
-                0 => 0,
-                ETIMEDOUT => EAI_SYSTEM,
-                EINTR => EAI_INTR,
-                _ => EAI_SYSTEM,
-            };
-        }
-        unlock();
-        rusty_libc_malloc::free(waitlist.cast());
-        rusty_libc_malloc::free(requestlist.cast());
-        result
     }
+    let result;
+    if none {
+        result = EAI_ALLDONE;
+    } else {
+        let mut status = 0;
+        let deadline: Option<[i64; 2]> = timeout.map(|t| [t.tv_sec, t.tv_nsec]);
+        let start = now();
+        let oldval = cntr.load(Ordering::SeqCst);
+        if oldval != 0 {
+            unlock();
+            let mut ov = oldval;
+            loop {
+                let remaining = match deadline {
+                    None => None,
+                    Some(d) => {
+                        let now = now();
+                        let mut s = d[0] - (now[0] - start[0]);
+                        let mut n = d[1] - (now[1] - start[1]);
+                        if n < 0 {
+                            n += 1_000_000_000;
+                            s -= 1;
+                        }
+                        if s < 0 {
+                            status = ETIMEDOUT;
+                            break;
+                        }
+                        Some([s, n])
+                    }
+                };
+                let st = futex_wait(&cntr, ov, remaining);
+                if st == EAGAIN || st == 0 {
+                    ov = cntr.load(Ordering::SeqCst);
+                    if ov == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                status = st;
+                break;
+            }
+            lock();
+        }
+        for (cnt, &g) in list.iter().enumerate() {
+            let r = reqs[cnt];
+            if !g.is_null() && !r.is_null() && find_request(g) == r {
+                let mine = Waiter(waitlist.wrapping_add(cnt));
+                let first = r.waiting();
+                if first == mine {
+                    r.set_waiting(mine.next());
+                } else {
+                    let mut w = first;
+                    while !w.is_null() {
+                        let n = w.next();
+                        if n == mine {
+                            w.set_next(mine.next());
+                            break;
+                        }
+                        w = n;
+                    }
+                }
+            }
+        }
+        result = match status {
+            0 => 0,
+            ETIMEDOUT => EAI_SYSTEM,
+            EINTR => EAI_INTR,
+            _ => EAI_SYSTEM,
+        };
+    }
+    unlock();
+    drop(wl);
+    drop(rl);
+    result
 }
+
+use crate::dns::monotonic as now;
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn gai_error(req: *mut Gaicb) -> c_int {
-    unsafe { core::ptr::read_volatile(&(*req).__return) }
+    unsafe { core::ptr::read_volatile(return_of(req)) }
+}
+
+fn return_of(g: *const Gaicb) -> *const c_int {
+    (g as *const u8).wrapping_add(core::mem::offset_of!(Gaicb, __return)) as *const c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn gai_cancel(gaicbp: *mut Gaicb) -> c_int {
-    unsafe {
-        lock();
-        let status = remove_request(gaicbp);
-        let result = if status == 0 {
-            EAI_CANCELED
-        } else if status > 0 {
-            EAI_NOTCANCELED
-        } else {
-            EAI_ALLDONE
-        };
-        unlock();
-        result
-    }
+pub extern "C" fn gai_cancel(gaicbp: *mut Gaicb) -> c_int {
+    lock();
+    let status = remove_request(gaicbp);
+    let result = if status == 0 {
+        EAI_CANCELED
+    } else if status > 0 {
+        EAI_NOTCANCELED
+    } else {
+        EAI_ALLDONE
+    };
+    unlock();
+    result
 }

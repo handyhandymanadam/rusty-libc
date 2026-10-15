@@ -68,7 +68,8 @@ impl<T> V<T> {
                 return;
             }
         }
-        unsafe { self.ptr.add(self.len).write(v) };
+        let slot = unsafe { self.ptr.add(self.len) };
+        unsafe { slot.write(v) };
         self.len += 1;
     }
 
@@ -77,14 +78,16 @@ impl<T> V<T> {
             None
         } else {
             self.len -= 1;
-            Some(unsafe { self.ptr.add(self.len).read() })
+            let slot = unsafe { self.ptr.add(self.len) };
+            Some(unsafe { slot.read() })
         }
     }
 
     pub fn truncate(&mut self, n: usize) {
         while self.len > n {
             self.len -= 1;
-            unsafe { core::ptr::drop_in_place(self.ptr.add(self.len)) };
+            let slot = unsafe { self.ptr.add(self.len) };
+            unsafe { core::ptr::drop_in_place(slot) };
         }
     }
 
@@ -101,7 +104,8 @@ impl<T: Copy> V<T> {
                 return;
             }
             while self.len < n {
-                unsafe { self.ptr.add(self.len).write(v) };
+                let slot = unsafe { self.ptr.add(self.len) };
+                unsafe { slot.write(v) };
                 self.len += 1;
             }
         } else {
@@ -120,7 +124,8 @@ impl<T: Copy> V<T> {
         if self.oom {
             return;
         }
-        unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), self.ptr.add(self.len), s.len()) };
+        let dst = unsafe { self.ptr.add(self.len) };
+        unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len()) };
         self.len += s.len();
     }
 
@@ -158,4 +163,28 @@ impl<T> Default for V<T> {
     fn default() -> V<T> {
         V::new()
     }
+}
+
+unsafe impl<T: Send> Send for V<T> {}
+unsafe impl<T: Sync> Sync for V<T> {}
+
+pub fn leak_copy<T: Copy>(v: &[T]) -> Option<&'static [T]> {
+    leak_with(v.len(), |i| v[i])
+}
+
+pub fn leak_with<T: Copy>(n: usize, mut f: impl FnMut(usize) -> T) -> Option<&'static [T]> {
+    if n == 0 {
+        return Some(&[]);
+    }
+    let bytes = n.checked_mul(core::mem::size_of::<T>())?;
+    let p = unsafe { rusty_libc_malloc::malloc(bytes) } as *mut T;
+    if p.is_null() {
+        return None;
+    }
+    for i in 0..n {
+        let v = f(i);
+        let slot = unsafe { p.add(i) };
+        unsafe { slot.write(v) };
+    }
+    Some(unsafe { core::slice::from_raw_parts(p, n) })
 }

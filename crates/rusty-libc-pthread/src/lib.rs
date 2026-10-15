@@ -1,7 +1,8 @@
 #![no_std]
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
-#![allow(clippy::deref_addrof, clippy::collapsible_if, clippy::collapsible_match, clippy::needless_range_loop, clippy::doc_lazy_continuation, clippy::let_and_return, clippy::arc_with_non_send_sync, clippy::missing_transmute_annotations, clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::collapsible_if, clippy::collapsible_match, clippy::needless_range_loop, clippy::doc_lazy_continuation, clippy::let_and_return, clippy::arc_with_non_send_sync)]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -16,9 +17,11 @@ pub mod misc;
 pub mod mutex;
 pub mod rwlock;
 pub mod sem;
+pub mod setxid;
 pub mod sync;
 pub mod sys;
 pub mod thread;
+pub mod tpp;
 #[cfg(feature = "unwind")]
 pub mod unwind;
 pub mod api;

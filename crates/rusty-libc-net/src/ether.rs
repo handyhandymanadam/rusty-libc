@@ -1,7 +1,16 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::nss::{self, Db};
 use crate::types::*;
-use crate::util::{Buf, cbytes};
+use crate::util::Buf;
 use core::ffi::{c_char, c_int};
+use rusty_libc_core::ffi;
+use rusty_libc_core::sync_cell::SyncCell;
+
+unsafe fn put_cstr(dst: *mut c_char, s: &[u8]) {
+    let d = unsafe { ffi::bytes_mut(dst.cast::<u8>(), s.len() + 1) };
+    d[..s.len()].copy_from_slice(s);
+    d[s.len()] = 0;
+}
 
 fn hexv(c: u8) -> Option<u8> {
     match c {
@@ -58,15 +67,15 @@ pub fn format_ether(a: &[u8; 6]) -> Buf<24> {
 }
 
 #[thread_local]
-static mut ATON_BUF: ether_addr = ether_addr { ether_addr_octet: [0; 6] };
+static ATON_BUF: SyncCell<ether_addr> = SyncCell::new(ether_addr { ether_addr_octet: [0; 6] });
 #[thread_local]
-static mut NTOA_BUF: [u8; 18] = [0; 18];
+static NTOA_BUF: SyncCell<[u8; 18]> = SyncCell::new([0; 18]);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ether_aton_r(asc: *const c_char, addr: *mut ether_addr) -> *mut ether_addr {
-    match parse_ether(unsafe { cbytes(asc) }) {
+    match parse_ether(unsafe { ffi::cstr_bytes(asc) }) {
         Some(a) => {
-            unsafe { (*addr).ether_addr_octet = a };
+            unsafe { addr.write(ether_addr { ether_addr_octet: a }) };
             addr
         }
         None => core::ptr::null_mut(),
@@ -75,22 +84,19 @@ pub unsafe extern "C" fn ether_aton_r(asc: *const c_char, addr: *mut ether_addr)
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ether_aton(asc: *const c_char) -> *mut ether_addr {
-    unsafe { ether_aton_r(asc, &raw mut ATON_BUF) }
+    unsafe { ether_aton_r(asc, ATON_BUF.as_ptr()) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ether_ntoa_r(addr: *const ether_addr, buf: *mut c_char) -> *mut c_char {
     let t = format_ether(unsafe { &(*addr).ether_addr_octet });
-    unsafe {
-        core::ptr::copy_nonoverlapping(t.b.as_ptr(), buf as *mut u8, t.len);
-        *buf.add(t.len) = 0;
-    }
+    unsafe { put_cstr(buf, t.as_bytes()) };
     buf
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ether_ntoa(addr: *const ether_addr) -> *mut c_char {
-    unsafe { ether_ntoa_r(addr, (&raw mut NTOA_BUF) as *mut c_char) }
+    unsafe { ether_ntoa_r(addr, NTOA_BUF.as_ptr().cast::<c_char>()) }
 }
 
 fn parse_line(line: &[u8]) -> Option<([u8; 6], &[u8])> {
@@ -110,14 +116,13 @@ fn parse_line(line: &[u8]) -> Option<([u8; 6], &[u8])> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ether_line(line: *const c_char, addr: *mut ether_addr, hostname: *mut c_char) -> c_int {
-    let s = unsafe { cbytes(line) };
+    let s = unsafe { ffi::cstr_bytes(line) };
     match parse_line(s) {
-        Some((a, h)) => unsafe {
-            (*addr).ether_addr_octet = a;
-            core::ptr::copy_nonoverlapping(h.as_ptr(), hostname as *mut u8, h.len());
-            *hostname.add(h.len()) = 0;
+        Some((a, h)) => {
+            unsafe { addr.write(ether_addr { ether_addr_octet: a }) };
+            unsafe { put_cstr(hostname, h) };
             0
-        },
+        }
         None => -1,
     }
 }
@@ -157,7 +162,7 @@ fn ethers_dispatch(func: &[u8], files: &mut dyn FnMut() -> i32, call: &mut dyn F
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ether_hostton(hostname: *const c_char, addr: *mut ether_addr) -> c_int {
-    let h = unsafe { cbytes(hostname) };
+    let h = unsafe { ffi::cstr_bytes(hostname) };
     let found = core::cell::Cell::new(None::<[u8; 6]>);
     let status = ethers_dispatch(
         b"gethostton_r",
@@ -193,7 +198,7 @@ pub unsafe extern "C" fn ether_hostton(hostname: *const c_char, addr: *mut ether
     );
     match (status, found.get()) {
         (1, Some(a)) => {
-            unsafe { (*addr).ether_addr_octet = a };
+            unsafe { addr.write(ether_addr { ether_addr_octet: a }) };
             0
         }
         _ => -1,
@@ -236,18 +241,17 @@ pub unsafe extern "C" fn ether_ntohost(hostname: *mut c_char, addr: *const ether
             let mut buf = [0u8; 1024];
             let mut e: c_int = 0;
             let st = unsafe { f(addr, &mut ent, buf.as_mut_ptr().cast(), 1024, &mut e) };
-            if st == 1 && !ent.e_name.is_null() {
-                keep(unsafe { cbytes(ent.e_name) });
+            if st == 1 {
+                if let Some(n) = unsafe { ffi::cstr(ent.e_name) } {
+                    keep(n.to_bytes());
+                }
             }
             st
         },
     );
     match (status, name.into_inner()) {
         (1, Some((b, l))) => {
-            unsafe {
-                core::ptr::copy_nonoverlapping(b.as_ptr(), hostname as *mut u8, l);
-                *hostname.add(l) = 0;
-            }
+            unsafe { put_cstr(hostname, &b[..l]) };
             0
         }
         _ => -1,

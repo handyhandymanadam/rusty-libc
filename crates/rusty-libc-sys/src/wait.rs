@@ -72,32 +72,7 @@ pub unsafe extern "C" fn waitid(idtype: c_int, id: u32, infop: *mut c_void, opti
     rc(unsafe { rusty_libc_core::tls::syscall_cp(nr::WAITID, idtype as usize, id as usize, infop as usize, options as usize, 0, 0) })
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct SigInfo {
-    pub raw: [i32; 32],
-}
-
-impl SigInfo {
-    pub const fn zeroed() -> SigInfo {
-        SigInfo { raw: [0; 32] }
-    }
-    pub const fn si_signo(&self) -> i32 {
-        self.raw[0]
-    }
-    pub const fn si_code(&self) -> i32 {
-        self.raw[2]
-    }
-    pub const fn si_pid(&self) -> i32 {
-        self.raw[4]
-    }
-    pub const fn si_uid(&self) -> u32 {
-        self.raw[5] as u32
-    }
-    pub const fn si_status(&self) -> i32 {
-        self.raw[6]
-    }
-}
+pub use rusty_libc_rs_core::wait::SigInfo;
 
 pub mod rs {
     use super::*;

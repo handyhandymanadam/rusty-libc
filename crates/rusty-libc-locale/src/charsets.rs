@@ -14,6 +14,9 @@ pub fn code_of_other(codeset: &[u8]) -> Option<u8> {
 }
 
 fn canon(name: &[u8]) -> Option<&'static str> {
+    if name == b"UTF-8" {
+        return Some("UTF-8");
+    }
     let s = core::str::from_utf8(name).ok()?;
     rusty_libc_iconv::canonical_name(s)
 }
@@ -56,3 +59,4 @@ pub fn same_charset(a: &[u8], b: &[u8]) -> bool {
         _ => false,
     }
 }
+

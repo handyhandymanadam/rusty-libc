@@ -1,6 +1,7 @@
 use core::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
-use rusty_libc_core::syscall::{check, syscall0, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6};
+use rusty_libc_core::syscall::{check, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6};
 use rusty_libc_core::{Errno, errno};
+use crate::kernel::plain;
 
 #[inline]
 pub(crate) fn sc(ret: usize) -> isize {
@@ -17,9 +18,6 @@ pub(crate) fn sci(ret: usize) -> c_int {
     sc(ret) as c_int
 }
 
-const SYS_READ: usize = 0;
-const SYS_OPEN: usize = 2;
-const SYS_CLOSE: usize = 3;
 const SYS_SCHED_YIELD: usize = 24;
 const SYS_SYSINFO: usize = 99;
 const SYS_TIMES: usize = 100;
@@ -64,7 +62,6 @@ const SYS_UNSHARE: usize = 272;
 const SYS_SETNS: usize = 308;
 const SYS_CAPGET: usize = 125;
 const SYS_CAPSET: usize = 126;
-const SYS_GETCPU: usize = 309;
 const SYS_CLOCK_ADJTIME: usize = 305;
 const SYS_SCHED_SETATTR: usize = 314;
 const SYS_SCHED_GETATTR: usize = 315;
@@ -82,19 +79,16 @@ const SYS_MOUNT_SETATTR: usize = 442;
 const EIO: i32 = 5;
 const EINTR: i32 = 4;
 const EFAULT: i32 = 14;
-const O_RDONLY_CLOEXEC: usize = 0o2000000;
 const CLOCK_REALTIME: c_int = 0;
 const ST_VALID: c_ulong = 0x20;
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn prctl(option: c_int, mut args: ...) -> c_int {
-    unsafe {
-        let a2 = args.next_arg::<c_ulong>();
-        let a3 = args.next_arg::<c_ulong>();
-        let a4 = args.next_arg::<c_ulong>();
-        let a5 = args.next_arg::<c_ulong>();
-        sci(syscall5(SYS_PRCTL, option as usize, a2 as usize, a3 as usize, a4 as usize, a5 as usize))
+    let mut a = [0 as c_ulong; 4];
+    for v in &mut a {
+        *v = unsafe { args.next_arg::<c_ulong>() };
     }
+    sci(unsafe { syscall5(SYS_PRCTL, option as usize, a[0] as usize, a[1] as usize, a[2] as usize, a[3] as usize) })
 }
 
 pub fn getrandom_r(buf: &mut [u8], flags: u32) -> Result<usize, Errno> {
@@ -108,29 +102,27 @@ pub unsafe extern "C" fn getrandom(buf: *mut c_void, len: usize, flags: c_uint) 
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getentropy(buf: *mut c_void, len: usize) -> c_int {
-    unsafe {
-        if len > 256 {
+    if len > 256 {
+        errno::set(EIO);
+        return -1;
+    }
+    let mut p = buf as usize;
+    let end = p + len;
+    while p < end {
+        let n = sc(unsafe { syscall3(rusty_libc_core::syscall::SYS_GETRANDOM, p, end - p, 0) });
+        if n < 0 {
+            if errno::get() == EINTR {
+                continue;
+            }
+            return -1;
+        }
+        if n == 0 {
             errno::set(EIO);
             return -1;
         }
-        let mut p = buf as usize;
-        let end = p + len;
-        while p < end {
-            let n = sc(syscall3(rusty_libc_core::syscall::SYS_GETRANDOM, p, end - p, 0));
-            if n < 0 {
-                if errno::get() == EINTR {
-                    continue;
-                }
-                return -1;
-            }
-            if n == 0 {
-                errno::set(EIO);
-                return -1;
-            }
-            p += n as usize;
-        }
-        0
+        p += n as usize;
     }
+    0
 }
 
 #[repr(C)]
@@ -162,144 +154,14 @@ pub unsafe extern "C" fn sysinfo(info: *mut sysinfo) -> c_int {
     unsafe { sci(syscall1(SYS_SYSINFO, info as usize)) }
 }
 
-unsafe fn slurp(path: *const u8, buf: &mut [u8]) -> usize {
-    unsafe {
-        let fd = syscall3(SYS_OPEN, path as usize, O_RDONLY_CLOEXEC, 0);
-        if fd > usize::MAX - 4095 {
-            return 0;
-        }
-        let n = syscall3(SYS_READ, fd, buf.as_mut_ptr() as usize, buf.len());
-        syscall1(SYS_CLOSE, fd);
-        if n > usize::MAX - 4095 { 0 } else { n }
-    }
-}
-
-fn count_cpu_list(text: &[u8]) -> c_int {
-    let mut i = 0;
-    let mut total: u64 = 0;
-    let num = |i: &mut usize| -> Option<u64> {
-        let s = *i;
-        let mut v: u64 = 0;
-        while *i < text.len() && text[*i].is_ascii_digit() {
-            v = v.saturating_mul(10).saturating_add((text[*i] - b'0') as u64);
-            *i += 1;
-        }
-        if *i == s { None } else { Some(v) }
-    };
-    if text.is_empty() || text[0] == b'\n' {
-        return 0;
-    }
-    loop {
-        let n = match num(&mut i) {
-            Some(v) => v,
-            None => return 0,
-        };
-        let mut m = n;
-        if i < text.len() && text[i] == b'-' {
-            i += 1;
-            m = match num(&mut i) {
-                Some(v) => v,
-                None => return 0,
-            };
-        }
-        if m >= n {
-            total += m - n + 1;
-        }
-        if i < text.len() && text[i] == b',' {
-            i += 1;
-        }
-        if !(i < text.len() && text[i] != b'\n') {
-            break;
-        }
-    }
-    total as c_int
-}
-
-fn nprocs_stat() -> c_int {
-    unsafe {
-        let fd = syscall3(SYS_OPEN, c"/proc/stat".as_ptr() as usize, O_RDONLY_CLOEXEC, 0);
-        if fd > usize::MAX - 4095 {
-            return 0;
-        }
-        let mut buf = [0u8; 1024];
-        let mut line = [0u8; 4];
-        let mut pos = 0usize;
-        let mut count = 0;
-        'outer: loop {
-            let n = syscall3(SYS_READ, fd, buf.as_mut_ptr() as usize, buf.len());
-            if n > usize::MAX - 4095 || n == 0 {
-                break;
-            }
-            for &b in &buf[..n] {
-                if b == b'\n' {
-                    if pos >= 3 && &line[..3] == b"cpu" {
-                        if pos >= 4 && line[3].is_ascii_digit() {
-                            count += 1;
-                        }
-                    } else {
-                        break 'outer;
-                    }
-                    pos = 0;
-                } else {
-                    if pos < 4 {
-                        line[pos] = b;
-                    }
-                    pos += 1;
-                }
-            }
-        }
-        syscall1(SYS_CLOSE, fd);
-        count
-    }
-}
-
-fn nprocs_sched() -> c_int {
-    unsafe {
-        let mut bits = [0u64; 512];
-        let r = syscall3(SYS_SCHED_GETAFFINITY, 0, 4096, bits.as_mut_ptr() as usize);
-        if r != 0 && r <= usize::MAX - 4095 {
-            let bytes = r.min(4096);
-            let mut c = 0u32;
-            for (i, w) in bits.iter().enumerate() {
-                if i * 8 < bytes {
-                    c += w.count_ones();
-                }
-            }
-            return c as c_int;
-        }
-        if r == (-22isize) as usize {
-            return 32768;
-        }
-        0
-    }
-}
-
-fn nprocs_fallback() -> c_int {
-    let r = nprocs_stat();
-    if r != 0 {
-        return r;
-    }
-    let r = nprocs_sched();
-    if r != 0 {
-        return r;
-    }
-    2
-}
-
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn get_nprocs() -> c_int {
-    let mut buf = [0u8; 1024];
-    let n = unsafe { slurp(c"/sys/devices/system/cpu/online".as_ptr().cast(), &mut buf) };
-    let r = count_cpu_list(&buf[..n]);
-    if r != 0 { r } else { nprocs_fallback() }
+    rusty_libc_rs_core::cpus::online()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn get_nprocs_conf() -> c_int {
-    let mut buf = [0u8; 1024];
-    let n = unsafe { slurp(c"/sys/devices/system/cpu/possible".as_ptr().cast(), &mut buf) };
-    let r = count_cpu_list(&buf[..n]);
-    if r != 0 { r } else { nprocs_fallback() }
+    rusty_libc_rs_core::cpus::configured()
 }
 
 fn mempages(num: c_ulong, mut mem_unit: c_uint) -> c_long {
@@ -318,15 +180,13 @@ fn mempages(num: c_ulong, mut mem_unit: c_uint) -> c_long {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn get_phys_pages() -> c_long {
-    let mut s = sysinfo::default();
-    unsafe { syscall1(SYS_SYSINFO, &mut s as *mut sysinfo as usize) };
+    let s = sysinfo_r().unwrap_or_default();
     mempages(s.totalram, s.mem_unit)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn get_avphys_pages() -> c_long {
-    let mut s = sysinfo::default();
-    unsafe { syscall1(SYS_SYSINFO, &mut s as *mut sysinfo as usize) };
+    let s = sysinfo_r().unwrap_or_default();
     mempages(s.freeram, s.mem_unit)
 }
 
@@ -353,27 +213,26 @@ pub struct sched_attr {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getcpu(cpu: *mut c_uint, node: *mut c_uint) -> c_int {
-    unsafe { sci(syscall3(309, cpu as usize, node as usize, 0)) }
+    unsafe { sci(rusty_libc_core::vdso::getcpu_raw(cpu, node)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sched_yield() -> c_int {
-    unsafe { sci(syscall0(SYS_SCHED_YIELD)) }
+    sci(plain!(SYS_SCHED_YIELD))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sched_getaffinity(pid: c_int, size: usize, mask: *mut c_void) -> c_int {
-    unsafe {
-        let r = sc(syscall3(SYS_SCHED_GETAFFINITY, pid as usize, size.min(i32::MAX as usize), mask as usize));
-        if r != -1 {
-            let w = r as usize;
-            if size > w {
-                core::ptr::write_bytes((mask as *mut u8).add(w), 0, size - w);
-            }
-            return 0;
+    let r = sc(unsafe { syscall3(SYS_SCHED_GETAFFINITY, pid as usize, size.min(i32::MAX as usize), mask as usize) });
+    if r != -1 {
+        let w = r as usize;
+        if size > w {
+            let m = unsafe { rusty_libc_core::ffi::bytes_mut(mask.cast::<u8>(), size) };
+            m[w..].fill(0);
         }
-        -1
+        return 0;
     }
+    -1
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -383,7 +242,7 @@ pub unsafe extern "C" fn sched_setaffinity(pid: c_int, size: usize, mask: *const
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sched_getscheduler(pid: c_int) -> c_int {
-    unsafe { sci(syscall1(SYS_SCHED_GETSCHEDULER, pid as usize)) }
+    sci(plain!(SYS_SCHED_GETSCHEDULER, pid as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -403,12 +262,12 @@ pub unsafe extern "C" fn sched_setparam(pid: c_int, param: *const sched_param) -
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sched_get_priority_max(policy: c_int) -> c_int {
-    unsafe { sci(syscall1(SYS_SCHED_GET_PRIORITY_MAX, policy as usize)) }
+    sci(plain!(SYS_SCHED_GET_PRIORITY_MAX, policy as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sched_get_priority_min(policy: c_int) -> c_int {
-    unsafe { sci(syscall1(SYS_SCHED_GET_PRIORITY_MIN, policy as usize)) }
+    sci(plain!(SYS_SCHED_GET_PRIORITY_MIN, policy as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -429,15 +288,13 @@ pub unsafe extern "C" fn sched_setattr(pid: c_int, attr: *mut sched_attr, flags:
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sched_getcpu() -> c_int {
     let mut cpu: c_uint = 0;
-    unsafe {
-        let r = sci(syscall3(SYS_GETCPU, &mut cpu as *mut c_uint as usize, 0, 0));
-        if r == -1 { -1 } else { cpu as c_int }
-    }
+    let r = sci(unsafe { rusty_libc_core::vdso::getcpu_raw(&mut cpu, core::ptr::null_mut()) });
+    if r == -1 { -1 } else { cpu as c_int }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn __sched_cpualloc(count: usize) -> *mut c_void {
-    unsafe { rusty_libc_malloc::malloc(count.div_ceil(64) * 8) }
+        crate::kernel::malloc(count.div_ceil(64) * 8)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -447,18 +304,13 @@ pub unsafe extern "C" fn __sched_cpufree(set: *mut c_void) {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __sched_cpucount(setsize: usize, set: *const u8) -> c_int {
-    unsafe {
-        let mut c = 0u32;
-        for i in 0..setsize {
-            c += (*set.add(i)).count_ones();
-        }
-        c as c_int
-    }
+    let s = unsafe { rusty_libc_core::ffi::bytes(set, setsize) };
+    s.iter().map(|b| b.count_ones()).sum::<u32>() as c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn unshare(flags: c_int) -> c_int {
-    unsafe { sci(syscall1(SYS_UNSHARE, flags as usize)) }
+    sci(plain!(SYS_UNSHARE, flags as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -473,7 +325,7 @@ pub unsafe extern "C" fn capset(header: *mut c_void, data: *mut c_void) -> c_int
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn setns(fd: c_int, nstype: c_int) -> c_int {
-    unsafe { sci(syscall2(SYS_SETNS, fd as usize, nstype as usize)) }
+    sci(plain!(SYS_SETNS, fd as usize, nstype as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -525,7 +377,7 @@ pub unsafe extern "C" fn fsconfig(fd: c_int, cmd: c_uint, key: *const c_char, va
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn fsmount(fd: c_int, flags: c_uint, attr_flags: c_uint) -> c_int {
-    unsafe { sci(syscall3(SYS_FSMOUNT, fd as usize, flags as usize, attr_flags as usize)) }
+    sci(plain!(SYS_FSMOUNT, fd as usize, flags as usize, attr_flags as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -550,27 +402,25 @@ pub unsafe extern "C" fn swapoff(path: *const c_char) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ptrace(request: c_int, mut args: ...) -> c_long {
-    unsafe {
-        let pid = args.next_arg::<c_int>();
-        let addr = args.next_arg::<*mut c_void>();
-        let mut data = args.next_arg::<*mut c_void>();
-        let mut word: c_long = 0;
-        let peek = request > 0 && request < 4;
-        if peek {
-            data = &mut word as *mut c_long as *mut c_void;
-        }
-        let res = sc(syscall4(SYS_PTRACE, request as isize as usize, pid as isize as usize, addr as usize, data as usize)) as c_long;
-        if res >= 0 && peek {
-            errno::set(0);
-            return word;
-        }
-        res
+    let pid = unsafe { args.next_arg::<c_int>() };
+    let addr = unsafe { args.next_arg::<*mut c_void>() };
+    let mut data = unsafe { args.next_arg::<*mut c_void>() };
+    let mut word: c_long = 0;
+    let peek = request > 0 && request < 4;
+    if peek {
+        data = &mut word as *mut c_long as *mut c_void;
     }
+    let res = sc(unsafe { syscall4(SYS_PTRACE, request as isize as usize, pid as isize as usize, addr as usize, data as usize) }) as c_long;
+    if res >= 0 && peek {
+        errno::set(0);
+        return word;
+    }
+    res
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn personality(persona: c_ulong) -> c_int {
-    unsafe { syscall1(SYS_PERSONALITY, persona as u32 as usize) as isize as c_int }
+    plain!(SYS_PERSONALITY, persona as u32 as usize) as isize as c_int
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -590,12 +440,12 @@ pub unsafe extern "C" fn quotactl(cmd: c_int, special: *const c_char, id: c_int,
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn pidfd_open(pid: c_int, flags: c_uint) -> c_int {
-    unsafe { sci(syscall2(SYS_PIDFD_OPEN, pid as usize, flags as usize)) }
+    sci(plain!(SYS_PIDFD_OPEN, pid as usize, flags as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn pidfd_getfd(pidfd: c_int, targetfd: c_int, flags: c_uint) -> c_int {
-    unsafe { sci(syscall3(SYS_PIDFD_GETFD, pidfd as usize, targetfd as usize, flags as usize)) }
+    sci(plain!(SYS_PIDFD_GETFD, pidfd as usize, targetfd as usize, flags as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -605,15 +455,11 @@ pub unsafe extern "C" fn pidfd_send_signal(pidfd: c_int, sig: c_int, info: *mut 
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn syscall(number: c_long, mut args: ...) -> c_long {
-    unsafe {
-        let a0 = args.next_arg::<c_long>();
-        let a1 = args.next_arg::<c_long>();
-        let a2 = args.next_arg::<c_long>();
-        let a3 = args.next_arg::<c_long>();
-        let a4 = args.next_arg::<c_long>();
-        let a5 = args.next_arg::<c_long>();
-        sc(syscall6(number as usize, a0 as usize, a1 as usize, a2 as usize, a3 as usize, a4 as usize, a5 as usize)) as c_long
+    let mut a = [0 as c_long; 6];
+    for v in &mut a {
+        *v = unsafe { args.next_arg::<c_long>() };
     }
+    sc(unsafe { syscall6(number as usize, a[0] as usize, a[1] as usize, a[2] as usize, a[3] as usize, a[4] as usize, a[5] as usize) }) as c_long
 }
 
 #[repr(C)]
@@ -662,35 +508,32 @@ pub unsafe extern "C" fn adjtimex(tx: *mut timex) -> c_int {
     unsafe { clock_adjtime(CLOCK_REALTIME, tx) }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn ntp_adjtime(tx: *mut timex) -> c_int {
-    unsafe { clock_adjtime(CLOCK_REALTIME, tx) }
-}
+crate::unistd::alias!(
+    ntp_adjtime => adjtimex(tx: *mut timex) -> c_int
+);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ntp_gettime(ntv: *mut ntptimeval) -> c_int {
-    unsafe {
-        let mut t = timex::default();
-        let r = clock_adjtime(CLOCK_REALTIME, &mut t);
-        (*ntv).time = t.time;
-        (*ntv).maxerror = t.maxerror;
-        (*ntv).esterror = t.esterror;
-        r
-    }
+    let mut t = timex::default();
+    let r = unsafe { clock_adjtime(CLOCK_REALTIME, &mut t) };
+    let ntv = unsafe { &mut *ntv };
+    ntv.time = t.time;
+    ntv.maxerror = t.maxerror;
+    ntv.esterror = t.esterror;
+    r
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ntp_gettimex(ntv: *mut ntptimeval) -> c_int {
-    unsafe {
-        let mut t = timex::default();
-        let r = clock_adjtime(CLOCK_REALTIME, &mut t);
-        (*ntv).time = t.time;
-        (*ntv).maxerror = t.maxerror;
-        (*ntv).esterror = t.esterror;
-        (*ntv).tai = t.tai as c_long;
-        (*ntv).reserved = [0; 4];
-        r
-    }
+    let mut t = timex::default();
+    let r = unsafe { clock_adjtime(CLOCK_REALTIME, &mut t) };
+    let ntv = unsafe { &mut *ntv };
+    ntv.time = t.time;
+    ntv.maxerror = t.maxerror;
+    ntv.esterror = t.esterror;
+    ntv.tai = t.tai as c_long;
+    ntv.reserved = [0; 4];
+    r
 }
 
 #[repr(C)]
@@ -704,13 +547,11 @@ pub struct tms {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn times(buf: *mut tms) -> c_long {
-    unsafe {
-        let ret = syscall1(SYS_TIMES, buf as usize);
-        if ret > usize::MAX - 4095 && (ret as isize).wrapping_neg() as i32 == EFAULT && !buf.is_null() {
-            let _ = core::ptr::read_volatile(&(*buf).tms_utime);
-        }
-        if ret as isize == -1 { 0 } else { ret as c_long }
+    let ret = unsafe { syscall1(SYS_TIMES, buf as usize) };
+    if ret > usize::MAX - 4095 && (ret as isize).wrapping_neg() as i32 == EFAULT && !buf.is_null() {
+        let _ = unsafe { core::ptr::read_volatile(buf.cast::<c_long>()) };
     }
+    if ret as isize == -1 { 0 } else { ret as c_long }
 }
 
 #[repr(C)]
@@ -767,11 +608,9 @@ pub fn statfs_to_statvfs(fs: &statfs) -> statvfs {
 }
 
 pub unsafe fn statfs_r(path: *const c_char) -> Result<statfs, Errno> {
-    unsafe {
-        let mut s = statfs::default();
-        check(syscall2(SYS_STATFS, path as usize, &mut s as *mut statfs as usize))?;
-        Ok(s)
-    }
+    let mut s = statfs::default();
+    check(unsafe { syscall2(SYS_STATFS, path as usize, &mut s as *mut statfs as usize) })?;
+    Ok(s)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -779,54 +618,46 @@ pub unsafe extern "C" fn statfs(path: *const c_char, buf: *mut statfs) -> c_int 
     unsafe { sci(syscall2(SYS_STATFS, path as usize, buf as usize)) }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn statfs64(path: *const c_char, buf: *mut statfs) -> c_int {
-    unsafe { statfs(path, buf) }
-}
+crate::unistd::alias!(
+    statfs64 => statfs(path: *const c_char, buf: *mut statfs) -> c_int
+);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fstatfs(fd: c_int, buf: *mut statfs) -> c_int {
     unsafe { sci(syscall2(SYS_FSTATFS, fd as usize, buf as usize)) }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn fstatfs64(fd: c_int, buf: *mut statfs) -> c_int {
-    unsafe { fstatfs(fd, buf) }
-}
+crate::unistd::alias!(
+    fstatfs64 => fstatfs(fd: c_int, buf: *mut statfs) -> c_int
+);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn statvfs(path: *const c_char, buf: *mut statvfs) -> c_int {
-    unsafe {
-        let mut fs = statfs::default();
-        if statfs(path, &mut fs) < 0 {
-            return -1;
-        }
-        *buf = statfs_to_statvfs(&fs);
-        0
+    let mut fs = statfs::default();
+    if unsafe { statfs(path, &mut fs) } < 0 {
+        return -1;
     }
+    unsafe { buf.write(statfs_to_statvfs(&fs)) };
+    0
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn statvfs64(path: *const c_char, buf: *mut statvfs) -> c_int {
-    unsafe { statvfs(path, buf) }
-}
+crate::unistd::alias!(
+    statvfs64 => statvfs(path: *const c_char, buf: *mut statvfs) -> c_int
+);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fstatvfs(fd: c_int, buf: *mut statvfs) -> c_int {
-    unsafe {
-        let mut fs = statfs::default();
-        if fstatfs(fd, &mut fs) < 0 {
-            return -1;
-        }
-        *buf = statfs_to_statvfs(&fs);
-        0
+    let mut fs = statfs::default();
+    if unsafe { fstatfs(fd, &mut fs) } < 0 {
+        return -1;
     }
+    unsafe { buf.write(statfs_to_statvfs(&fs)) };
+    0
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn fstatvfs64(fd: c_int, buf: *mut statvfs) -> c_int {
-    unsafe { fstatvfs(fd, buf) }
-}
+crate::unistd::alias!(
+    fstatvfs64 => fstatvfs(fd: c_int, buf: *mut statvfs) -> c_int
+);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getxattr(path: *const c_char, name: *const c_char, value: *mut c_void, size: usize) -> isize {
@@ -890,11 +721,11 @@ pub unsafe extern "C" fn fremovexattr(fd: c_int, name: *const c_char) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn setfsuid(uid: c_uint) -> c_int {
-    unsafe { sci(syscall1(SYS_SETFSUID, uid as usize)) }
+    sci(plain!(SYS_SETFSUID, uid as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn setfsgid(gid: c_uint) -> c_int {
-    unsafe { sci(syscall1(SYS_SETFSGID, gid as usize)) }
+    sci(plain!(SYS_SETFSGID, gid as usize))
 }
 

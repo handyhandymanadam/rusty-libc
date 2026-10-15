@@ -64,8 +64,8 @@ macro_rules! q2_to_ld {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: f128, y: f128, o: *mut crate::longdouble::common::F80) {
-                unsafe { *o = $imp(F128(x.to_bits()), F128(y.to_bits())) }
+            pub(super) extern "C" fn inner(x: f128, y: f128, o: &mut core::mem::MaybeUninit<crate::longdouble::common::F80>) {
+                o.write($imp(F128(x.to_bits()), F128(y.to_bits())));
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -90,8 +90,8 @@ macro_rules! q3_to_ld {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: f128, y: f128, z: f128, o: *mut crate::longdouble::common::F80) {
-                unsafe { *o = $imp(F128(x.to_bits()), F128(y.to_bits()), F128(z.to_bits())) }
+            pub(super) extern "C" fn inner(x: f128, y: f128, z: f128, o: &mut core::mem::MaybeUninit<crate::longdouble::common::F80>) {
+                o.write($imp(F128(x.to_bits()), F128(y.to_bits()), F128(z.to_bits())));
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -116,8 +116,8 @@ macro_rules! q1_to_ld {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: f128, o: *mut crate::longdouble::common::F80) {
-                unsafe { *o = $imp(F128(x.to_bits())) }
+            pub(super) extern "C" fn inner(x: f128, o: &mut core::mem::MaybeUninit<crate::longdouble::common::F80>) {
+                o.write($imp(F128(x.to_bits())));
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]

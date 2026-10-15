@@ -1,6 +1,7 @@
+use crate::kernel;
 use crate::util::{sc, sci};
 use core::ffi::{c_int, c_long, c_ulong, c_void};
-use rusty_libc_core::syscall::{syscall1, syscall2, syscall3, syscall4};
+use rusty_libc_core::syscall::{syscall1, syscall3, syscall4};
 use rusty_libc_core::tls::syscall_cp;
 
 pub const SYS_SHMGET: usize = 29;
@@ -15,7 +16,6 @@ pub const SYS_MSGSND: usize = 69;
 pub const SYS_MSGRCV: usize = 70;
 pub const SYS_MSGCTL: usize = 71;
 pub const SYS_SEMTIMEDOP: usize = 220;
-pub const SYS_STAT: usize = 4;
 
 pub const IPC_CREAT: c_int = 0o1000;
 pub const IPC_EXCL: c_int = 0o2000;
@@ -228,18 +228,22 @@ const _: () = {
     assert!(core::mem::size_of::<Semun>() == 8);
 };
 
+pub fn key_from(dev: u64, ino: u64, id: c_int) -> key_t {
+    (((ino & 0xffff) | ((dev & 0xff) << 16) | (((id as u64) & 0xff) << 24)) as u32) as key_t
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ftok(path: *const core::ffi::c_char, id: c_int) -> key_t {
     let mut st = [0u64; 18];
-    if sc(unsafe { syscall2(SYS_STAT, path as usize, st.as_mut_ptr() as usize) }) < 0 {
+    if sc(unsafe { rusty_libc_core::syscall::sys_stat(path as usize, st.as_mut_ptr() as usize) }) < 0 {
         return -1;
     }
-    (((st[1] & 0xffff) | ((st[0] & 0xff) << 16) | (((id as u64) & 0xff) << 24)) as u32) as key_t
+    key_from(st[0], st[1], id)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn msgget(key: key_t, flags: c_int) -> c_int {
-    sci(unsafe { syscall2(SYS_MSGGET, key as usize, flags as usize) })
+    sci(kernel::msgget(key as usize, flags as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -259,12 +263,12 @@ pub unsafe extern "C" fn msgrcv(id: c_int, msg: *mut c_void, size: usize, ty: c_
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn semget(key: key_t, nsems: c_int, flags: c_int) -> c_int {
-    sci(unsafe { syscall3(SYS_SEMGET, key as usize, nsems as usize, flags as usize) })
+    sci(kernel::semget(key as usize, nsems as usize, flags as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn semop(id: c_int, ops: *mut Sembuf, n: usize) -> c_int {
-    sci(unsafe { syscall3(SYS_SEMOP, id as usize, ops as usize, n) })
+    sci(unsafe { syscall4(SYS_SEMTIMEDOP, id as usize, ops as usize, n, 0) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -272,20 +276,23 @@ pub unsafe extern "C" fn semtimedop(id: c_int, ops: *mut Sembuf, n: usize, timeo
     sci(unsafe { syscall4(SYS_SEMTIMEDOP, id as usize, ops as usize, n, timeout as usize) })
 }
 
+pub fn semctl_has_arg(cmd: c_int) -> bool {
+    matches!(cmd, SETVAL | GETALL | SETALL | IPC_STAT | IPC_SET | SEM_STAT | SEM_STAT_ANY | IPC_INFO | SEM_INFO)
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn semctl(id: c_int, num: c_int, cmd: c_int, mut args: ...) -> c_int {
-    unsafe {
-        let arg: usize = match cmd {
-            SETVAL | GETALL | SETALL | IPC_STAT | IPC_SET | SEM_STAT | SEM_STAT_ANY | IPC_INFO | SEM_INFO => args.next_arg::<usize>(),
-            _ => 0,
-        };
-        sci(syscall4(SYS_SEMCTL, id as usize, num as usize, cmd as usize, arg))
-    }
+    let arg: usize = if semctl_has_arg(cmd) {
+        unsafe { args.next_arg::<usize>() }
+    } else {
+        0
+    };
+    sci(unsafe { syscall4(SYS_SEMCTL, id as usize, num as usize, cmd as usize, arg) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn shmget(key: key_t, size: usize, flags: c_int) -> c_int {
-    sci(unsafe { syscall3(SYS_SHMGET, key as usize, size, flags as usize) })
+    sci(kernel::shmget(key as usize, size, flags as usize))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

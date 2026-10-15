@@ -1,3 +1,4 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use core::arch::global_asm;
 #[cfg(not(feature = "shared"))]
 use core::arch::naked_asm;
@@ -13,6 +14,16 @@ pub(crate) fn set_sysinfo_ehdr(v: usize) {
 
 pub fn sysinfo_ehdr() -> usize {
     SYSINFO_EHDR.load(Ordering::Relaxed)
+}
+
+static AUXV: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn set_auxv(v: *const usize) {
+    AUXV.store(v as usize, Ordering::Relaxed);
+}
+
+pub fn auxv() -> *const usize {
+    AUXV.load(Ordering::Relaxed) as *const usize
 }
 
 #[cfg(not(feature = "shared"))]
@@ -38,9 +49,11 @@ global_asm!(
     ".size _environ, 8",
 );
 
-unsafe extern "C" {
-    pub static mut environ: *mut *mut c_char;
-}
+pub use crate::env::environ;
+
+#[cfg(not(feature = "shared"))]
+#[unsafe(no_mangle)]
+pub static __libc_stack_end: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(not(feature = "shared"))]
 #[unsafe(no_mangle)]
@@ -59,43 +72,52 @@ pub unsafe extern "C" fn _start() -> ! {
 macro_rules! weak_addr {
     ($sym:literal) => {{
         let a: usize;
-        core::arch::asm!(concat!(".weak ", $sym), concat!("lea {0}, [rip + ", $sym, "]"), out(reg) a, options(nomem, nostack, preserves_flags));
+        unsafe { core::arch::asm!(concat!(".weak ", $sym), concat!("lea {0}, [rip + ", $sym, "]"), out(reg) a, options(nomem, nostack, preserves_flags)) };
         a
     }};
 }
 
-#[cfg(not(feature = "shared"))]
-pub(crate) unsafe fn run_hooks(argc: c_int, argv: *mut *mut c_char, envp: *mut *mut c_char) {
-    unsafe { run_hooks_auxv(argc, argv, envp, auxv_after(envp)) }
-}
-
-pub(crate) unsafe fn auxv_after(envp: *mut *mut c_char) -> *const u64 {
-    unsafe {
-        let mut p = envp;
-        while !(*p).is_null() {
-            p = p.add(1);
+pub(crate) unsafe fn aux_each(aux: *const usize, mut f: impl FnMut(usize, usize)) {
+    let mut a = aux;
+    loop {
+        let [tag, val] = unsafe { *(a as *const [usize; 2]) };
+        if tag == 0 {
+            break;
         }
-        p.add(1) as *const u64
+        f(tag, val);
+        a = a.wrapping_add(2);
     }
 }
 
+#[cfg(not(feature = "shared"))]
+pub(crate) unsafe fn run_hooks(argc: c_int, argv: *mut *mut c_char, envp: *mut *mut c_char) {
+    let auxv = unsafe { auxv_after(envp) };
+    unsafe { run_hooks_auxv(argc, argv, envp, auxv) }
+}
+
+pub(crate) unsafe fn auxv_after(envp: *mut *mut c_char) -> *const u64 {
+    let mut p = envp;
+    while !unsafe { *p }.is_null() {
+        p = p.wrapping_add(1);
+    }
+    p.wrapping_add(1) as *const u64
+}
+
 pub(crate) unsafe fn run_hooks_auxv(argc: c_int, argv: *mut *mut c_char, envp: *mut *mut c_char, auxv: *const u64) {
-    unsafe {
-        let misc = weak_addr!("__init_misc");
-        if misc != 0 {
-            let f: unsafe extern "C" fn(c_int, *mut *mut c_char, *mut *mut c_char) = core::mem::transmute(misc);
-            f(argc, argv, envp);
-        }
-        let aux = weak_addr!("__init_auxv");
-        if aux != 0 {
-            let f: unsafe extern "C" fn(*const u64) = core::mem::transmute(aux);
-            f(auxv);
-        }
-        let cache = weak_addr!("__rusty_libc_init_cacheinfo");
-        if cache != 0 {
-            let f: extern "C" fn() = core::mem::transmute(cache);
-            f();
-        }
+    let misc = weak_addr!("__init_misc");
+    if misc != 0 {
+        let f: unsafe extern "C" fn(c_int, *mut *mut c_char, *mut *mut c_char) = unsafe { core::mem::transmute(misc) };
+        unsafe { f(argc, argv, envp) };
+    }
+    let aux = weak_addr!("__init_auxv");
+    if aux != 0 {
+        let f: unsafe extern "C" fn(*const u64) = unsafe { core::mem::transmute(aux) };
+        unsafe { f(auxv) };
+    }
+    let cache = weak_addr!("__rusty_libc_init_cacheinfo");
+    if cache != 0 {
+        let f: extern "C" fn() = unsafe { core::mem::transmute(cache) };
+        f();
     }
 }
 
@@ -113,73 +135,95 @@ unsafe fn array(start: usize, end: usize) -> &'static [InitFn] {
 
 #[cfg(not(feature = "shared"))]
 unsafe fn call_init(argc: c_int, argv: *mut *mut c_char, envp: *mut *mut c_char) {
-    unsafe {
-        for f in array(weak_addr!("__preinit_array_start"), weak_addr!("__preinit_array_end")) {
-            f(argc, argv, envp);
-        }
-        let init = weak_addr!("_init");
-        if init != 0 {
-            let f: unsafe extern "C" fn() = core::mem::transmute(init);
-            f();
-        }
-        for f in array(weak_addr!("__init_array_start"), weak_addr!("__init_array_end")) {
-            f(argc, argv, envp);
-        }
+    for f in unsafe { array(weak_addr!("__preinit_array_start"), weak_addr!("__preinit_array_end")) } {
+        unsafe { f(argc, argv, envp) };
+    }
+    let init = weak_addr!("_init");
+    if init != 0 {
+        let f: unsafe extern "C" fn() = unsafe { core::mem::transmute(init) };
+        unsafe { f() };
+    }
+    for f in unsafe { array(weak_addr!("__init_array_start"), weak_addr!("__init_array_end")) } {
+        unsafe { f(argc, argv, envp) };
     }
 }
 
 #[cfg(not(feature = "shared"))]
 extern "C" fn call_fini() {
-    unsafe {
-        for f in array(weak_addr!("__fini_array_start"), weak_addr!("__fini_array_end")).iter().rev() {
-            f(0, core::ptr::null_mut(), core::ptr::null_mut());
+    for f in unsafe { array(weak_addr!("__fini_array_start"), weak_addr!("__fini_array_end")) }.iter().rev() {
+        unsafe { f(0, core::ptr::null_mut(), core::ptr::null_mut()) };
+    }
+    let fini = weak_addr!("_fini");
+    if fini != 0 {
+        let f: unsafe extern "C" fn() = unsafe { core::mem::transmute(fini) };
+        unsafe { f() };
+    }
+}
+
+#[cfg(not(feature = "shared"))]
+fn check_standard_fds() {
+    use crate::syscall::{syscall3, syscall4};
+    const EBADF: usize = (-9isize) as usize;
+    let fds: [(usize, &core::ffi::CStr, usize, u64); 3] = [
+        (0, c"/dev/full", 0o1 | 0o400000, (1 << 8) | 7),
+        (1, c"/dev/null", 0o400000, (1 << 8) | 3),
+        (2, c"/dev/null", 0o400000, (1 << 8) | 3),
+    ];
+    for (fd, path, mode, dev) in fds {
+        if unsafe { syscall3(crate::syscall::SYS_FCNTL, fd, 1 , 0) } != EBADF {
+            continue;
         }
-        let fini = weak_addr!("_fini");
-        if fini != 0 {
-            let f: unsafe extern "C" fn() = core::mem::transmute(fini);
-            f();
+        let got = unsafe { syscall4(crate::syscall::SYS_OPENAT, (-100isize) as usize, path.as_ptr() as usize, mode, 0) };
+        let mut st = [0u64; 18];
+        let ok = got == fd
+            && unsafe { syscall3(crate::syscall::SYS_FSTAT, fd, st.as_mut_ptr() as usize, 0) } == 0
+            && (st[3] as u32) & 0o170000 == 0o020000
+            && st[5] == dev;
+        if !ok {
+            loop {
+                unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+            }
         }
     }
 }
 
 #[cfg(not(feature = "shared"))]
 extern "C" fn entry(sp: *const usize) -> ! {
+    let argc = unsafe { *sp } as c_int;
+    let argv = sp.wrapping_add(1) as *mut *mut c_char;
+    let envp = argv.wrapping_add(argc as usize + 1);
+    __libc_stack_end.store(sp as usize, Ordering::Relaxed);
+    crate::tls::set_stack_end(sp as usize);
+    let aux = unsafe { auxv_after(envp) } as *const usize;
+    unsafe { crate::tls::init_main(aux) };
+    environ.store(envp, Ordering::Relaxed);
+    set_auxv(aux);
+    let mut secure = false;
     unsafe {
-        let argc = *sp as c_int;
-        let argv = sp.add(1) as *mut *mut c_char;
-        let envp = argv.add(argc as usize + 1);
-        {
-            let mut p = envp;
-            while !(*p).is_null() {
-                p = p.add(1);
-            }
-            crate::tls::init_main(p.add(1) as *const usize);
-        }
-        environ = envp;
-        let mut p = envp;
-        while !(*p).is_null() {
-            p = p.add(1);
-        }
-        let mut aux = p.add(1) as *const usize;
-        let mut secure = false;
-        while *aux != 0 {
-            if *aux == 33 {
-                SYSINFO_EHDR.store(*aux.add(1), Ordering::Relaxed);
-            } else if *aux == 23 {
-                secure = *aux.add(1) != 0;
+        aux_each(aux, |tag, val| {
+            if tag == 33 {
+                SYSINFO_EHDR.store(val, Ordering::Relaxed);
+            } else if tag == 23 {
+                secure = val != 0;
                 crate::lock::set_at_secure(secure);
             }
-            aux = aux.add(2);
-        }
+        })
+    };
+    let secure = unsafe {
         crate::tunables::init_static(envp as *mut *mut u8, secure, &mut |b| {
             let _ = crate::unistd::write(2, b);
-        }, &mut apply_hwcaps);
-        apply_irel();
-        run_hooks(argc, argv, envp);
-        crate::process::atexit(call_fini);
-        call_init(argc, argv, envp);
-        crate::process::exit(main(argc, argv, envp))
+        }, &mut apply_hwcaps)
+    };
+    if secure {
+        crate::lock::set_at_secure(true);
+        check_standard_fds();
     }
+    unsafe { apply_irel() };
+    unsafe { run_hooks(argc, argv, envp) };
+    crate::process::atexit(call_fini);
+    unsafe { call_init(argc, argv, envp) };
+    let status = unsafe { main(argc, argv, envp) };
+    crate::process::exit(status)
 }
 
 pub(crate) fn apply_hwcaps(list: &[u8]) {
@@ -196,21 +240,20 @@ pub(crate) fn apply_hwcaps(list: &[u8]) {
 
 #[cfg(not(feature = "shared"))]
 unsafe fn apply_irel() {
-    unsafe {
-        let start = weak_addr!("__rela_iplt_start");
-        let end = weak_addr!("__rela_iplt_end");
-        if start == 0 || end == 0 {
-            return;
+    let start = weak_addr!("__rela_iplt_start");
+    let end = weak_addr!("__rela_iplt_end");
+    if start == 0 || end == 0 {
+        return;
+    }
+    let mut r = start as *const [u64; 3];
+    while (r as usize) < end {
+        let [offset, info, addend] = unsafe { *r };
+        if (info & 0xffff_ffff) == 37 {
+            let resolver: extern "C" fn() -> usize = unsafe { core::mem::transmute(addend as usize) };
+            let v = resolver();
+            unsafe { *(offset as *mut usize) = v };
         }
-        let mut r = start as *const [u64; 3];
-        while (r as usize) < end {
-            let [offset, info, addend] = *r;
-            if (info & 0xffff_ffff) == 37 {
-                let resolver: extern "C" fn() -> usize = core::mem::transmute(addend as usize);
-                *(offset as *mut usize) = resolver();
-            }
-            r = r.add(1);
-        }
+        r = r.wrapping_add(1);
     }
 }
 

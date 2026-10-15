@@ -1,6 +1,7 @@
 use crate::unistd::{EINVAL, fail, nr, rc};
 use core::ffi::{c_int, c_long, c_void};
 use rusty_libc_core::{Errno, errno, syscall};
+use crate::kernel::plain;
 
 pub const RLIMIT_CPU: c_int = 0;
 pub const RLIMIT_FSIZE: c_int = 1;
@@ -95,7 +96,7 @@ pub unsafe extern "C" fn getrusage(who: c_int, usage: *mut c_void) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn getpriority(which: c_int, who: u32) -> c_int {
-    let r = unsafe { syscall::syscall2(nr::GETPRIORITY, which as usize, who as usize) };
+    let r = plain!(nr::GETPRIORITY, which as usize, who as usize);
     match syscall::check(r) {
         Ok(v) => 20 - v as c_int,
         Err(e) => fail(e.0),
@@ -104,7 +105,7 @@ pub extern "C" fn getpriority(which: c_int, who: u32) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn setpriority(which: c_int, who: u32, prio: c_int) -> c_int {
-    rc(unsafe { syscall::syscall3(nr::SETPRIORITY, which as usize, who as usize, prio as usize) })
+    rc(plain!(nr::SETPRIORITY, which as usize, who as usize, prio as usize))
 }
 
 const UL_GETFSIZE: c_int = 1;
@@ -113,33 +114,31 @@ const UL_GETOPENMAX: c_int = 4;
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ulimit(cmd: c_int, mut args: ...) -> c_long {
-    unsafe {
-        let mut lim = Rlimit::default();
-        match cmd {
-            UL_GETFSIZE => {
-                if getrlimit(RLIMIT_FSIZE, &mut lim) == 0 {
-                    return if lim.rlim_cur == RLIM_INFINITY { c_long::MAX } else { (lim.rlim_cur / 512) as c_long };
-                }
-                -1
+    let mut lim = Rlimit::default();
+    match cmd {
+        UL_GETFSIZE => {
+            if rs::getrlimit_into(RLIMIT_FSIZE, &mut lim) == 0 {
+                return if lim.rlim_cur == RLIM_INFINITY { c_long::MAX } else { (lim.rlim_cur / 512) as c_long };
             }
-            UL_SETFSIZE => {
-                let newlimit: c_long = args.next_arg();
-                let newlen;
-                if (newlimit as u64) > RLIM_INFINITY / 512 {
-                    lim = Rlimit { rlim_cur: RLIM_INFINITY, rlim_max: RLIM_INFINITY };
-                    newlen = c_long::MAX;
-                } else {
-                    let v = (newlimit as u64).wrapping_mul(512);
-                    lim = Rlimit { rlim_cur: v, rlim_max: v };
-                    newlen = newlimit;
-                }
-                if setrlimit(RLIMIT_FSIZE, &lim) == -1 { -1 } else { newlen }
+            -1
+        }
+        UL_SETFSIZE => {
+            let newlimit: c_long = unsafe { args.next_arg() };
+            let newlen;
+            if (newlimit as u64) > RLIM_INFINITY / 512 {
+                lim = Rlimit { rlim_cur: RLIM_INFINITY, rlim_max: RLIM_INFINITY };
+                newlen = c_long::MAX;
+            } else {
+                let v = (newlimit as u64).wrapping_mul(512);
+                lim = Rlimit { rlim_cur: v, rlim_max: v };
+                newlen = newlimit;
             }
-            UL_GETOPENMAX => crate::unistd::getdtablesize() as c_long,
-            _ => {
-                errno::set(EINVAL);
-                -1
-            }
+            if rs::setrlimit_from(RLIMIT_FSIZE, &lim) == -1 { -1 } else { newlen }
+        }
+        UL_GETOPENMAX => crate::unistd::getdtablesize() as c_long,
+        _ => {
+            errno::set(EINVAL);
+            -1
         }
     }
 }
@@ -164,10 +163,19 @@ pub mod rs {
         Ok(ru)
     }
     pub fn getpriority(which: i32, who: u32) -> Result<i32, Errno> {
-        crate::unistd::val(unsafe { syscall::syscall2(nr::GETPRIORITY, which as usize, who as usize) }).map(|v| 20 - v as i32)
+        crate::unistd::val(plain!(nr::GETPRIORITY, which as usize, who as usize)).map(|v| 20 - v as i32)
+    }
+    pub(crate) fn prlimit_raw(resource: i32, lim: &mut Rlimit) -> usize {
+        unsafe { syscall::syscall4(nr::PRLIMIT64, 0, resource as usize, 0, lim as *mut Rlimit as usize) }
+    }
+    pub(crate) fn getrlimit_into(resource: i32, lim: &mut Rlimit) -> c_int {
+        rc(unsafe { syscall::syscall4(nr::PRLIMIT64, 0, resource as usize, 0, lim as *mut Rlimit as usize) })
+    }
+    pub(crate) fn setrlimit_from(resource: i32, lim: &Rlimit) -> c_int {
+        rc(unsafe { syscall::syscall4(nr::PRLIMIT64, 0, resource as usize, lim as *const Rlimit as usize, 0) })
     }
     pub fn setpriority(which: i32, who: u32, prio: i32) -> Result<(), Errno> {
-        crate::unistd::unit(unsafe { syscall::syscall3(nr::SETPRIORITY, which as usize, who as usize, prio as usize) })
+        crate::unistd::unit(plain!(nr::SETPRIORITY, which as usize, who as usize, prio as usize))
     }
 }
 

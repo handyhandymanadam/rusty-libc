@@ -19,7 +19,7 @@ pub fn sys_fns() -> Vec<(&'static str, Vec<&'static str>)> {
         pread pread64 pwrite pwrite64 read readlink readlinkat revoke rmdir sbrk setdomainname setegid seteuid
         setgid setgroups sethostid sethostname setlogin setpgid setpgrp setregid setresgid setresuid setreuid
         setsid setuid symlink symlinkat sync syncfs sysconf syscall tcgetpgrp
-        tcsetpgrp truncate truncate64 ttyname ttyname_r unlink unlinkat vfork vhangup __getpgid gettid _Fork ualarm getpass")),
+        tcsetpgrp truncate truncate64 ttyname ttyname_r unlink unlinkat vfork vhangup __getpgid gettid _Fork ualarm")),
         ("fcntl", w("creat fcntl fcntl64 open open64 openat openat64 openat2 posix_fadvise posix_fallocate fallocate
         fallocate64 posix_fadvise64 posix_fallocate64 creat64 lockf lockf64 name_to_handle_at open_by_handle_at
         readahead splice sync_file_range tee vmsplice")),
@@ -238,11 +238,10 @@ impl Sys {
         let mut sigs = BTreeMap::new();
         let mut names: Vec<String> = fs::read_dir(&self.root).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
         names.sort();
-        for name in names {
-            if !name.ends_with(".rs") || name == "lib.rs" {
-                continue;
-            }
-            let text = fs::read_to_string(self.root.join(&name)).unwrap();
+        let mut paths: Vec<std::path::PathBuf> = names.iter().filter(|n| n.ends_with(".rs") && *n != "lib.rs").map(|n| self.root.join(n)).collect();
+        paths.push(self.root.join("../../rusty-libc-net/src/hostid.rs"));
+        for path in paths {
+            let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             for m in fn_re.captures_iter(&text) {
                 sigs.insert(m[2].to_string(), (clean_params(&m[3]), m.get(4).map(|x| x.as_str().trim().to_string()).unwrap_or_default()));
             }

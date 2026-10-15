@@ -1,14 +1,16 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
+
 use crate::clnt::*;
+use crate::stream::XdrStream;
 use crate::types::*;
 use crate::vars::*;
-use crate::xdr::*;
 use core::ffi::{c_char, c_int, c_ulong};
 
 const MCALL_MSG_SIZE: usize = 24;
 
 #[repr(C)]
 union MashlCallmsg {
-    msg: [c_char; MCALL_MSG_SIZE],
+    msg: [u8; MCALL_MSG_SIZE],
     rm_xid: c_ulong,
 }
 
@@ -16,7 +18,7 @@ union MashlCallmsg {
 struct ClntRawPrivate {
     client_object: CLIENT,
     xdr_stream: XDR,
-    raw_buf: [c_char; UDPMSGSIZE as usize],
+    raw_buf: [u8; UDPMSGSIZE as usize],
     mashl_callmsg: MashlCallmsg,
     mcnt: u_int,
 }
@@ -30,81 +32,98 @@ static CLIENT_OPS: clnt_ops = clnt_ops {
     cl_control: Some(clntraw_control),
 };
 
+#[inline]
+unsafe fn private<'a>() -> Option<&'a mut ClntRawPrivate> {
+    unsafe { tv_clntraw_private().cast::<ClntRawPrivate>().as_mut() }
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn clntraw_create(prog: c_ulong, vers: c_ulong) -> *mut CLIENT {
-    let tvp = thread_vars();
-    let mut clp = (*tvp).clntraw_private as *mut ClntRawPrivate;
-    if clp.is_null() {
-        clp = calloc(1, core::mem::size_of::<ClntRawPrivate>()) as *mut ClntRawPrivate;
+pub extern "C" fn clntraw_create(prog: c_ulong, vers: c_ulong) -> *mut CLIENT {
+    if tv_clntraw_private().is_null() {
+        let clp = alloc_zeroed(1, core::mem::size_of::<ClntRawPrivate>());
         if clp.is_null() {
             return core::ptr::null_mut();
         }
-        (*tvp).clntraw_private = clp.cast();
+        set_tv_clntraw_private(clp);
     }
-    let xdrs = &raw mut (*clp).xdr_stream;
-    let client = &raw mut (*clp).client_object;
+    let Some(clp) = (unsafe { private() }) else { return core::ptr::null_mut() };
     let mut call_msg = rpc_msg::zeroed();
     call_msg.rm_direction = CALL;
-    call_msg.ru.RM_cmb.cb_rpcvers = RPC_MSG_VERSION;
-    call_msg.ru.RM_cmb.cb_prog = prog;
-    call_msg.ru.RM_cmb.cb_vers = vers;
-    xdrmem_create(xdrs, (&raw mut (*clp).mashl_callmsg.msg).cast(), MCALL_MSG_SIZE as u_int, XDR_ENCODE);
-    if crate::msg::xdr_callhdr(xdrs, &mut call_msg) == 0 {
-        perror("clnt_raw.c: fatal header serialization error");
+    let cb = call_msg.ru.cmb_mut();
+    cb.cb_rpcvers = RPC_MSG_VERSION;
+    cb.cb_prog = prog;
+    cb.cb_vers = vers;
+    let msgbuf = unsafe { &mut clp.mashl_callmsg.msg };
+    let mut x = XdrStream::mem(&mut clp.xdr_stream, msgbuf, XDR_ENCODE);
+    if crate::msg::callhdr_in(&mut x, &mut call_msg) == 0 {
+        perror_msg("clnt_raw.c: fatal header serialization error");
     }
-    (*clp).mcnt = x_getpos(xdrs);
-    x_destroy(xdrs);
-    xdrmem_create(xdrs, (*clp).raw_buf.as_mut_ptr(), UDPMSGSIZE, XDR_FREE);
-    (*client).cl_ops = &CLIENT_OPS;
-    (*client).cl_auth = crate::auth::authnone_create();
-    client
+    clp.mcnt = x.getpos();
+    x.destroy();
+    XdrStream::mem(&mut clp.xdr_stream, &mut clp.raw_buf, XDR_FREE);
+    clp.client_object.cl_ops = &CLIENT_OPS;
+    clp.client_object.cl_auth = crate::auth::authnone_create();
+    &raw mut clp.client_object
+}
+
+#[inline]
+unsafe fn raw_stream<'a>() -> Option<XdrStream<'a>> {
+    let clp = unsafe { private() }?;
+    Some(unsafe { XdrStream::from_ptr(&mut clp.xdr_stream) })
 }
 
 unsafe extern "C" fn clntraw_call(h: *mut CLIENT, proc_: c_ulong, xargs: xdrproc_t, argsp: caddr_t, xresults: xdrproc_t, resultsp: caddr_t, _timeout: timeval) -> c_int {
-    let clp = (*thread_vars()).clntraw_private as *mut ClntRawPrivate;
-    if clp.is_null() {
+    if tv_clntraw_private().is_null() {
         return RPC_FAILED;
     }
-    let xdrs = &raw mut (*clp).xdr_stream;
     loop {
-        (*xdrs).x_op = XDR_ENCODE;
-        x_setpos(xdrs, 0);
-        (*clp).mashl_callmsg.rm_xid = (*clp).mashl_callmsg.rm_xid.wrapping_add(1);
-        let proc_l = proc_ as i64;
-        if x_putbytes(xdrs, (&raw const (*clp).mashl_callmsg.msg).cast(), (*clp).mcnt) == 0
-            || x_putlong(xdrs, &proc_l) == 0
-            || auth_marshall((*h).cl_auth, xdrs) == 0
-            || crate::clnt_tcp::call_results(xargs, xdrs, argsp) == 0
         {
-            return RPC_CANTENCODEARGS;
+            let Some(clp) = (unsafe { private() }) else { return RPC_FAILED };
+            let xid = unsafe { &mut clp.mashl_callmsg.rm_xid };
+            *xid = xid.wrapping_add(1);
+            let hdr = unsafe { clp.mashl_callmsg.msg };
+            let mcnt = clp.mcnt;
+            let mut x = unsafe { XdrStream::from_ptr(&mut clp.xdr_stream) };
+            x.set_op(XDR_ENCODE);
+            x.setpos(0);
+            let auth = unsafe { client_auth(h) };
+            if x.put_bytes(&hdr[..mcnt as usize]) == 0 || x.put_long(proc_ as i64) == 0 || unsafe { auth_marshall(auth, x.as_ptr()) } == 0
+                || unsafe { crate::clnt_stream::call_results(xargs, x.as_ptr(), argsp) } == 0
+            {
+                return RPC_CANTENCODEARGS;
+            }
+            x.getpos();
         }
-        x_getpos(xdrs);
         crate::svc::svc_getreq(1);
-        (*xdrs).x_op = XDR_DECODE;
-        x_setpos(xdrs, 0);
+        let Some(mut x) = (unsafe { raw_stream() }) else { return RPC_FAILED };
+        x.set_op(XDR_DECODE);
+        x.setpos(0);
         let mut msg = rpc_msg::zeroed();
-        msg.ru.RM_rmb.ru.RP_ar.ar_verf = *(&raw const _null_auth);
-        msg.ru.RM_rmb.ru.RP_ar.ru.AR_results = ar_results { where_: resultsp, proc_: xresults };
-        if crate::msg::xdr_replymsg(xdrs, &mut msg) == 0 {
+        let ar = msg.ru.rmb_mut().ru.ar_mut();
+        ar.ar_verf = null_auth();
+        ar.ru.AR_results = ar_results { where_: resultsp, proc_: xresults };
+        if unsafe { crate::msg::replymsg_in(&mut x, &mut msg) } == 0 {
             return RPC_CANTDECODERES;
         }
         let mut error = rpc_err::zeroed();
-        crate::msg::_seterr_reply(&mut msg, &mut error);
+        crate::msg::seterr_reply(&msg, &mut error);
         let mut status = error.re_status;
+        let verf = &mut msg.ru.rmb_mut().ru.ar_mut().ar_verf;
+        let auth = unsafe { client_auth(h) };
         if status == RPC_SUCCESS {
-            if auth_validate((*h).cl_auth, &mut msg.ru.RM_rmb.ru.RP_ar.ar_verf) == 0 {
+            if unsafe { auth_validate(auth, verf) } == 0 {
                 status = RPC_AUTHERROR;
             }
-        } else if auth_refresh((*h).cl_auth) != 0 {
+        } else if unsafe { auth_refresh(auth) } != 0 {
             continue;
         }
         if status == RPC_SUCCESS {
-            if auth_validate((*h).cl_auth, &mut msg.ru.RM_rmb.ru.RP_ar.ar_verf) == 0 {
+            if unsafe { auth_validate(auth, verf) } == 0 {
                 status = RPC_AUTHERROR;
             }
-            if !msg.ru.RM_rmb.ru.RP_ar.ar_verf.oa_base.is_null() {
-                (*xdrs).x_op = XDR_FREE;
-                crate::msg::xdr_opaque_auth(xdrs, &mut msg.ru.RM_rmb.ru.RP_ar.ar_verf);
+            if !verf.oa_base.is_null() {
+                x.set_op(XDR_FREE);
+                unsafe { crate::msg::opaque_auth_in(&mut x, verf) };
             }
         }
         return status;
@@ -114,13 +133,9 @@ unsafe extern "C" fn clntraw_call(h: *mut CLIENT, proc_: c_ulong, xargs: xdrproc
 unsafe extern "C" fn clntraw_geterr(_cl: *mut CLIENT, _err: *mut rpc_err) {}
 
 unsafe extern "C" fn clntraw_freeres(_cl: *mut CLIENT, xdr_res: xdrproc_t, res_ptr: caddr_t) -> bool_t {
-    let clp = (*thread_vars()).clntraw_private as *mut ClntRawPrivate;
-    if clp.is_null() {
-        return RPC_FAILED;
-    }
-    let xdrs = &raw mut (*clp).xdr_stream;
-    (*xdrs).x_op = XDR_FREE;
-    crate::clnt_tcp::call_results(xdr_res, xdrs, res_ptr)
+    let Some(mut x) = (unsafe { raw_stream() }) else { return RPC_FAILED };
+    x.set_op(XDR_FREE);
+    unsafe { crate::clnt_stream::call_results(xdr_res, x.as_ptr(), res_ptr) }
 }
 
 unsafe extern "C" fn clntraw_abort() {}
@@ -131,10 +146,9 @@ unsafe extern "C" fn clntraw_control(_cl: *mut CLIENT, _i: c_int, _c: *mut c_cha
 
 unsafe extern "C" fn clntraw_destroy(_cl: *mut CLIENT) {}
 
-pub unsafe fn thread_raw_cleanup() {
-    let tvp = thread_vars();
-    mem_free((*tvp).clntraw_private);
-    (*tvp).clntraw_private = core::ptr::null_mut();
-    mem_free((*tvp).svcraw_private);
-    (*tvp).svcraw_private = core::ptr::null_mut();
+pub fn thread_raw_cleanup() {
+    unsafe { mem_free(tv_clntraw_private()) };
+    set_tv_clntraw_private(core::ptr::null_mut());
+    unsafe { mem_free(tv_svcraw_private()) };
+    set_tv_svcraw_private(core::ptr::null_mut());
 }

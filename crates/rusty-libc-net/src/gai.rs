@@ -1,3 +1,4 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::dns::{Addr, HostData};
 use crate::inet;
 use crate::netdb;
@@ -5,7 +6,8 @@ use crate::nss::{self, Action, Source, Status};
 use crate::strerr::set_h_errno;
 use crate::types::*;
 use crate::util::{Buf, HeapVec, cbytes};
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{CStr, c_char, c_int, c_void};
+use crate::netdb::{Bytes, CIn, OptBytesMut, OptRef, OptStr, Out};
 use rusty_libc_core::errno;
 
 const DEPRECATED_AI_IDN: c_int = 0x300;
@@ -57,28 +59,32 @@ fn serv_by_name(name: &[u8], proto: &[u8]) -> Option<u16> {
     n.push(0);
     let mut p = Buf::<16>::from(proto)?;
     p.push(0);
+    let n = CStr::from_bytes_until_nul(n.as_bytes()).ok()?;
+    let p = CStr::from_bytes_until_nul(p.as_bytes()).ok()?;
     let mut res = SERVENT_ZERO;
     let mut buf = [0u8; 1024];
-    let mut out: *mut servent = core::ptr::null_mut();
-    let mut big: *mut c_char = core::ptr::null_mut();
-    let mut cap = buf.len();
-    let mut bp = buf.as_mut_ptr() as *mut c_char;
+    with_growing(&mut buf, |b| match netdb::servbyname_r(n, Some(p), &mut res, b) {
+        (ERANGE, _) => None,
+        (0, true) => Some(Some(res.s_port as u16)),
+        _ => Some(None),
+    })
+    .flatten()
+}
+
+fn with_growing<R>(first: &mut [u8], mut f: impl FnMut(&mut [u8]) -> Option<R>) -> Option<R> {
+    if let Some(r) = f(first) {
+        return Some(r);
+    }
+    let mut cap = first.len();
+    let mut heap = crate::nss::ZBuf::new();
     loop {
-        let r = unsafe { netdb::getservbyname_r(n.b.as_ptr() as *const c_char, p.b.as_ptr() as *const c_char, &mut res, bp, cap, &mut out) };
-        if r == ERANGE {
-            cap *= 2;
-            big = unsafe { rusty_libc_malloc::realloc(big as *mut c_void, cap) } as *mut c_char;
-            if big.is_null() {
-                return None;
-            }
-            bp = big;
-            continue;
+        cap *= 2;
+        if !heap.grow(cap) {
+            return None;
         }
-        let v = if r == 0 && !out.is_null() { Some(res.s_port as u16) } else { None };
-        if !big.is_null() {
-            unsafe { rusty_libc_malloc::free(big as *mut c_void) };
+        if let Some(r) = f(heap.as_mut_slice()) {
+            return Some(r);
         }
-        return v;
     }
 }
 
@@ -487,42 +493,24 @@ struct SortInfo {
 
 fn source_for(at: &At, locals: &[crate::ifaddrs::LocalAddr]) -> SortInfo {
     let mut si = SortInfo { got_source: false, src_family: 0, src: [0; 16], flags: 0, prefixlen: 0, index: u32::MAX };
-    let fd = unsafe { crate::sock::socket(at.family, SOCK_DGRAM | SOCK_CLOEXEC, 0) };
+    let fd = crate::dns::sock_open(at.family, SOCK_DGRAM | SOCK_CLOEXEC);
     if fd < 0 {
         return si;
     }
     let mut ss = sockaddr_storage::default();
-    let len: socklen_t = unsafe {
-        if at.family == AF_INET {
-            let p = &mut ss as *mut _ as *mut sockaddr_in;
-            (*p).sin_family = AF_INET as u16;
-            (*p).sin_addr.s_addr = u32::from_ne_bytes([at.addr[0], at.addr[1], at.addr[2], at.addr[3]]);
-            16
-        } else {
-            let p = &mut ss as *mut _ as *mut sockaddr_in6;
-            (*p).sin6_family = AF_INET6 as u16;
-            (*p).sin6_addr.s6_addr = at.addr;
-            (*p).sin6_scope_id = at.scope;
-            28
-        }
-    };
-    let mut sl: socklen_t = core::mem::size_of::<sockaddr_storage>() as u32;
+    let len = crate::dns::sockaddr_from(at.family, &at.addr, 0, at.scope, &mut ss);
     let mut out = sockaddr_storage::default();
-    let ok = unsafe { crate::sock::connect(fd, &ss as *const _ as *const sockaddr, len) == 0 && crate::sock::getsockname(fd, &mut out as *mut _ as *mut sockaddr, &mut sl) == 0 };
+    let ok = crate::dns::sock_connect(fd, &ss, len) == 0 && crate::dns::sock_name(fd, &mut out) == 0;
     let _ = rusty_libc_core::unistd::close(fd);
     if !ok {
         return si;
     }
     si.got_source = true;
     si.src_family = at.family;
-    unsafe {
-        if at.family == AF_INET {
-            let p = &out as *const _ as *const sockaddr_in;
-            si.src[..4].copy_from_slice(&(*p).sin_addr.s_addr.to_ne_bytes());
-        } else {
-            let p = &out as *const _ as *const sockaddr_in6;
-            si.src = (*p).sin6_addr.s6_addr;
-        }
+    if at.family == AF_INET {
+        si.src[..4].copy_from_slice(&out.__ss_padding[2..6]);
+    } else {
+        si.src.copy_from_slice(&out.__ss_padding[6..22]);
     }
     let mut key = si.src;
     if at.family == AF_INET && key[0] == 127 {
@@ -685,37 +673,44 @@ fn sort_addresses(at: &mut [At]) -> bool {
     true
 }
 
-unsafe fn alloc_ai(flags: c_int, at: &At, st: &ServTuple) -> *mut addrinfo {
-    unsafe {
-        let socklen = if at.family == AF_INET6 { 28 } else { 16 };
-        let p = rusty_libc_malloc::malloc(core::mem::size_of::<addrinfo>() + socklen) as *mut addrinfo;
-        if p.is_null() {
-            return p;
-        }
-        let sa = p.add(1) as *mut u8;
-        core::ptr::write_bytes(sa, 0, socklen);
-        *p = addrinfo { ai_flags: flags, ai_family: at.family, ai_socktype: st.socktype, ai_protocol: st.protocol, ai_addrlen: socklen as u32, ai_addr: sa as *mut sockaddr, ai_canonname: core::ptr::null_mut(), ai_next: core::ptr::null_mut() };
-        if at.family == AF_INET6 {
-            let s = sa as *mut sockaddr_in6;
-            (*s).sin6_family = AF_INET6 as u16;
-            (*s).sin6_port = st.port;
-            (*s).sin6_addr.s6_addr = at.addr;
-            (*s).sin6_scope_id = at.scope;
-        } else {
-            let s = sa as *mut sockaddr_in;
-            (*s).sin_family = AF_INET as u16;
-            (*s).sin_port = st.port;
-            (*s).sin_addr.s_addr = u32::from_ne_bytes([at.addr[0], at.addr[1], at.addr[2], at.addr[3]]);
-        }
-        p
+fn alloc_ai(flags: c_int, at: &At, st: &ServTuple) -> *mut addrinfo {
+    let socklen = if at.family == AF_INET6 { 28 } else { 16 };
+    let p = unsafe { rusty_libc_malloc::malloc(core::mem::size_of::<addrinfo>() + socklen) } as *mut addrinfo;
+    if p.is_null() {
+        return p;
     }
+    let sa = p.wrapping_add(1) as *mut u8;
+    let mut b = [0u8; 28];
+    b[0..2].copy_from_slice(&(at.family as u16).to_ne_bytes());
+    b[2..4].copy_from_slice(&st.port.to_ne_bytes());
+    if at.family == AF_INET6 {
+        b[8..24].copy_from_slice(&at.addr);
+        b[24..28].copy_from_slice(&at.scope.to_ne_bytes());
+    } else {
+        b[4..8].copy_from_slice(&at.addr[..4]);
+    }
+    unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), sa, socklen) };
+    let node = addrinfo { ai_flags: flags, ai_family: at.family, ai_socktype: st.socktype, ai_protocol: st.protocol, ai_addrlen: socklen as u32, ai_addr: sa as *mut sockaddr, ai_canonname: core::ptr::null_mut(), ai_next: core::ptr::null_mut() };
+    unsafe { p.write(node) };
+    p
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getaddrinfo(name: *const c_char, service: *const c_char, hints: *const addrinfo, pai: *mut *mut addrinfo) -> c_int {
-    unsafe {
-        let mut name: Option<&[u8]> = if name.is_null() { None } else { Some(cbytes(name)) };
-        let mut service: Option<&[u8]> = if service.is_null() { None } else { Some(cbytes(service)) };
+    let ((name, service), (hints, pai)) = unsafe { ((OptStr(name), OptStr(service)), (OptRef(hints), Out(pai))).conv() };
+    match addrinfo_list(name.map(CStr::to_bytes), service.map(CStr::to_bytes), hints) {
+        Ok(head) => {
+            *pai = head;
+            0
+        }
+        Err(e) => e,
+    }
+}
+
+pub fn addrinfo_list(name: Option<&[u8]>, service: Option<&[u8]>, hints: Option<&addrinfo>) -> Result<*mut addrinfo, c_int> {
+    {
+        let mut name = name;
+        let mut service = service;
         if name == Some(b"*") {
             name = None;
         }
@@ -723,18 +718,18 @@ pub unsafe extern "C" fn getaddrinfo(name: *const c_char, service: *const c_char
             service = None;
         }
         if name.is_none() && service.is_none() {
-            return EAI_NONAME;
+            return Err(EAI_NONAME);
         }
         let default_hints = addrinfo { ai_flags: AI_DEFAULT, ..addrinfo::default() };
-        let mut h = if hints.is_null() { default_hints } else { *hints };
+        let mut h = hints.copied().unwrap_or(default_hints);
         if h.ai_flags & !(AI_PASSIVE | AI_CANONNAME | AI_NUMERICHOST | AI_ADDRCONFIG | AI_V4MAPPED | AI_IDN | AI_CANONIDN | DEPRECATED_AI_IDN | AI_NUMERICSERV | AI_ALL) != 0 {
-            return EAI_BADFLAGS;
+            return Err(EAI_BADFLAGS);
         }
         if h.ai_flags & AI_CANONNAME != 0 && name.is_none() {
-            return EAI_BADFLAGS;
+            return Err(EAI_BADFLAGS);
         }
         if h.ai_family != AF_UNSPEC && h.ai_family != AF_INET && h.ai_family != AF_INET6 {
-            return EAI_FAMILY;
+            return Err(EAI_FAMILY);
         }
         if h.ai_flags & AI_ADDRCONFIG != 0 {
             let (s4, s6) = crate::ifaddrs::check_pf();
@@ -743,7 +738,7 @@ pub unsafe extern "C" fn getaddrinfo(name: *const c_char, service: *const c_char
                     h.ai_family = if s4 { AF_INET } else { AF_INET6 };
                 }
             } else if (h.ai_family == AF_INET && !s4) || (h.ai_family == AF_INET6 && !s6) {
-                return EAI_NONAME;
+                return Err(EAI_NONAME);
             }
         }
         let svc: Option<Service> = match service {
@@ -766,7 +761,7 @@ pub unsafe extern "C" fn getaddrinfo(name: *const c_char, service: *const c_char
                 let end = if i == st { 0 } else { i };
                 if end != s.len() {
                     if h.ai_flags & AI_NUMERICSERV != 0 {
-                        return EAI_NONAME;
+                        return Err(EAI_NONAME);
                     }
                     Some(Service::Name(s))
                 } else {
@@ -777,17 +772,12 @@ pub unsafe extern "C" fn getaddrinfo(name: *const c_char, service: *const c_char
             _ => None,
         };
         let mut st = [ServTuple::default(); MAX_ST];
-        if let Err(e) = get_servtuples(&svc, h.ai_socktype, h.ai_protocol, &mut st) {
-            return e;
-        }
+        get_servtuples(&svc, h.ai_socktype, h.ai_protocol, &mut st)?;
         let orig = name;
         let idn_name;
         if h.ai_flags & AI_IDN != 0 {
             if let Some(n) = name {
-                idn_name = match crate::idna::to_dns(n) {
-                    Ok(v) => v,
-                    Err(e) => return e,
-                };
+                idn_name = crate::idna::to_dns(n)?;
                 if let Some(e) = &idn_name {
                     name = Some(e.as_bytes());
                 }
@@ -812,12 +802,10 @@ pub unsafe extern "C" fn getaddrinfo(name: *const c_char, service: *const c_char
                 }
             }
             Some(nm) => match text_to_binary(nm, h.ai_family, h.ai_flags, &mut found) {
-                Err(e) => return e,
+                Err(e) => return Err(e),
                 Ok(true) => {}
                 Ok(false) => {
-                    if let Err(e) = get_nss_addresses(nm, h.ai_family, h.ai_flags, &mut found) {
-                        return e;
-                    }
+                    get_nss_addresses(nm, h.ai_family, h.ai_flags, &mut found)?;
                 }
             },
         }
@@ -829,13 +817,13 @@ pub unsafe extern "C" fn getaddrinfo(name: *const c_char, service: *const c_char
                     match crate::idna::from_dns(c.as_bytes()) {
                         Ok(Some(u)) => canon = Buf::from(&u.as_bytes()[..u.as_bytes().len().min(256)]),
                         Ok(None) | Err(EAI_IDN_ENCODE) => {}
-                        Err(e) => return e,
+                        Err(e) => return Err(e),
                     }
                 }
             }
         }
         if found.oom {
-            return EAI_MEMORY;
+            return Err(EAI_MEMORY);
         }
         let mut list = HeapVec::<At>::new();
         for a in found.at.iter() {
@@ -843,54 +831,78 @@ pub unsafe extern "C" fn getaddrinfo(name: *const c_char, service: *const c_char
                 continue;
             }
             if !list.push(*a) {
-                return EAI_MEMORY;
+                return Err(EAI_MEMORY);
             }
         }
         if list.len() > 1 && !sort_addresses(&mut list) {
-            return EAI_MEMORY;
+            return Err(EAI_MEMORY);
         }
-        let mut head: *mut addrinfo = core::ptr::null_mut();
-        let mut tail: *mut *mut addrinfo = &mut head;
+        let mut nodes = AiList { head: core::ptr::null_mut(), tail: core::ptr::null_mut() };
         for a in list.iter() {
             for s in st.iter().take_while(|s| s.set) {
                 let ai = alloc_ai(h.ai_flags, a, s);
                 if ai.is_null() {
-                    freeaddrinfo(head);
-                    return EAI_MEMORY;
+                    return Err(EAI_MEMORY);
                 }
-                *tail = ai;
-                tail = &mut (*ai).ai_next;
+                nodes.push(ai);
             }
         }
-        if head.is_null() {
-            return EAI_NONAME;
+        if nodes.head.is_null() {
+            return Err(EAI_NONAME);
         }
         if let Some(c) = canon {
-            let p = rusty_libc_malloc::malloc(c.len + 1) as *mut u8;
+            let p = crate::nss::c_dup(c.as_bytes());
             if p.is_null() {
-                freeaddrinfo(head);
-                return EAI_MEMORY;
+                return Err(EAI_MEMORY);
             }
-            core::ptr::copy_nonoverlapping(c.b.as_ptr(), p, c.len);
-            *p.add(c.len) = 0;
-            (*head).ai_canonname = p as *mut c_char;
+            nodes.set_canon(p as *mut c_char);
         }
-        *pai = head;
-        0
+        Ok(nodes.finish())
+    }
+}
+
+struct AiList {
+    head: *mut addrinfo,
+    tail: *mut addrinfo,
+}
+
+impl AiList {
+    fn push(&mut self, ai: *mut addrinfo) {
+        if self.tail.is_null() {
+            self.head = ai;
+        } else {
+            unsafe { (*self.tail).ai_next = ai };
+        }
+        self.tail = ai;
+    }
+    fn set_canon(&mut self, p: *mut c_char) {
+        unsafe { (*self.head).ai_canonname = p };
+    }
+    fn finish(mut self) -> *mut addrinfo {
+        core::mem::replace(&mut self.head, core::ptr::null_mut())
+    }
+}
+
+impl Drop for AiList {
+    #[inline]
+    fn drop(&mut self) {
+        if self.head.is_null() {
+            return;
+        }
+        unsafe { freeaddrinfo(self.head) };
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn freeaddrinfo(mut ai: *mut addrinfo) {
     while !ai.is_null() {
-        unsafe {
-            let next = (*ai).ai_next;
-            if !(*ai).ai_canonname.is_null() {
-                rusty_libc_malloc::free((*ai).ai_canonname as *mut c_void);
-            }
-            rusty_libc_malloc::free(ai as *mut c_void);
-            ai = next;
+        let node = unsafe { &*ai };
+        let next = node.ai_next;
+        if !node.ai_canonname.is_null() {
+            unsafe { rusty_libc_malloc::free(node.ai_canonname as *mut c_void) };
         }
+        unsafe { rusty_libc_malloc::free(ai as *mut c_void) };
+        ai = next;
     }
 }
 
@@ -902,7 +914,7 @@ fn domain_name() -> Option<Buf<256>> {
         }
     }
     let mut un = [0u8; 390];
-    unsafe { rusty_libc_core::syscall::syscall1(63, un.as_mut_ptr() as usize) };
+    crate::dns::uname(&mut un);
     let nn = &un[65..130];
     let l = nn.iter().position(|&c| c == 0).unwrap_or(65);
     if let Some(d) = nn[..l].iter().position(|&c| c == b'.') {
@@ -917,222 +929,185 @@ fn domain_name() -> Option<Buf<256>> {
     None
 }
 
-unsafe fn copy_out(dst: *mut c_char, len: socklen_t, s: &[u8]) -> c_int {
-    if s.len() + 1 > len as usize {
+fn copy_out(dst: &mut [u8], s: &[u8]) -> c_int {
+    if s.len() + 1 > dst.len() {
         return EAI_OVERFLOW;
     }
-    unsafe {
-        core::ptr::copy_nonoverlapping(s.as_ptr(), dst as *mut u8, s.len());
-        *dst.add(s.len()) = 0;
-    }
+    dst[..s.len()].copy_from_slice(s);
+    dst[s.len()] = 0;
     0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getnameinfo(sa: *const sockaddr, addrlen: socklen_t, host: *mut c_char, hostlen: socklen_t, serv: *mut c_char, servlen: socklen_t, flags: c_int) -> c_int {
-    unsafe {
-        if flags & !(NI_NUMERICHOST | NI_NUMERICSERV | NI_NOFQDN | NI_NAMEREQD | NI_DGRAM | NI_IDN | 0xc0) != 0 {
-            return EAI_BADFLAGS;
-        }
-        if sa.is_null() || (addrlen as usize) < 2 {
-            return EAI_FAMILY;
-        }
-        if flags & NI_NAMEREQD != 0 && host.is_null() && serv.is_null() {
-            return EAI_NONAME;
-        }
-        let fam = (*sa).sa_family as c_int;
-        match fam {
-            AF_UNIX if (addrlen as usize) < 2 => return EAI_FAMILY,
-            AF_UNIX => {}
-            AF_INET if (addrlen as usize) < 16 => return EAI_FAMILY,
-            AF_INET6 if (addrlen as usize) < 28 => return EAI_FAMILY,
-            AF_INET | AF_INET6 => {}
-            _ => return EAI_FAMILY,
-        }
-        if !host.is_null() && hostlen > 0 {
-            let r = gni_host(sa, host, hostlen, flags);
-            if r != 0 {
-                return r;
-            }
-        }
-        if !serv.is_null() && servlen > 0 {
-            let r = gni_serv(sa, serv, servlen, flags);
-            if r != 0 {
-                return r;
-            }
-        }
-        0
+    if flags & !(NI_NUMERICHOST | NI_NUMERICSERV | NI_NOFQDN | NI_NAMEREQD | NI_DGRAM | NI_IDN | 0xc0) != 0 {
+        return EAI_BADFLAGS;
     }
+    if sa.is_null() || (addrlen as usize) < 2 {
+        return EAI_FAMILY;
+    }
+    if flags & NI_NAMEREQD != 0 && host.is_null() && serv.is_null() {
+        return EAI_NONAME;
+    }
+    let fam = unsafe { Bytes(sa as *const u8, 2).conv() };
+    let fam = c_int::from(u16::from_ne_bytes([fam[0], fam[1]]));
+    let need = match fam {
+        AF_UNIX => 110,
+        AF_INET if (addrlen as usize) < 16 => return EAI_FAMILY,
+        AF_INET6 if (addrlen as usize) < 28 => return EAI_FAMILY,
+        AF_INET => 16,
+        AF_INET6 => 28,
+        _ => return EAI_FAMILY,
+    };
+    let (sab, (host, serv)) = unsafe { (Bytes(sa as *const u8, need), (OptBytesMut(host as *mut u8, hostlen as usize), OptBytesMut(serv as *mut u8, servlen as usize))).conv() };
+    nameinfo(sab, host, serv, flags)
 }
 
-unsafe fn gni_host(sa: *const sockaddr, host: *mut c_char, hostlen: socklen_t, flags: c_int) -> c_int {
-    unsafe {
-        let fam = (*sa).sa_family as c_int;
-        if fam == AF_UNIX {
-            if flags & NI_NUMERICHOST == 0 {
-                let mut un = [0u8; 390];
-                if rusty_libc_core::syscall::check(rusty_libc_core::syscall::syscall1(63, un.as_mut_ptr() as usize)).is_ok() {
-                    let nn = &un[65..130];
-                    let l = nn.iter().position(|&c| c == 0).unwrap_or(65);
-                    return copy_out(host, hostlen, &nn[..l]);
-                }
-            }
-            if flags & NI_NAMEREQD != 0 {
-                return EAI_NONAME;
-            }
-            return copy_out(host, hostlen, b"localhost");
+pub fn nameinfo(sa: &[u8], host: Option<&mut [u8]>, serv: Option<&mut [u8]>, flags: c_int) -> c_int {
+    if let Some(h) = host {
+        let r = gni_host(sa, h, flags);
+        if r != 0 {
+            return r;
         }
-        let (addr, alen): ([u8; 16], usize) = if fam == AF_INET6 {
-            ((*(sa as *const sockaddr_in6)).sin6_addr.s6_addr, 16)
-        } else {
-            let mut a = [0u8; 16];
-            a[..4].copy_from_slice(&(*(sa as *const sockaddr_in)).sin_addr.s_addr.to_ne_bytes());
-            (a, 4)
-        };
+    }
+    if let Some(sv) = serv {
+        let r = gni_serv(sa, sv, flags);
+        if r != 0 {
+            return r;
+        }
+    }
+    0
+}
+
+fn gni_host(sa: &[u8], host: &mut [u8], flags: c_int) -> c_int {
+    let fam = c_int::from(u16::from_ne_bytes([sa[0], sa[1]]));
+    if fam == AF_UNIX {
         if flags & NI_NUMERICHOST == 0 {
-            let mut res = HOSTENT0;
-            let mut buf = [0u8; 2048];
-            let mut out: *mut hostent = core::ptr::null_mut();
-            let mut herr = 0;
-            let mut big: *mut c_char = core::ptr::null_mut();
-            let mut cap = buf.len();
-            let mut bp = buf.as_mut_ptr() as *mut c_char;
-            let rc = loop {
-                let rc = netdb::gethostbyaddr_r(addr.as_ptr() as *const c_void, alen as u32, fam, &mut res, bp, cap, &mut out, &mut herr);
-                if rc == ERANGE && herr == NETDB_INTERNAL {
-                    cap *= 2;
-                    big = rusty_libc_malloc::realloc(big as *mut c_void, cap) as *mut c_char;
-                    if big.is_null() {
-                        return EAI_MEMORY;
-                    }
-                    bp = big;
-                    continue;
-                }
-                break rc;
-            };
-            let _ = rc;
-            let mut result = None;
-            if out.is_null() {
-                if herr == NETDB_INTERNAL {
-                    set_h_errno(herr);
-                    if !big.is_null() {
-                        rusty_libc_malloc::free(big as *mut c_void);
-                    }
-                    return EAI_SYSTEM;
-                }
-                if herr == TRY_AGAIN {
-                    set_h_errno(herr);
-                    if !big.is_null() {
-                        rusty_libc_malloc::free(big as *mut c_void);
-                    }
-                    return EAI_AGAIN;
-                }
-            } else {
-                let mut nm = cbytes((*out).h_name);
-                let dom;
-                if flags & NI_NOFQDN != 0 {
-                    dom = domain_name();
-                    if let Some(d) = &dom {
-                        let db = d.as_bytes();
-                        if !db.is_empty() {
-                            if let Some(pos) = nm.windows(db.len()).position(|w| w == db) {
-                                if pos > 0 && nm[pos - 1] == b'.' {
-                                    nm = &nm[..pos - 1];
-                                }
-                            }
-                        }
-                    }
-                }
-                let idn = if flags & NI_IDN != 0 { crate::idna::from_dns(nm) } else { Ok(None) };
-                let r = match &idn {
-                    Ok(Some(u)) => copy_out(host, hostlen, u.as_bytes()),
-                    Ok(None) | Err(EAI_IDN_ENCODE) => copy_out(host, hostlen, nm),
-                    Err(e) => *e,
-                };
-                result = Some(r);
-            }
-            if !big.is_null() {
-                rusty_libc_malloc::free(big as *mut c_void);
-            }
-            if let Some(r) = result {
-                return r;
+            let mut un = [0u8; 390];
+            if crate::dns::uname(&mut un) {
+                let nn = &un[65..130];
+                let l = nn.iter().position(|&c| c == 0).unwrap_or(65);
+                return copy_out(host, &nn[..l]);
             }
         }
         if flags & NI_NAMEREQD != 0 {
             return EAI_NONAME;
         }
-        let mut t = if fam == AF_INET6 { inet::format_ipv6(&addr) } else { inet::format_ipv4(&[addr[0], addr[1], addr[2], addr[3]]) };
-        if fam == AF_INET6 {
-            let scope = (*(sa as *const sockaddr_in6)).sin6_scope_id;
-            if scope != 0 {
-                t.push(b'%');
-                let ll = addr[0] == 0xfe && addr[1] & 0xc0 == 0x80;
-                let mc_ll = addr[0] == 0xff && addr[1] & 0xf == 2;
-                let mut named = false;
-                if ll || mc_ll {
-                    let mut nb = [0u8; 16];
-                    if !crate::ifaddrs::if_indextoname(scope, nb.as_mut_ptr() as *mut c_char).is_null() {
-                        let l = nb.iter().position(|&c| c == 0).unwrap_or(16);
-                        t.push_all(&nb[..l]);
-                        named = true;
+        return copy_out(host, b"localhost");
+    }
+    let (addr, alen): ([u8; 16], usize) = if fam == AF_INET6 {
+        let mut a = [0u8; 16];
+        a.copy_from_slice(&sa[8..24]);
+        (a, 16)
+    } else {
+        let mut a = [0u8; 16];
+        a[..4].copy_from_slice(&sa[4..8]);
+        (a, 4)
+    };
+    if flags & NI_NUMERICHOST == 0 {
+        let mut res = HOSTENT0;
+        let mut buf = [0u8; 2048];
+        let mut herr = 0;
+        let found = with_growing(&mut buf, |b| {
+            let (rc, ok) = netdb::hostbyaddr_r(&addr[..alen], alen as u32, fam, &mut res, b, &mut herr);
+            if rc == ERANGE && herr == NETDB_INTERNAL {
+                return None;
+            }
+            if !ok {
+                return Some(None);
+            }
+            let mut nm = unsafe { cbytes(res.h_name) };
+            let dom;
+            if flags & NI_NOFQDN != 0 {
+                dom = domain_name();
+                if let Some(d) = &dom {
+                    let db = d.as_bytes();
+                    if !db.is_empty() {
+                        if let Some(pos) = nm.windows(db.len()).position(|w| w == db) {
+                            if pos > 0 && nm[pos - 1] == b'.' {
+                                nm = &nm[..pos - 1];
+                            }
+                        }
                     }
                 }
-                if !named {
-                    t.push_u32(scope);
+            }
+            let idn = if flags & NI_IDN != 0 { crate::idna::from_dns(nm) } else { Ok(None) };
+            Some(Some(match &idn {
+                Ok(Some(u)) => copy_out(host, u.as_bytes()),
+                Ok(None) | Err(EAI_IDN_ENCODE) => copy_out(host, nm),
+                Err(e) => *e,
+            }))
+        });
+        match found {
+            None => return EAI_MEMORY,
+            Some(Some(r)) => return r,
+            Some(None) => {
+                if herr == NETDB_INTERNAL {
+                    set_h_errno(herr);
+                    return EAI_SYSTEM;
+                }
+                if herr == TRY_AGAIN {
+                    set_h_errno(herr);
+                    return EAI_AGAIN;
                 }
             }
         }
-        copy_out(host, hostlen, t.as_bytes())
     }
+    if flags & NI_NAMEREQD != 0 {
+        return EAI_NONAME;
+    }
+    let mut t = if fam == AF_INET6 { inet::format_ipv6(&addr) } else { inet::format_ipv4(&[addr[0], addr[1], addr[2], addr[3]]) };
+    if fam == AF_INET6 {
+        let scope = u32::from_ne_bytes([sa[24], sa[25], sa[26], sa[27]]);
+        if scope != 0 {
+            t.push(b'%');
+            let ll = addr[0] == 0xfe && addr[1] & 0xc0 == 0x80;
+            let mc_ll = addr[0] == 0xff && addr[1] & 0xf == 2;
+            let mut named = false;
+            if ll || mc_ll {
+                let mut nb = [0u8; 16];
+                if !unsafe { crate::ifaddrs::if_indextoname(scope, nb.as_mut_ptr() as *mut c_char) }.is_null() {
+                    let l = nb.iter().position(|&c| c == 0).unwrap_or(16);
+                    t.push_all(&nb[..l]);
+                    named = true;
+                }
+            }
+            if !named {
+                t.push_u32(scope);
+            }
+        }
+    }
+    copy_out(host, t.as_bytes())
 }
 
 const HOSTENT0: hostent = hostent { h_name: core::ptr::null_mut(), h_aliases: core::ptr::null_mut(), h_addrtype: 0, h_length: 0, h_addr_list: core::ptr::null_mut() };
 
-unsafe fn gni_serv(sa: *const sockaddr, serv: *mut c_char, servlen: socklen_t, flags: c_int) -> c_int {
-    unsafe {
-        let fam = (*sa).sa_family as c_int;
-        if fam == AF_UNIX {
-            let p = (sa as *const u8).add(2);
-            let mut l = 0;
-            while l < 108 && *p.add(l) != 0 {
-                l += 1;
-            }
-            return copy_out(serv, servlen, core::slice::from_raw_parts(p, l));
-        }
-        let port = (*(sa as *const sockaddr_in)).sin_port;
-        if flags & NI_NUMERICSERV == 0 {
-            let mut res = SERVENT_ZERO;
-            let mut buf = [0u8; 1024];
-            let mut out: *mut servent = core::ptr::null_mut();
-            let proto: &[u8] = if flags & NI_DGRAM != 0 { b"udp\0" } else { b"tcp\0" };
-            let mut big: *mut c_char = core::ptr::null_mut();
-            let mut cap = buf.len();
-            let mut bp = buf.as_mut_ptr() as *mut c_char;
-            loop {
-                let e = netdb::getservbyport_r(port as c_int, proto.as_ptr() as *const c_char, &mut res, bp, cap, &mut out);
-                if e == ERANGE {
-                    cap *= 2;
-                    big = rusty_libc_malloc::realloc(big as *mut c_void, cap) as *mut c_char;
-                    if big.is_null() {
-                        return EAI_MEMORY;
-                    }
-                    bp = big;
-                    continue;
-                }
-                break;
-            }
-            let r = if !out.is_null() { Some(copy_out(serv, servlen, cbytes((*out).s_name))) } else { None };
-            if !big.is_null() {
-                rusty_libc_malloc::free(big as *mut c_void);
-            }
-            if let Some(r) = r {
-                return r;
-            }
-        }
-        let mut t = Buf::<8>::new();
-        t.push_u32(u16::from_be(port) as u32);
-        copy_out(serv, servlen, t.as_bytes())
+fn gni_serv(sa: &[u8], serv: &mut [u8], flags: c_int) -> c_int {
+    let fam = c_int::from(u16::from_ne_bytes([sa[0], sa[1]]));
+    if fam == AF_UNIX {
+        let path = &sa[2..110];
+        let l = path.iter().position(|&c| c == 0).unwrap_or(108);
+        return copy_out(serv, &path[..l]);
     }
+    let port = u16::from_ne_bytes([sa[2], sa[3]]);
+    if flags & NI_NUMERICSERV == 0 {
+        let mut res = SERVENT_ZERO;
+        let mut buf = [0u8; 1024];
+        let proto = if flags & NI_DGRAM != 0 { c"udp" } else { c"tcp" };
+        let r = with_growing(&mut buf, |b| match netdb::servbyport_r(port as c_int, Some(proto), &mut res, b) {
+            (ERANGE, _) => None,
+            (_, true) => Some(Some(copy_out(serv, unsafe { cbytes(res.s_name) }))),
+            _ => Some(None),
+        });
+        match r {
+            None => return EAI_MEMORY,
+            Some(Some(r)) => return r,
+            Some(None) => {}
+        }
+    }
+    let mut t = Buf::<8>::new();
+    t.push_u32(u16::from_be(port) as u32);
+    copy_out(serv, t.as_bytes())
 }
 
 #[allow(dead_code)]

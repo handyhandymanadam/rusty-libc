@@ -1,6 +1,7 @@
 use crate::vdso;
 use core::ffi::{c_char, c_int, c_uint, c_void};
-use rusty_libc_core::{Errno, errno, syscall};
+use crate::sys;
+use rusty_libc_core::{Errno, errno, ffi, syscall};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -178,109 +179,97 @@ fn vdso_status(r: c_int) -> Option<c_int> {
 
 #[inline]
 unsafe fn clock_gettime_raw(clock: ClockId, tp: *mut Timespec) -> c_int {
-    unsafe {
-        if let Some(f) = vdso::clock_gettime() {
-            let r = f(clock, tp.cast());
-            if let Some(r) = vdso_status(r) {
-                return r;
-            }
+    if let Some(f) = vdso::clock_gettime() {
+        let r = unsafe { f(clock, tp.cast()) };
+        if let Some(r) = vdso_status(r) {
+            return r;
         }
-        let r = syscall::syscall2(SYS_CLOCK_GETTIME, clock as isize as usize, tp as usize);
-        match raw_err(r) {
-            None => 0,
-            Some(e) => -e,
-        }
+    }
+    let r = unsafe { syscall::syscall2(SYS_CLOCK_GETTIME, clock as isize as usize, tp as usize) };
+    match raw_err(r) {
+        None => 0,
+        Some(e) => -e,
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn clock_gettime(clock: ClockId, tp: *mut Timespec) -> c_int {
-    unsafe {
-        let r = clock_gettime_raw(clock, tp);
-        if r == 0 { 0 } else { fail(-r) }
-    }
+    let r = unsafe { clock_gettime_raw(clock, tp) };
+    if r == 0 { 0 } else { fail(-r) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn time(t: *mut TimeT) -> TimeT {
-    unsafe {
-        if let Some(f) = vdso::time() {
-            return f(t);
-        }
-        let r = syscall::syscall1(SYS_TIME, t as usize);
-        match raw_err(r) {
-            None => r as i64,
-            Some(e) => {
-                errno::set(e);
-                -1
-            }
+    if let Some(f) = vdso::time() {
+        return unsafe { f(t) };
+    }
+    let r = unsafe { syscall::syscall1(SYS_TIME, t as usize) };
+    match raw_err(r) {
+        None => r as i64,
+        Some(e) => {
+            errno::set(e);
+            -1
         }
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn gettimeofday(tv: *mut Timeval, tz: *mut c_void) -> c_int {
-    unsafe {
-        if let Some(f) = vdso::gettimeofday() {
-            let r = f(tv.cast(), tz);
-            if let Some(r) = vdso_status(r) {
-                return if r == 0 { 0 } else { fail(-r) };
-            }
+    if let Some(f) = vdso::gettimeofday() {
+        let r = unsafe { f(tv.cast(), tz) };
+        if let Some(r) = vdso_status(r) {
+            return if r == 0 { 0 } else { fail(-r) };
         }
-        if !tz.is_null() {
-            core::ptr::write_bytes(tz.cast::<u8>(), 0, core::mem::size_of::<Timezone>());
-        }
-        finish(syscall::syscall2(SYS_GETTIMEOFDAY, tv as usize, tz as usize))
     }
+    if !tz.is_null() {
+        unsafe { core::ptr::write_bytes(tz.cast::<u8>(), 0, core::mem::size_of::<Timezone>()) };
+    }
+    finish(unsafe { syscall::syscall2(SYS_GETTIMEOFDAY, tv as usize, tz as usize) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn clock_getres(clock: ClockId, res: *mut Timespec) -> c_int {
-    unsafe {
-        if let Some(f) = vdso::clock_getres() {
-            let r = f(clock, res.cast());
-            if let Some(r) = vdso_status(r) {
-                return if r == 0 { 0 } else { fail(-r) };
-            }
+    if let Some(f) = vdso::clock_getres() {
+        let r = unsafe { f(clock, res.cast()) };
+        if let Some(r) = vdso_status(r) {
+            return if r == 0 { 0 } else { fail(-r) };
         }
-        finish(syscall::syscall2(SYS_CLOCK_GETRES, clock as isize as usize, res as usize))
     }
+    finish(unsafe { syscall::syscall2(SYS_CLOCK_GETRES, clock as isize as usize, res as usize) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn clock_settime(clock: ClockId, tp: *const Timespec) -> c_int {
-    unsafe {
-        if !valid_nanoseconds((*tp).tv_nsec) {
-            return fail(EINVAL);
-        }
-        finish(syscall::syscall2(SYS_CLOCK_SETTIME, clock as isize as usize, tp as usize))
+    let ts = unsafe { sys::arg(tp) };
+    clock_settime_ts(clock, ts)
+}
+
+fn clock_settime_ts(clock: ClockId, ts: &Timespec) -> c_int {
+    if !valid_nanoseconds(ts.tv_nsec) {
+        return fail(EINVAL);
     }
+    finish(unsafe { syscall::syscall2(SYS_CLOCK_SETTIME, clock as isize as usize, ts as *const Timespec as usize) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn clock() -> ClockT {
-    unsafe {
-        let mut ts = Timespec::default();
-        if clock_gettime_raw(CLOCK_PROCESS_CPUTIME_ID, &mut ts) != 0 {
-            return -1;
-        }
-        ts.tv_sec.wrapping_mul(CLOCKS_PER_SEC).wrapping_add(ts.tv_nsec / (1_000_000_000 / CLOCKS_PER_SEC))
-    }
+    let Ok(ts) = now(CLOCK_PROCESS_CPUTIME_ID) else {
+        return -1;
+    };
+    ts.tv_sec.wrapping_mul(CLOCKS_PER_SEC).wrapping_add(ts.tv_nsec / (1_000_000_000 / CLOCKS_PER_SEC))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn clock_getcpuclockid(pid: c_int, clock_id: *mut ClockId) -> c_int {
-    unsafe {
-        let pidclock: ClockId = ((!(pid as u32)) << 3 | 2) as ClockId;
-        let r = syscall::syscall2(SYS_CLOCK_GETRES, pidclock as isize as usize, 0);
-        match raw_err(r) {
-            None => {
-                *clock_id = pidclock;
-                0
-            }
-            Some(EINVAL) => ESRCH,
-            Some(e) => e,
+    let pidclock: ClockId = ((!(pid as u32)) << 3 | 2) as ClockId;
+    let r = unsafe { syscall::syscall2(SYS_CLOCK_GETRES, pidclock as isize as usize, 0) };
+    match raw_err(r) {
+        None => {
+            *unsafe { sys::arg_mut(clock_id) } = pidclock;
+            0
         }
+        Some(EINVAL) => ESRCH,
+        Some(e) => e,
     }
 }
 
@@ -291,37 +280,30 @@ pub extern "C" fn difftime(t1: TimeT, t0: TimeT) -> f64 {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn timespec_get(ts: *mut Timespec, base: c_int) -> c_int {
-    unsafe { if clock_gettime(base.wrapping_sub(1), ts) == 0 { base } else { 0 } }
+    if unsafe { clock_gettime(base.wrapping_sub(1), ts) } == 0 { base } else { 0 }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn timespec_getres(ts: *mut Timespec, base: c_int) -> c_int {
-    unsafe { if clock_getres(base.wrapping_sub(1), ts) == 0 { base } else { 0 } }
+    if unsafe { clock_getres(base.wrapping_sub(1), ts) } == 0 { base } else { 0 }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn settimeofday(tv: *const Timeval, tz: *const Timezone) -> c_int {
-    unsafe {
-        if !tz.is_null() {
-            if !tv.is_null() {
-                return fail(EINVAL);
-            }
-            return finish(syscall::syscall2(SYS_SETTIMEOFDAY, 0, tz as usize));
+    if !tz.is_null() {
+        if !tv.is_null() {
+            return fail(EINVAL);
         }
-        if tv.is_null() {
-            return fail(EFAULT);
-        }
-        let ts = Timespec { tv_sec: (*tv).tv_sec, tv_nsec: (*tv).tv_usec.wrapping_mul(1000) };
-        clock_settime(CLOCK_REALTIME, &ts)
+        return finish(unsafe { syscall::syscall2(SYS_SETTIMEOFDAY, 0, tz as usize) });
     }
+    let Some(tv) = (unsafe { tv.as_ref() }) else { return fail(EFAULT) };
+    clock_settime_ts(CLOCK_REALTIME, &Timespec { tv_sec: tv.tv_sec, tv_nsec: tv.tv_usec.wrapping_mul(1000) })
 }
 
 #[cfg_attr(feature = "export", unsafe(export_name = "__rl_stime_impl"))]
 pub unsafe extern "C" fn stime(when: *const TimeT) -> c_int {
-    unsafe {
-        let ts = Timespec { tv_sec: *when, tv_nsec: 0 };
-        clock_settime(CLOCK_REALTIME, &ts)
-    }
+    let t = unsafe { *sys::arg(when) };
+    clock_settime_ts(CLOCK_REALTIME, &Timespec { tv_sec: t, tv_nsec: 0 })
 }
 
 #[repr(C)]
@@ -337,102 +319,95 @@ const ADJ_OFFSET_SS_READ: c_uint = 0xa001;
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn adjtime(delta: *const Timeval, olddelta: *mut Timeval) -> c_int {
-    unsafe {
-        const MAX_SEC: i64 = (i32::MAX as i64) / 1_000_000 - 2;
-        const MIN_SEC: i64 = (i32::MIN as i64) / 1_000_000 + 2;
-        let mut tx = Timex { modes: 0, _pad: 0, offset: 0, rest: [0; 24] };
-        if !delta.is_null() {
-            let d = *delta;
-            let sec = d.tv_sec.wrapping_add(d.tv_usec / 1_000_000);
-            let usec = d.tv_usec % 1_000_000;
-            if !(MIN_SEC..=MAX_SEC).contains(&sec) {
-                return fail(EINVAL);
-            }
-            tx.offset = usec + sec * 1_000_000;
-            tx.modes = ADJ_OFFSET_SINGLESHOT;
-        } else {
-            tx.modes = ADJ_OFFSET_SS_READ;
+    let delta = unsafe { delta.as_ref() };
+    let olddelta = unsafe { ffi::out(olddelta) };
+    adjtime_rs(delta, olddelta)
+}
+
+fn adjtime_rs(delta: Option<&Timeval>, olddelta: Option<&mut Timeval>) -> c_int {
+    const MAX_SEC: i64 = (i32::MAX as i64) / 1_000_000 - 2;
+    const MIN_SEC: i64 = (i32::MIN as i64) / 1_000_000 + 2;
+    let mut tx = Timex { modes: 0, _pad: 0, offset: 0, rest: [0; 24] };
+    if let Some(d) = delta {
+        let sec = d.tv_sec.wrapping_add(d.tv_usec / 1_000_000);
+        let usec = d.tv_usec % 1_000_000;
+        if !(MIN_SEC..=MAX_SEC).contains(&sec) {
+            return fail(EINVAL);
         }
-        let r = syscall::syscall2(SYS_CLOCK_ADJTIME, CLOCK_REALTIME as usize, &mut tx as *mut Timex as usize);
-        if let Some(e) = raw_err(r) {
-            return fail(e);
-        }
-        if !olddelta.is_null() {
-            if tx.offset < 0 {
-                (*olddelta).tv_usec = -(-tx.offset % 1_000_000);
-                (*olddelta).tv_sec = -(-tx.offset / 1_000_000);
-            } else {
-                (*olddelta).tv_usec = tx.offset % 1_000_000;
-                (*olddelta).tv_sec = tx.offset / 1_000_000;
-            }
-        }
-        0
+        tx.offset = usec + sec * 1_000_000;
+        tx.modes = ADJ_OFFSET_SINGLESHOT;
+    } else {
+        tx.modes = ADJ_OFFSET_SS_READ;
     }
+    let r = unsafe { syscall::syscall2(SYS_CLOCK_ADJTIME, CLOCK_REALTIME as usize, &raw mut tx as usize) };
+    if let Some(e) = raw_err(r) {
+        return fail(e);
+    }
+    if let Some(o) = olddelta {
+        if tx.offset < 0 {
+            o.tv_usec = -(-tx.offset % 1_000_000);
+            o.tv_sec = -(-tx.offset / 1_000_000);
+        } else {
+            o.tv_usec = tx.offset % 1_000_000;
+            o.tv_sec = tx.offset / 1_000_000;
+        }
+    }
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ftime(tb: *mut Timeb) -> c_int {
-    unsafe {
-        let mut ts = Timespec::default();
-        clock_gettime_raw(CLOCK_REALTIME, &mut ts);
-        (*tb).time = ts.tv_sec;
-        (*tb).millitm = (ts.tv_nsec / 1_000_000) as u16;
-        (*tb).timezone = 0;
-        (*tb).dstflag = 0;
-        0
-    }
+    let ts = now(CLOCK_REALTIME).unwrap_or_default();
+    let tb = unsafe { sys::arg_mut(tb) };
+    tb.time = ts.tv_sec;
+    tb.millitm = (ts.tv_nsec / 1_000_000) as u16;
+    tb.timezone = 0;
+    tb.dstflag = 0;
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn clock_nanosleep(clock: ClockId, flags: c_int, req: *const Timespec, rem: *mut Timespec) -> c_int {
-    unsafe {
-        if clock == CLOCK_THREAD_CPUTIME_ID {
-            return EINVAL;
-        }
-        let clock = if clock == CLOCK_PROCESS_CPUTIME_ID { PROCESS_CLOCK } else { clock };
-        let r = rusty_libc_core::tls::syscall_cp(SYS_CLOCK_NANOSLEEP, clock as isize as usize, flags as isize as usize, req as usize, rem as usize, 0, 0);
-        raw_err(r).unwrap_or(0)
+    if clock == CLOCK_THREAD_CPUTIME_ID {
+        return EINVAL;
     }
+    let clock = if clock == CLOCK_PROCESS_CPUTIME_ID { PROCESS_CLOCK } else { clock };
+    let r = unsafe { rusty_libc_core::tls::syscall_cp(SYS_CLOCK_NANOSLEEP, clock as isize as usize, flags as isize as usize, req as usize, rem as usize, 0, 0) };
+    raw_err(r).unwrap_or(0)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> c_int {
-    unsafe {
-        let e = clock_nanosleep(CLOCK_REALTIME, 0, req, rem);
-        if e != 0 { fail(e) } else { 0 }
-    }
+    let e = unsafe { clock_nanosleep(CLOCK_REALTIME, 0, req, rem) };
+    if e != 0 { fail(e) } else { 0 }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sleep(seconds: c_uint) -> c_uint {
-    unsafe {
-        let saved = errno::get();
-        let ts_in = Timespec { tv_sec: seconds as i64, tv_nsec: 0 };
-        let mut ts = ts_in;
-        if nanosleep(&ts_in, &mut ts) < 0 {
-            return ts.tv_sec as c_uint;
-        }
-        errno::set(saved);
-        0
+    let saved = errno::get();
+    let ts_in = Timespec { tv_sec: seconds as i64, tv_nsec: 0 };
+    let mut ts = ts_in;
+    if unsafe { nanosleep(&ts_in, &mut ts) } < 0 {
+        return ts.tv_sec as c_uint;
     }
+    errno::set(saved);
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn usleep(usec: c_uint) -> c_int {
-    unsafe {
-        let ts = Timespec { tv_sec: (usec / 1_000_000) as i64, tv_nsec: (usec % 1_000_000) as i64 * 1000 };
-        nanosleep(&ts, core::ptr::null_mut())
-    }
+    let ts = Timespec { tv_sec: (usec / 1_000_000) as i64, tv_nsec: (usec % 1_000_000) as i64 * 1000 };
+    unsafe { nanosleep(&ts, core::ptr::null_mut()) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getitimer(which: c_int, value: *mut Itimerval) -> c_int {
-    unsafe { finish(syscall::syscall2(SYS_GETITIMER, which as isize as usize, value as usize)) }
+    finish(unsafe { syscall::syscall2(SYS_GETITIMER, which as isize as usize, value as usize) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setitimer(which: c_int, new: *const Itimerval, old: *mut Itimerval) -> c_int {
-    unsafe { finish(syscall::syscall3(SYS_SETITIMER, which as isize as usize, new as usize, old as usize)) }
+    finish(unsafe { syscall::syscall3(SYS_SETITIMER, which as isize as usize, new as usize, old as usize) })
 }
 
 #[repr(C)]
@@ -454,47 +429,40 @@ struct Job {
 }
 
 unsafe extern "C" fn timer_notify_thread(arg: *mut c_void) -> *mut c_void {
-    unsafe {
-        let j = arg as *mut Job;
-        let (f, v) = ((*j).f, (*j).v);
-        rusty_libc_malloc::free(arg);
-        rusty_libc_ipc::notify::detach_self();
-        rusty_libc_ipc::notify::unblock_all();
-        if let Some(f) = f {
-            f(v);
-        }
-        core::ptr::null_mut()
+    let Job { f, v } = unsafe { arg.cast::<Job>().read() };
+    unsafe { rusty_libc_malloc::free(arg) };
+    rusty_libc_ipc::notify::detach_self();
+    rusty_libc_ipc::notify::unblock_all();
+    if let Some(f) = f {
+        unsafe { f(v) };
     }
+    core::ptr::null_mut()
 }
 
 unsafe extern "C" fn timer_helper_thread(_arg: *mut c_void) -> *mut c_void {
-    use core::sync::atomic::Ordering::*;
-    unsafe {
-        HELPER_TID.store(syscall::syscall0(syscall::SYS_GETTID) as c_int, Release);
-        HELPER_STATE.store(2, Release);
-        let set: u64 = 1 << (SIGTIMER - 1);
-        loop {
-            let mut info = [0u8; 128];
-            let r = syscall::syscall4(128, &set as *const u64 as usize, info.as_mut_ptr() as usize, 0, 8);
-            if r as isize != SIGTIMER as isize {
-                continue;
-            }
-            let code = core::ptr::read_unaligned(info.as_ptr().add(8) as *const c_int);
-            if code != SI_TIMER {
-                continue;
-            }
-            let tp = core::ptr::read_unaligned(info.as_ptr().add(24) as *const *mut Timer);
-            if tp.is_null() {
-                continue;
-            }
-            let j = rusty_libc_malloc::malloc(core::mem::size_of::<Job>()) as *mut Job;
-            if j.is_null() {
-                continue;
-            }
-            j.write(Job { f: (*tp).notify, v: (*tp).value });
-            if rusty_libc_ipc::notify::spawn(timer_notify_thread, j as *mut c_void, (*tp).attr, 0) != 0 {
-                rusty_libc_malloc::free(j as *mut c_void);
-            }
+    let set: u64 = 1 << (SIGTIMER - 1);
+    loop {
+        let mut info = [0u8; 128];
+        let r = unsafe { syscall::syscall4(128, &set as *const u64 as usize, info.as_mut_ptr() as usize, 0, 8) };
+        if r as isize != SIGTIMER as isize {
+            continue;
+        }
+        let code = c_int::from_ne_bytes([info[8], info[9], info[10], info[11]]);
+        if code != SI_TIMER {
+            continue;
+        }
+        let tp = usize::from_ne_bytes(info[24..32].try_into().unwrap()) as *const Timer;
+        if tp.is_null() {
+            continue;
+        }
+        let t = unsafe { &*tp };
+        let j = unsafe { rusty_libc_malloc::malloc(core::mem::size_of::<Job>()) }.cast::<Job>();
+        if j.is_null() {
+            continue;
+        }
+        unsafe { j.write(Job { f: t.notify, v: t.value }) };
+        if unsafe { rusty_libc_ipc::notify::spawn(timer_notify_thread, j as *mut c_void, t.attr, 0) } != 0 {
+            unsafe { rusty_libc_malloc::free(j as *mut c_void) };
         }
     }
 }
@@ -506,204 +474,190 @@ unsafe extern "C" fn timer_fork_child() {
 
 unsafe extern "C" fn timer_fork_nop() {}
 
-unsafe fn start_timer_helper() -> bool {
+fn start_timer_helper() -> bool {
     use core::sync::atomic::Ordering::*;
-    unsafe {
-        loop {
-            match HELPER_STATE.compare_exchange(0, 1, AcqRel, Acquire) {
-                Ok(_) => break,
-                Err(2) => return true,
-                Err(3) => return false,
-                Err(_) => {
-                    syscall::syscall0(24);
-                }
+    loop {
+        match HELPER_STATE.compare_exchange(0, 1, AcqRel, Acquire) {
+            Ok(_) => break,
+            Err(2) => return true,
+            Err(3) => return false,
+            Err(_) => {
+                rusty_libc_core::lock::futex_wait(&HELPER_STATE, 1);
             }
         }
-        static HOOKED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        if HOOKED.swap(1, AcqRel) == 0 {
-            rusty_libc_core::process::register_fork_handlers(timer_fork_nop, timer_fork_nop, timer_fork_child);
-        }
-        let r = rusty_libc_ipc::notify::with_signals_blocked(|| rusty_libc_ipc::notify::spawn(timer_helper_thread, core::ptr::null_mut(), core::ptr::null(), 128 * 1024));
-        if r != 0 {
-            HELPER_STATE.store(3, Release);
-            return false;
-        }
-        while HELPER_STATE.load(Acquire) == 1 {
-            syscall::syscall0(24);
-        }
-        HELPER_TID.load(Acquire) != 0
     }
+    static HOOKED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if HOOKED.swap(1, AcqRel) == 0 {
+        rusty_libc_core::process::register_fork_handlers(timer_fork_nop, timer_fork_nop, timer_fork_child);
+    }
+    let mut tid: c_int = 0;
+    let r = rusty_libc_ipc::notify::with_signals_blocked(|| {
+        unsafe { rusty_libc_ipc::notify::spawn_tid(timer_helper_thread, core::ptr::null_mut(), core::ptr::null(), 128 * 1024, &mut tid) }
+    });
+    let ok = r == 0 && tid > 0;
+    if ok {
+        HELPER_TID.store(tid, Release);
+    }
+    HELPER_STATE.store(if ok { 2 } else { 3 }, Release);
+    rusty_libc_core::lock::futex_wake(&HELPER_STATE, u32::MAX);
+    ok
+}
+
+fn sigevent(value: *mut c_void, signo: c_int, notify: c_int) -> Sigevent {
+    Sigevent { sigev_value: Sigval { sival_ptr: value }, sigev_signo: signo, sigev_notify: notify, un: SigevUn { pad: [0; 12] } }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn timer_create(clock: ClockId, evp: *mut Sigevent, timerid: *mut TimerId) -> c_int {
-    unsafe {
-        let kclock = match clock {
-            CLOCK_PROCESS_CPUTIME_ID => PROCESS_CLOCK,
-            CLOCK_THREAD_CPUTIME_ID => THREAD_CLOCK,
-            c => c,
-        };
-        if !evp.is_null() && (*evp).sigev_notify == SIGEV_THREAD {
-            if !start_timer_helper() {
-                return fail(EAGAIN);
-            }
-            let attr = match rusty_libc_ipc::notify::attr_clone((*evp).un.thread[1] as *const c_void) {
-                Ok(a) => a,
-                Err(e) => return fail(e),
-            };
-            let t = rusty_libc_malloc::malloc(core::mem::size_of::<Timer>()) as *mut Timer;
-            if t.is_null() {
-                rusty_libc_ipc::notify::attr_free(attr);
-                return fail(12);
-            }
-            let f: Option<unsafe extern "C" fn(rusty_libc_ipc::notify::SigVal)> = core::mem::transmute((*evp).un.thread[0]);
-            let v = rusty_libc_ipc::notify::SigVal { sival_ptr: (*evp).sigev_value.sival_ptr };
-            t.write(Timer { notify: f, value: v, attr, ktimer: 0 });
-            let mut kev: Sigevent = core::mem::zeroed();
-            kev.sigev_value.sival_ptr = t as *mut c_void;
-            kev.sigev_signo = SIGTIMER;
-            kev.sigev_notify = 4;
-            kev.un.tid = HELPER_TID.load(core::sync::atomic::Ordering::Acquire);
-            let mut kid_out: c_int = 0;
-            let r = syscall::syscall3(SYS_TIMER_CREATE, kclock as isize as usize, &mut kev as *mut Sigevent as usize, &mut kid_out as *mut c_int as usize);
-            if let Some(e) = raw_err(r) {
-                rusty_libc_ipc::notify::attr_free(attr);
-                rusty_libc_malloc::free(t as *mut c_void);
-                return fail(e);
-            }
-            (*t).ktimer = kid_out;
-            *timerid = t as TimerId;
-            return 0;
+    let kclock = match clock {
+        CLOCK_PROCESS_CPUTIME_ID => PROCESS_CLOCK,
+        CLOCK_THREAD_CPUTIME_ID => THREAD_CLOCK,
+        c => c,
+    };
+    if let Some(ev) = unsafe { evp.as_ref() }
+        && ev.sigev_notify == SIGEV_THREAD
+    {
+        if !start_timer_helper() {
+            return fail(EAGAIN);
         }
-        let mut local: Sigevent = core::mem::zeroed();
-        let ev: *mut Sigevent = if evp.is_null() {
-            local.sigev_notify = SIGEV_SIGNAL;
-            local.sigev_signo = SIGALRM;
-            local.sigev_value.sival_ptr = core::ptr::null_mut();
-            &mut local
-        } else {
-            evp
+        let [func, attr_p] = unsafe { ev.un.thread };
+        let attr = match unsafe { rusty_libc_ipc::notify::attr_clone(attr_p as *const c_void) } {
+            Ok(a) => a,
+            Err(e) => return fail(e),
         };
-        let mut kid: c_int = 0;
-        let r = syscall::syscall3(SYS_TIMER_CREATE, kclock as isize as usize, ev as usize, &mut kid as *mut c_int as usize);
+        let t = unsafe { rusty_libc_malloc::malloc(core::mem::size_of::<Timer>()) }.cast::<Timer>();
+        if t.is_null() {
+            unsafe { rusty_libc_ipc::notify::attr_free(attr) };
+            return fail(12);
+        }
+        let f: Option<unsafe extern "C" fn(rusty_libc_ipc::notify::SigVal)> = unsafe { core::mem::transmute::<usize, _>(func) };
+        let v = rusty_libc_ipc::notify::SigVal { sival_ptr: unsafe { ev.sigev_value.sival_ptr } };
+        unsafe { t.write(Timer { notify: f, value: v, attr, ktimer: 0 }) };
+        let mut kev = sigevent(t as *mut c_void, SIGTIMER, SIGEV_THREAD_ID);
+        kev.un.tid = HELPER_TID.load(core::sync::atomic::Ordering::Acquire);
+        let mut kid_out: c_int = 0;
+        let r = unsafe { syscall::syscall3(SYS_TIMER_CREATE, kclock as isize as usize, &raw mut kev as usize, &raw mut kid_out as usize) };
         if let Some(e) = raw_err(r) {
+            unsafe { rusty_libc_ipc::notify::attr_free(attr) };
+            unsafe { rusty_libc_malloc::free(t as *mut c_void) };
             return fail(e);
         }
-        *timerid = (isize::MIN as usize | kid as u32 as usize) as TimerId;
-        0
+        unsafe { (*t).ktimer = kid_out };
+        *unsafe { sys::arg_mut(timerid) } = thread_timer_id(t);
+        return 0;
     }
+    let local = sigevent(core::ptr::null_mut(), SIGALRM, SIGEV_SIGNAL);
+    let ev: *const Sigevent = if evp.is_null() { &local } else { evp };
+    let mut kid: c_int = 0;
+    let r = unsafe { syscall::syscall3(SYS_TIMER_CREATE, kclock as isize as usize, ev as usize, &raw mut kid as usize) };
+    if let Some(e) = raw_err(r) {
+        return fail(e);
+    }
+    *unsafe { sys::arg_mut(timerid) } = kid as isize as TimerId;
+    0
+}
+
+fn thread_timer_id(t: *mut Timer) -> TimerId {
+    (isize::MIN as usize | (t as usize) >> 1) as TimerId
+}
+
+fn is_thread_timer(t: TimerId) -> bool {
+    (t as isize) < 0
+}
+
+fn thread_timer(t: TimerId) -> *mut Timer {
+    ((t as usize) << 1) as *mut Timer
 }
 
 #[inline]
 unsafe fn kid(t: TimerId) -> usize {
-    unsafe {
-        if (t as isize) < 0 { (t as usize) & 0x7fff_ffff } else { (*(t as *mut Timer)).ktimer as usize }
+    if is_thread_timer(t) {
+        (unsafe { (*thread_timer(t)).ktimer }) as usize
+    } else {
+        t as usize as u32 as usize
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn timer_settime(t: TimerId, flags: c_int, new: *const Itimerspec, old: *mut Itimerspec) -> c_int {
-    unsafe { finish(syscall::syscall4(SYS_TIMER_SETTIME, kid(t), flags as isize as usize, new as usize, old as usize)) }
+    let k = unsafe { kid(t) };
+    finish(unsafe { syscall::syscall4(SYS_TIMER_SETTIME, k, flags as isize as usize, new as usize, old as usize) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn timer_gettime(t: TimerId, value: *mut Itimerspec) -> c_int {
-    unsafe { finish(syscall::syscall2(SYS_TIMER_GETTIME, kid(t), value as usize)) }
+    let k = unsafe { kid(t) };
+    finish(unsafe { syscall::syscall2(SYS_TIMER_GETTIME, k, value as usize) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn timer_getoverrun(t: TimerId) -> c_int {
-    unsafe {
-        let r = syscall::syscall1(SYS_TIMER_GETOVERRUN, kid(t));
-        match raw_err(r) {
-            None => r as c_int,
-            Some(e) => fail(e),
-        }
+    let k = unsafe { kid(t) };
+    let r = unsafe { syscall::syscall1(SYS_TIMER_GETOVERRUN, k) };
+    match raw_err(r) {
+        None => r as c_int,
+        Some(e) => fail(e),
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn timer_delete(t: TimerId) -> c_int {
-    unsafe {
-        let r = finish(syscall::syscall1(SYS_TIMER_DELETE, kid(t)));
-        if r == 0 && (t as isize) >= 0 {
-            let p = t as *mut Timer;
-            rusty_libc_ipc::notify::attr_free((*p).attr);
-            rusty_libc_malloc::free(p as *mut c_void);
-        }
-        r
+    let k = unsafe { kid(t) };
+    let r = finish(unsafe { syscall::syscall1(SYS_TIMER_DELETE, k) });
+    if r == 0 && is_thread_timer(t) {
+        let p = thread_timer(t);
+        let attr = unsafe { (*p).attr };
+        unsafe { rusty_libc_ipc::notify::attr_free(attr) };
+        unsafe { rusty_libc_malloc::free(p as *mut c_void) };
     }
+    r
 }
 
 #[inline]
 unsafe fn utimensat(fd: usize, path: *const c_char, ts: *const Timespec, flags: usize) -> c_int {
-    unsafe { finish(syscall::syscall4(SYS_UTIMENSAT, fd, path as usize, ts as usize, flags)) }
+    finish(unsafe { syscall::syscall4(SYS_UTIMENSAT, fd, path as usize, ts as usize, flags) })
 }
 
 #[inline]
-unsafe fn tv_to_ts(tvp: *const Timeval, ts: &mut [Timespec; 2]) {
-    unsafe {
-        for (i, t) in ts.iter_mut().enumerate() {
-            let tv = *tvp.add(i);
-            *t = Timespec { tv_sec: tv.tv_sec, tv_nsec: tv.tv_usec.wrapping_mul(1000) };
-        }
-    }
+unsafe fn utimensat_tv(fd: usize, path: *const c_char, tvp: *const Timeval, flags: usize) -> c_int {
+    let ts = if tvp.is_null() {
+        None
+    } else {
+        let tv = unsafe { ffi::slice(tvp, 2) };
+        Some([0, 1].map(|i| Timespec { tv_sec: tv[i].tv_sec, tv_nsec: tv[i].tv_usec.wrapping_mul(1000) }))
+    };
+    unsafe { utimensat(fd, path, pair_ptr(&ts), flags) }
+}
+
+#[inline]
+fn pair_ptr(ts: &Option<[Timespec; 2]>) -> *const Timespec {
+    ts.as_ref().map_or(core::ptr::null(), |t| t.as_ptr())
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn utimes(file: *const c_char, tvp: *const Timeval) -> c_int {
-    unsafe {
-        let mut ts = [Timespec::default(); 2];
-        if !tvp.is_null() {
-            tv_to_ts(tvp, &mut ts);
-        }
-        utimensat(AT_FDCWD, file, if tvp.is_null() { core::ptr::null() } else { ts.as_ptr() }, 0)
-    }
+    unsafe { utimensat_tv(AT_FDCWD, file, tvp, 0) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn lutimes(file: *const c_char, tvp: *const Timeval) -> c_int {
-    unsafe {
-        let mut ts = [Timespec::default(); 2];
-        if !tvp.is_null() {
-            tv_to_ts(tvp, &mut ts);
-        }
-        utimensat(AT_FDCWD, file, if tvp.is_null() { core::ptr::null() } else { ts.as_ptr() }, AT_SYMLINK_NOFOLLOW)
-    }
+    unsafe { utimensat_tv(AT_FDCWD, file, tvp, AT_SYMLINK_NOFOLLOW) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn futimes(fd: c_int, tvp: *const Timeval) -> c_int {
-    unsafe {
-        let mut ts = [Timespec::default(); 2];
-        if !tvp.is_null() {
-            tv_to_ts(tvp, &mut ts);
-        }
-        utimensat(fd as isize as usize, core::ptr::null(), if tvp.is_null() { core::ptr::null() } else { ts.as_ptr() }, 0)
-    }
+    unsafe { utimensat_tv(fd as isize as usize, core::ptr::null(), tvp, 0) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn futimesat(fd: c_int, file: *const c_char, tvp: *const Timeval) -> c_int {
-    unsafe {
-        let mut ts = [Timespec::default(); 2];
-        if !tvp.is_null() {
-            tv_to_ts(tvp, &mut ts);
-        }
-        utimensat(fd as isize as usize, file, if tvp.is_null() { core::ptr::null() } else { ts.as_ptr() }, 0)
-    }
+    unsafe { utimensat_tv(fd as isize as usize, file, tvp, 0) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn utime(file: *const c_char, times: *const Utimbuf) -> c_int {
-    unsafe {
-        let mut ts = [Timespec::default(); 2];
-        if !times.is_null() {
-            ts[0] = Timespec { tv_sec: (*times).actime, tv_nsec: 0 };
-            ts[1] = Timespec { tv_sec: (*times).modtime, tv_nsec: 0 };
-        }
-        utimensat(AT_FDCWD, file, if times.is_null() { core::ptr::null() } else { ts.as_ptr() }, 0)
-    }
+    let ts = unsafe { times.as_ref() }.map(|t| [Timespec { tv_sec: t.actime, tv_nsec: 0 }, Timespec { tv_sec: t.modtime, tv_nsec: 0 }]);
+    unsafe { utimensat(AT_FDCWD, file, pair_ptr(&ts), 0) }
 }
 
 pub fn now(clock: ClockId) -> Result<Timespec, Errno> {
@@ -714,15 +668,13 @@ pub fn now(clock: ClockId) -> Result<Timespec, Errno> {
 
 pub fn resolution(clock: ClockId) -> Result<Timespec, Errno> {
     let mut ts = Timespec::default();
-    let r = unsafe {
-        if let Some(f) = vdso::clock_getres() {
-            let r = f(clock, (&mut ts as *mut Timespec).cast());
-            if r != -ENOSYS {
-                return if r == 0 { Ok(ts) } else { Err(Errno(-r)) };
-            }
+    if let Some(f) = vdso::clock_getres() {
+        let r = unsafe { f(clock, (&raw mut ts).cast()) };
+        if r != -ENOSYS {
+            return if r == 0 { Ok(ts) } else { Err(Errno(-r)) };
         }
-        syscall::syscall2(SYS_CLOCK_GETRES, clock as isize as usize, &mut ts as *mut Timespec as usize)
-    };
+    }
+    let r = unsafe { syscall::syscall2(SYS_CLOCK_GETRES, clock as isize as usize, &raw mut ts as usize) };
     res(r).map(|_| ts)
 }
 

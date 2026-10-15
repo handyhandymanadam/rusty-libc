@@ -22,8 +22,7 @@ fn poly<const F: bool>(row: &[f64; 6], z: f64) -> f64 {
 
 #[inline(always)]
 fn finish(y: f64) -> Option<f32> {
-    let low = y.to_bits() & 0x1fff_ffff;
-    if low.wrapping_sub(0x1000_0000 - M) > 2 * M { Some(y as f32) } else { None }
+    crate::exp::ffast::round_cr_x(y, M)
 }
 
 #[inline(always)]
@@ -71,29 +70,42 @@ fn sin_cos_pi<const F: bool>(ax: f64, exact_mask: usize) -> Option<(f64, f64)> {
 
 #[inline(always)]
 pub fn sinpif<const F: bool>(x: f32) -> Option<f32> {
-    if !in_range(x.to_bits() & 0x7fff_ffff) {
-        return None;
-    }
-    let (s, _) = sin_cos_pi::<F>(f64::from(x), 63)?;
-    finish(s)
+    finish(sinpif_raw::<F>(x)?)
 }
 
 #[inline(always)]
 pub fn cospif<const F: bool>(x: f32) -> Option<f32> {
-    if !in_range(x.to_bits() & 0x7fff_ffff) {
-        return None;
-    }
-    let (_, c) = sin_cos_pi::<F>(f64::from(x), 63)?;
-    finish(c)
+    finish(cospif_raw::<F>(x)?)
 }
 
 #[inline(always)]
 pub fn tanpif<const F: bool>(x: f32) -> Option<f32> {
+    finish(tanpif_raw::<F>(x)?)
+}
+
+#[inline(always)]
+pub(crate) fn sinpif_raw<const F: bool>(x: f32) -> Option<f64> {
+    if !in_range(x.to_bits() & 0x7fff_ffff) {
+        return None;
+    }
+    Some(sin_cos_pi::<F>(f64::from(x), 63)?.0)
+}
+
+#[inline(always)]
+pub(crate) fn cospif_raw<const F: bool>(x: f32) -> Option<f64> {
+    if !in_range(x.to_bits() & 0x7fff_ffff) {
+        return None;
+    }
+    Some(sin_cos_pi::<F>(f64::from(x), 63)?.1)
+}
+
+#[inline(always)]
+pub(crate) fn tanpif_raw<const F: bool>(x: f32) -> Option<f64> {
     if !in_range(x.to_bits() & 0x7fff_ffff) {
         return None;
     }
     let (s, c) = sin_cos_pi::<F>(f64::from(x), 31)?;
-    finish(s / c)
+    Some(s / c)
 }
 
 #[inline(always)]

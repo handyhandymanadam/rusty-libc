@@ -64,13 +64,11 @@ pub unsafe extern "C" fn __getcwd_chk(buf: *mut c_char, size: usize, buflen: usi
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __getwd_chk(buf: *mut c_char, buflen: usize) -> *mut c_char {
-    unsafe {
-        let r = rusty_libc_sys::unistd::getcwd(buf, buflen);
-        if r.is_null() && errno::get() == ERANGE {
-            chk_fail();
-        }
-        r
+    let r = unsafe { rusty_libc_sys::unistd::getcwd(buf, buflen) };
+    if r.is_null() && errno::get() == ERANGE {
+        chk_fail();
     }
+    r
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

@@ -1,15 +1,23 @@
 #![allow(non_upper_case_globals)]
 use crate::calendar::{Tm, offtime};
-use core::ffi::{c_char, c_int, c_long, c_void};
-use core::ptr::{null, null_mut};
-use rusty_libc_core::{env, syscall};
+use crate::mbuf::MBuf;
+use crate::sys;
+use core::cell::Cell;
+use core::ffi::{CStr, c_char, c_int, c_long};
+use core::ptr::{NonNull, null_mut};
+use core::sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, Ordering::Relaxed};
+use rusty_libc_core::sync_cell::SyncCell;
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub static mut __tzname: [*mut c_char; 2] = [c"GMT".as_ptr().cast_mut(), c"GMT".as_ptr().cast_mut()];
+pub static __tzname: [AtomicPtr<c_char>; 2] = [AtomicPtr::new(c"GMT".as_ptr().cast_mut()), AtomicPtr::new(c"GMT".as_ptr().cast_mut())];
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub static mut __daylight: c_int = 0;
+pub static __daylight: AtomicI32 = AtomicI32::new(0);
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub static mut __timezone: c_long = 0;
+pub static __timezone: AtomicI64 = AtomicI64::new(0);
+
+const _: () = assert!(size_of::<[AtomicPtr<c_char>; 2]>() == 16 && align_of::<AtomicPtr<c_char>>() == align_of::<*mut c_char>());
+const _: () = assert!(size_of::<AtomicI32>() == size_of::<c_int>() && align_of::<AtomicI32>() == align_of::<c_int>());
+const _: () = assert!(size_of::<AtomicI64>() == size_of::<c_long>() && align_of::<AtomicI64>() == align_of::<c_long>());
 
 #[cfg(feature = "export")]
 core::arch::global_asm!(
@@ -27,78 +35,75 @@ core::arch::global_asm!(
     ".set timezone, __timezone",
 );
 
+#[inline]
+fn tzname_get(i: usize) -> *mut c_char {
+    __tzname[i].load(Relaxed)
+}
+
+#[inline]
+fn tzname_set(i: usize, p: *mut c_char) {
+    __tzname[i].store(p, Relaxed)
+}
+
+#[inline]
+fn name_ptr(n: Option<&'static CStr>) -> *mut c_char {
+    n.map_or(null_mut(), |s| s.as_ptr().cast_mut())
+}
+
 const TZDEFAULT: &[u8] = b"/etc/localtime";
 const TZDEFRULES: &[u8] = b"posixrules";
 const TZDIR: &[u8] = b"/usr/share/zoneinfo";
 
-unsafe fn alloc<T>(n: usize) -> *mut T {
-    unsafe { rusty_libc_malloc::malloc((n * core::mem::size_of::<T>()).max(1)).cast() }
-}
-
-unsafe fn release<T>(p: *mut T) {
-    unsafe {
-        if !p.is_null() {
-            rusty_libc_malloc::free(p.cast::<c_void>());
-        }
-    }
-}
-
-unsafe fn cstrlen(s: *const u8) -> usize {
-    unsafe {
-        let mut n = 0;
-        while *s.add(n) != 0 {
-            n += 1;
-        }
-        n
-    }
-}
-
-unsafe fn cslice<'a>(s: *const u8) -> &'a [u8] {
-    unsafe { core::slice::from_raw_parts(s, cstrlen(s)) }
-}
-
+#[repr(C)]
 struct TzStr {
     next: *mut TzStr,
     len: usize,
 }
 
-static mut TZSTRINGS: *mut TzStr = null_mut();
+struct StrPool {
+    head: *mut TzStr,
+}
 
-unsafe fn tzstring_len(s: *const u8, len: usize) -> *const u8 {
-    unsafe {
-        let mut u: *mut TzStr = null_mut();
-        let mut t = TZSTRINGS;
+unsafe fn node_data(t: *mut TzStr) -> &'static [u8] {
+    let len = unsafe { (*t).len };
+    unsafe { core::slice::from_raw_parts(t.wrapping_add(1).cast::<u8>(), len + 1) }
+}
+
+impl StrPool {
+    fn intern(&mut self, s: &[u8]) -> Option<&'static CStr> {
+        let len = s.len();
+        let mut last: *mut TzStr = null_mut();
+        let mut t = self.head;
         while !t.is_null() {
-            if len <= (*t).len {
-                let data = t.add(1).cast::<u8>();
-                let p = data.add((*t).len - len);
-                if core::slice::from_raw_parts(p, len) == core::slice::from_raw_parts(s, len) {
-                    return p;
-                }
+            let data = unsafe { node_data(t) };
+            let tlen = data.len() - 1;
+            if len <= tlen && &data[tlen - len..tlen] == s {
+                return CStr::from_bytes_until_nul(&data[tlen - len..]).ok();
             }
-            u = t;
-            t = (*t).next;
+            last = t;
+            t = unsafe { (*t).next };
         }
-        let new: *mut TzStr = rusty_libc_malloc::malloc(core::mem::size_of::<TzStr>() + len + 1).cast();
-        if new.is_null() {
-            return null();
-        }
-        (*new).next = null_mut();
-        (*new).len = len;
-        let data = new.add(1).cast::<u8>();
-        core::ptr::copy_nonoverlapping(s, data, len);
-        *data.add(len) = 0;
-        if u.is_null() {
-            TZSTRINGS = new;
+        let new = unsafe { rusty_libc_malloc::malloc(size_of::<TzStr>() + len + 1) }.cast::<TzStr>();
+        let new = NonNull::new(new)?;
+        unsafe { new.write(TzStr { next: null_mut(), len }) };
+        let dst = unsafe { core::slice::from_raw_parts_mut(new.as_ptr().wrapping_add(1).cast::<u8>(), len + 1) };
+        dst[..len].copy_from_slice(s);
+        dst[len] = 0;
+        if last.is_null() {
+            self.head = new.as_ptr();
         } else {
-            (*u).next = new;
+            unsafe { (*last).next = new.as_ptr() };
         }
-        data
+        CStr::from_bytes_until_nul(unsafe { node_data(new.as_ptr()) }).ok()
+    }
+
+    fn intern_c(&mut self, s: &[u8]) -> Option<&'static CStr> {
+        self.intern(until_nul(s))
     }
 }
 
-unsafe fn tzstring(s: *const u8) -> *const u8 {
-    unsafe { tzstring_len(s, cstrlen(s)) }
+fn until_nul(s: &[u8]) -> &[u8] {
+    &s[..s.iter().position(|&c| c == 0).unwrap_or(s.len())]
 }
 
 const J0: u8 = 0;
@@ -107,7 +112,7 @@ const M: u8 = 2;
 
 #[derive(Clone, Copy)]
 struct Rule {
-    name: *const u8,
+    name: Option<&'static CStr>,
     typ: u8,
     m: u16,
     n: u16,
@@ -118,9 +123,7 @@ struct Rule {
     computed_for: i32,
 }
 
-const RULE0: Rule = Rule { name: null(), typ: J0, m: 0, n: 0, d: 0, secs: 0, offset: 0, change: 0, computed_for: 0 };
-
-static mut RULES: [Rule; 2] = [RULE0; 2];
+const RULE0: Rule = Rule { name: None, typ: J0, m: 0, n: 0, d: 0, secs: 0, offset: 0, change: 0, computed_for: 0 };
 
 const MON_YDAY: [[u16; 13]; 2] = [
     [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365],
@@ -131,19 +134,11 @@ fn isleap(y: i64) -> bool {
     y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
 }
 
-#[allow(clippy::deref_addrof)]
-unsafe fn rules() -> &'static mut [Rule; 2] {
-    unsafe { &mut *(&raw mut RULES) }
-}
-
-unsafe fn update_vars() {
-    unsafe {
-        let r = rules();
-        __daylight = (r[0].offset != r[1].offset) as c_int;
-        __timezone = -(r[0].offset as c_long);
-        __tzname[0] = r[0].name as *mut c_char;
-        __tzname[1] = r[1].name as *mut c_char;
-    }
+fn update_vars(r: &[Rule; 2]) {
+    __daylight.store((r[0].offset != r[1].offset) as c_int, Relaxed);
+    __timezone.store(-(r[0].offset as c_long), Relaxed);
+    tzname_set(0, name_ptr(r[0].name));
+    tzname_set(1, name_ptr(r[1].name));
 }
 
 fn isspace(c: u8) -> bool {
@@ -214,185 +209,173 @@ impl Cur<'_> {
     }
 }
 
-unsafe fn parse_tzname(c: &mut Cur, which: usize) -> bool {
-    unsafe {
-        let start = c.i;
-        let mut p = start;
-        let at = |i: usize| c.s.get(i).copied().unwrap_or(0);
-        while at(p).is_ascii_alphabetic() {
-            p += 1;
-        }
-        let mut st = start;
-        let mut len = p - start;
-        if len < 3 {
-            p = c.i;
-            if at(p) != b'<' {
-                return false;
-            }
-            p += 1;
-            st = p;
-            while at(p).is_ascii_alphanumeric() || at(p) == b'+' || at(p) == b'-' {
-                p += 1;
-            }
-            len = p - st;
-            let close = at(p);
-            p += 1;
-            if close != b'>' || len < 3 {
-                return false;
-            }
-        }
-        let name = tzstring_len(c.s.as_ptr().add(st), len);
-        if name.is_null() {
+fn parse_tzname(z: &mut Zone, c: &mut Cur, which: usize) -> bool {
+    let start = c.i;
+    let mut p = start;
+    let at = |i: usize| c.s.get(i).copied().unwrap_or(0);
+    while at(p).is_ascii_alphabetic() {
+        p += 1;
+    }
+    let mut st = start;
+    let mut len = p - start;
+    if len < 3 {
+        p = c.i;
+        if at(p) != b'<' {
             return false;
         }
-        rules()[which].name = name;
-        c.i = p;
-        true
+        p += 1;
+        st = p;
+        while at(p).is_ascii_alphanumeric() || at(p) == b'+' || at(p) == b'-' {
+            p += 1;
+        }
+        len = p - st;
+        let close = at(p);
+        p += 1;
+        if close != b'>' || len < 3 {
+            return false;
+        }
     }
+    let Some(bytes) = c.s.get(st..st + len) else { return false };
+    let Some(name) = z.strings.intern(bytes) else { return false };
+    z.rules[which].name = Some(name);
+    c.i = p;
+    true
 }
 
-unsafe fn parse_offset(c: &mut Cur, which: usize) -> bool {
-    unsafe {
-        let r = rules();
-        let ch = c.at(0);
-        if which == 0 && (ch == 0 || (ch != b'+' && ch != b'-' && !ch.is_ascii_digit())) {
-            return false;
-        }
-        let sign: i32;
-        if ch == b'-' || ch == b'+' {
-            sign = if ch == b'-' { 1 } else { -1 };
+fn parse_offset(r: &mut [Rule; 2], c: &mut Cur, which: usize) -> bool {
+    let ch = c.at(0);
+    if which == 0 && (ch == 0 || (ch != b'+' && ch != b'-' && !ch.is_ascii_digit())) {
+        return false;
+    }
+    let sign: i32;
+    if ch == b'-' || ch == b'+' {
+        sign = if ch == b'-' { 1 } else { -1 };
+        c.i += 1;
+    } else {
+        sign = -1;
+    }
+    let (v, count, consumed) = scan_hms(c.rest(), [0, 0, 0]);
+    if count > 0 {
+        r[which].offset = sign * compute_offset(v[2] as u32, v[1] as u32, v[0] as u32);
+    } else if which == 0 {
+        r[0].offset = 0;
+        return false;
+    } else {
+        r[1].offset = r[0].offset + 3600;
+    }
+    c.i += consumed;
+    true
+}
+
+fn parse_rule(r: &mut Rule, c: &mut Cur, which: usize) -> bool {
+    if c.at(0) == b',' {
+        c.i += 1;
+    }
+    let ch = c.at(0);
+    if ch == b'J' || ch.is_ascii_digit() {
+        r.typ = if ch == b'J' { J1 } else { J0 };
+        if r.typ == J1 {
             c.i += 1;
-        } else {
-            sign = -1;
+            if !c.at(0).is_ascii_digit() {
+                return false;
+            }
         }
-        let (v, count, consumed) = scan_hms(c.rest(), [0, 0, 0]);
-        if count > 0 {
-            r[which].offset = sign * compute_offset(v[2] as u32, v[1] as u32, v[0] as u32);
-        } else if which == 0 {
-            r[0].offset = 0;
+        let mut d: u64 = 0;
+        while c.at(0).is_ascii_digit() {
+            d = d.saturating_mul(10).saturating_add((c.at(0) - b'0') as u64);
+            c.i += 1;
+        }
+        if d > 365 || (r.typ == J1 && d == 0) {
             return false;
-        } else {
-            r[1].offset = r[0].offset + 3600;
         }
+        r.d = d as u16;
+    } else if ch == b'M' {
+        r.typ = M;
+        let s = c.rest();
+        let at = |i: usize| s.get(i).copied().unwrap_or(0);
+        let Some((m, p1)) = scan_hu(s, 1) else { return false };
+        r.m = m;
+        if at(p1) != b'.' {
+            return false;
+        }
+        let Some((n, p2)) = scan_hu(s, p1 + 1) else { return false };
+        r.n = n;
+        if at(p2) != b'.' {
+            return false;
+        }
+        let Some((d, p3)) = scan_hu(s, p2 + 1) else { return false };
+        r.d = d;
+        if r.m < 1 || r.m > 12 || r.n < 1 || r.n > 5 || r.d > 6 {
+            return false;
+        }
+        c.i += p3;
+    } else if ch == 0 {
+        r.typ = M;
+        if which == 0 {
+            r.m = 3;
+            r.n = 2;
+            r.d = 0;
+        } else {
+            r.m = 11;
+            r.n = 1;
+            r.d = 0;
+        }
+    } else {
+        return false;
+    }
+    let ch = c.at(0);
+    if ch != 0 && ch != b'/' && ch != b',' {
+        return false;
+    } else if ch == b'/' {
+        c.i += 1;
+        if c.at(0) == 0 {
+            return false;
+        }
+        let negative = c.at(0) == b'-';
+        if negative {
+            c.i += 1;
+        }
+        let (v, _count, consumed) = scan_hms(c.rest(), [2, 0, 0]);
         c.i += consumed;
-        true
+        let secs = v[0] as i32 * 3600 + v[1] as i32 * 60 + v[2] as i32;
+        r.secs = if negative { -secs } else { secs };
+    } else {
+        r.secs = 2 * 3600;
     }
+    r.computed_for = -1;
+    true
 }
 
-unsafe fn parse_rule(c: &mut Cur, which: usize) -> bool {
-    unsafe {
-        let r = &mut rules()[which];
-        if c.at(0) == b',' {
-            c.i += 1;
-        }
-        let ch = c.at(0);
-        if ch == b'J' || ch.is_ascii_digit() {
-            r.typ = if ch == b'J' { J1 } else { J0 };
-            if r.typ == J1 {
-                c.i += 1;
-                if !c.at(0).is_ascii_digit() {
-                    return false;
-                }
-            }
-            let mut d: u64 = 0;
-            while c.at(0).is_ascii_digit() {
-                d = d.saturating_mul(10).saturating_add((c.at(0) - b'0') as u64);
-                c.i += 1;
-            }
-            if d > 365 || (r.typ == J1 && d == 0) {
-                return false;
-            }
-            r.d = d as u16;
-        } else if ch == b'M' {
-            r.typ = M;
-            let s = c.rest();
-            let at = |i: usize| s.get(i).copied().unwrap_or(0);
-            let Some((m, p1)) = scan_hu(s, 1) else { return false };
-            r.m = m;
-            if at(p1) != b'.' {
-                return false;
-            }
-            let Some((n, p2)) = scan_hu(s, p1 + 1) else { return false };
-            r.n = n;
-            if at(p2) != b'.' {
-                return false;
-            }
-            let Some((d, p3)) = scan_hu(s, p2 + 1) else { return false };
-            r.d = d;
-            if r.m < 1 || r.m > 12 || r.n < 1 || r.n > 5 || r.d > 6 {
-                return false;
-            }
-            c.i += p3;
-        } else if ch == 0 {
-            r.typ = M;
-            if which == 0 {
-                r.m = 3;
-                r.n = 2;
-                r.d = 0;
-            } else {
-                r.m = 11;
-                r.n = 1;
-                r.d = 0;
-            }
-        } else {
-            return false;
-        }
-        let ch = c.at(0);
-        if ch != 0 && ch != b'/' && ch != b',' {
-            return false;
-        } else if ch == b'/' {
-            c.i += 1;
-            if c.at(0) == 0 {
-                return false;
-            }
-            let negative = c.at(0) == b'-';
-            if negative {
-                c.i += 1;
-            }
-            let (v, _count, consumed) = scan_hms(c.rest(), [2, 0, 0]);
-            c.i += consumed;
-            let secs = v[0] as i32 * 3600 + v[1] as i32 * 60 + v[2] as i32;
-            r.secs = if negative { -secs } else { secs };
-        } else {
-            r.secs = 2 * 3600;
-        }
-        r.computed_for = -1;
-        true
-    }
-}
-
-unsafe fn tzset_parse_tz(tz: &[u8]) {
-    unsafe {
-        let r = rules();
-        *r = [RULE0; 2];
-        r[0].name = c"".as_ptr().cast();
-        r[1].name = c"".as_ptr().cast();
-        let mut c = Cur { s: tz, i: 0 };
-        if parse_tzname(&mut c, 0) && parse_offset(&mut c, 0) {
-            if c.at(0) != 0 {
-                if parse_tzname(&mut c, 1) {
-                    parse_offset(&mut c, 1);
-                    if c.at(0) == 0 || (c.at(0) == b',' && c.at(1) == 0) {
-                        let r = rules();
-                        tzfile_default(r[0].name, r[1].name, r[0].offset, r[1].offset);
-                        if (*tzf()).used {
-                            release(OLD_TZ);
-                            OLD_TZ = null_mut();
-                            return;
-                        }
+fn tzset_parse_tz(z: &mut Zone, tz: &[u8]) -> bool {
+    z.rules = [RULE0; 2];
+    z.rules[0].name = Some(c"");
+    z.rules[1].name = Some(c"");
+    let mut c = Cur { s: tz, i: 0 };
+    let mut by_string = true;
+    if parse_tzname(z, &mut c, 0) && parse_offset(&mut z.rules, &mut c, 0) {
+        if c.at(0) != 0 {
+            if parse_tzname(z, &mut c, 1) {
+                parse_offset(&mut z.rules, &mut c, 1);
+                if c.at(0) == 0 || (c.at(0) == b',' && c.at(1) == 0) {
+                    let r = z.rules;
+                    tzfile_default(z, r[0].name, r[1].name, r[0].offset, r[1].offset);
+                    if z.file.used {
+                        z.old_tz = MBuf::empty();
+                        return false;
                     }
+                    by_string = false;
                 }
-                if parse_rule(&mut c, 0) {
-                    parse_rule(&mut c, 1);
-                }
-            } else {
-                let r = rules();
-                r[1].name = r[0].name;
-                r[1].offset = r[0].offset;
             }
+            if parse_rule(&mut z.rules[0], &mut c, 0) {
+                parse_rule(&mut z.rules[1], &mut c, 1);
+            }
+        } else {
+            z.rules[1].name = z.rules[0].name;
+            z.rules[1].offset = z.rules[0].offset;
         }
-        update_vars();
     }
+    update_vars(&z.rules);
+    by_string
 }
 
 fn compute_change(rule: &mut Rule, year: i32) {
@@ -453,22 +436,19 @@ fn compute_change(rule: &mut Rule, year: i32) {
     rule.computed_for = year;
 }
 
-unsafe fn tz_compute(timer: i64, tm: &mut Tm, use_localtime: bool) {
-    unsafe {
-        let r = rules();
-        let year = 1900i32.wrapping_add(tm.tm_year);
-        compute_change(&mut r[0], year);
-        compute_change(&mut r[1], year);
-        if use_localtime {
-            let isdst = if r[0].change > r[1].change {
-                timer < r[1].change || timer >= r[0].change
-            } else {
-                timer >= r[0].change && timer < r[1].change
-            };
-            tm.tm_isdst = isdst as c_int;
-            tm.tm_zone = __tzname[isdst as usize];
-            tm.tm_gmtoff = r[isdst as usize].offset as c_long;
-        }
+fn tz_compute(r: &mut [Rule; 2], timer: i64, tm: &mut Tm, use_localtime: bool) {
+    let year = 1900i32.wrapping_add(tm.tm_year);
+    compute_change(&mut r[0], year);
+    compute_change(&mut r[1], year);
+    if use_localtime {
+        let isdst = if r[0].change > r[1].change {
+            timer < r[1].change || timer >= r[0].change
+        } else {
+            timer >= r[0].change && timer < r[1].change
+        };
+        tm.tm_isdst = isdst as c_int;
+        tm.tm_zone = tzname_get(isdst as usize);
+        tm.tm_gmtoff = r[isdst as usize].offset as c_long;
     }
 }
 
@@ -481,6 +461,8 @@ struct TType {
     isgmt: u8,
 }
 
+const TTYPE0: TType = TType { offset: 0, isdst: 0, idx: 0, isstd: 0, isgmt: 0 };
+
 #[derive(Clone, Copy)]
 struct Leap {
     transition: i64,
@@ -492,69 +474,82 @@ struct TzFile {
     dev: u64,
     ino: u64,
     mtime: i64,
-    trans: *mut i64,
-    ntrans: usize,
-    idxs: *mut u8,
-    types: *mut TType,
-    ntypes: usize,
-    names_base: *mut u8,
-    names: *mut u8,
-    leaps: *mut Leap,
-    nleaps: usize,
-    tzspec: *mut u8,
+    trans: MBuf<i64>,
+    idxs: MBuf<u8>,
+    types: MBuf<TType>,
+    names_base: MBuf<u8>,
+    names_off: usize,
+    leaps: MBuf<Leap>,
+    tzspec: MBuf<u8>,
     stdoff: i64,
     dstoff: i64,
     daylight_saved: c_int,
     default_names: bool,
     nchars1: usize,
+    spec_rules: Option<[Rule; 2]>,
+    name_memo: [Cell<Option<&'static CStr>>; 256],
 }
 
-static mut TZFILE: TzFile = TzFile {
-    used: false,
-    dev: 0,
-    ino: 0,
-    mtime: 0,
-    trans: null_mut(),
-    ntrans: 0,
-    idxs: null_mut(),
-    types: null_mut(),
-    ntypes: 0,
-    names_base: null_mut(),
-    names: null_mut(),
-    leaps: null_mut(),
-    nleaps: 0,
-    tzspec: null_mut(),
-    stdoff: 0,
-    dstoff: 0,
-    daylight_saved: 0,
-    default_names: false,
-    nchars1: 0,
-};
+impl TzFile {
+    const fn new() -> TzFile {
+        TzFile {
+            used: false,
+            dev: 0,
+            ino: 0,
+            mtime: 0,
+            trans: MBuf::empty(),
+            idxs: MBuf::empty(),
+            types: MBuf::empty(),
+            names_base: MBuf::empty(),
+            names_off: 0,
+            leaps: MBuf::empty(),
+            tzspec: MBuf::empty(),
+            stdoff: 0,
+            dstoff: 0,
+            daylight_saved: 0,
+            default_names: false,
+            nchars1: 0,
+            spec_rules: None,
+            name_memo: [const { Cell::new(None) }; 256],
+        }
+    }
 
-unsafe fn tzf() -> *mut TzFile {
-    &raw mut TZFILE
-}
+    fn names(&self) -> &[u8] {
+        self.names_base.get(self.names_off..).unwrap_or(&[])
+    }
 
-unsafe fn free_tzfile_data(f: &mut TzFile) {
-    unsafe {
-        release(f.trans);
-        release(f.idxs);
-        release(f.types);
-        release(f.names_base);
-        release(f.leaps);
-        release(f.tzspec);
-        f.trans = null_mut();
-        f.idxs = null_mut();
-        f.types = null_mut();
-        f.names_base = null_mut();
-        f.names = null_mut();
-        f.leaps = null_mut();
-        f.tzspec = null_mut();
-        f.ntrans = 0;
-        f.ntypes = 0;
-        f.nleaps = 0;
-        f.default_names = false;
-        f.nchars1 = 0;
+    fn name_at(&self, idx: usize) -> &[u8] {
+        until_nul(self.names().get(idx..).unwrap_or(&[]))
+    }
+
+    fn free_data(&mut self) {
+        self.trans = MBuf::empty();
+        self.idxs = MBuf::empty();
+        self.types = MBuf::empty();
+        self.names_base = MBuf::empty();
+        self.names_off = 0;
+        self.leaps = MBuf::empty();
+        self.tzspec = MBuf::empty();
+        self.default_names = false;
+        self.nchars1 = 0;
+        self.spec_rules = None;
+        self.clear_name_memo();
+    }
+
+    fn clear_name_memo(&self) {
+        for m in &self.name_memo {
+            m.set(None);
+        }
+    }
+
+    fn type_name(&self, strings: &mut StrPool, t: &TType) -> *mut c_char {
+        let memo = &self.name_memo[t.idx as usize];
+        if let Some(n) = memo.get() {
+            return name_ptr(Some(n));
+        }
+        let n = strings.intern_c(self.name_at(t.idx as usize));
+        memo.set(n);
+        name_ptr(n)
     }
 }
 
@@ -566,657 +561,632 @@ fn be64(b: &[u8]) -> i64 {
     i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
-const SYS_OPENAT: usize = 257;
-const SYS_READ: usize = 0;
-const SYS_CLOSE: usize = 3;
-const SYS_FSTAT: usize = 5;
-const SYS_NEWFSTATAT: usize = 262;
-const AT_FDCWD: usize = -100isize as usize;
-const O_RDONLY_CLOEXEC: usize = 0o2000000;
-
-#[repr(C)]
-struct KStat {
-    st_dev: u64,
-    st_ino: u64,
-    st_nlink: u64,
-    st_mode: u32,
-    st_uid: u32,
-    st_gid: u32,
-    _pad0: u32,
-    st_rdev: u64,
-    st_size: i64,
-    st_blksize: i64,
-    st_blocks: i64,
-    st_atime: i64,
-    st_atime_nsec: i64,
-    st_mtime: i64,
-    st_mtime_nsec: i64,
-    st_ctime: i64,
-    st_ctime_nsec: i64,
-    _unused: [i64; 3],
-}
-
 fn secure() -> bool {
-    use core::sync::atomic::{AtomicU8, Ordering};
+    use core::sync::atomic::AtomicU8;
     static S: AtomicU8 = AtomicU8::new(2);
-    let v = S.load(Ordering::Relaxed);
+    let v = S.load(Relaxed);
     if v != 2 {
         return v == 1;
     }
-    let s = crate::vdso::auxv_entry(23) != 0;
-    S.store(s as u8, Ordering::Relaxed);
+    let s = match rusty_libc_core::lock::at_secure() {
+        Some(v) => v,
+        None => crate::vdso::auxv_entry(23) != 0,
+    };
+    S.store(s as u8, Relaxed);
     s
 }
 
-unsafe fn tzfile_read(file: &[u8], extra: usize) {
-    unsafe {
-        let f = &mut *tzf();
-        let was_using = f.used;
-        f.used = false;
-        let fname = &file[..file.iter().position(|&c| c == 0).unwrap_or(file.len())];
-        if fname.is_empty() {
-            free_tzfile_data(f);
-            return;
-        }
-        if secure()
-            && ((fname[0] == b'/' && fname != TZDEFAULT && !fname.starts_with(TZDIR)) || fname.windows(3).any(|w| w == b"../"))
-        {
-            free_tzfile_data(f);
-            return;
-        }
-        let mut path = [0u8; 4352];
-        let plen = if fname[0] != b'/' {
-            let d = env::getenv(b"TZDIR");
-            let dir: &[u8] = if d.is_null() || *d == 0 { TZDIR } else { cslice(d.cast()) };
-            if dir.len() + 1 + fname.len() + 1 > path.len() {
-                free_tzfile_data(f);
-                return;
-            }
-            path[..dir.len()].copy_from_slice(dir);
-            path[dir.len()] = b'/';
-            path[dir.len() + 1..dir.len() + 1 + fname.len()].copy_from_slice(fname);
-            dir.len() + 1 + fname.len()
-        } else {
-            if fname.len() + 1 > path.len() {
-                free_tzfile_data(f);
-                return;
-            }
-            path[..fname.len()].copy_from_slice(fname);
-            fname.len()
+fn tzfile_read(z: &mut Zone, file: &[u8], extra: usize) {
+    let f = &mut z.file;
+    let was_using = f.used;
+    f.used = false;
+    let fname = until_nul(file);
+    if fname.is_empty() {
+        f.free_data();
+        return;
+    }
+    if secure() && ((fname[0] == b'/' && fname != TZDEFAULT && !fname.starts_with(TZDIR)) || fname.windows(3).any(|w| w == b"../")) {
+        f.free_data();
+        return;
+    }
+    let mut path = [0u8; 4352];
+    let plen = if fname[0] != b'/' {
+        let dir: &[u8] = match sys::getenv(b"TZDIR") {
+            Some(d) if !d.is_empty() => d,
+            _ => TZDIR,
         };
-        path[plen] = 0;
-        let mut st: KStat = core::mem::zeroed();
-        if was_using
-            && syscall::check(syscall::syscall4(SYS_NEWFSTATAT, AT_FDCWD, path.as_ptr() as usize, &mut st as *mut KStat as usize, 0)).is_ok()
-            && f.ino == st.st_ino
-            && f.dev == st.st_dev
-            && f.mtime == st.st_mtime
-        {
-            f.used = true;
+        if dir.len() + 1 + fname.len() + 1 > path.len() {
+            f.free_data();
             return;
         }
-        let fd = syscall::syscall4(SYS_OPENAT, AT_FDCWD, path.as_ptr() as usize, O_RDONLY_CLOEXEC, 0);
-        if syscall::check(fd).is_err() {
-            free_tzfile_data(f);
+        path[..dir.len()].copy_from_slice(dir);
+        path[dir.len()] = b'/';
+        path[dir.len() + 1..dir.len() + 1 + fname.len()].copy_from_slice(fname);
+        dir.len() + 1 + fname.len()
+    } else {
+        if fname.len() + 1 > path.len() {
+            f.free_data();
             return;
         }
-        let ok = syscall::check(syscall::syscall2(SYS_FSTAT, fd, &mut st as *mut KStat as usize)).is_ok();
-        let mut data: *mut u8 = null_mut();
-        let mut len = 0usize;
-        if ok {
-            free_tzfile_data(f);
-            f.dev = st.st_dev;
-            f.ino = st.st_ino;
-            f.mtime = st.st_mtime;
-            let size = st.st_size.clamp(0, 64 << 20) as usize;
-            data = alloc::<u8>(size + 1);
-            if !data.is_null() {
-                while len < size {
-                    let r = syscall::syscall3(SYS_READ, fd, data.add(len) as usize, size - len);
-                    match syscall::check(r) {
-                        Ok(0) => break,
-                        Ok(n) => len += n,
-                        Err(e) if e.0 == rusty_libc_core::errno::EINTR => {}
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-        syscall::syscall1(SYS_CLOSE, fd);
-        if data.is_null() {
-            return;
-        }
-        let parsed = parse_tzif(f, core::slice::from_raw_parts(data, len), extra);
-        release(data);
-        if !parsed {
-            free_tzfile_data(f);
-            return;
-        }
+        path[..fname.len()].copy_from_slice(fname);
+        fname.len()
+    };
+    path[plen] = 0;
+    let Ok(cpath) = CStr::from_bytes_until_nul(&path) else { return };
+    if was_using
+        && let Ok(st) = sys::stat(cpath)
+        && f.ino == st.st_ino
+        && f.dev == st.st_dev
+        && f.mtime == st.st_mtime
+    {
         f.used = true;
-        let ntypes = f.ntypes;
-        let types = core::slice::from_raw_parts(f.types, ntypes);
-        let idxs = core::slice::from_raw_parts(f.idxs, f.ntrans);
-        let trans_n = f.ntrans;
-        let name_of = |t: &TType| tzstring(f.names.add(t.idx as usize));
-        __tzname[0] = null_mut();
-        __tzname[1] = null_mut();
-        let mut i = trans_n;
-        while i > 0 {
-            i -= 1;
-            let t = &types[idxs[i] as usize];
-            let dst = t.isdst as usize;
-            if __tzname[dst].is_null() {
-                __tzname[dst] = name_of(t) as *mut c_char;
-                if !__tzname[1 - dst].is_null() {
-                    break;
-                }
-            }
-        }
-        if __tzname[0].is_null() {
-            __tzname[0] = tzstring(f.names) as *mut c_char;
-        }
-        if __tzname[1].is_null() {
-            __tzname[1] = __tzname[0];
-        }
-        f.daylight_saved = 0;
-        if trans_n == 0 {
-            f.stdoff = types[0].offset as i64;
-            f.dstoff = f.stdoff;
-        } else {
-            f.stdoff = 0;
-            let trans_idx = |i: usize| types[idxs[i] as usize];
-            let mut i = trans_n - 1;
-            loop {
-                if trans_idx(i).isdst == 0 {
-                    f.stdoff = trans_idx(i).offset as i64;
-                    break;
-                } else {
-                    f.daylight_saved = 1;
-                }
-                if i == 0 {
-                    i = usize::MAX;
-                    break;
-                }
-                i -= 1;
-            }
-            if i != usize::MAX {
-                while i > 0 && f.daylight_saved == 0 {
-                    i -= 1;
-                    f.daylight_saved = trans_idx(i).isdst as c_int;
-                }
-            }
-        }
-        __daylight = f.daylight_saved;
-        __timezone = -f.stdoff;
+        return;
     }
-}
-
-unsafe fn parse_tzif(f: &mut TzFile, d: &[u8], extra: usize) -> bool {
-    unsafe {
-        let mut pos = 0usize;
-        let mut width = 4usize;
+    let Ok(fd) = sys::open_rdonly_cloexec(cpath) else {
+        f.free_data();
+        return;
+    };
+    let mut data: Option<MBuf<u8>> = None;
+    let mut len = 0usize;
+    if let Ok(st) = sys::fstat(fd) {
+        f.free_data();
+        f.dev = st.st_dev;
+        f.ino = st.st_ino;
+        f.mtime = st.st_mtime;
+        let size = st.st_size.clamp(0, 64 << 20) as usize;
+        data = MBuf::filled(size + 1, 0u8);
+        if let Some(d) = data.as_mut() {
+            while len < size {
+                match rusty_libc_core::unistd::read_nocancel(fd, &mut d[len..size]) {
+                    Ok(0) => break,
+                    Ok(n) => len += n,
+                    Err(e) if e.0 == rusty_libc_core::errno::EINTR => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    let _ = rusty_libc_core::unistd::close(fd);
+    let Some(data) = data else { return };
+    let parsed = parse_tzif(f, &data[..len], extra);
+    drop(data);
+    if !parsed {
+        f.free_data();
+        return;
+    }
+    f.used = true;
+    let f = &z.file;
+    let types = f.types.as_slice();
+    let idxs = f.idxs.as_slice();
+    let trans_n = f.trans.len();
+    tzname_set(0, null_mut());
+    tzname_set(1, null_mut());
+    let mut i = trans_n;
+    while i > 0 {
+        i -= 1;
+        let t = &types[idxs[i] as usize];
+        let dst = t.isdst as usize;
+        if tzname_get(dst).is_null() {
+            tzname_set(dst, name_ptr(z.strings.intern_c(f.name_at(t.idx as usize))));
+            if !tzname_get(1 - dst).is_null() {
+                break;
+            }
+        }
+    }
+    if tzname_get(0).is_null() {
+        tzname_set(0, name_ptr(z.strings.intern_c(f.names())));
+    }
+    if tzname_get(1).is_null() {
+        tzname_set(1, tzname_get(0));
+    }
+    let f = &mut z.file;
+    let types = f.types.as_slice();
+    let idxs = f.idxs.as_slice();
+    f.daylight_saved = 0;
+    if trans_n == 0 {
+        f.stdoff = types[0].offset as i64;
+        f.dstoff = f.stdoff;
+    } else {
+        f.stdoff = 0;
+        let trans_idx = |i: usize| types[idxs[i] as usize];
+        let mut i = trans_n - 1;
         loop {
-            if d.len() < pos + 44 || &d[pos..pos + 4] != b"TZif" {
-                return false;
-            }
-            let version = d[pos + 4];
-            let isgmt = be32(&d[pos + 20..]);
-            let isstd = be32(&d[pos + 24..]);
-            let nleaps = be32(&d[pos + 28..]);
-            let ntrans = be32(&d[pos + 32..]);
-            let ntypes = be32(&d[pos + 36..]);
-            let chars = be32(&d[pos + 40..]);
-            if isgmt < 0 || isstd < 0 || nleaps < 0 || ntrans < 0 || ntypes < 0 || chars < 0 {
-                return false;
-            }
-            let (isgmt, isstd, nleaps, ntrans, ntypes, chars) =
-                (isgmt as usize, isstd as usize, nleaps as usize, ntrans as usize, ntypes as usize, chars as usize);
-            if isstd > ntypes || isgmt > ntypes {
-                return false;
-            }
-            pos += 44;
-            if width == 4 && version != 0 {
-                width = 8;
-                pos += ntrans * 5 + ntypes * 6 + chars + nleaps * 8 + isstd + isgmt;
-                continue;
-            }
-            let mut tzspec_len = 0usize;
-            if width == 8 {
-                let rem = match d.len().checked_sub(pos) {
-                    Some(r) => r,
-                    None => return false,
-                };
-                let need = ntrans * 9 + ntypes * 6 + chars;
-                if rem < need {
-                    return false;
-                }
-                tzspec_len = rem - need;
-                if tzspec_len < nleaps * 12 {
-                    return false;
-                }
-                tzspec_len -= nleaps * 12;
-                if tzspec_len < isstd {
-                    return false;
-                }
-                tzspec_len -= isstd;
-                if tzspec_len == 0 || tzspec_len - 1 < isgmt {
-                    return false;
-                }
-                tzspec_len -= isgmt + 1;
-                if tzspec_len == 0 {
-                    return false;
-                }
-            }
-            f.trans = alloc::<i64>(ntrans);
-            f.leaps = alloc::<Leap>(nleaps);
-            f.types = alloc::<TType>(ntypes);
-            f.idxs = alloc::<u8>(ntrans);
-            f.names_base = alloc::<u8>(chars + 1 + extra);
-            if width == 8 && tzspec_len > 0 {
-                f.tzspec = alloc::<u8>(tzspec_len);
-            }
-            if f.trans.is_null() || f.leaps.is_null() || f.types.is_null() || f.idxs.is_null() || f.names_base.is_null() {
-                return false;
-            }
-            f.ntrans = ntrans;
-            f.ntypes = ntypes;
-            f.nleaps = nleaps;
-            let need_total = ntrans * width + ntrans + ntypes * 6 + chars + nleaps * (width + 4) + isstd + isgmt;
-            if d.len() < pos + need_total {
-                return false;
-            }
-            for i in 0..ntrans {
-                let b = &d[pos + i * width..];
-                *f.trans.add(i) = if width == 4 { be32(b) as i64 } else { be64(b) };
-            }
-            pos += ntrans * width;
-            for i in 0..ntrans {
-                let v = d[pos + i];
-                if v as usize >= ntypes {
-                    return false;
-                }
-                *f.idxs.add(i) = v;
-            }
-            pos += ntrans;
-            for i in 0..ntypes {
-                let b = &d[pos + i * 6..];
-                let isdst = b[4];
-                let idx = b[5];
-                if isdst > 1 || idx as usize > chars {
-                    return false;
-                }
-                *f.types.add(i) = TType { offset: be32(b), isdst, idx, isstd: 0, isgmt: 0 };
-            }
-            pos += ntypes * 6;
-            core::ptr::copy_nonoverlapping(d.as_ptr().add(pos), f.names_base, chars);
-            *f.names_base.add(chars) = 0;
-            f.names = f.names_base;
-            f.nchars1 = chars + 1;
-            pos += chars;
-            for i in 0..nleaps {
-                let b = &d[pos + i * (width + 4)..];
-                let transition = if width == 4 { be32(b) as i64 } else { be64(b) };
-                let change = be32(&b[width..]) as i64;
-                *f.leaps.add(i) = Leap { transition, change };
-            }
-            pos += nleaps * (width + 4);
-            for i in 0..isstd {
-                (*f.types.add(i)).isstd = (d[pos + i] != 0) as u8;
-            }
-            pos += isstd;
-            for i in 0..isgmt {
-                (*f.types.add(i)).isgmt = (d[pos + i] != 0) as u8;
-            }
-            pos += isgmt;
-            if !f.tzspec.is_null() {
-                if d.len() >= pos + tzspec_len && d[pos] == b'\n' {
-                    core::ptr::copy_nonoverlapping(d.as_ptr().add(pos + 1), f.tzspec, tzspec_len - 1);
-                    *f.tzspec.add(tzspec_len - 1) = 0;
-                    if *f.tzspec == 0 {
-                        release(f.tzspec);
-                        f.tzspec = null_mut();
-                    }
-                } else {
-                    release(f.tzspec);
-                    f.tzspec = null_mut();
-                }
-            }
-            return true;
-        }
-    }
-}
-
-unsafe fn tzfile_default(std: *const u8, dst: *const u8, stdoff: i32, dstoff: i32) {
-    unsafe {
-        let stdlen = cstrlen(std) + 1;
-        let dstlen = cstrlen(dst) + 1;
-        let mut name = [0u8; 16];
-        name[..TZDEFRULES.len()].copy_from_slice(TZDEFRULES);
-        tzfile_read(&name, stdlen + dstlen);
-        let f = &mut *tzf();
-        if !f.used {
-            return;
-        }
-        if f.ntypes < 2 {
-            f.used = false;
-            return;
-        }
-        let cp = f.names_extra_ptr();
-        core::ptr::copy_nonoverlapping(std, cp, stdlen);
-        core::ptr::copy_nonoverlapping(dst, cp.add(stdlen), dstlen);
-        f.names = cp;
-        f.default_names = true;
-        f.ntypes = 2;
-        let mut isdst = false;
-        for i in 0..f.ntrans {
-            let tt = *f.types.add(*f.idxs.add(i) as usize);
-            *f.idxs.add(i) = tt.isdst;
-            if tt.isgmt != 0 {
-            } else if isdst && tt.isstd == 0 {
-                *f.trans.add(i) += dstoff as i64 - f.dstoff;
+            if trans_idx(i).isdst == 0 {
+                f.stdoff = trans_idx(i).offset as i64;
+                break;
             } else {
-                *f.trans.add(i) += stdoff as i64 - f.stdoff;
+                f.daylight_saved = 1;
             }
-            isdst = tt.isdst != 0;
+            if i == 0 {
+                i = usize::MAX;
+                break;
+            }
+            i -= 1;
         }
-        f.stdoff = stdoff as i64;
-        f.dstoff = dstoff as i64;
-        let t = f.types;
-        *t = TType { offset: stdoff, isdst: 0, idx: 0, isstd: (*t).isstd, isgmt: (*t).isgmt };
-        *t.add(1) = TType { offset: dstoff, isdst: 1, idx: stdlen as u8, isstd: (*t.add(1)).isstd, isgmt: (*t.add(1)).isgmt };
-        __tzname[0] = std as *mut c_char;
-        __tzname[1] = dst as *mut c_char;
-        __timezone = -(stdoff as c_long);
-        f.dev = 0;
-        f.ino = 0;
-        f.mtime = 0;
-    }
-}
-
-impl TzFile {
-    unsafe fn names_extra_ptr(&self) -> *mut u8 {
-        unsafe { self.names_base.add(self.nchars1) }
-    }
-}
-
-static mut OLD_TZ: *mut u8 = null_mut();
-static mut INITIALIZED: bool = false;
-
-unsafe fn dup(s: &[u8]) -> *mut u8 {
-    unsafe {
-        let p = alloc::<u8>(s.len() + 1);
-        if !p.is_null() {
-            core::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
-            *p.add(s.len()) = 0;
+        if i != usize::MAX {
+            while i > 0 && f.daylight_saved == 0 {
+                i -= 1;
+                f.daylight_saved = trans_idx(i).isdst as c_int;
+            }
         }
-        p
+    }
+    __daylight.store(f.daylight_saved, Relaxed);
+    __timezone.store(-f.stdoff, Relaxed);
+}
+
+fn parse_tzif(f: &mut TzFile, d: &[u8], extra: usize) -> bool {
+    let mut pos = 0usize;
+    let mut width = 4usize;
+    loop {
+        if d.len() < pos + 44 || &d[pos..pos + 4] != b"TZif" {
+            return false;
+        }
+        let version = d[pos + 4];
+        let isgmt = be32(&d[pos + 20..]);
+        let isstd = be32(&d[pos + 24..]);
+        let nleaps = be32(&d[pos + 28..]);
+        let ntrans = be32(&d[pos + 32..]);
+        let ntypes = be32(&d[pos + 36..]);
+        let chars = be32(&d[pos + 40..]);
+        if isgmt < 0 || isstd < 0 || nleaps < 0 || ntrans < 0 || ntypes < 0 || chars < 0 {
+            return false;
+        }
+        let (isgmt, isstd, nleaps, ntrans, ntypes, chars) = (isgmt as usize, isstd as usize, nleaps as usize, ntrans as usize, ntypes as usize, chars as usize);
+        if isstd > ntypes || isgmt > ntypes {
+            return false;
+        }
+        pos += 44;
+        if width == 4 && version != 0 {
+            width = 8;
+            pos += ntrans * 5 + ntypes * 6 + chars + nleaps * 8 + isstd + isgmt;
+            continue;
+        }
+        let mut tzspec_len = 0usize;
+        if width == 8 {
+            let rem = match d.len().checked_sub(pos) {
+                Some(r) => r,
+                None => return false,
+            };
+            let need = ntrans * 9 + ntypes * 6 + chars;
+            if rem < need {
+                return false;
+            }
+            tzspec_len = rem - need;
+            if tzspec_len < nleaps * 12 {
+                return false;
+            }
+            tzspec_len -= nleaps * 12;
+            if tzspec_len < isstd {
+                return false;
+            }
+            tzspec_len -= isstd;
+            if tzspec_len == 0 || tzspec_len - 1 < isgmt {
+                return false;
+            }
+            tzspec_len -= isgmt + 1;
+            if tzspec_len == 0 {
+                return false;
+            }
+        }
+        let trans = MBuf::filled(ntrans, 0i64);
+        let leaps = MBuf::filled(nleaps, Leap { transition: 0, change: 0 });
+        let types = MBuf::filled(ntypes, TTYPE0);
+        let idxs = MBuf::filled(ntrans, 0u8);
+        let names = MBuf::filled(chars + 1 + extra, 0u8);
+        if width == 8 && tzspec_len > 0 {
+            f.tzspec = MBuf::filled(tzspec_len, 0u8).unwrap_or(MBuf::empty());
+        }
+        let (Some(trans), Some(leaps), Some(types), Some(idxs), Some(names)) = (trans, leaps, types, idxs, names) else {
+            return false;
+        };
+        f.trans = trans;
+        f.leaps = leaps;
+        f.types = types;
+        f.idxs = idxs;
+        f.names_base = names;
+        let need_total = ntrans * width + ntrans + ntypes * 6 + chars + nleaps * (width + 4) + isstd + isgmt;
+        if d.len() < pos + need_total {
+            return false;
+        }
+        for (i, t) in f.trans.iter_mut().enumerate() {
+            let b = &d[pos + i * width..];
+            *t = if width == 4 { be32(b) as i64 } else { be64(b) };
+        }
+        pos += ntrans * width;
+        for (i, x) in f.idxs.iter_mut().enumerate() {
+            let v = d[pos + i];
+            if v as usize >= ntypes {
+                return false;
+            }
+            *x = v;
+        }
+        pos += ntrans;
+        for (i, t) in f.types.iter_mut().enumerate() {
+            let b = &d[pos + i * 6..];
+            let isdst = b[4];
+            let idx = b[5];
+            if isdst > 1 || idx as usize > chars {
+                return false;
+            }
+            *t = TType { offset: be32(b), isdst, idx, isstd: 0, isgmt: 0 };
+        }
+        pos += ntypes * 6;
+        f.names_base[..chars].copy_from_slice(&d[pos..pos + chars]);
+        f.names_base[chars] = 0;
+        f.names_off = 0;
+        f.nchars1 = chars + 1;
+        pos += chars;
+        for (i, l) in f.leaps.iter_mut().enumerate() {
+            let b = &d[pos + i * (width + 4)..];
+            let transition = if width == 4 { be32(b) as i64 } else { be64(b) };
+            let change = be32(&b[width..]) as i64;
+            *l = Leap { transition, change };
+        }
+        pos += nleaps * (width + 4);
+        for i in 0..isstd {
+            f.types[i].isstd = (d[pos + i] != 0) as u8;
+        }
+        pos += isstd;
+        for i in 0..isgmt {
+            f.types[i].isgmt = (d[pos + i] != 0) as u8;
+        }
+        pos += isgmt;
+        if !f.tzspec.is_empty_block() {
+            if d.len() >= pos + tzspec_len && d[pos] == b'\n' {
+                f.tzspec[..tzspec_len - 1].copy_from_slice(&d[pos + 1..pos + tzspec_len]);
+                f.tzspec[tzspec_len - 1] = 0;
+                if f.tzspec[0] == 0 {
+                    f.tzspec = MBuf::empty();
+                }
+            } else {
+                f.tzspec = MBuf::empty();
+            }
+        }
+        return true;
     }
 }
+
+fn tzfile_default(z: &mut Zone, std: Option<&'static CStr>, dst: Option<&'static CStr>, stdoff: i32, dstoff: i32) {
+    let (Some(std), Some(dst)) = (std, dst) else { return };
+    let (stdb, dstb) = (std.to_bytes_with_nul(), dst.to_bytes_with_nul());
+    let (stdlen, dstlen) = (stdb.len(), dstb.len());
+    let mut name = [0u8; 16];
+    name[..TZDEFRULES.len()].copy_from_slice(TZDEFRULES);
+    tzfile_read(z, &name, stdlen + dstlen);
+    let f = &mut z.file;
+    if !f.used {
+        return;
+    }
+    if f.types.len() < 2 {
+        f.used = false;
+        return;
+    }
+    let cp = f.nchars1;
+    f.names_base[cp..cp + stdlen].copy_from_slice(stdb);
+    f.names_base[cp + stdlen..cp + stdlen + dstlen].copy_from_slice(dstb);
+    f.names_off = cp;
+    f.clear_name_memo();
+    f.default_names = true;
+    let mut isdst = false;
+    for i in 0..f.trans.len() {
+        let tt = f.types[f.idxs[i] as usize];
+        f.idxs[i] = tt.isdst;
+        if tt.isgmt != 0 {
+        } else if isdst && tt.isstd == 0 {
+            f.trans[i] += dstoff as i64 - f.dstoff;
+        } else {
+            f.trans[i] += stdoff as i64 - f.stdoff;
+        }
+        isdst = tt.isdst != 0;
+    }
+    f.types.truncate(2);
+    f.stdoff = stdoff as i64;
+    f.dstoff = dstoff as i64;
+    let t = f.types.as_mut_slice();
+    t[0] = TType { offset: stdoff, isdst: 0, idx: 0, isstd: t[0].isstd, isgmt: t[0].isgmt };
+    t[1] = TType { offset: dstoff, isdst: 1, idx: stdlen as u8, isstd: t[1].isstd, isgmt: t[1].isgmt };
+    tzname_set(0, std.as_ptr().cast_mut());
+    tzname_set(1, dst.as_ptr().cast_mut());
+    __timezone.store(-(stdoff as c_long), Relaxed);
+    f.dev = 0;
+    f.ino = 0;
+    f.mtime = 0;
+}
+
+struct Zone {
+    rules: [Rule; 2],
+    file: TzFile,
+    old_tz: MBuf<u8>,
+    initialized: bool,
+    strings: StrPool,
+}
+
+static ZONE: SyncCell<Zone> = SyncCell::new(Zone { rules: [RULE0; 2], file: TzFile::new(), old_tz: MBuf::empty(), initialized: false, strings: StrPool { head: null_mut() } });
 
 static TZ_LOCK: rusty_libc_core::lock::RawMutex = rusty_libc_core::lock::RawMutex::new();
 
-unsafe fn tzset_internal(always: bool) {
-    unsafe {
-        if INITIALIZED && !always {
-            return;
+#[inline]
+fn with_zone<R>(f: impl FnOnce(&mut Zone) -> R) -> R {
+    let _g = TZ_LOCK.guard();
+    unsafe { ZONE.with_unsync(f) }
+}
+
+fn tzset_internal(z: &mut Zone, always: bool) {
+    if z.initialized && !always {
+        return;
+    }
+    z.initialized = true;
+    let mut tz: Option<&[u8]> = None;
+    if let Some(mut s) = sys::getenv(b"TZ") {
+        if s.is_empty() {
+            s = b"Universal";
         }
-        INITIALIZED = true;
-        let envtz = env::getenv(b"TZ");
-        let mut tz: Option<&[u8]> = None;
-        if !envtz.is_null() {
-            let mut s = cslice(envtz.cast());
-            if s.is_empty() {
-                s = b"Universal";
-            }
-            if s[0] == b':' {
-                s = &s[1..];
-            }
-            tz = Some(s);
+        if s[0] == b':' {
+            s = &s[1..];
         }
-        if let Some(s) = tz
-            && !OLD_TZ.is_null()
-            && cslice(OLD_TZ) == s
-        {
-            return;
+        tz = Some(s);
+    }
+    if let Some(s) = tz
+        && !z.old_tz.is_empty_block()
+        && until_nul(&z.old_tz) == s
+    {
+        return;
+    }
+    let tz = tz.unwrap_or(TZDEFAULT);
+    z.rules[0].name = None;
+    z.rules[1].name = None;
+    z.old_tz = MBuf::empty();
+    z.old_tz = dup(tz);
+    let mut buf = [0u8; 512];
+    let owned: MBuf<u8>;
+    let tzc: &[u8] = if tz.len() < buf.len() {
+        buf[..tz.len()].copy_from_slice(tz);
+        &buf[..tz.len() + 1]
+    } else {
+        owned = dup(tz);
+        owned.get(..tz.len() + 1).unwrap_or(b"\0")
+    };
+    tzfile_read(z, tzc, 0);
+    if z.file.used {
+        return;
+    }
+    if tz.is_empty() || tz == TZDEFAULT {
+        z.rules = [RULE0; 2];
+        z.rules[0].name = Some(c"UTC");
+        z.rules[1].name = Some(c"UTC");
+        z.rules[0].change = -1;
+        z.rules[1].change = -1;
+        update_vars(&z.rules);
+        return;
+    }
+    tzset_parse_tz(z, tzc);
+}
+
+fn dup(s: &[u8]) -> MBuf<u8> {
+    match MBuf::filled(s.len() + 1, 0u8) {
+        Some(mut p) => {
+            p[..s.len()].copy_from_slice(s);
+            p
         }
-        let tz = tz.unwrap_or(TZDEFAULT);
-        let r = rules();
-        r[0].name = null();
-        r[1].name = null();
-        release(OLD_TZ);
-        OLD_TZ = dup(tz);
-        let mut buf = [0u8; 512];
-        let owned: *mut u8;
-        let tzc: &[u8] = if tz.len() < buf.len() {
-            buf[..tz.len()].copy_from_slice(tz);
-            owned = null_mut();
-            &buf[..tz.len() + 1]
-        } else {
-            owned = dup(tz);
-            core::slice::from_raw_parts(owned, tz.len() + 1)
-        };
-        tzfile_read(tzc, 0);
-        if (*tzf()).used {
-            release(owned);
-            return;
-        }
-        if tz.is_empty() || tz == TZDEFAULT {
-            *rules() = [RULE0; 2];
-            let r = rules();
-            r[0].name = c"UTC".as_ptr().cast();
-            r[1].name = c"UTC".as_ptr().cast();
-            r[0].change = -1;
-            r[1].change = -1;
-            update_vars();
-            release(owned);
-            return;
-        }
-        tzset_parse_tz(tzc);
-        release(owned);
+        None => MBuf::empty(),
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn tzset() {
-    unsafe {
-        let _g = TZ_LOCK.guard();
-        tzset_internal(true);
-        if !(*tzf()).used {
-            let r = rules();
-            __tzname[0] = r[0].name as *mut c_char;
-            __tzname[1] = r[1].name as *mut c_char;
-        }
-    }
+    tzset_now()
 }
 
-unsafe fn tzfile_compute(timer: i64, use_localtime: bool, tp: &mut Tm) -> (i64, i32) {
-    unsafe {
-        let f = &mut *tzf();
-        if use_localtime {
-            __tzname[0] = null_mut();
-            __tzname[1] = null_mut();
-            let types = core::slice::from_raw_parts(f.types, f.ntypes);
-            let trans = core::slice::from_raw_parts(f.trans, f.ntrans);
-            let idxs = core::slice::from_raw_parts(f.idxs, f.ntrans);
-            let name = |t: &TType| tzstring(f.names.add(t.idx as usize)) as *mut c_char;
-            let found = |i: usize| -> usize {
-                let t0 = &types[idxs[i - 1] as usize];
-                __tzname[t0.isdst as usize] = name(t0);
+pub fn tzset_now() {
+    with_zone(|z| {
+        tzset_internal(z, true);
+        if !z.file.used {
+            tzname_set(0, name_ptr(z.rules[0].name));
+            tzname_set(1, name_ptr(z.rules[1].name));
+        }
+    })
+}
+
+fn tzfile_compute(z: &mut Zone, timer: i64, use_localtime: bool, tp: &mut Tm) -> (i64, i32) {
+    if use_localtime {
+        tzname_set(0, null_mut());
+        tzname_set(1, null_mut());
+        let ntrans = z.file.trans.len();
+        let ti: usize;
+        let mut spec_done = false;
+        if ntrans == 0 || timer < z.file.trans[0] {
+            let (f, strings) = (&z.file, &mut z.strings);
+            let types = f.types.as_slice();
+            let mut name = |t: &TType| f.type_name(strings, t);
+            let mut i = 0;
+            while i < types.len() && types[i].isdst != 0 {
+                if tzname_get(1).is_null() {
+                    tzname_set(1, name(&types[i]));
+                }
+                i += 1;
+            }
+            if i == types.len() {
+                i = 0;
+            }
+            tzname_set(0, name(&types[i]));
+            if tzname_get(1).is_null() {
                 let mut j = i;
-                while j < trans.len() {
-                    let t = &types[idxs[j] as usize];
-                    let dst = t.isdst as usize;
-                    if __tzname[dst].is_null() {
-                        __tzname[dst] = name(t);
-                        if !__tzname[1 - dst].is_null() {
-                            break;
-                        }
+                while j < types.len() {
+                    if types[j].isdst != 0 {
+                        tzname_set(1, name(&types[j]));
+                        break;
                     }
                     j += 1;
                 }
-                if __tzname[0].is_null() {
-                    __tzname[0] = __tzname[1];
-                }
-                idxs[i - 1] as usize
-            };
-            let ti: usize;
-            let mut spec_done = false;
-            if trans.is_empty() || timer < trans[0] {
-                let mut i = 0;
-                while i < types.len() && types[i].isdst != 0 {
-                    if __tzname[1].is_null() {
-                        __tzname[1] = name(&types[i]);
-                    }
-                    i += 1;
-                }
-                if i == types.len() {
-                    i = 0;
-                }
-                __tzname[0] = name(&types[i]);
-                if __tzname[1].is_null() {
-                    let mut j = i;
-                    while j < types.len() {
-                        if types[j].isdst != 0 {
-                            __tzname[1] = name(&types[j]);
-                            break;
-                        }
-                        j += 1;
-                    }
-                }
-                ti = i;
-            } else if timer >= trans[trans.len() - 1] {
-                if f.tzspec.is_null() {
-                    ti = found(trans.len());
+            }
+            ti = i;
+        } else if timer >= z.file.trans[ntrans - 1] {
+            if z.file.tzspec.is_empty_block() {
+                ti = found(z, ntrans);
+            } else {
+                if let Some(r) = z.file.spec_rules {
+                    z.rules = r;
+                    update_vars(&z.rules);
                 } else {
-                    let spec = cslice(f.tzspec);
+                    let spec = until_nul(&z.file.tzspec);
                     let mut specz = [0u8; 256];
                     let n = spec.len().min(255);
                     specz[..n].copy_from_slice(&spec[..n]);
-                    tzset_parse_tz(&specz[..n + 1]);
-                    let f = &mut *tzf();
-                    let mut tm2 = *tp;
-                    if !offtime(timer, 0, &mut tm2) {
-                        ti = found_after_parse(f, trans.len());
-                    } else {
-                        *tp = tm2;
-                        tz_compute(timer, tp, true);
-                        spec_done = true;
-                        ti = 0;
+                    if tzset_parse_tz(z, &specz[..n + 1]) {
+                        z.file.spec_rules = Some(z.rules);
                     }
                 }
-            } else {
-                let i = trans.partition_point(|&t| t <= timer);
-                ti = found(i);
-            }
-            if !spec_done {
-                let f = &mut *tzf();
-                let types = core::slice::from_raw_parts(f.types, f.ntypes);
-                let info = types[ti];
-                __daylight = f.daylight_saved;
-                __timezone = -f.stdoff;
-                if __tzname[0].is_null() {
-                    __tzname[0] = tzstring(f.names) as *mut c_char;
+                let mut tm2 = *tp;
+                if !offtime(timer, 0, &mut tm2) {
+                    ti = found_after_parse(z, ntrans);
+                } else {
+                    *tp = tm2;
+                    tz_compute(&mut z.rules, timer, tp, true);
+                    if z.file.spec_rules.is_some() {
+                        z.file.spec_rules = Some(z.rules);
+                    }
+                    spec_done = true;
+                    ti = 0;
                 }
-                if __tzname[1].is_null() {
-                    __tzname[1] = __tzname[0];
-                }
-                tp.tm_isdst = info.isdst as c_int;
-                tp.tm_zone = __tzname[info.isdst as usize];
-                tp.tm_gmtoff = info.offset as c_long;
             }
+        } else {
+            let i = z.file.trans.partition_point(|&t| t <= timer);
+            ti = found(z, i);
         }
-        let f = &*tzf();
-        if f.nleaps == 0 {
+        if !spec_done {
+            let f = &z.file;
+            let info = f.types[ti];
+            __daylight.store(f.daylight_saved, Relaxed);
+            __timezone.store(-f.stdoff, Relaxed);
+            if tzname_get(0).is_null() {
+                tzname_set(0, name_ptr(z.strings.intern_c(f.names())));
+            }
+            if tzname_get(1).is_null() {
+                tzname_set(1, tzname_get(0));
+            }
+            tp.tm_isdst = info.isdst as c_int;
+            tp.tm_zone = tzname_get(info.isdst as usize);
+            tp.tm_gmtoff = info.offset as c_long;
+        }
+    }
+    let leaps = z.file.leaps.as_slice();
+    if leaps.is_empty() {
+        return (0, 0);
+    }
+    let mut i = leaps.len();
+    loop {
+        if i == 0 {
             return (0, 0);
         }
-        let leaps = core::slice::from_raw_parts(f.leaps, f.nleaps);
-        let mut i = leaps.len();
-        loop {
-            if i == 0 {
-                return (0, 0);
-            }
+        i -= 1;
+        if timer >= leaps[i].transition {
+            break;
+        }
+    }
+    let correct = leaps[i].change;
+    let mut hit = 0;
+    if timer == leaps[i].transition && leaps[i].change > (if i == 0 { 0 } else { leaps[i - 1].change }) {
+        hit = 1;
+        while i > 0 && leaps[i].transition == leaps[i - 1].transition + 1 && leaps[i].change == leaps[i - 1].change + 1 {
+            hit += 1;
             i -= 1;
-            if timer >= leaps[i].transition {
+        }
+    }
+    (correct, hit)
+}
+
+fn found(z: &mut Zone, i: usize) -> usize {
+    let (f, strings) = (&z.file, &mut z.strings);
+    let (types, idxs) = (f.types.as_slice(), f.idxs.as_slice());
+    let mut name = |t: &TType| f.type_name(strings, t);
+    let t0 = &types[idxs[i - 1] as usize];
+    tzname_set(t0.isdst as usize, name(t0));
+    let mut j = i;
+    while j < idxs.len() {
+        let t = &types[idxs[j] as usize];
+        let dst = t.isdst as usize;
+        if tzname_get(dst).is_null() {
+            tzname_set(dst, name(t));
+            if !tzname_get(1 - dst).is_null() {
                 break;
             }
         }
-        let correct = leaps[i].change;
-        let mut hit = 0;
-        if timer == leaps[i].transition && leaps[i].change > (if i == 0 { 0 } else { leaps[i - 1].change }) {
-            hit = 1;
-            while i > 0 && leaps[i].transition == leaps[i - 1].transition + 1 && leaps[i].change == leaps[i - 1].change + 1 {
-                hit += 1;
-                i -= 1;
+        j += 1;
+    }
+    if tzname_get(0).is_null() {
+        tzname_set(0, tzname_get(1));
+    }
+    idxs[i - 1] as usize
+}
+
+fn found_after_parse(z: &mut Zone, n: usize) -> usize {
+    let (f, strings) = (&z.file, &mut z.strings);
+    let (types, idxs) = (f.types.as_slice(), f.idxs.as_slice());
+    let n = n.min(idxs.len());
+    if n == 0 {
+        return 0;
+    }
+    let t0 = &types[idxs[n - 1] as usize];
+    tzname_set(t0.isdst as usize, f.type_name(strings, t0));
+    if tzname_get(0).is_null() {
+        tzname_set(0, tzname_get(1));
+    }
+    idxs[n - 1] as usize
+}
+
+fn tz_convert_locked(z: &mut Zone, timer: i64, use_localtime: bool, tm: &mut Tm, always: bool) -> bool {
+    tzset_internal(z, always && use_localtime);
+    let leap_correction: i64;
+    let leap_extra: i32;
+    if z.file.used {
+        let (c, e) = tzfile_compute(z, timer, use_localtime, tm);
+        leap_correction = c;
+        leap_extra = e;
+    } else {
+        if use_localtime {
+            if !offtime(timer, 0, tm) {
+                return false;
             }
+            tz_compute(&mut z.rules, timer, tm, true);
         }
-        (correct, hit)
+        leap_correction = 0;
+        leap_extra = 0;
+    }
+    if !use_localtime {
+        tm.tm_isdst = 0;
+        tm.tm_zone = c"GMT".as_ptr();
+        tm.tm_gmtoff = 0;
+    }
+    if offtime(timer, tm.tm_gmtoff - leap_correction, tm) {
+        tm.tm_sec += leap_extra;
+        true
+    } else {
+        false
     }
 }
 
-unsafe fn found_after_parse(f: &mut TzFile, n: usize) -> usize {
-    unsafe {
-        let types = core::slice::from_raw_parts(f.types, f.ntypes);
-        let idxs = core::slice::from_raw_parts(f.idxs, f.ntrans);
-        let t0 = &types[idxs[n - 1] as usize];
-        __tzname[t0.isdst as usize] = tzstring(f.names.add(t0.idx as usize)) as *mut c_char;
-        if __tzname[0].is_null() {
-            __tzname[0] = __tzname[1];
-        }
-        idxs[n - 1] as usize
-    }
+pub(crate) fn tz_convert(timer: i64, use_localtime: bool, tm: &mut Tm, always: bool) -> bool {
+    with_zone(|z| tz_convert_locked(z, timer, use_localtime, tm, always))
 }
 
-pub(crate) unsafe fn tz_convert(timer: i64, use_localtime: bool, tp: *mut Tm, always: bool) -> *mut Tm {
-    unsafe {
-        let _g = TZ_LOCK.guard();
-        tzset_internal(always && use_localtime);
-        let tm = &mut *tp;
-        let leap_correction: i64;
-        let leap_extra: i32;
-        if (*tzf()).used {
-            let (c, e) = tzfile_compute(timer, use_localtime, tm);
-            leap_correction = c;
-            leap_extra = e;
-        } else {
-            if use_localtime {
-                if !offtime(timer, 0, tm) {
-                    return null_mut();
-                }
-                tz_compute(timer, tm, true);
-            }
-            leap_correction = 0;
-            leap_extra = 0;
-        }
-        if !use_localtime {
-            tm.tm_isdst = 0;
-            tm.tm_zone = c"GMT".as_ptr();
-            tm.tm_gmtoff = 0;
-        }
-        if offtime(timer, tm.tm_gmtoff - leap_correction, tm) {
-            tm.tm_sec += leap_extra;
-            tp
-        } else {
-            null_mut()
-        }
-    }
+pub(crate) fn tz_convert_static(timer: i64, use_localtime: bool, buf: &SyncCell<Tm>, always: bool) -> *mut Tm {
+    with_zone(|z| {
+        let ok = unsafe { buf.with_unsync(|tm| tz_convert_locked(z, timer, use_localtime, tm, always)) };
+        if ok { buf.as_ptr() } else { null_mut() }
+    })
 }
 
-#[allow(clippy::deref_addrof)]
 pub(crate) fn tzname_ptr(i: usize) -> *const c_char {
-    unsafe { (*(&raw const __tzname))[i] }
+    tzname_get(i)
 }
 
-#[allow(clippy::deref_addrof)]
 pub fn names() -> ([&'static [u8]; 2], i64, bool) {
-    unsafe {
-        let mut out: [&'static [u8]; 2] = [b"", b""];
-        for (i, o) in out.iter_mut().enumerate() {
-            let p = (*(&raw const __tzname))[i];
-            if !p.is_null() {
-                *o = cslice(p.cast());
-            }
+    let mut out: [&'static [u8]; 2] = [b"", b""];
+    for (i, o) in out.iter_mut().enumerate() {
+        if let Some(s) = unsafe { rusty_libc_core::ffi::cstr(tzname_get(i)) } {
+            *o = s.to_bytes();
         }
-        (out, __timezone, __daylight != 0)
     }
+    (out, __timezone.load(Relaxed), __daylight.load(Relaxed) != 0)
 }
 

@@ -23,7 +23,7 @@ impl WFileSink {
     }
 
     fn flush(&mut self) -> bool {
-        let ok = unsafe { wfile::put_wide_chars(self.f, &self.buf[..self.n]) };
+        let ok = wfile::put_wide_chars(unsafe { file::stream(self.f) }, &self.buf[..self.n]);
         self.n = 0;
         ok
     }
@@ -72,7 +72,7 @@ pub struct WBufSink {
 }
 
 impl WBufSink {
-    pub fn new(buf: *mut u32, cap: usize) -> WBufSink {
+    pub unsafe fn new(buf: *mut u32, cap: usize) -> WBufSink {
         WBufSink { buf, cap, pos: 0 }
     }
 
@@ -83,7 +83,7 @@ impl WBufSink {
     fn push(&mut self, w: &[u32]) -> bool {
         let room = self.cap - self.pos;
         let k = w.len().min(room);
-        unsafe { crate::fmt::small_copy(self.buf.add(self.pos).cast(), w.as_ptr().cast(), k * 4) };
+        unsafe { crate::fmt::small_copy(self.buf.wrapping_add(self.pos).cast(), w.as_ptr().cast(), k * 4) };
         self.pos += k;
         if k < w.len() {
             errno::set(E2BIG);
@@ -92,9 +92,9 @@ impl WBufSink {
         true
     }
 
-    pub unsafe fn terminate(&mut self) {
+    pub fn terminate(&mut self) {
         if self.cap > 0 {
-            unsafe { *self.buf.add(self.pos.min(self.cap - 1)) = 0 };
+            unsafe { *self.buf.wrapping_add(self.pos.min(self.cap - 1)) = 0 };
         }
     }
 }
@@ -104,11 +104,9 @@ impl Sink for WBufSink {
     fn put(&mut self, bytes: &[u8]) -> bool {
         let room = self.cap - self.pos;
         let k = bytes.len().min(room);
-        unsafe {
-            let d = self.buf.add(self.pos);
-            for (j, &b) in bytes[..k].iter().enumerate() {
-                *d.add(j) = u32::from(b);
-            }
+        let d = self.buf.wrapping_add(self.pos);
+        for (j, &b) in bytes[..k].iter().enumerate() {
+            unsafe { *d.wrapping_add(j) = u32::from(b) };
         }
         self.pos += k;
         if k < bytes.len() {
@@ -123,41 +121,35 @@ impl Sink for WBufSink {
 }
 
 unsafe fn stream_wprintf(f: *mut FILE, format: *const wchar_t, va: &mut VaList) -> c_int {
-    unsafe { locked!(f, move || stream_wprintf_u(f, format, va)) }
-}
-
-unsafe fn stream_wprintf_u(f: *mut FILE, format: *const wchar_t, va: &mut VaList) -> c_int {
-    unsafe {
-        if !wfile::wide_ok(f) {
+    locked!(f, |s| {
+        if !wfile::wide_ok(s) {
             return -1;
         }
-        if (*f).flags & F_WRITE == 0 {
-            (*f).flags |= F_ERR;
+        if s.flags & F_WRITE == 0 {
+            s.flags |= F_ERR;
             errno::set(EBADF);
             return -1;
         }
         let mut sink = WFileSink::new(f);
-        let r = run_fmt::<WFileSink, u32>(&mut sink, format as *const u32, va);
+        let r = unsafe { run_fmt::<WFileSink, u32>(&mut sink, format as *const u32, va) };
         if r < 0 {
             return r;
         }
         if sink.finish() { r } else { -1 }
-    }
+    })
 }
 
 unsafe fn string_wprintf(s: *mut wchar_t, n: usize, format: *const wchar_t, va: &mut VaList) -> c_int {
-    unsafe {
-        if n == 0 {
-            return -1;
-        }
-        let mut sink = WBufSink::new(s as *mut u32, n);
-        let r = run_fmt::<WBufSink, u32>(&mut sink, format as *const u32, va);
-        sink.terminate();
-        if r >= 0 && (r as usize) >= n {
-            return -1;
-        }
-        r
+    if n == 0 {
+        return -1;
     }
+    let mut sink = unsafe { WBufSink::new(s as *mut u32, n) };
+    let r = unsafe { run_fmt::<WBufSink, u32>(&mut sink, format as *const u32, va) };
+    sink.terminate();
+    if r >= 0 && (r as usize) >= n {
+        return -1;
+    }
+    r
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]

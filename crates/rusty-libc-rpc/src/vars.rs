@@ -1,9 +1,10 @@
 use crate::types::*;
-use core::cell::UnsafeCell;
+use core::cell::Cell;
 use core::ffi::{c_char, c_int, c_long, c_void};
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use rusty_libc_core::errno;
-use rusty_libc_core::lock::RawMutex;
+use rusty_libc_core::lock::Locked;
+pub use rusty_libc_core::sync_cell::SyncCell;
 
 pub const EINTR: c_int = 4;
 pub const EAGAIN: c_int = 11;
@@ -20,30 +21,18 @@ pub const EPROTOTYPE: c_int = 91;
 pub const ENOSYS: c_int = 38;
 
 #[inline]
-pub unsafe fn mem_alloc(n: usize) -> *mut c_void {
-    rusty_libc_malloc::malloc(n)
-}
-
-#[inline]
 pub unsafe fn mem_free(p: *mut c_void) {
-    rusty_libc_malloc::free(p)
+    unsafe { rusty_libc_malloc::free(p) }
 }
 
 #[inline]
-pub unsafe fn calloc(n: usize, size: usize) -> *mut c_void {
-    rusty_libc_malloc::calloc(n, size)
+pub fn alloc(n: usize) -> *mut c_void {
+    unsafe { rusty_libc_malloc::malloc(n) }
 }
 
-pub struct Racy<T>(pub UnsafeCell<T>);
-unsafe impl<T> Sync for Racy<T> {}
-impl<T> Racy<T> {
-    pub const fn new(v: T) -> Racy<T> {
-        Racy(UnsafeCell::new(v))
-    }
-    #[inline]
-    pub fn get(&self) -> *mut T {
-        self.0.get()
-    }
+#[inline]
+pub fn alloc_zeroed(n: usize, size: usize) -> *mut c_void {
+    unsafe { rusty_libc_malloc::calloc(n, size) }
 }
 
 pub struct RpcVars {
@@ -64,42 +53,47 @@ pub struct RpcVars {
     pub svc_max_pollfd_s: c_int,
 }
 
-static MEM: Racy<core::mem::MaybeUninit<RpcVars>> = Racy::new(core::mem::MaybeUninit::zeroed());
+static MEM: SyncCell<core::mem::MaybeUninit<RpcVars>> = SyncCell::new(core::mem::MaybeUninit::zeroed());
 static MEM_TAKEN: AtomicBool = AtomicBool::new(false);
 
 #[thread_local]
-static mut TVP: *mut RpcVars = core::ptr::null_mut();
+static TVP: Cell<*mut RpcVars> = Cell::new(core::ptr::null_mut());
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub static mut svc_fdset: fd_set = fd_set::ZERO;
+pub static svc_fdset: SyncCell<fd_set> = SyncCell::new(fd_set::ZERO);
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub static mut rpc_createerr: rpc_createerr = rpc_createerr { cf_stat: 0, cf_error: rpc_err::zeroed() };
+pub static rpc_createerr: SyncCell<rpc_createerr> = SyncCell::new(rpc_createerr { cf_stat: 0, cf_error: rpc_err::zeroed() });
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub static mut svc_pollfd: *mut pollfd = core::ptr::null_mut();
+pub static svc_pollfd: SyncCell<*mut pollfd> = SyncCell::new(core::ptr::null_mut());
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub static mut svc_max_pollfd: c_int = 0;
+pub static svc_max_pollfd: SyncCell<c_int> = SyncCell::new(0);
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub static mut _null_auth: opaque_auth = opaque_auth::null();
+pub static _null_auth: SyncCell<opaque_auth> = SyncCell::new(opaque_auth::null());
+
+#[inline]
+pub fn null_auth() -> opaque_auth {
+    unsafe { _null_auth.read() }
+}
 
 #[inline]
 fn mem_ptr() -> *mut RpcVars {
-    MEM.get().cast()
+    MEM.as_ptr().cast()
 }
 
-pub unsafe fn thread_vars() -> *mut RpcVars {
-    let mut tvp = *(&raw const TVP);
+pub fn tv() -> *mut RpcVars {
+    let mut tvp = TVP.get();
     if tvp.is_null() {
         if MEM_TAKEN.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            *(&raw mut TVP) = mem_ptr();
+            TVP.set(mem_ptr());
             register_exit_cleanup();
         }
-        tvp = *(&raw const TVP);
+        tvp = TVP.get();
         if tvp.is_null() {
-            tvp = rusty_libc_malloc::calloc(1, core::mem::size_of::<RpcVars>()) as *mut RpcVars;
+            tvp = alloc_zeroed(1, core::mem::size_of::<RpcVars>()) as *mut RpcVars;
             if tvp.is_null() {
                 tvp = mem_ptr();
             } else {
-                *(&raw mut TVP) = tvp;
+                TVP.set(tvp);
                 register_exit_cleanup();
             }
         }
@@ -107,54 +101,107 @@ pub unsafe fn thread_vars() -> *mut RpcVars {
     tvp
 }
 
+macro_rules! tv_field {
+    ($( $f:ident : $t:ty => $get:ident, $set:ident; )*) => {
+        $(
+            #[inline]
+            pub fn $get() -> $t {
+                let p = tv();
+                unsafe { (*p).$f }
+            }
+            #[inline]
+            pub fn $set(v: $t) {
+                let p = tv();
+                unsafe { (*p).$f = v }
+            }
+        )*
+    };
+}
+
+tv_field! {
+    clnt_perr_buf: *mut c_char => tv_clnt_perr_buf, set_tv_clnt_perr_buf;
+    clntraw_private: *mut c_void => tv_clntraw_private, set_tv_clntraw_private;
+    svcraw_private: *mut c_void => tv_svcraw_private, set_tv_svcraw_private;
+    authdes_cache: *mut c_void => tv_authdes_cache, set_tv_authdes_cache;
+    authdes_lru: *mut c_int => tv_authdes_lru, set_tv_authdes_lru;
+    svc_xports: *mut *mut SVCXPRT => tv_svc_xports, set_tv_svc_xports;
+    svc_head: *mut crate::svc::SvcCallout => tv_svc_head, set_tv_svc_head;
+    svcsimple_proglst: *mut c_void => tv_svcsimple_proglst, set_tv_svcsimple_proglst;
+    svcsimple_transp: *mut SVCXPRT => tv_svcsimple_transp, set_tv_svcsimple_transp;
+    callrpc_private: *mut c_void => tv_callrpc_private, set_tv_callrpc_private;
+    key_call_private: *mut c_void => tv_key_call_private, set_tv_key_call_private;
+}
+
 unsafe extern "C" fn thread_exit(_arg: *mut c_void) {
     crate::pmap::thread_destroy();
-    let tvp = *(&raw const TVP);
+    let tvp = TVP.get();
     if !tvp.is_null() && tvp != mem_ptr() {
-        rusty_libc_malloc::free(tvp.cast());
+        unsafe { rusty_libc_malloc::free(tvp.cast()) };
     }
-    *(&raw mut TVP) = core::ptr::null_mut();
+    TVP.set(core::ptr::null_mut());
 }
 
 fn register_exit_cleanup() {
-    let tid = unsafe { rusty_libc_core::syscall::syscall0(rusty_libc_core::syscall::SYS_GETTID) } as i32;
-    if tid != getpid() {
-        rusty_libc_core::tls::register_thread_dtor(thread_exit, core::ptr::null_mut());
+    if !rusty_libc_core::tls::is_initial_thread() {
+        rusty_libc_core::tls::register_thread_dtor(thread_exit, core::ptr::null_mut(), 0);
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn __rpc_thread_svc_fdset() -> *mut fd_set {
-    let tvp = thread_vars();
-    if tvp == mem_ptr() { &raw mut svc_fdset } else { &raw mut (*tvp).svc_fdset_s }
+pub extern "C" fn __rpc_thread_svc_fdset() -> *mut fd_set {
+    let tvp = tv();
+    if tvp == mem_ptr() { svc_fdset.as_ptr() } else { unsafe { &raw mut (*tvp).svc_fdset_s } }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn __rpc_thread_createerr() -> *mut rpc_createerr {
-    let tvp = thread_vars();
-    if tvp == mem_ptr() { &raw mut rpc_createerr } else { &raw mut (*tvp).rpc_createerr_s }
+pub extern "C" fn __rpc_thread_createerr() -> *mut rpc_createerr {
+    let tvp = tv();
+    if tvp == mem_ptr() { rpc_createerr.as_ptr() } else { unsafe { &raw mut (*tvp).rpc_createerr_s } }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn __rpc_thread_svc_pollfd() -> *mut *mut pollfd {
-    let tvp = thread_vars();
-    if tvp == mem_ptr() { &raw mut svc_pollfd } else { &raw mut (*tvp).svc_pollfd_s }
+pub extern "C" fn __rpc_thread_svc_pollfd() -> *mut *mut pollfd {
+    let tvp = tv();
+    if tvp == mem_ptr() { svc_pollfd.as_ptr() } else { unsafe { &raw mut (*tvp).svc_pollfd_s } }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn __rpc_thread_svc_max_pollfd() -> *mut c_int {
-    let tvp = thread_vars();
-    if tvp == mem_ptr() { &raw mut svc_max_pollfd } else { &raw mut (*tvp).svc_max_pollfd_s }
+pub extern "C" fn __rpc_thread_svc_max_pollfd() -> *mut c_int {
+    let tvp = tv();
+    if tvp == mem_ptr() { svc_max_pollfd.as_ptr() } else { unsafe { &raw mut (*tvp).svc_max_pollfd_s } }
 }
 
-pub unsafe fn createerr() -> *mut rpc_createerr {
-    __rpc_thread_createerr()
+#[inline]
+pub fn get_createerr() -> rpc_createerr {
+    let p = __rpc_thread_createerr();
+    unsafe { *p }
 }
 
-pub unsafe fn set_createerr(stat: c_int, errno_val: c_int) {
-    let ce = createerr();
-    (*ce).cf_stat = stat;
-    (*ce).cf_error.ru.RE_errno = errno_val;
+#[inline]
+pub fn set_createerr_stat(stat: c_int) {
+    let p = __rpc_thread_createerr();
+    unsafe { (*p).cf_stat = stat };
+}
+
+#[inline]
+pub fn set_createerr(stat: c_int, errno_val: c_int) {
+    let p = __rpc_thread_createerr();
+    let mut ce = unsafe { *p };
+    ce.cf_stat = stat;
+    ce.cf_error.ru.RE_errno = errno_val;
+    unsafe { *p = ce };
+}
+
+#[inline]
+pub fn set_createerr_full(stat: c_int, err: rpc_err) {
+    let p = __rpc_thread_createerr();
+    unsafe { *p = rpc_createerr { cf_stat: stat, cf_error: err } };
+}
+
+#[inline]
+pub fn set_createerr_error_status(status: c_int) {
+    let p = __rpc_thread_createerr();
+    unsafe { (*p).cf_error.re_status = status };
 }
 
 static DTABLE: AtomicI32 = AtomicI32::new(0);
@@ -169,24 +216,32 @@ pub extern "C" fn _rpc_dtablesize() -> c_int {
     s
 }
 
-static XID_LOCK: RawMutex = RawMutex::new();
-static XID_PID: Racy<i32> = Racy::new(0);
-static XID_STATE: Racy<rusty_libc_stdlib::rand::Drand48Data> =
-    Racy::new(rusty_libc_stdlib::rand::Drand48Data { x: [0; 3], old_x: [0; 3], c: 0, init: 0, a: 0 });
+struct XidState {
+    pid: i32,
+    rand: rusty_libc_stdlib::rand::Drand48Data,
+}
+
+static XID: Locked<XidState> = Locked::new(XidState { pid: 0, rand: rusty_libc_stdlib::rand::Drand48Data { x: [0; 3], old_x: [0; 3], c: 0, init: 0, a: 0 } });
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn _create_xid() -> c_ulong_t {
-    let _g = XID_LOCK.guard();
-    let pid = rusty_libc_sys::unistd::getpid();
-    if *XID_PID.get() != pid {
-        let mut now = rusty_libc_time::clock::Timespec::default();
-        rusty_libc_time::clock::clock_gettime(0, &mut now);
-        rusty_libc_stdlib::rand::srand48_r(now.tv_sec ^ now.tv_nsec ^ pid as i64, XID_STATE.get());
-        *XID_PID.get() = pid;
-    }
-    let mut res: c_long = 0;
-    rusty_libc_stdlib::rand::lrand48_r(XID_STATE.get(), &mut res);
-    res as c_ulong_t
+pub extern "C" fn _create_xid() -> c_ulong_t {
+    XID.with(|st| {
+        let pid = rusty_libc_sys::unistd::getpid();
+        if st.pid != pid {
+            let (_, now) = gettime(0);
+            unsafe { rusty_libc_stdlib::rand::srand48_r(now.tv_sec ^ now.tv_nsec ^ pid as i64, &mut st.rand) };
+            st.pid = pid;
+        }
+        let mut res: c_long = 0;
+        unsafe { rusty_libc_stdlib::rand::lrand48_r(&mut st.rand, &mut res) };
+        res as c_ulong_t
+    })
+}
+
+pub fn gettime(clock: c_int) -> (c_int, rusty_libc_time::clock::Timespec) {
+    let mut ts = rusty_libc_time::clock::Timespec::default();
+    let r = unsafe { rusty_libc_time::clock::clock_gettime(clock, &mut ts) };
+    (r, ts)
 }
 
 pub type c_ulong_t = core::ffi::c_ulong;
@@ -206,11 +261,9 @@ impl Deadline {
 }
 
 pub fn deadline_current_time() -> (i64, i64) {
-    let mut ts = rusty_libc_time::clock::Timespec::default();
-    unsafe {
-        if rusty_libc_time::clock::clock_gettime(1, &mut ts) != 0 {
-            rusty_libc_time::clock::clock_gettime(0, &mut ts);
-        }
+    let (r, mut ts) = gettime(1);
+    if r != 0 {
+        ts = gettime(0).1;
     }
     (ts.tv_sec, ts.tv_nsec)
 }
@@ -295,20 +348,20 @@ pub fn sc_isize(ret: usize) -> isize {
     }
 }
 
-pub unsafe fn sys_write(fd: c_int, buf: *const u8, n: usize) -> isize {
-    sc_isize(rusty_libc_core::tls::syscall_cp(1, fd as usize, buf as usize, n, 0, 0, 0))
+pub fn write_fd(fd: c_int, buf: &[u8]) -> isize {
+    sc_isize(unsafe { rusty_libc_core::tls::syscall_cp(1, fd as usize, buf.as_ptr() as usize, buf.len(), 0, 0, 0) })
 }
 
-pub unsafe fn sys_read(fd: c_int, buf: *mut u8, n: usize) -> isize {
-    rusty_libc_sys::unistd::read(fd, buf.cast(), n)
+pub fn read_fd(fd: c_int, buf: &mut [u8]) -> isize {
+    unsafe { rusty_libc_sys::unistd::read(fd, buf.as_mut_ptr().cast(), buf.len()) }
 }
 
 pub fn sys_close(fd: c_int) -> c_int {
     rusty_libc_sys::unistd::close(fd)
 }
 
-pub unsafe fn sys_poll(fds: *mut pollfd, n: usize, ms: c_int) -> c_int {
-    rusty_libc_sys::poll::poll(fds.cast(), n as core::ffi::c_ulong, ms)
+pub fn poll_fds(fds: &mut [pollfd], ms: c_int) -> c_int {
+    unsafe { rusty_libc_sys::poll::poll(fds.as_mut_ptr().cast(), fds.len() as core::ffi::c_ulong, ms) }
 }
 
 pub fn get_errno() -> c_int {
@@ -347,15 +400,11 @@ pub fn ntohl(x: u32) -> u32 {
     u32::from_be(x)
 }
 
-pub unsafe fn strlen(s: *const c_char) -> usize {
-    rusty_libc_mem::strlen(s)
-}
+pub use rusty_libc_core::ffi::cstr_len as strlen;
 
 pub fn eprint(text: &[u8]) {
-    unsafe {
-        let e = rusty_libc_stdio::file::stderr_ptr();
-        rusty_libc_stdio::file::write_bytes(e, text.as_ptr(), text.len());
-    }
+    let e = rusty_libc_stdio::file::stderr_ptr();
+    rusty_libc_stdio::file::write_bytes(unsafe { rusty_libc_stdio::file::stream(e) }, text);
 }
 
 pub fn oom(func: &str) {
@@ -365,11 +414,12 @@ pub fn oom(func: &str) {
     eprint(b.as_bytes());
 }
 
-pub unsafe fn perror(msg: &str) {
+pub fn perror_msg(msg: &str) {
     let mut b = StackBuf::<256>::new();
     b.push(msg.as_bytes());
     b.push(&[0]);
-    rusty_libc_stdio::file_api::perror(b.buf.as_ptr().cast());
+    b.buf[255] = 0;
+    unsafe { rusty_libc_stdio::file_api::perror(b.buf.as_ptr().cast()) };
 }
 
 pub struct StackBuf<const N: usize> {
@@ -430,11 +480,10 @@ impl CBuf {
             self.ptr = np;
             self.cap = ncap;
         }
-        unsafe {
-            core::ptr::copy_nonoverlapping(s.as_ptr(), self.ptr.add(self.len), s.len());
-        }
+        let buf = unsafe { rusty_libc_core::ffi::bytes_mut(self.ptr, self.cap) };
+        buf[self.len..self.len + s.len()].copy_from_slice(s);
         self.len += s.len();
-        unsafe { *self.ptr.add(self.len) = 0 };
+        buf[self.len] = 0;
     }
     pub fn finish(self) -> *mut c_char {
         if self.failed {
@@ -442,7 +491,7 @@ impl CBuf {
             return core::ptr::null_mut();
         }
         if self.ptr.is_null() {
-            let p = unsafe { rusty_libc_malloc::malloc(1) } as *mut u8;
+            let p = alloc(1) as *mut u8;
             if !p.is_null() {
                 unsafe { *p = 0 };
             }
@@ -466,14 +515,12 @@ impl core::fmt::Write for CBuf {
 }
 
 pub fn strerror_into(code: c_int, out: &mut CBuf) {
-    if let Some(m) = rusty_libc_core::messages::error_message(code) {
+    if let Some(m) = rusty_libc_core::messages::error_message_tr(code) {
         out.push(m.to_bytes());
         return;
     }
     use core::fmt::Write;
-    let _ = write!(out, "Unknown error {}", code);
+    let _ = write!(out, "{}{}", core::str::from_utf8(rusty_libc_core::i18n::tr(c"Unknown error ").to_bytes()).unwrap_or("Unknown error "), code);
 }
 
-pub unsafe fn cstr<'a>(p: *const c_char) -> &'a [u8] {
-    core::slice::from_raw_parts(p.cast(), strlen(p))
-}
+pub use rusty_libc_core::ffi::cstr_bytes as cstr;

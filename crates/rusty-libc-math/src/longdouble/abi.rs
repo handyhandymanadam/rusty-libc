@@ -4,8 +4,8 @@ macro_rules! ld_unary {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: *const F80, o: *mut F80) {
-                unsafe { $crate::longdouble::common::put_f80(o, $imp($crate::longdouble::common::load_f80(x))) }
+            pub(super) extern "C" fn inner(x: &$crate::longdouble::common::LdArg, o: &mut $crate::longdouble::common::LdOut) {
+                $crate::longdouble::common::put(o, $imp(x.get()))
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -33,25 +33,22 @@ macro_rules! ld_unary_fast {
             use super::*;
             #[inline(never)]
             #[cold]
-            unsafe extern "C" fn slow_out(x: *const F80, o: *mut F80) {
-                unsafe { $crate::longdouble::common::put_f80(o, $imp($crate::longdouble::common::load_f80(x))) }
+            extern "C" fn slow_out(x: &$crate::longdouble::common::LdArg, o: &mut $crate::longdouble::common::LdOut) {
+                $crate::longdouble::common::put(o, $imp(x.get()))
             }
             #[inline(always)]
-            unsafe fn body(x: *const F80, o: *mut F80) {
-                unsafe {
-                    let xv = $crate::longdouble::common::load_f80(x);
-                    match $fast(xv) {
-                        Some(r) => $crate::longdouble::common::put_f80(o, r),
-                        None => slow_out(x, o),
-                    }
+            fn body(x: &$crate::longdouble::common::LdArg, o: &mut $crate::longdouble::common::LdOut) {
+                match $fast(x.get()) {
+                    Some(r) => $crate::longdouble::common::put(o, r),
+                    None => slow_out(x, o),
                 }
             }
-            pub(super) unsafe extern "C" fn inner(x: *const F80, o: *mut F80) {
-                unsafe { body(x, o) }
+            pub(super) extern "C" fn inner(x: &$crate::longdouble::common::LdArg, o: &mut $crate::longdouble::common::LdOut) {
+                body(x, o)
             }
             #[target_feature(enable = "fma")]
-            pub(super) unsafe extern "C" fn inner_fma(x: *const F80, o: *mut F80) {
-                unsafe { body(x, o) }
+            pub(super) extern "C" fn inner_fma(x: &$crate::longdouble::common::LdArg, o: &mut $crate::longdouble::common::LdOut) {
+                body(x, o)
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -87,25 +84,22 @@ macro_rules! ld_binary_fast {
             use super::*;
             #[inline(never)]
             #[cold]
-            unsafe extern "C" fn slow_out(x: *const F80, y: *const F80, o: *mut F80) {
-                unsafe { $crate::longdouble::common::put_f80(o, $imp($crate::longdouble::common::load_f80(x), $crate::longdouble::common::load_f80(y))) }
+            extern "C" fn slow_out(x: &$crate::longdouble::common::LdArg, y: &$crate::longdouble::common::LdArg, o: &mut $crate::longdouble::common::LdOut) {
+                $crate::longdouble::common::put(o, $imp(x.get(), y.get()))
             }
             #[inline(always)]
-            unsafe fn body(x: *const F80, y: *const F80, o: *mut F80) {
-                unsafe {
-                    let (xv, yv) = ($crate::longdouble::common::load_f80(x), $crate::longdouble::common::load_f80(y));
-                    match $fast(xv, yv) {
-                        Some(r) => $crate::longdouble::common::put_f80(o, r),
-                        None => slow_out(x, y, o),
-                    }
+            fn body(x: &$crate::longdouble::common::LdArg, y: &$crate::longdouble::common::LdArg, o: &mut $crate::longdouble::common::LdOut) {
+                match $fast(x.get(), y.get()) {
+                    Some(r) => $crate::longdouble::common::put(o, r),
+                    None => slow_out(x, y, o),
                 }
             }
-            pub(super) unsafe extern "C" fn inner(x: *const F80, y: *const F80, o: *mut F80) {
-                unsafe { body(x, y, o) }
+            pub(super) extern "C" fn inner(x: &$crate::longdouble::common::LdArg, y: &$crate::longdouble::common::LdArg, o: &mut $crate::longdouble::common::LdOut) {
+                body(x, y, o)
             }
             #[target_feature(enable = "fma")]
-            pub(super) unsafe extern "C" fn inner_fma(x: *const F80, y: *const F80, o: *mut F80) {
-                unsafe { body(x, y, o) }
+            pub(super) extern "C" fn inner_fma(x: &$crate::longdouble::common::LdArg, y: &$crate::longdouble::common::LdArg, o: &mut $crate::longdouble::common::LdOut) {
+                body(x, y, o)
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -140,8 +134,8 @@ macro_rules! ld_binary {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: *const F80, y: *const F80, o: *mut F80) {
-                unsafe { $crate::longdouble::common::put_f80(o, $imp($crate::longdouble::common::load_f80(x), $crate::longdouble::common::load_f80(y))) }
+            pub(super) extern "C" fn inner(x: &$crate::longdouble::common::LdArg, y: &$crate::longdouble::common::LdArg, o: &mut $crate::longdouble::common::LdOut) {
+                $crate::longdouble::common::put(o, $imp(x.get(), y.get()))
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -168,8 +162,8 @@ macro_rules! ld_ternary {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: *const F80, y: *const F80, z: *const F80, o: *mut F80) {
-                unsafe { $crate::longdouble::common::put_f80(o, $imp($crate::longdouble::common::load_f80(x), $crate::longdouble::common::load_f80(y), $crate::longdouble::common::load_f80(z))) }
+            pub(super) extern "C" fn inner(x: &$crate::longdouble::common::LdArg, y: &$crate::longdouble::common::LdArg, z: &$crate::longdouble::common::LdArg, o: &mut $crate::longdouble::common::LdOut) {
+                $crate::longdouble::common::put(o, $imp(x.get(), y.get(), z.get()))
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -197,8 +191,8 @@ macro_rules! ld_int {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: *const F80, n: $t, o: *mut F80) {
-                unsafe { $crate::longdouble::common::put_f80(o, $imp($crate::longdouble::common::load_f80(x), n)) }
+            pub(super) extern "C" fn inner(x: &$crate::longdouble::common::LdArg, n: $t, o: &mut $crate::longdouble::common::LdOut) {
+                $crate::longdouble::common::put(o, $imp(x.get(), n))
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -221,14 +215,44 @@ macro_rules! ld_int {
 
 macro_rules! ld_ptr {
     ($name:ident, $imp:path, $t:ty) => {
+        ld_ptr!(@go $name, $imp, $t, false);
+    };
+    ($name:ident, $imp:path, $t:ty, null_ok) => {
+        ld_ptr!(@go $name, $imp, $t, true);
+    };
+    ($name:ident, $imp:path, $t:ty, always) => {
         #[allow(non_snake_case)]
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: *const F80, p: *mut $t, o: *mut F80) {
-                unsafe { $crate::longdouble::common::put_f80(o, $imp($crate::longdouble::common::load_f80(x), p)) }
+            pub(super) unsafe extern "C" fn inner(x: &$crate::longdouble::common::LdArg, p: *mut $t, o: &mut $crate::longdouble::common::LdOut) {
+                let mut v = <$t>::default();
+                let r = $imp(x.get(), &mut v);
+                unsafe { p.write(v) };
+                $crate::longdouble::common::put(o, r)
             }
         }
+        ld_ptr!(@naked $name, $t);
+    };
+    (@go $name:ident, $imp:path, $t:ty, $null_ok:expr) => {
+        #[allow(non_snake_case)]
+        mod $name {
+            #[allow(unused_imports)]
+            use super::*;
+            pub(super) unsafe extern "C" fn inner(x: &$crate::longdouble::common::LdArg, p: *mut $t, o: &mut $crate::longdouble::common::LdOut) {
+                let mut v = None;
+                let r = $imp(x.get(), &mut v);
+                if let Some(v) = v
+                    && !($null_ok && p.is_null())
+                {
+                    unsafe { p.write(v) };
+                }
+                $crate::longdouble::common::put(o, r)
+            }
+        }
+        ld_ptr!(@naked $name, $t);
+    };
+    (@naked $name:ident, $t:ty) => {
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         #[unsafe(naked)]
         pub unsafe extern "C" fn $name(_p: *mut $t, _x: f64) -> f64 {
@@ -253,8 +277,13 @@ macro_rules! ld_ld_ptr {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: *const F80, y: *const F80, p: *mut $t, o: *mut F80) {
-                unsafe { $crate::longdouble::common::put_f80(o, $imp($crate::longdouble::common::load_f80(x), $crate::longdouble::common::load_f80(y), p)) }
+            pub(super) unsafe extern "C" fn inner(x: &$crate::longdouble::common::LdArg, y: &$crate::longdouble::common::LdArg, p: *mut $t, o: &mut $crate::longdouble::common::LdOut) {
+                let mut v = None;
+                let r = $imp(x.get(), y.get(), &mut v);
+                if let Some(v) = v {
+                    unsafe { p.write(v) };
+                }
+                $crate::longdouble::common::put(o, r)
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -282,8 +311,8 @@ macro_rules! ld_to_int {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: *const F80) -> $r {
-                unsafe { $imp($crate::longdouble::common::load_f80(x)) }
+            pub(super) extern "C" fn inner(x: &$crate::longdouble::common::LdArg) -> $r {
+                $imp(x.get())
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -304,8 +333,8 @@ macro_rules! ld2_to {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: *const F80, y: *const F80) -> $r {
-                unsafe { $imp($crate::longdouble::common::load_f80(x), $crate::longdouble::common::load_f80(y)) }
+            pub(super) extern "C" fn inner(x: &$crate::longdouble::common::LdArg, y: &$crate::longdouble::common::LdArg) -> $r {
+                $imp(x.get(), y.get())
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -327,8 +356,8 @@ macro_rules! ld3_to {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: *const F80, y: *const F80, z: *const F80) -> $r {
-                unsafe { $imp($crate::longdouble::common::load_f80(x), $crate::longdouble::common::load_f80(y), $crate::longdouble::common::load_f80(z)) }
+            pub(super) extern "C" fn inner(x: &$crate::longdouble::common::LdArg, y: &$crate::longdouble::common::LdArg, z: &$crate::longdouble::common::LdArg) -> $r {
+                $imp(x.get(), y.get(), z.get())
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -351,8 +380,8 @@ macro_rules! ld_fromfp {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: *const F80, round: i32, width: u32, o: *mut F80) {
-                unsafe { $crate::longdouble::common::put_f80(o, $imp($crate::longdouble::common::load_f80(x), round, width)) }
+            pub(super) extern "C" fn inner(x: &$crate::longdouble::common::LdArg, round: i32, width: u32, o: &mut $crate::longdouble::common::LdOut) {
+                $crate::longdouble::common::put(o, $imp(x.get(), round, width))
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -380,12 +409,10 @@ macro_rules! ld_sincos {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(x: *const F80, s: *mut F80, c: *mut F80) {
-                unsafe {
-                    let (a, b) = $imp($crate::longdouble::common::load_f80(x));
-                    *s = a;
-                    *c = b;
-                }
+            pub(super) unsafe extern "C" fn inner(x: &$crate::longdouble::common::LdArg, s: *mut F80, c: *mut F80) {
+                let (a, b) = $imp(x.get());
+                unsafe { s.write(a) };
+                unsafe { c.write(b) };
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -403,13 +430,14 @@ macro_rules! ld_sincos {
 }
 
 macro_rules! ptr_to_ld {
-    ($name:ident, $imp:path, $t:ty) => {
+    ($name:ident, $imp:path, $t:ty, $conv:path) => {
         #[allow(non_snake_case)]
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(p: $t, o: *mut F80) {
-                unsafe { $crate::longdouble::common::put_f80(o, $imp(p)) }
+            pub(super) unsafe extern "C" fn inner(p: $t, o: &mut $crate::longdouble::common::LdOut) {
+                let a = unsafe { $conv(p) };
+                $crate::longdouble::common::put(o, $imp(a))
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -434,8 +462,10 @@ macro_rules! ptr_ld_to_int {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(p: *mut F80, x: *const F80) -> i32 {
-                unsafe { $imp(p, $crate::longdouble::common::load_f80(x)) }
+            pub(super) unsafe extern "C" fn inner(p: *mut F80, x: &$crate::longdouble::common::LdArg) -> i32 {
+                let (r, v) = $imp(x.get());
+                unsafe { p.write(v) };
+                r
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -456,11 +486,8 @@ macro_rules! c_to_ld {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(z: *const [F80; 2], o: *mut F80) {
-                unsafe {
-                    let z = *z;
-                    $crate::longdouble::common::put_f80(o, $imp(z[0], z[1]))
-                }
+            pub(super) extern "C" fn inner(z: &[$crate::longdouble::common::LdArg; 2], o: &mut $crate::longdouble::common::LdOut) {
+                $crate::longdouble::common::put(o, $imp(z[0].get(), z[1].get()))
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -486,12 +513,9 @@ macro_rules! c_to_c {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(z: *const [F80; 2], o: *mut [F80; 2]) {
-                unsafe {
-                    let z = *z;
-                    let (a, b) = $imp(z[0], z[1]);
-                    *o = [a, b];
-                }
+            pub(super) extern "C" fn inner(z: &[$crate::longdouble::common::LdArg; 2], o: &mut [$crate::longdouble::common::LdOut; 2]) {
+                let (a, b) = $imp(z[0].get(), z[1].get());
+                $crate::longdouble::common::put2(o, a, b)
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -518,12 +542,9 @@ macro_rules! c2_to_c {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
-            pub(super) unsafe extern "C" fn inner(a: *const [F80; 2], b: *const [F80; 2], o: *mut [F80; 2]) {
-                unsafe {
-                    let (a, b) = (*a, *b);
-                    let (x, y) = $imp(a[0], a[1], b[0], b[1]);
-                    *o = [x, y];
-                }
+            pub(super) extern "C" fn inner(a: &[$crate::longdouble::common::LdArg; 2], b: &[$crate::longdouble::common::LdArg; 2], o: &mut [$crate::longdouble::common::LdOut; 2]) {
+                let (x, y) = $imp(a[0].get(), a[1].get(), b[0].get(), b[1].get());
+                $crate::longdouble::common::put2(o, x, y)
             }
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]

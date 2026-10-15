@@ -6,15 +6,19 @@ fn fma<const F: bool>(a: f64, b: f64, c: f64) -> f64 {
 }
 use super::fast::SHIFT;
 use super::fast_tables::*;
-
-#[allow(dead_code)]
-const SIGN: u64 = 0x8000_0000_0000_0000;
+use crate::exp::ffast::{round_cr_x, round_pair_slow};
 
 #[inline(always)]
-fn sincos_plain<const F: bool>(ax: f64) -> (f64, f64) {
-    let kd = fma::<F>(ax, INV_PI128, SHIFT);
-    let j = (kd.to_bits() & 255) as usize;
-    let mf = kd - SHIFT;
+fn nearest_m<const F: bool>(ax: f64) -> (f64, usize) {
+    let t = ax * INV_PI128;
+    let mf = if F { dd::round_even_avx(t) } else { dd::round_half_away(t) };
+    (mf, ((mf + SHIFT).to_bits() & 255) as usize)
+}
+
+
+#[inline(always)]
+pub(crate) fn sincos_plain<const F: bool>(ax: f64) -> (f64, f64) {
+    let (mf, j) = nearest_m::<F>(ax);
     let t1 = fma::<F>(-mf, PI128_1, ax);
     let y = fma::<F>(-mf, PI128_3, fma::<F>(-mf, PI128_2, t1));
     let z = y * y;
@@ -26,25 +30,56 @@ fn sincos_plain<const F: bool>(ax: f64) -> (f64, f64) {
     (fma::<F>(sh, cy, ch * sy), fma::<F>(ch, cy, -(sh * sy)))
 }
 
+pub(crate) const SINCOSF_MARGIN: u64 = 1 << 6;
+pub(crate) const TANF_MARGIN: u64 = 1 << 6;
+
 #[inline(always)]
 pub fn sinf<const F: bool>(x: f32) -> f32 {
-    sincos_plain::<F>(f64::from(x)).0 as f32
+    match round_cr_x(sincos_plain::<F>(f64::from(x)).0, SINCOSF_MARGIN) {
+        Some(r) => r,
+        None => sinf_slow(x),
+    }
 }
 
 #[inline(always)]
 pub fn cosf<const F: bool>(x: f32) -> f32 {
-    sincos_plain::<F>(f64::from(x)).1 as f32
+    match round_cr_x(sincos_plain::<F>(f64::from(x)).1, SINCOSF_MARGIN) {
+        Some(r) => r,
+        None => cosf_slow(x),
+    }
 }
 
 #[inline(always)]
 pub fn sincosf<const F: bool>(x: f32) -> (f32, f32) {
     let (sn, c) = sincos_plain::<F>(f64::from(x));
-    (sn as f32, c as f32)
+    match (round_cr_x(sn, SINCOSF_MARGIN), round_cr_x(c, SINCOSF_MARGIN)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => (sinf_slow(x), cosf_slow(x)),
+    }
 }
 
 #[inline(always)]
 pub fn tanf<const F: bool>(x: f32) -> f32 {
     let (sn, c) = sincos_plain::<F>(f64::from(x));
-    (sn / c) as f32
+    match round_cr_x(sn / c, TANF_MARGIN) {
+        Some(r) => r,
+        None => tanf_slow(x),
+    }
+}
+
+#[cold]
+#[inline(never)]
+pub fn sinf_slow(x: f32) -> f32 {
+    round_pair_slow(f64::from(x), false, super::direct::sin_pair::<false>)
+}
+#[cold]
+#[inline(never)]
+pub fn cosf_slow(x: f32) -> f32 {
+    round_pair_slow(f64::from(x), false, super::direct::cos_pair::<false>)
+}
+#[cold]
+#[inline(never)]
+pub fn tanf_slow(x: f32) -> f32 {
+    round_pair_slow(f64::from(x), false, super::direct::tan_pair::<false>)
 }
 

@@ -1,3 +1,5 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
+use crate::SyncCell;
 use crate::lock::RawMutex;
 use crate::nssmod::{self, Order, Source, ACT_CONTINUE, ACT_MERGE, ACT_RETURN, NSS_NOTFOUND, NSS_SUCCESS, NSS_TRYAGAIN, NSS_UNAVAIL};
 
@@ -5,10 +7,9 @@ const CONF_DBS: usize = 16;
 type Slot = ([u8; 12], u8, Order, bool);
 struct Overrides {
     lock: RawMutex,
-    e: core::cell::UnsafeCell<[Slot; CONF_DBS]>,
+    e: SyncCell<[Slot; CONF_DBS]>,
 }
-unsafe impl Sync for Overrides {}
-static OVERRIDES: Overrides = Overrides { lock: RawMutex::new(), e: core::cell::UnsafeCell::new([([0; 12], 0, Order::EMPTY, false); CONF_DBS]) };
+static OVERRIDES: Overrides = Overrides { lock: RawMutex::new(), e: SyncCell::new([([0; 12], 0, Order::EMPTY, false); CONF_DBS]) };
 
 pub fn configure(db: &[u8], spec: &[u8]) -> bool {
     let Some(o) = nssmod::parse_sources(spec) else { return false };
@@ -16,16 +17,19 @@ pub fn configure(db: &[u8], spec: &[u8]) -> bool {
         return false;
     }
     OVERRIDES.lock.lock_always();
-    let tab = unsafe { &mut *OVERRIDES.e.get() };
-    let idx = tab.iter().position(|c| c.3 && &c.0[..c.1 as usize] == db).or_else(|| tab.iter().position(|c| !c.3));
-    let ok = if let Some(i) = idx {
-        tab[i].0[..db.len()].copy_from_slice(db);
-        tab[i].1 = db.len() as u8;
-        tab[i].2 = o;
-        tab[i].3 = true;
-        true
-    } else {
-        false
+    let ok = unsafe {
+        OVERRIDES.e.with_unsync(|tab| {
+            let idx = tab.iter().position(|c| c.3 && &c.0[..c.1 as usize] == db).or_else(|| tab.iter().position(|c| !c.3));
+            if let Some(i) = idx {
+                tab[i].0[..db.len()].copy_from_slice(db);
+                tab[i].1 = db.len() as u8;
+                tab[i].2 = o;
+                tab[i].3 = true;
+                true
+            } else {
+                false
+            }
+        })
     };
     OVERRIDES.lock.unlock_always();
     ok
@@ -33,8 +37,7 @@ pub fn configure(db: &[u8], spec: &[u8]) -> bool {
 
 pub fn overridden(db: &[u8]) -> Option<Order> {
     OVERRIDES.lock.lock_always();
-    let tab = unsafe { &*OVERRIDES.e.get() };
-    let r = tab.iter().find(|c| c.3 && &c.0[..c.1 as usize] == db).map(|c| c.2);
+    let r = unsafe { OVERRIDES.e.with_unsync(|tab| tab.iter().find(|c| c.3 && &c.0[..c.1 as usize] == db).map(|c| c.2)) };
     OVERRIDES.lock.unlock_always();
     r
 }
@@ -62,8 +65,6 @@ pub struct EntState {
     stay_tmp: i32,
     pub lock: RawMutex,
 }
-
-unsafe impl Sync for EntState {}
 
 impl EntState {
     pub const fn new() -> EntState {

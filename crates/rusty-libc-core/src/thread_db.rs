@@ -1,3 +1,4 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use crate::tls::Tcb;
 use core::mem::{offset_of, size_of};
 
@@ -44,113 +45,111 @@ pub struct DbSlotList<const N: usize> {
 pub const LINK_MAP_TLS_MODID: usize = 504;
 pub const LINK_MAP_TLS_OFFSET: usize = 544;
 
-#[cfg_attr(not(feature = "start"), allow(dead_code))]
-struct Shared<T>(core::cell::UnsafeCell<T>);
-unsafe impl<T> Sync for Shared<T> {}
+use crate::SyncCell;
 
 #[cfg_attr(not(feature = "start"), allow(dead_code))]
-static DB_GLOBAL: Shared<DbGlobal> = Shared(core::cell::UnsafeCell::new(DbGlobal {
+static DB_GLOBAL: SyncCell<DbGlobal> = SyncCell::new(DbGlobal {
     stack_user: ListT { next: core::ptr::null_mut(), prev: core::ptr::null_mut() },
     stack_used: ListT { next: core::ptr::null_mut(), prev: core::ptr::null_mut() },
     slotinfo: 0,
-}));
+});
 
 fn global() -> *mut DbGlobal {
-    DB_GLOBAL.0.get()
+    DB_GLOBAL.as_ptr()
+}
+
+fn head_used() -> *mut ListT {
+    unsafe { &raw mut (*global()).stack_used }
+}
+
+fn head_user() -> *mut ListT {
+    unsafe { &raw mut (*global()).stack_user }
 }
 
 #[cfg(not(feature = "shared"))]
-static STATIC_SLOTS: Shared<DbSlotList<2>> = Shared(core::cell::UnsafeCell::new(DbSlotList { len: 2, next: 0, slots: [DbSlot { generation: 0, map: 0 }, DbSlot { generation: 1, map: 0 }] }));
+static STATIC_SLOTS: SyncCell<DbSlotList<2>> = SyncCell::new(DbSlotList { len: 2, next: 0, slots: [DbSlot { generation: 0, map: 0 }, DbSlot { generation: 1, map: 0 }] });
 #[cfg(not(feature = "shared"))]
-static STATIC_MAP: Shared<[usize; LINK_MAP_TLS_OFFSET / 8 + 1]> = Shared(core::cell::UnsafeCell::new([0; LINK_MAP_TLS_OFFSET / 8 + 1]));
+static STATIC_MAP: SyncCell<[usize; LINK_MAP_TLS_OFFSET / 8 + 1]> = SyncCell::new([0; LINK_MAP_TLS_OFFSET / 8 + 1]);
 
 #[cfg(not(feature = "shared"))]
 pub unsafe fn set_static_dtv(tp: *mut Tcb, block: usize) {
-    unsafe {
-        let d = &raw mut (*tp).db_dtv as *mut usize;
-        *d = 1;
-        *d.add(2) = 1;
-        *d.add(4) = block;
-        (*tp).dtv = d.add(2) as *mut u8;
-    }
+    let d = unsafe { &raw mut (*tp).db_dtv };
+    unsafe { (*d)[0] = 1 };
+    unsafe { (*d)[2] = 1 };
+    unsafe { (*d)[4] = block };
+    unsafe { (*tp).dtv = (d as *mut usize).wrapping_add(2) as *mut u8 };
 }
 
 unsafe fn list_init(h: *mut ListT) {
-    unsafe {
-        (*h).next = h;
-        (*h).prev = h;
-    }
+    unsafe { h.write(ListT { next: h, prev: h }) };
 }
 
 unsafe fn list_add(h: *mut ListT, n: *mut ListT) {
-    unsafe {
-        let last = (*h).prev;
-        (*n).next = h;
-        (*n).prev = last;
-        (*last).next = n;
-        (*h).prev = n;
-    }
+    let last = unsafe { (*h).prev };
+    unsafe { n.write(ListT { next: h, prev: last }) };
+    unsafe { (*last).next = n };
+    unsafe { (*h).prev = n };
 }
 
 unsafe fn list_del(n: *mut ListT) {
-    unsafe {
-        if (*n).next.is_null() {
-            return;
-        }
-        (*(*n).prev).next = (*n).next;
-        (*(*n).next).prev = (*n).prev;
-        (*n).next = core::ptr::null_mut();
-        (*n).prev = core::ptr::null_mut();
+    let ListT { next, prev } = unsafe { n.read() };
+    if next.is_null() {
+        return;
     }
+    unsafe { (*prev).next = next };
+    unsafe { (*next).prev = prev };
+    unsafe { n.write(ListT { next: core::ptr::null_mut(), prev: core::ptr::null_mut() }) };
 }
 
 pub unsafe fn init(main: *mut Tcb, slots: usize) {
-    unsafe {
-        let g = global();
-        #[cfg(not(feature = "shared"))]
-        let slots = {
-            let _ = slots;
-            let t = crate::tls::template();
-            let a = t.align.max(1);
-            (*STATIC_MAP.0.get())[LINK_MAP_TLS_MODID / 8] = 1;
-            (*STATIC_MAP.0.get())[LINK_MAP_TLS_OFFSET / 8] = (t.memsz + a - 1) & !(a - 1);
-            (*STATIC_SLOTS.0.get()).slots[1].map = STATIC_MAP.0.get() as usize;
-            STATIC_SLOTS.0.get() as usize
+    let g = global();
+    #[cfg(not(feature = "shared"))]
+    let slots = {
+        let _ = slots;
+        let t = crate::tls::template();
+        let a = t.align.max(1);
+        unsafe {
+            STATIC_MAP.with_unsync(|m| {
+                m[LINK_MAP_TLS_MODID / 8] = 1;
+                m[LINK_MAP_TLS_OFFSET / 8] = (t.memsz + a - 1) & !(a - 1);
+            })
         };
-        (*g).slotinfo = slots;
-        list_init(&raw mut (*g).stack_used);
-        list_init(&raw mut (*g).stack_user);
-        list_add(&raw mut (*g).stack_user, &raw mut (*main).db_list);
-        #[cfg(feature = "start")]
-        core::hint::black_box(&raw const __nptl_version);
-    }
+        unsafe { STATIC_SLOTS.with_unsync(|l| l.slots[1].map = STATIC_MAP.as_ptr() as usize) };
+        STATIC_SLOTS.as_ptr() as usize
+    };
+    unsafe { (*g).slotinfo = slots };
+    unsafe { list_init(head_used()) };
+    unsafe { list_init(head_user()) };
+    let node = unsafe { &raw mut (*main).db_list };
+    unsafe { list_add(head_user(), node) };
+    #[cfg(feature = "start")]
+    core::hint::black_box(&raw const __nptl_version);
 }
 
 pub unsafe fn add(t: *mut Tcb) {
-    unsafe {
-        let g = global();
-        if (*g).stack_used.next.is_null() {
-            return;
-        }
-        list_add(&raw mut (*g).stack_used, &raw mut (*t).db_list);
+    let g = global();
+    if unsafe { (*g).stack_used.next }.is_null() {
+        return;
     }
+    let node = unsafe { &raw mut (*t).db_list };
+    unsafe { list_add(head_used(), node) };
 }
 
 pub unsafe fn remove(t: *mut Tcb) {
-    unsafe { list_del(&raw mut (*t).db_list) }
+    let node = unsafe { &raw mut (*t).db_list };
+    unsafe { list_del(node) }
 }
 
 pub unsafe fn after_fork(me: *mut Tcb) {
-    unsafe {
-        let g = global();
-        if (*g).stack_used.next.is_null() {
-            return;
-        }
-        list_init(&raw mut (*g).stack_used);
-        list_init(&raw mut (*g).stack_user);
-        (*me).db_list = ListT { next: core::ptr::null_mut(), prev: core::ptr::null_mut() };
-        list_add(&raw mut (*g).stack_user, &raw mut (*me).db_list);
+    let g = global();
+    if unsafe { (*g).stack_used.next }.is_null() {
+        return;
     }
+    unsafe { list_init(head_used()) };
+    unsafe { list_init(head_user()) };
+    let node = unsafe { &raw mut (*me).db_list };
+    unsafe { node.write(ListT { next: core::ptr::null_mut(), prev: core::ptr::null_mut() }) };
+    unsafe { list_add(head_user(), node) };
 }
 
 #[cfg(feature = "start")]
@@ -227,7 +226,7 @@ core::arch::global_asm!(
     "__nptl_death_event: ret",
     ".size __nptl_death_event, . - __nptl_death_event",
     ".popsection",
-    sz_pthread = const size_of::<Tcb>(),
+    sz_pthread = const crate::tls::TCB_SIZE,
     o_list = const offset_of!(Tcb, db_list),
     o_report = const offset_of!(Tcb, db) + offset_of!(DbZero, report_events),
     o_tid = const offset_of!(Tcb, tid),

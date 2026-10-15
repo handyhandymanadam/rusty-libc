@@ -45,10 +45,10 @@ impl Args for SliceArgs<'_, '_> {
 }
 
 pub fn snprintf(buf: &mut [u8], format: &CStr, args: &[Arg]) -> c_int {
-    let mut sink = BufSink::new_snprintf(buf.as_mut_ptr(), buf.len());
+    let mut sink = unsafe { BufSink::new_snprintf(buf.as_mut_ptr(), buf.len()) };
     let mut a = SliceArgs { args, next: 0 };
     let n = unsafe { fmt::format(&mut sink, format.as_ptr() as *const u8, &mut a) };
-    unsafe { sink.finish() };
+    sink.finish();
     n
 }
 
@@ -72,10 +72,8 @@ impl PtrArgs for Slots<'_> {
 }
 
 pub unsafe fn sscanf(input: &CStr, format: &CStr, outs: &[*mut c_void]) -> c_int {
-    unsafe {
-        let mut src = StrSrc::new(input.as_ptr() as *const u8);
-        scan::scan(&mut src, format.as_ptr() as *const u8, &mut Slots(outs, 0), 0)
-    }
+    let mut src = unsafe { StrSrc::new(input.as_ptr() as *const u8) };
+    unsafe { scan::scan(&mut src, format.as_ptr() as *const u8, &mut Slots(outs, 0), 0) }
 }
 
 pub fn wformat_to<S: Sink>(sink: &mut S, format: &[u32], args: &[Arg]) -> c_int {
@@ -91,18 +89,16 @@ pub fn wsnprintf(buf: &mut [u32], format: &[u32], args: &[Arg]) -> c_int {
     if buf.is_empty() {
         return -1;
     }
-    let mut sink = crate::wprintf_api::WBufSink::new(buf.as_mut_ptr(), buf.len());
+    let mut sink = unsafe { crate::wprintf_api::WBufSink::new(buf.as_mut_ptr(), buf.len()) };
     let r = wformat_to(&mut sink, format, args);
-    unsafe { sink.terminate() };
+    sink.terminate();
     if r >= 0 && r as usize >= buf.len() { -1 } else { r }
 }
 
 pub unsafe fn wsscanf(input: &[u32], format: &[u32], outs: &[*mut c_void]) -> c_int {
-    unsafe {
-        if input.last() != Some(&0) || format.last() != Some(&0) {
-            return -1;
-        }
-        let mut src = crate::wscan_api::WStrSrc::new(input.as_ptr());
-        scan::scan(&mut src, format.as_ptr(), &mut Slots(outs, 0), 0)
+    if input.last() != Some(&0) || format.last() != Some(&0) {
+        return -1;
     }
+    let mut src = unsafe { crate::wscan_api::WStrSrc::new(input.as_ptr()) };
+    unsafe { scan::scan(&mut src, format.as_ptr(), &mut Slots(outs, 0), 0) }
 }

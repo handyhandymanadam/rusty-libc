@@ -212,43 +212,34 @@ fn tgammal_fast(x: F80) -> Option<F80> {
     }
 }
 
-pub unsafe fn lgamma_r_impl(x: F80, sign: *mut i32) -> F80 {
-    let set = |s: i32| {
-        if !sign.is_null() {
-            unsafe { *sign = s };
-        }
-    };
-    set(1);
+pub fn lgamma_r_impl(x: F80) -> (F80, i32) {
+    let sgn = |neg: bool| if neg { -1 } else { 1 };
     if let Some((r, neg)) = lgammal_fast(x) {
-        set(if neg { -1 } else { 1 });
-        return r;
+        return (r, sgn(neg));
     }
     if x.is_nan_() {
-        return nan1(x);
+        return (nan1(x), 1);
     }
     if is_inf(x) {
-        return inf(false);
+        return (inf(false), 1);
     }
     if x.is_zero_() {
-        set(if is_neg(x) { -1 } else { 1 });
-        return pole(false);
+        return (pole(false), sgn(is_neg(x)));
     }
     let e = Ext::from_f80(x);
     if is_neg_int(&e) {
-        return pole(false);
+        return (pole(false), 1);
     }
     if !e.neg && (e.cmp_abs(&Ext::ONE) == Ordering::Equal || e.cmp_abs(&Ext::from_u64(2)) == Ordering::Equal) {
-        return zero(false);
+        return (zero(false), 1);
     }
     let (l, neg) = lgamma_ext(e);
-    set(if neg { -1 } else { 1 });
-    fin(&l, Exact::Never)
+    (fin(&l, Exact::Never), sgn(neg))
 }
 
 pub fn lgammal_impl(x: F80) -> F80 {
-    let mut s = 1i32;
-    let r = unsafe { lgamma_r_impl(x, &mut s) };
-    unsafe { core::ptr::write_volatile(&raw mut crate::special::__signgam, s) };
+    let (r, s) = lgamma_r_impl(x);
+    crate::special::__signgam.store(s, core::sync::atomic::Ordering::Relaxed);
     r
 }
 
@@ -593,14 +584,15 @@ ld_unary_fast!(erfl, super::erfl_impl, crate::longdouble::fast_special::erfl);
 ld_unary_fast!(erfcl, super::erfcl_impl, crate::longdouble::fast_special::erfcl);
 ld_unary!(lgammal, super::lgammal_impl);
 ld_unary!(gammal, super::lgammal_impl);
-pub unsafe fn lgammal_r_entry(x: F80, sign: *mut i32) -> F80 {
-    let r = unsafe { lgamma_r_impl(x, sign) };
+pub fn lgammal_r_entry(x: F80, sign: &mut Option<i32>) -> F80 {
+    let (r, s) = lgamma_r_impl(x);
     if crate::SVID && is_inf(r) && !is_inf(x) && !x.is_nan_() && rusty_libc_core::x87::lt(F80::from_f64(f64::MAX), super::common::abs(x)) {
         crate::fenv::raise_exceptions(crate::fenv::FE_OVERFLOW as u32);
     }
+    *sign = Some(s);
     r
 }
-ld_ptr!(lgammal_r, super::lgammal_r_entry, i32);
+ld_ptr!(lgammal_r, super::lgammal_r_entry, i32, null_ok);
 ld_unary!(tgammal, super::tgammal_impl);
 ld_unary_fast!(j0l, super::j0l_impl, crate::longdouble::fast_special::j0l);
 ld_unary_fast!(j1l, super::j1l_impl, crate::longdouble::fast_special::j1l);

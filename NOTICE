@@ -22,7 +22,8 @@ Copied verbatim (the upstream file notice is kept at the top of each file):
 
 Derived (structure, algorithms, message strings, tables or ABI layouts
 follow glibc sources, rewritten in Rust; the upstream licence applies):
-  tools/hdrgen/src/hdr    bits_rlibc_cdefs.rs (from misc/sys/cdefs.h), bits_rlibc_features.rs and features.rs (from include/features.h),
+  tools/hdrgen/src/hdr    bits_rlibc_cdefs.rs (from misc/sys/cdefs.h, including its _FORTIFY_SOURCE clang forms), tgmath.rs (from math/tgmath.h),
+                          bits_rlibc_features.rs and features.rs (from include/features.h),
                           pthread.rs (C++ cleanup class), bits_types___locale_t.rs (struct __locale_struct): C text derived from glibc headers
   tools/hdrgen/src/hdr_cb ctype.rs (_ISbit and the _IS* enum, from ctype.h)
   crates/rusty-libc-stdlib   rand.rs (random table, 48-bit generator constants), sort.rs
@@ -401,3 +402,12 @@ see tools/hdrgen/Cargo.lock for the complete list and versions:
 Their transitive dependencies are licensed MIT and/or Apache-2.0 (some also
 Unlicense or Apache-2.0 WITH LLVM-exception; unicode-ident adds Unicode-3.0),
 as stated in each crate's own metadata.
+
+crates/rusty-libc-rs (the safe Rust API) depends on crates from crates.io, built
+from the registry; no third-party source is copied into this repository (see
+Cargo.lock for versions):
+  rustix 1.1.5          Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+  linux-raw-sys 0.12.1  Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+  bitflags 2.13.2       MIT OR Apache-2.0
+rusty-libc-rs-core and the crates that make up the C library have no
+dependencies.

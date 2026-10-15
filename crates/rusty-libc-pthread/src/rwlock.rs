@@ -80,8 +80,8 @@ fn is_timeout(e: c_int) -> bool {
     e == ETIMEDOUT || e == EOVERFLOW
 }
 
-fn rdlock_full(l: &RwLock, clock: c_int, abs: *const Timespec) -> c_int {
-    if !abs.is_null() && ((clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC) || !valid_nsec(unsafe { &*abs })) {
+pub fn rdlock_full(l: &RwLock, clock: c_int, abs: Option<&Timespec>) -> c_int {
+    if abs.is_some_and(|a| (clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC) || !valid_nsec(a)) {
         return EINVAL;
     }
     if l.cur_writer.load(Ordering::Relaxed) == tid() {
@@ -201,8 +201,8 @@ fn wrunlock(l: &RwLock) {
     }
 }
 
-fn wrlock_full(l: &RwLock, clock: c_int, abs: *const Timespec) -> c_int {
-    if !abs.is_null() && ((clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC) || !valid_nsec(unsafe { &*abs })) {
+pub fn wrlock_full(l: &RwLock, clock: c_int, abs: Option<&Timespec>) -> c_int {
+    if abs.is_some_and(|a| (clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC) || !valid_nsec(a)) {
         return EINVAL;
     }
     if l.cur_writer.load(Ordering::Relaxed) == tid() {
@@ -356,55 +356,27 @@ fn wrlock_full(l: &RwLock, clock: c_int, abs: *const Timespec) -> c_int {
     0
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_rwlock_init(l: *mut RwLock, attr: *const RwLockAttr) -> c_int {
-    unsafe {
-        core::ptr::write_bytes(l as *mut u8, 0, core::mem::size_of::<RwLock>());
-        let (kind, pshared) = if attr.is_null() { (0, 0) } else { ((*attr).lockkind, (*attr).pshared) };
-        (*l).flags = kind as u32;
-        (*l).shared = (pshared != 0) as u32;
-        0
+impl RwLock {
+    pub const fn with_kind(flags: u32, shared: bool) -> RwLock {
+        RwLock {
+            readers: AtomicU32::new(0),
+            writers: AtomicU32::new(0),
+            wrphase_futex: AtomicU32::new(0),
+            writers_futex: AtomicU32::new(0),
+            pad3: 0,
+            pad4: 0,
+            cur_writer: AtomicU32::new(0),
+            shared: shared as u32,
+            pad1: 0,
+            pad2: 0,
+            flags,
+            pad5: 0,
+        }
     }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_rwlock_destroy(_l: *mut RwLock) -> c_int {
-    0
-}
-
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_rwlock_rdlock(l: *mut RwLock) -> c_int {
-    rdlock_full(unsafe { &*l }, 0, core::ptr::null())
-}
-
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_rwlock_timedrdlock(l: *mut RwLock, abs: *const Timespec) -> c_int {
-    rdlock_full(unsafe { &*l }, CLOCK_REALTIME, abs)
-}
-
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_rwlock_clockrdlock(l: *mut RwLock, clock: c_int, abs: *const Timespec) -> c_int {
-    rdlock_full(unsafe { &*l }, clock, abs)
-}
-
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_rwlock_wrlock(l: *mut RwLock) -> c_int {
-    wrlock_full(unsafe { &*l }, 0, core::ptr::null())
-}
-
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_rwlock_timedwrlock(l: *mut RwLock, abs: *const Timespec) -> c_int {
-    wrlock_full(unsafe { &*l }, CLOCK_REALTIME, abs)
-}
-
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_rwlock_clockwrlock(l: *mut RwLock, clock: c_int, abs: *const Timespec) -> c_int {
-    wrlock_full(unsafe { &*l }, clock, abs)
-}
-
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_rwlock_tryrdlock(l: *mut RwLock) -> c_int {
-    let l = unsafe { &*l };
+#[inline(always)]
+pub fn tryrdlock(l: &RwLock) -> c_int {
     let mut r = l.readers.load(Ordering::Relaxed);
     let mut rnew;
     loop {
@@ -433,9 +405,8 @@ pub unsafe extern "C" fn pthread_rwlock_tryrdlock(l: *mut RwLock) -> c_int {
     0
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_rwlock_trywrlock(l: *mut RwLock) -> c_int {
-    let l = unsafe { &*l };
+#[inline(always)]
+pub fn trywrlock(l: &RwLock) -> c_int {
     let mut r = l.readers.load(Ordering::Relaxed);
     let prefer_writer = l.flags != PTHREAD_RWLOCK_PREFER_READER_NP;
     while r & WRLOCKED == 0 && (r >> READER_SHIFT == 0 || (prefer_writer && r & WRPHASE != 0)) {
@@ -454,9 +425,8 @@ pub unsafe extern "C" fn pthread_rwlock_trywrlock(l: *mut RwLock) -> c_int {
     EBUSY
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_rwlock_unlock(l: *mut RwLock) -> c_int {
-    let l = unsafe { &*l };
+#[inline(always)]
+pub fn unlock(l: &RwLock) -> c_int {
     if l.cur_writer.load(Ordering::Relaxed) == tid() {
         wrunlock(l);
     } else {
@@ -465,13 +435,116 @@ pub unsafe extern "C" fn pthread_rwlock_unlock(l: *mut RwLock) -> c_int {
     0
 }
 
+macro_rules! lock_ref {
+    ($p:expr) => {{
+        unsafe { arg($p as *const RwLock) }
+    }};
+}
+
+macro_rules! timeout {
+    ($p:expr) => {{
+        unsafe { $p.as_ref() }
+    }};
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_rwlockattr_init(a: *mut RwLockAttr) -> c_int {
-    unsafe {
-        (*a).lockkind = 0;
-        (*a).pshared = 0;
+pub unsafe extern "C" fn pthread_rwlock_init(l: *mut RwLock, attr: *const RwLockAttr) -> c_int {
+    let (kind, pshared) = match unsafe { attr.as_ref() } {
+        None => (0, 0),
+        Some(a) => (a.lockkind, a.pshared),
+    };
+    unsafe { core::ptr::write(l, RwLock::with_kind(kind as u32, pshared != 0)) };
+    0
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_rwlock_destroy(_l: *mut RwLock) -> c_int {
+    0
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_rwlock_rdlock(l: *mut RwLock) -> c_int {
+    rdlock_full(lock_ref!(l), 0, None)
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_rwlock_timedrdlock(l: *mut RwLock, abs: *const Timespec) -> c_int {
+    rdlock_full(lock_ref!(l), CLOCK_REALTIME, timeout!(abs))
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_rwlock_clockrdlock(l: *mut RwLock, clock: c_int, abs: *const Timespec) -> c_int {
+    rdlock_full(lock_ref!(l), clock, timeout!(abs))
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_rwlock_wrlock(l: *mut RwLock) -> c_int {
+    wrlock_full(lock_ref!(l), 0, None)
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_rwlock_timedwrlock(l: *mut RwLock, abs: *const Timespec) -> c_int {
+    wrlock_full(lock_ref!(l), CLOCK_REALTIME, timeout!(abs))
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_rwlock_clockwrlock(l: *mut RwLock, clock: c_int, abs: *const Timespec) -> c_int {
+    wrlock_full(lock_ref!(l), clock, timeout!(abs))
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_rwlock_tryrdlock(l: *mut RwLock) -> c_int {
+    tryrdlock(lock_ref!(l))
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_rwlock_trywrlock(l: *mut RwLock) -> c_int {
+    trywrlock(lock_ref!(l))
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_rwlock_unlock(l: *mut RwLock) -> c_int {
+    unlock(lock_ref!(l))
+}
+
+impl RwLockAttr {
+    pub fn set_pshared(&mut self, p: c_int) -> c_int {
+        if p != 0 && p != 1 {
+            return EINVAL;
+        }
+        self.pshared = p;
         0
     }
+
+    pub fn set_kind(&mut self, k: c_int) -> c_int {
+        if k as u32 > PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP {
+            return EINVAL;
+        }
+        self.lockkind = k;
+        0
+    }
+}
+
+macro_rules! attr_mut {
+    ($p:expr) => {{
+        unsafe { arg_mut($p) }
+    }};
+}
+macro_rules! attr_ref {
+    ($p:expr) => {{
+        unsafe { arg($p) }
+    }};
+}
+macro_rules! out {
+    ($p:expr) => {{
+        unsafe { arg_mut($p) }
+    }};
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_rwlockattr_init(a: *mut RwLockAttr) -> c_int {
+    unsafe { core::ptr::write(a, RwLockAttr { lockkind: 0, pshared: 0 }) };
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -481,39 +554,23 @@ pub unsafe extern "C" fn pthread_rwlockattr_destroy(_a: *mut RwLockAttr) -> c_in
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_rwlockattr_getpshared(a: *const RwLockAttr, p: *mut c_int) -> c_int {
-    unsafe {
-        *p = (*a).pshared;
-        0
-    }
+    *out!(p) = attr_ref!(a).pshared;
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_rwlockattr_setpshared(a: *mut RwLockAttr, p: c_int) -> c_int {
-    unsafe {
-        if p != 0 && p != 1 {
-            return EINVAL;
-        }
-        (*a).pshared = p;
-        0
-    }
+    attr_mut!(a).set_pshared(p)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_rwlockattr_getkind_np(a: *const RwLockAttr, k: *mut c_int) -> c_int {
-    unsafe {
-        *k = (*a).lockkind;
-        0
-    }
+    *out!(k) = attr_ref!(a).lockkind;
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_rwlockattr_setkind_np(a: *mut RwLockAttr, k: c_int) -> c_int {
-    unsafe {
-        if k as u32 > PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP {
-            return EINVAL;
-        }
-        (*a).lockkind = k;
-        0
-    }
+    attr_mut!(a).set_kind(k)
 }
 

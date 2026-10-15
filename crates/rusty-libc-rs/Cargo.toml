@@ -1,0 +1,13 @@
+[package]
+name = "rusty-libc-rs"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+rust-version = "1.88"
+keywords = ["libc", "linux", "posix", "syscall", "safe"]
+categories = ["os::linux-apis", "api-bindings"]
+description = "Safe Rust API (std, stable Rust) for Rust ports on rusty-libc: rustix's system-call API re-exported plus spawn, signal dispositions, waitid with pid/uid, confstr"
+
+[dependencies]
+rusty-libc-rs-core = { path = "../rusty-libc-rs-core", version = "0.1.0", features = ["std", "libc-services"] }
+rustix = { version = "1.1.5", default-features = false, features = ["std", "event", "fs", "mm", "net", "param", "pipe", "process", "pty", "rand", "stdio", "system", "termios", "thread", "time"] }

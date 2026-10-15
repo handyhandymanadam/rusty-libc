@@ -1,6 +1,6 @@
 #![cfg(feature = "unwind")]
 use crate::cancel::{UnwindBuf, UnwindException, rl_unwind_longjmp};
-use crate::thread::current_thread;
+use crate::thread::{current_thread, field_of};
 use core::ffi::{c_int, c_void};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rusty_libc_core::cleanup;
@@ -34,18 +34,19 @@ fn find() -> (usize, usize) {
         fn dlopen(file: *const core::ffi::c_char, mode: c_int) -> *mut c_void;
         fn dlsym(handle: *mut c_void, name: *const core::ffi::c_char) -> *mut c_void;
     }
-    unsafe {
-        let mut f = dlsym(core::ptr::null_mut(), c"_Unwind_ForcedUnwind".as_ptr()) as usize;
-        let mut c = dlsym(core::ptr::null_mut(), c"_Unwind_GetCFA".as_ptr()) as usize;
-        if f == 0 || c == 0 {
-            let h = dlopen(c"libgcc_s.so.1".as_ptr(), 2);
-            if !h.is_null() {
-                f = dlsym(h, c"_Unwind_ForcedUnwind".as_ptr()) as usize;
-                c = dlsym(h, c"_Unwind_GetCFA".as_ptr()) as usize;
-            }
+    let sym = |h: *mut c_void, name: &core::ffi::CStr| {
+        unsafe { dlsym(h, name.as_ptr()) as usize }
+    };
+    let mut f = sym(core::ptr::null_mut(), c"_Unwind_ForcedUnwind");
+    let mut c = sym(core::ptr::null_mut(), c"_Unwind_GetCFA");
+    if f == 0 || c == 0 {
+        let h = unsafe { dlopen(c"libgcc_s.so.1".as_ptr(), 2) };
+        if !h.is_null() {
+            f = sym(h, c"_Unwind_ForcedUnwind");
+            c = sym(h, c"_Unwind_GetCFA");
         }
-        if f == 0 || c == 0 { (0, 0) } else { (f, c) }
     }
+    if f == 0 || c == 0 { (0, 0) } else { (f, c) }
 }
 
 pub(crate) fn resolve() -> Option<(ForcedUnwind, GetCfa)> {
@@ -68,7 +69,9 @@ pub(crate) fn resolve() -> Option<(ForcedUnwind, GetCfa)> {
     if f == 0 || c == 0 {
         return None;
     }
-    Some(unsafe { (core::mem::transmute::<usize, ForcedUnwind>(f), core::mem::transmute::<usize, GetCfa>(c)) })
+    let forced = unsafe { core::mem::transmute::<usize, ForcedUnwind>(f) };
+    let cfa = unsafe { core::mem::transmute::<usize, GetCfa>(c) };
+    Some((forced, cfa))
 }
 
 unsafe extern "C" fn exception_cleanup(_reason: c_int, _exc: *mut UnwindException) {
@@ -78,52 +81,45 @@ unsafe extern "C" fn exception_cleanup(_reason: c_int, _exc: *mut UnwindExceptio
 }
 
 unsafe fn buf_rsp(b: *const UnwindBuf) -> usize {
-    unsafe {
-        let guard: usize;
-        core::arch::asm!("mov {0}, qword ptr fs:[0x30]", out(reg) guard, options(nostack, preserves_flags, readonly));
-        ((*b).jmp[6] as usize).rotate_right(0x11) ^ guard
-    }
+    let guard: usize;
+    unsafe { core::arch::asm!("mov {0}, qword ptr fs:[0x30]", out(reg) guard, options(nostack, preserves_flags, readonly)) };
+    let saved = unsafe { (*b).jmp[6] };
+    (saved as usize).rotate_right(0x11) ^ guard
 }
 
 unsafe extern "C" fn stop(_version: c_int, actions: c_int, _class: u64, _exc: *mut UnwindException, context: *mut c_void, _arg: *mut c_void) -> c_int {
-    unsafe {
-        let t = current_thread();
-        let get_cfa: GetCfa = core::mem::transmute::<usize, GetCfa>(CFA.load(Ordering::Acquire));
-        let end = actions & UA_END_OF_STACK != 0;
-        let cfa = if end { usize::MAX } else { get_cfa(context) };
-        let top = (*t).unwind;
-        let reached = !top.is_null() && (end || cfa >= buf_rsp(top));
-        let stop_at = if reached { (*top).cleanup } else { core::ptr::null_mut() };
-        loop {
-            let b = cleanup::head();
-            if b.is_null() || b == stop_at || !(end || reached || b as usize <= cfa) {
-                break;
-            }
-            cleanup::set_head((*b).prev);
-            ((*b).routine)((*b).arg);
+    let t = current_thread();
+    let get_cfa: GetCfa = unsafe { core::mem::transmute::<usize, GetCfa>(CFA.load(Ordering::Acquire)) };
+    let end = actions & UA_END_OF_STACK != 0;
+    let cfa = if end { usize::MAX } else { unsafe { get_cfa(context) } };
+    let unwind = field_of!(t, unwind: *mut UnwindBuf);
+    let top = unsafe { *unwind };
+    let reached = !top.is_null() && (end || cfa >= unsafe { buf_rsp(top) });
+    let stop_at = if reached { unsafe { (*top).cleanup } } else { core::ptr::null_mut() };
+    loop {
+        let b = cleanup::head();
+        if b.is_null() || b == stop_at || !(end || reached || b as usize <= cfa) {
+            break;
         }
-        if reached {
-            (*t).unwind = (*top).prev;
-            rl_unwind_longjmp(top, 1);
-        }
-        if end {
-            crate::thread::thread_exit((*t).exit_value);
-        }
-        URC_NO_REASON
+        unsafe { crate::cancel::run_cleanup(b) };
     }
+    if reached {
+        let prev = unsafe { (*top).prev };
+        unsafe { *unwind = prev };
+        unsafe { rl_unwind_longjmp(top, 1) };
+    }
+    if end {
+        crate::thread::thread_exit(unsafe { *field_of!(t, exit_value: *mut c_void) });
+    }
+    URC_NO_REASON
 }
 
 pub(crate) unsafe fn forced_unwind() {
-    unsafe {
-        let Some((forced, _)) = resolve() else { return };
-        let t = current_thread();
-        let exc = &raw mut (*t).exc;
-        (*exc).exception_class = 0;
-        (*exc).exception_cleanup = Some(exception_cleanup);
-        forced(exc, stop, core::ptr::null_mut());
-    }
-}
-
-pub(crate) fn available() -> bool {
-    resolve().is_some()
+    let Some((forced, _)) = resolve() else { return };
+    let t = current_thread();
+    let exc = field_of!(t, exc: UnwindException);
+    let e = unsafe { &mut *exc };
+    e.exception_class = 0;
+    e.exception_cleanup = Some(exception_cleanup);
+    unsafe { forced(exc, stop, core::ptr::null_mut()) };
 }

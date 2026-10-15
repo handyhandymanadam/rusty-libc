@@ -2,27 +2,8 @@ use super::dd::{fma, sqrt};
 use super::fast::SHIFT;
 use super::fast_tables::*;
 use crate::exp::dexp::exp_impl;
-use super::tables::LN2;
 
 const SIGN: u64 = 0x8000_0000_0000_0000;
-
-#[inline(always)]
-fn log_plain<const F: bool>(zh: f64) -> f64 {
-    let bits = zh.to_bits();
-    let tmp = bits.wrapping_sub(0x3fe6_a09e_667f_3bcd);
-    let k = (tmp as i64) >> 52;
-    let m = f64::from_bits(bits.wrapping_sub((k as u64) << 52));
-    let t = (m - 1.0) * 128.0 + SHIFT;
-    let j = (t.to_bits() as i64).wrapping_sub(SHIFT.to_bits() as i64);
-    let [invc, lh, _] = LOG128[(j + 37) as usize];
-    let r = fma::<F>(m, invc, -1.0);
-    let r2 = r * r;
-    let p01 = fma::<F>(r, 1.0 / 3.0, -0.5);
-    let p23 = fma::<F>(r, 1.0 / 5.0, -0.25);
-    let p4 = -1.0 / 6.0;
-    let q = fma::<F>(r2 * r2, p4, fma::<F>(r2, p23, p01));
-    fma::<F>(k as f64, LN2.0, lh) + fma::<F>(r2, q, r)
-}
 
 #[inline(always)]
 fn est6<const F: bool>(z: f64, c: [f64; 6]) -> f64 {
@@ -64,6 +45,9 @@ pub fn sinhf<const F: bool>(x: f32) -> f32 {
     let s = xd.to_bits() & SIGN;
     let ax = f64::from_bits(xd.to_bits() & !SIGN);
     if ax < 0.5 {
+        if super::super::exp::common::unlikely(x.to_bits() & 0x7fff_ffff == 0x3a12_85ff) {
+            return sinhf_hard(x);
+        }
         let z = ax * ax;
         return (xd + xd * z * est6::<F>(z, [1.0 / 6.0, 1.0 / 120.0, 1.0 / 5040.0, 1.0 / 362880.0, 1.0 / 39916800.0, 1.0 / 6227020800.0]))
             as f32;
@@ -71,6 +55,12 @@ pub fn sinhf<const F: bool>(x: f32) -> f32 {
     let e = exp_impl::<F>(ax);
     let r = 0.5 * (e - 1.0 / e);
     with_sign(r, s)
+}
+
+#[cold]
+#[inline(never)]
+fn sinhf_hard(x: f32) -> f32 {
+    core::hint::black_box(x) + core::hint::black_box(f32::from_bits(0x2180_0000 | (x.to_bits() & 0x8000_0000)))
 }
 
 #[inline(always)]
@@ -86,81 +76,97 @@ pub fn coshf<const F: bool>(x: f32) -> f32 {
     r as f32
 }
 
-#[inline(always)]
-pub fn tanhf<const F: bool>(x: f32) -> f32 {
+#[cold]
+#[inline(never)]
+pub fn tanhf_slow(x: f32) -> f32 {
     let xd = f64::from(x);
-    let s = xd.to_bits() & SIGN;
-    let ax = f64::from_bits(xd.to_bits() & !SIGN);
-    if ax < 0.25 {
+    let ax = xd.abs_();
+    if ax >= 9.02 {
+        let t = core::hint::black_box(f32::from_bits(0x2180_0000));
+        return if x > 0.0 { core::hint::black_box(1.0f32) - t } else { core::hint::black_box(-1.0f32) + t };
+    }
+    if ax < SMALL_DIRECTED {
         let z = ax * ax;
         let c = &TANH_C;
-        return (xd + xd * z * est7::<F>(z, [c[0], c[1], c[2], c[3], c[4], c[5], c[6]])) as f32;
+        return (xd + xd * z * est7::<false>(z, [c[0], c[1], c[2], c[3], c[4], c[5], c[6]])) as f32;
     }
-    let r = 1.0 - 2.0 / (exp_impl::<F>(2.0 * ax) + 1.0);
-    with_sign(r, s)
+    crate::exp::ffast::round_pair_slow(ax, x < 0.0, super::hyp::tanh_parts::<false>)
 }
 
 #[inline(always)]
 pub fn asinhf<const F: bool>(x: f32) -> f32 {
     let xd = f64::from(x);
-    let s = xd.to_bits() & SIGN;
-    let ax = f64::from_bits(xd.to_bits() & !SIGN);
-    if ax < SMALL_DIRECTED && !super::dd::is_nearest() {
-        let u = ax * ax;
-        return (xd + xd * u * (-1.0 / 6.0 + 3.0 / 40.0 * u)) as f32;
+    let ax = xd.abs_();
+    if ax < 0.5 {
+        if ax < SMALL_DIRECTED {
+            if !super::dd::is_nearest() {
+                let u = ax * ax;
+                return (xd + xd * u * (-1.0 / 6.0 + 3.0 / 40.0 * u)) as f32;
+            }
+            return asinhf_small_raw::<F>(x) as f32;
+        }
+        if let Some(r) = crate::exp::ffast::round_cr_x(asinhf_small_raw::<F>(x), ASINHF_SMALL_MARGIN) {
+            return r;
+        }
     }
-    let r = if ax < 0.5 {
-        let u = ax * ax;
-        let kd = u * 128.0 + SHIFT;
-        let j = (kd.to_bits() & 63) as usize;
-        let c = (kd - SHIFT) * (1.0 / 128.0);
-        ax * row_plain::<F>(&ASINH_ROWS[j.min(32)], u - c)
-    } else if ax >= 64.0 {
-        let w = 1.0 / (ax * ax);
-        log_plain::<F>(2.0 * ax) + w * fma::<F>(w, fma::<F>(w, 15.0 / 288.0, -3.0 / 32.0), 0.25)
-    } else {
-        log_plain::<F>(ax + sqrt(fma::<F>(ax, ax, 1.0)))
-    };
-    with_sign(r, s)
+    asinhf_slow(x)
+}
+
+pub(crate) const ASINHF_SMALL_MARGIN: u64 = 1 << 8;
+
+#[inline(always)]
+pub(crate) fn asinhf_small_raw<const F: bool>(x: f32) -> f64 {
+    let xd = f64::from(x);
+    let u = xd * xd;
+    let kd = u * 128.0 + SHIFT;
+    let j = (kd.to_bits() & 63) as usize;
+    let c = (kd - SHIFT) * (1.0 / 128.0);
+    xd * row_plain::<F>(&ASINH_ROWS[j.min(32)], u - c)
+}
+
+#[cold]
+#[inline(never)]
+fn asinhf_slow(x: f32) -> f32 {
+    crate::exp::ffast::round_pair_slow(f64::from(x).abs_(), x < 0.0, super::lg::asinh_pos::<false>)
 }
 
 #[inline(always)]
 pub fn acoshf<const F: bool>(x: f32) -> f32 {
-    let xd = f64::from(x);
-    let r = if xd < 2.0 {
-        let t = xd - 1.0;
-        let kd = t * 128.0 + SHIFT;
-        let j = (kd.to_bits() & 255) as usize;
-        let c = (kd - SHIFT) * (1.0 / 128.0);
-        sqrt(2.0 * t) * row_plain::<F>(&ACOSHQ_ROWS[j.min(128)], t - c)
-    } else if xd >= 64.0 {
-        let w = 1.0 / (xd * xd);
-        log_plain::<F>(2.0 * xd) - w * fma::<F>(w, fma::<F>(w, 15.0 / 288.0, 3.0 / 32.0), 0.25)
-    } else {
-        log_plain::<F>(xd + sqrt((xd - 1.0) * (xd + 1.0)))
-    };
-    r as f32
+    if x < 2.0
+        && let Some(r) = crate::exp::ffast::round_cr_x(acoshf_small_raw::<F>(x), ACOSHF_SMALL_MARGIN)
+    {
+        return r;
+    }
+    acoshf_slow(x)
 }
 
+pub(crate) const ACOSHF_SMALL_MARGIN: u64 = 1 << 6;
+
 #[inline(always)]
-pub fn atanhf<const F: bool>(x: f32) -> f32 {
+pub(crate) fn acoshf_small_raw<const F: bool>(x: f32) -> f64 {
+    let t = f64::from(x) - 1.0;
+    let kd = t * 128.0 + SHIFT;
+    let j = (kd.to_bits() & 255) as usize;
+    let c = (kd - SHIFT) * (1.0 / 128.0);
+    sqrt(2.0 * t) * row_plain::<F>(&ACOSHQ_ROWS[j.min(128)], t - c)
+}
+
+#[cold]
+#[inline(never)]
+fn acoshf_slow(x: f32) -> f32 {
+    crate::exp::ffast::round_pair_slow(f64::from(x), false, super::lg::acosh_pos::<false>)
+}
+
+#[cold]
+#[inline(never)]
+pub fn atanhf_slow(x: f32) -> f32 {
     let xd = f64::from(x);
-    let s = xd.to_bits() & SIGN;
-    let ax = f64::from_bits(xd.to_bits() & !SIGN);
-    if ax < SMALL_DIRECTED && !super::dd::is_nearest() {
+    let ax = xd.abs_();
+    if ax < SMALL_DIRECTED {
         let u = ax * ax;
         return (xd + xd * u * (1.0 / 3.0 + 1.0 / 5.0 * u)) as f32;
     }
-    let r = if ax < 0.5 {
-        let u = ax * ax;
-        let kd = u * 128.0 + SHIFT;
-        let j = (kd.to_bits() & 63) as usize;
-        let c = (kd - SHIFT) * (1.0 / 128.0);
-        ax * row_plain::<F>(&ATANH_ROWS[j.min(32)], u - c)
-    } else {
-        0.5 * log_plain::<F>((1.0 + ax) / (1.0 - ax))
-    };
-    with_sign(r, s)
+    crate::exp::ffast::round_pair_slow(ax, x < 0.0, super::lg::atanh_pos::<false>)
 }
 
 trait AbsBits {

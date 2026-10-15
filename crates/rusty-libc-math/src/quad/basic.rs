@@ -341,7 +341,7 @@ pub fn frexp(x: F128, e: &mut i32) -> F128 {
 pub unsafe extern "C" fn frexpf128(x: f128, e: *mut i32) -> f128 {
     let mut ev = 0;
     let r = frexp(F128(x.to_bits()), &mut ev);
-    unsafe { *e = ev };
+    unsafe { e.write(ev) };
     r.to_f128()
 }
 
@@ -370,7 +370,7 @@ pub fn modf(x: F128, ip: &mut F128) -> F128 {
 pub unsafe extern "C" fn modff128(x: f128, ip: *mut f128) -> f128 {
     let mut i = F128::ZERO;
     let r = modf(F128(x.to_bits()), &mut i);
-    unsafe { *ip = i.to_f128() };
+    unsafe { ip.write(i.to_f128()) };
     r.to_f128()
 }
 
@@ -676,22 +676,19 @@ pub fn fmod(x: F128, y: F128) -> F128 {
     from_scaled(r, ey).with_sign(x.is_neg())
 }
 
-pub fn remquo(x: F128, y: F128, quo: Option<&mut i32>) -> F128 {
+pub fn remquo(x: F128, y: F128) -> (F128, Option<i32>) {
     if x.is_nan() || y.is_nan() {
         if x.is_snan() || y.is_snan() {
             raise(FE_INVALID);
         }
         let pick = if x.is_nan() && y.is_nan() { if y.frac() > x.frac() { y } else { x } } else if x.is_nan() { x } else { y };
-        return pick.quieted();
+        return (pick.quieted(), None);
     }
     if x.is_inf() || y.is_zero() {
-        return invalid();
+        return (invalid(), None);
     }
     if y.is_inf() || x.is_zero() {
-        if let Some(q) = quo {
-            *q = 0;
-        }
-        return x;
+        return (x, Some(0));
     }
     let sxy = x.is_neg() != y.is_neg();
     let (ex, mx) = normalized(x.abs());
@@ -713,15 +710,13 @@ pub fn remquo(x: F128, y: F128, quo: Option<&mut i32>) -> F128 {
             (from_scaled(r, ey), false, q)
         }
     };
-    if let Some(qo) = quo {
-        let m = ((q & 7) + flip as u32) as i32;
-        *qo = if sxy { -m } else { m };
-    }
-    if mag.is_zero() { F128::zero(x.is_neg()) } else { mag.with_sign(x.is_neg() != flip) }
+    let m = ((q & 7) + flip as u32) as i32;
+    let qo = if sxy { -m } else { m };
+    (if mag.is_zero() { F128::zero(x.is_neg()) } else { mag.with_sign(x.is_neg() != flip) }, Some(qo))
 }
 
 pub fn remainder(x: F128, y: F128) -> F128 {
-    let r = remquo(x, y, None);
+    let (r, _) = remquo(x, y);
     if r.is_nan() && !x.is_nan() && !y.is_nan() {
         set_errno(EDOM);
     }
@@ -733,7 +728,11 @@ q_bin!(remainderf128, remainder);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn remquof128(x: f128, y: f128, quo: *mut i32) -> f128 {
-    remquo(F128(x.to_bits()), F128(y.to_bits()), Some(unsafe { &mut *quo })).to_f128()
+    let (r, q) = remquo(F128(x.to_bits()), F128(y.to_bits()));
+    if let Some(q) = q {
+        unsafe { quo.write(q) };
+    }
+    r.to_f128()
 }
 
 pub fn hypot(x: F128, y: F128) -> F128 {
@@ -794,23 +793,18 @@ fn nan_payload(tag: &[u8]) -> u128 {
     v as u128
 }
 
-pub unsafe fn nan_(tag: *const core::ffi::c_char) -> F128 {
-    let mut n = 0;
-    while unsafe { *tag.add(n) } != 0 {
-        n += 1;
-    }
-    let t = unsafe { core::slice::from_raw_parts(tag.cast::<u8>(), n) };
+pub fn nan_(t: &[u8]) -> F128 {
     F128(EXPM | QUIET | (nan_payload(t) & (QUIET - 1)))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn nanf128(tag: *const core::ffi::c_char) -> f128 {
-    unsafe { nan_(tag) }.to_f128()
+    nan_(unsafe { rusty_libc_core::ffi::cstr_bytes_scalar(tag) }).to_f128()
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getpayloadf128(p: *const f128) -> f128 {
-    let x = F128(unsafe { (*p).to_bits() });
+    let x = F128(unsafe { p.read() }.to_bits());
     if !x.is_nan() {
         return F128::NEG_ONE.to_f128();
     }
@@ -821,11 +815,8 @@ pub unsafe extern "C" fn getpayloadf128(p: *const f128) -> f128 {
     arith::from_u128(pl).to_f128()
 }
 
-unsafe fn setpay(res: *mut f128, p: F128, sig: bool) -> i32 {
-    let bad = || {
-        unsafe { *res = F128::ZERO.to_f128() };
-        1
-    };
+fn setpay(p: F128, sig: bool) -> (i32, F128) {
+    let bad = || (1, F128::ZERO);
     if p.is_nan() || p.is_inf() || p.is_neg() {
         return bad();
     }
@@ -845,24 +836,28 @@ unsafe fn setpay(res: *mut f128, p: F128, sig: bool) -> i32 {
     if sig && v == 0 {
         return bad();
     }
-    unsafe { *res = F128(EXPM | v | if sig { 0 } else { QUIET }).to_f128() };
-    0
+    (0, F128(EXPM | v | if sig { 0 } else { QUIET }))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setpayloadf128(res: *mut f128, p: f128) -> i32 {
-    unsafe { setpay(res, F128(p.to_bits()), false) }
+    let (r, v) = setpay(F128(p.to_bits()), false);
+    unsafe { res.write(v.to_f128()) };
+    r
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setpayloadsigf128(res: *mut f128, p: f128) -> i32 {
-    unsafe { setpay(res, F128(p.to_bits()), true) }
+    let (r, v) = setpay(F128(p.to_bits()), true);
+    unsafe { res.write(v.to_f128()) };
+    r
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn canonicalizef128(cx: *mut f128, x: *const f128) -> i32 {
-    let v = F128(unsafe { (*x).to_bits() });
-    unsafe { *cx = if v.is_nan() { nan1(v) } else { v }.to_f128() };
+    let v = F128(unsafe { x.read() }.to_bits());
+    let r = if v.is_nan() { nan1(v) } else { v }.to_f128();
+    unsafe { cx.write(r) };
     0
 }
 
@@ -873,10 +868,14 @@ fn total_order(x: F128, y: F128) -> bool {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn totalorderf128(x: *const f128, y: *const f128) -> i32 {
-    total_order(F128(unsafe { (*x).to_bits() }), F128(unsafe { (*y).to_bits() })) as i32
+    let x = F128(unsafe { x.read() }.to_bits());
+    let y = F128(unsafe { y.read() }.to_bits());
+    total_order(x, y) as i32
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn totalordermagf128(x: *const f128, y: *const f128) -> i32 {
-    total_order(F128(unsafe { (*x).to_bits() }).abs(), F128(unsafe { (*y).to_bits() }).abs()) as i32
+    let x = F128(unsafe { x.read() }.to_bits());
+    let y = F128(unsafe { y.read() }.to_bits());
+    total_order(x.abs(), y.abs()) as i32
 }

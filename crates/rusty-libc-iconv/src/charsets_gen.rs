@@ -17640,7 +17640,7 @@ pub static ALIASES: AliasTable<1181> = AliasTable([
     (12423, 4, 0xbe),
 ]);
 
-pub static SPECIAL_NAMES: [(u8, &str); 57] = [
+pub const SPECIAL_NAMES: [(u8, &str); 57] = [
 
     (0, "UCS-4"),
     (1, "UCS-4LE"),
@@ -17700,3 +17700,23 @@ pub static SPECIAL_NAMES: [(u8, &str); 57] = [
     (63, "ISO-2022-CN-EXT"),
     (64, "TSCII"),
 ];
+pub static SPECIAL_CODES: [u8; 57] = {
+    let mut out = [0; 57];
+    let mut i = 0;
+    while i < 57 {
+        out[i] = SPECIAL_NAMES[i].0;
+        i += 1;
+    }
+    out
+};
+const fn special_strs() -> [&'static str; 57] {
+    let mut out = [""; 57];
+    let mut i = 0;
+    while i < 57 {
+        out[i] = SPECIAL_NAMES[i].1;
+        i += 1;
+    }
+    out
+}
+pub static SPECIAL_STRS: rusty_libc_core::strtab::StrTab<57, { rusty_libc_core::strtab::packed_len(&special_strs()) }> =
+    rusty_libc_core::strtab::StrTab::new(&special_strs());

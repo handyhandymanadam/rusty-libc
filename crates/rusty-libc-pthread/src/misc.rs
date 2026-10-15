@@ -1,26 +1,21 @@
 use crate::cancel::INTERNAL_SIGNALS;
 use crate::sys::*;
-use crate::thread::{Thread, current_thread};
-use core::ffi::{c_char, c_int, c_void};
+use crate::thread::{Thread, current_thread, tid_word, with_sched_locked};
+use core::ffi::{CStr, c_char, c_int, c_void};
 use core::sync::atomic::{AtomicI32, Ordering};
-use rusty_libc_core::syscall::{syscall1, syscall2, syscall3, syscall4};
+use rusty_libc_core::syscall::{syscall3, syscall4};
 
-fn tid_of(t: PthreadT) -> i32 {
-    let t = t as *mut Thread;
-    if t == current_thread() { gettid() } else { unsafe { (*t).tcb.tid } }
+unsafe fn tid_of(th: PthreadT) -> i32 {
+    let t = th as *mut Thread;
+    if t == current_thread() { gettid() } else { unsafe { tid_word(t) }.load(Ordering::Relaxed) }
 }
 
 fn is_internal(sig: c_int) -> bool {
     sig == crate::cancel::SIGCANCEL || sig == crate::cancel::SIGSETXID
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_kill(th: PthreadT, sig: c_int) -> c_int {
-    if is_internal(sig) {
-        return EINVAL;
-    }
-    let tid = tid_of(th);
-    if th as *mut Thread != current_thread() {
+pub fn kill_tid(is_self: bool, tid: i32, sig: c_int) -> c_int {
+    if !is_self {
         if tid == 0 {
             return 0;
         }
@@ -29,7 +24,16 @@ pub unsafe extern "C" fn pthread_kill(th: PthreadT, sig: c_int) -> c_int {
         }
     }
     let r = tgkill(getpid(), tid, sig);
-    if r == ESRCH && th as *mut Thread != current_thread() { 0 } else { r }
+    if r == ESRCH && !is_self { 0 } else { r }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_kill(th: PthreadT, sig: c_int) -> c_int {
+    if is_internal(sig) {
+        return EINVAL;
+    }
+    let tid = unsafe { tid_of(th) };
+    kill_tid(th as *mut Thread == current_thread(), tid, sig)
 }
 
 #[repr(C)]
@@ -44,51 +48,58 @@ struct SigInfo {
     rest: [u64; 12],
 }
 
+pub fn sigqueue_tid(is_self: bool, tid: i32, sig: c_int, value: usize) -> c_int {
+    if tid <= 0 && !is_self {
+        return ESRCH;
+    }
+    let info = SigInfo {
+        si_signo: sig,
+        si_errno: 0,
+        si_code: -1,
+        pad0: 0,
+        si_pid: getpid(),
+        si_uid: rusty_libc_core::unistd::getuid() as c_int,
+        si_value: value,
+        rest: [0; 12],
+    };
+    errno_of(unsafe { syscall4(SYS_RT_TGSIGQUEUEINFO, getpid() as usize, tid as usize, sig as usize, &info as *const SigInfo as usize) })
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_sigqueue(th: PthreadT, sig: c_int, value: usize) -> c_int {
-    unsafe {
-        if is_internal(sig) {
-            return EINVAL;
-        }
-        let tid = tid_of(th);
-        if tid <= 0 && th as *mut Thread != current_thread() {
-            return ESRCH;
-        }
-        let mut info: SigInfo = core::mem::zeroed();
-        info.si_signo = sig;
-        info.si_code = -1;
-        info.si_pid = getpid();
-        info.si_uid = syscall1(102, 0) as c_int;
-        info.si_value = value;
-        errno_of(syscall4(SYS_RT_TGSIGQUEUEINFO, getpid() as usize, tid as usize, sig as usize, &info as *const SigInfo as usize))
+    if is_internal(sig) {
+        return EINVAL;
     }
+    let tid = unsafe { tid_of(th) };
+    sigqueue_tid(th as *mut Thread == current_thread(), tid, sig, value)
+}
+
+pub fn sigmask(how: c_int, set: Option<&SigsetT>, old: Option<&mut SigsetT>) -> c_int {
+    let new = set.map(|s| s.val[0] & !INTERNAL_SIGNALS);
+    let setp = new.as_ref().map_or(0, |n| n as *const u64 as usize);
+    let mut oldmask = 0u64;
+    let oldp = if old.is_none() { 0 } else { &mut oldmask as *mut u64 as usize };
+    let r = unsafe { syscall4(rusty_libc_core::syscall::SYS_RT_SIGPROCMASK, how as usize, setp, oldp, 8) };
+    let e = errno_of(r);
+    if e != 0 {
+        return e;
+    }
+    if let Some(o) = old {
+        o.val[0] = oldmask & !INTERNAL_SIGNALS;
+    }
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_sigmask(how: c_int, set: *const SigsetT, old: *mut SigsetT) -> c_int {
-    unsafe {
-        let new;
-        let mut setp = 0;
-        if !set.is_null() {
-            new = (*set).val[0] & !INTERNAL_SIGNALS;
-            setp = &new as *const u64 as usize;
-        }
-        let mut oldmask = 0u64;
-        let r = syscall4(rusty_libc_core::syscall::SYS_RT_SIGPROCMASK, how as usize, setp, if old.is_null() { 0 } else { &mut oldmask as *mut u64 as usize }, 8);
-        let e = errno_of(r);
-        if e != 0 {
-            return e;
-        }
-        if !old.is_null() {
-            (*old).val[0] = oldmask & !INTERNAL_SIGNALS;
-        }
-        0
-    }
+    let set = unsafe { set.as_ref() };
+    let old = unsafe { old.as_mut() };
+    sigmask(how, set, old)
 }
 
 const TASK_COMM_LEN: usize = 16;
 
-fn comm_path(tid: i32, buf: &mut [u8; 48]) -> usize {
+fn comm_path(tid: i32, buf: &mut [u8; 48]) -> &CStr {
     let pre = b"/proc/self/task/";
     buf[..pre.len()].copy_from_slice(pre);
     let mut i = pre.len();
@@ -110,145 +121,174 @@ fn comm_path(tid: i32, buf: &mut [u8; 48]) -> usize {
     }
     let post = b"/comm\0";
     buf[i..i + post.len()].copy_from_slice(post);
-    i + post.len() - 1
+    CStr::from_bytes_with_nul(&buf[..i + post.len()]).unwrap_or(c"")
+}
+
+fn open_comm(tid: i32, flags: usize) -> Result<usize, c_int> {
+    let mut path = [0u8; 48];
+    let path = comm_path(tid, &mut path);
+    let fd = unsafe { rusty_libc_core::syscall::sys_open(path.as_ptr() as usize, flags | 0o2000000, 0) };
+    match errno_of(fd) {
+        0 => Ok(fd),
+        ENOENT => Err(ESRCH),
+        e => Err(e),
+    }
+}
+
+fn close_fd(fd: usize) {
+    let _ = rusty_libc_core::unistd::close(fd as i32);
+}
+
+pub fn setname(is_self: bool, tid: impl FnOnce() -> i32, name: &CStr) -> c_int {
+    let len = name.to_bytes().len();
+    if len > TASK_COMM_LEN - 1 {
+        return ERANGE;
+    }
+    if is_self {
+        return errno_of(unsafe { syscall3(SYS_PRCTL, 15 , name.as_ptr() as usize, 0) });
+    }
+    let fd = match open_comm(tid(), 1 ) {
+        Ok(fd) => fd,
+        Err(e) => return e,
+    };
+    let w = rusty_libc_core::unistd::write_nocancel(fd as i32, name.to_bytes());
+    close_fd(fd);
+    match w {
+        Ok(_) => 0,
+        Err(e) => e.0,
+    }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_setname_np(th: PthreadT, name: *const c_char) -> c_int {
-    unsafe {
-        let mut len = 0;
-        while *name.add(len) != 0 {
-            len += 1;
-        }
-        if len > TASK_COMM_LEN - 1 {
-            return ERANGE;
-        }
-        if th as *mut Thread == current_thread() {
-            let r = syscall3(SYS_PRCTL, 15 , name as usize, 0);
-            let e = errno_of(r);
-            return if e != 0 { e } else { 0 };
-        }
-        let tid = tid_of(th);
-        let mut path = [0u8; 48];
-        comm_path(tid, &mut path);
-        let fd = syscall3(rusty_libc_core::syscall::SYS_OPEN, path.as_ptr() as usize, 1  | 0o2000000, 0);
-        let e = errno_of(fd);
-        if e != 0 {
-            return if e == ENOENT { ESRCH } else { e };
-        }
-        let w = syscall3(rusty_libc_core::syscall::SYS_WRITE, fd, name as usize, len);
-        syscall1(rusty_libc_core::syscall::SYS_CLOSE, fd);
-        let e = errno_of(w);
-        if e != 0 { e } else { 0 }
+    let name = unsafe { rusty_libc_core::ffi::cstr_nonnull(name) };
+    setname(th as *mut Thread == current_thread(), || unsafe { tid_of(th) }, name)
+}
+
+pub fn getname(is_self: bool, tid: impl FnOnce() -> i32, buf: &mut [u8]) -> c_int {
+    if buf.len() < TASK_COMM_LEN {
+        return ERANGE;
     }
+    if is_self {
+        return errno_of(unsafe { syscall3(SYS_PRCTL, 16 , buf.as_mut_ptr() as usize, 0) });
+    }
+    let fd = match open_comm(tid(), 0) {
+        Ok(fd) => fd,
+        Err(e) => return e,
+    };
+    let r = rusty_libc_core::unistd::read_nocancel(fd as i32, buf);
+    close_fd(fd);
+    let mut n = match r {
+        Ok(n) => n,
+        Err(e) => return e.0,
+    };
+    if n > 0 && buf[n - 1] == b'\n' {
+        n -= 1;
+    }
+    if let Some(b) = buf.get_mut(n) {
+        *b = 0;
+    }
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_getname_np(th: PthreadT, buf: *mut c_char, buflen: usize) -> c_int {
-    unsafe {
-        if buflen < TASK_COMM_LEN {
-            return ERANGE;
-        }
-        let tid = tid_of(th);
-        let mut path = [0u8; 48];
-        comm_path(tid, &mut path);
-        let fd = syscall3(rusty_libc_core::syscall::SYS_OPEN, path.as_ptr() as usize, 0o2000000, 0);
-        let e = errno_of(fd);
-        if e != 0 {
-            return if e == ENOENT { ESRCH } else { e };
-        }
-        let r = syscall3(rusty_libc_core::syscall::SYS_READ, fd, buf as usize, buflen);
-        syscall1(rusty_libc_core::syscall::SYS_CLOSE, fd);
-        let e = errno_of(r);
-        if e != 0 {
-            return e;
-        }
-        let mut n = r;
-        if n > 0 && *buf.add(n - 1) as u8 == b'\n' {
-            n -= 1;
-        }
-        *buf.add(n) = 0;
-        0
-    }
+    let out = unsafe { rusty_libc_core::ffi::bytes_mut(buf.cast::<u8>(), buflen) };
+    getname(th as *mut Thread == current_thread(), || unsafe { tid_of(th) }, out)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_setschedparam(th: PthreadT, policy: c_int, param: *const SchedParam) -> c_int {
-    unsafe {
-        let tid = tid_of(th);
-        if tid <= 0 {
-            return ESRCH;
-        }
-        crate::attr::sched_setscheduler(tid, policy, &*param)
+    let tid = unsafe { tid_of(th) };
+    if tid <= 0 {
+        return ESRCH;
     }
+    let t = th as *mut Thread;
+    let prio = unsafe { arg(param) }.sched_priority;
+    let body = |sched: &mut crate::thread::Sched| {
+        let p = SchedParam { sched_priority: unsafe { crate::tpp::boosted(t, prio) } };
+        let r = crate::attr::sched_setscheduler(tid, policy, &p);
+        if r == 0 {
+            sched.policy = policy;
+            sched.prio = prio;
+            sched.flags |= crate::attr::ATTR_FLAG_SCHED_SET | crate::attr::ATTR_FLAG_POLICY_SET;
+        }
+        r
+    };
+    unsafe { with_sched_locked(t, body) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_getschedparam(th: PthreadT, policy: *mut c_int, param: *mut SchedParam) -> c_int {
-    unsafe {
-        let tid = tid_of(th);
-        if tid <= 0 {
-            return ESRCH;
+    let tid = unsafe { tid_of(th) };
+    if tid <= 0 {
+        return ESRCH;
+    }
+    let got = unsafe { with_sched_locked(th as *mut Thread, |sched| if sched.fill(tid) != 0 { None } else { Some((sched.policy, sched.prio)) }) };
+    match got {
+        None => 1,
+        Some((pol, prio)) => {
+            unsafe { *policy = pol };
+            unsafe { (*param).sched_priority = prio };
+            0
         }
-        let p = syscall1(SYS_SCHED_GETSCHEDULER, tid as usize);
-        let e = errno_of(p);
-        if e != 0 {
-            return e;
-        }
-        let r = syscall2(SYS_SCHED_GETPARAM, tid as usize, param as usize);
-        let e = errno_of(r);
-        if e != 0 {
-            return e;
-        }
-        *policy = p as c_int;
-        0
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_setschedprio(th: PthreadT, prio: c_int) -> c_int {
-    let tid = tid_of(th);
+    let tid = unsafe { tid_of(th) };
     if tid <= 0 {
         return ESRCH;
     }
-    crate::attr::sched_setparam(tid, &SchedParam { sched_priority: prio })
+    let t = th as *mut Thread;
+    let body = |sched: &mut crate::thread::Sched| {
+        let r = crate::attr::sched_setparam(tid, &SchedParam { sched_priority: unsafe { crate::tpp::boosted(t, prio) } });
+        if r == 0 {
+            sched.prio = prio;
+            sched.flags |= crate::attr::ATTR_FLAG_SCHED_SET;
+        }
+        r
+    };
+    unsafe { with_sched_locked(t, body) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_setaffinity_np(th: PthreadT, size: usize, set: *const CpuSet) -> c_int {
-    let tid = tid_of(th);
+    let tid = unsafe { tid_of(th) };
     if tid <= 0 {
         return ESRCH;
     }
-    crate::attr::sched_setaffinity(tid, size, set as *const u8)
+    let mask = unsafe { rusty_libc_core::ffi::bytes(set.cast::<u8>(), size) };
+    crate::attr::sched_setaffinity(tid, mask)
+}
+
+pub fn getaffinity(tid: i32, set: &mut [u8]) -> c_int {
+    let r = crate::attr::sched_getaffinity(tid, set);
+    if r < 0 {
+        return (-r) as c_int;
+    }
+    set[r as usize..].fill(0);
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_getaffinity_np(th: PthreadT, size: usize, set: *mut CpuSet) -> c_int {
-    unsafe {
-        let tid = tid_of(th);
-        if tid <= 0 {
-            return ESRCH;
-        }
-        let r = crate::attr::sched_getaffinity(tid, size, set as *mut u8);
-        if r < 0 {
-            return (-r) as c_int;
-        }
-        core::ptr::write_bytes((set as *mut u8).add(r as usize), 0, size - r as usize);
-        0
+    let tid = unsafe { tid_of(th) };
+    if tid <= 0 {
+        return ESRCH;
     }
+    getaffinity(tid, unsafe { rusty_libc_core::ffi::bytes_mut(set.cast::<u8>(), size) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_getcpuclockid(th: PthreadT, clockid: *mut c_int) -> c_int {
-    unsafe {
-        let tid = tid_of(th);
-        if tid <= 0 {
-            return ESRCH;
-        }
-        *clockid = ((!(tid as c_int)) << 3) | 6;
-        0
+    let tid = unsafe { tid_of(th) };
+    if tid <= 0 {
+        return ESRCH;
     }
+    unsafe { *clockid = ((!(tid as c_int)) << 3) | 6 };
+    0
 }
 
 static CONCURRENCY: AtomicI32 = AtomicI32::new(0);

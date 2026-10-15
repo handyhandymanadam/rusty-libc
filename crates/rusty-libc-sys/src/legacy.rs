@@ -1,7 +1,8 @@
-use crate::resource::{Rlimit, getrlimit, setrlimit};
+use crate::resource::Rlimit;
 use crate::unistd::rc;
 use core::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use rusty_libc_core::syscall::{self, syscall1, syscall2, syscall3, syscall4, syscall5};
+use crate::kernel::plain;
 use rusty_libc_core::errno;
 
 const ENOSYS: c_int = 38;
@@ -12,7 +13,6 @@ const ENOENT: c_int = 2;
 
 mod nr {
     pub const ARCH_PRCTL: usize = 158;
-    pub const SYSCTL: usize = 156;
     pub const MODIFY_LDT: usize = 154;
     pub const IOPL: usize = 172;
     pub const IOPERM: usize = 173;
@@ -25,7 +25,6 @@ mod nr {
     pub const USTAT: usize = 136;
     pub const USELIB: usize = 134;
     pub const OPENAT: usize = 257;
-    pub const READ: usize = 0;
     pub const CLOSE: usize = 3;
 }
 
@@ -54,21 +53,9 @@ pub extern "C" fn fchflags(_fd: c_int, _flags: c_ulong) -> c_int {
     fail(ENOSYS)
 }
 
-#[repr(C)]
-struct SysctlArgs {
-    name: *mut c_int,
-    nlen: c_int,
-    oldval: *mut c_void,
-    oldlenp: *mut usize,
-    newval: *mut c_void,
-    newlen: usize,
-    unused: [c_ulong; 4],
-}
-
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn sysctl(name: *mut c_int, nlen: c_int, oldval: *mut c_void, oldlenp: *mut usize, newval: *mut c_void, newlen: usize) -> c_int {
-    let args = SysctlArgs { name, nlen, oldval, oldlenp, newval, newlen, unused: [0; 4] };
-    rc(unsafe { syscall1(nr::SYSCTL, &args as *const SysctlArgs as usize) })
+pub unsafe extern "C" fn sysctl(_name: *mut c_int, _nlen: c_int, _oldval: *mut c_void, _oldlenp: *mut usize, _newval: *mut c_void, _newlen: usize) -> c_int {
+    fail(ENOSYS)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -132,15 +119,13 @@ pub extern "C" fn bdflush(_func: c_int, _data: c_long) -> c_int {
     fail(ENOSYS)
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn __sysctl(name: *mut c_int, nlen: c_int, oldval: *mut c_void, oldlenp: *mut usize, newval: *mut c_void, newlen: usize) -> c_int {
-    unsafe { sysctl(name, nlen, oldval, oldlenp, newval, newlen) }
-}
+crate::unistd::alias!(
+    __sysctl => sysctl(name: *mut c_int, nlen: c_int, oldval: *mut c_void, oldlenp: *mut usize, newval: *mut c_void, newlen: usize) -> c_int
+);
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn isastream(fildes: c_int) -> c_int {
-    let r = unsafe { syscall3(72, fildes as isize as usize, 1, 0) };
-    match syscall::check(r) {
+    match rusty_libc_core::unistd::fcntl_int(fildes, rusty_libc_core::unistd::F_GETFD, 0) {
         Ok(_) => 0,
         Err(e) => fail(e.0),
     }
@@ -198,34 +183,32 @@ pub struct Vtimes {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn vtimes(current: *mut Vtimes, child: *mut Vtimes) -> c_int {
-    unsafe {
-        const HZ: i64 = 60;
-        fn from_usage(v: &mut Vtimes, r: &crate::resource::Rusage) {
-            let ticks = |t: &crate::resource::Timeval| (t.tv_sec * HZ + t.tv_usec * HZ / 1_000_000) as c_int;
-            v.vm_utime = ticks(&r.ru_utime);
-            v.vm_stime = ticks(&r.ru_stime);
-            v.vm_idsrss = (r.ru_idrss as u64).wrapping_add(r.ru_isrss as u64) as c_uint;
-            v.vm_majflt = r.ru_majflt as c_int;
-            v.vm_minflt = r.ru_minflt as c_int;
-            v.vm_nswap = r.ru_nswap as c_int;
-            v.vm_inblk = r.ru_inblock as c_int;
-            v.vm_oublk = r.ru_oublock as c_int;
-        }
-        let mut usage = crate::resource::Rusage::default();
-        if !current.is_null() {
-            if crate::resource::getrusage(crate::resource::RUSAGE_SELF, (&mut usage as *mut crate::resource::Rusage).cast()) < 0 {
-                return -1;
-            }
-            from_usage(&mut *current, &usage);
-        }
-        if !child.is_null() {
-            if crate::resource::getrusage(crate::resource::RUSAGE_CHILDREN, (&mut usage as *mut crate::resource::Rusage).cast()) < 0 {
-                return -1;
-            }
-            from_usage(&mut *child, &usage);
-        }
-        0
+    const HZ: i64 = 60;
+    fn from_usage(v: &mut Vtimes, r: &crate::resource::Rusage) {
+        let ticks = |t: &crate::resource::Timeval| (t.tv_sec * HZ + t.tv_usec * HZ / 1_000_000) as c_int;
+        v.vm_utime = ticks(&r.ru_utime);
+        v.vm_stime = ticks(&r.ru_stime);
+        v.vm_idsrss = (r.ru_idrss as u64).wrapping_add(r.ru_isrss as u64) as c_uint;
+        v.vm_majflt = r.ru_majflt as c_int;
+        v.vm_minflt = r.ru_minflt as c_int;
+        v.vm_nswap = r.ru_nswap as c_int;
+        v.vm_inblk = r.ru_inblock as c_int;
+        v.vm_oublk = r.ru_oublock as c_int;
     }
+    let mut usage = crate::resource::Rusage::default();
+    if let Some(cur) = unsafe { current.as_mut() } {
+        if unsafe { crate::resource::getrusage(crate::resource::RUSAGE_SELF, (&mut usage as *mut crate::resource::Rusage).cast()) } < 0 {
+            return -1;
+        }
+        from_usage(cur, &usage);
+    }
+    if let Some(ch) = unsafe { child.as_mut() } {
+        if unsafe { crate::resource::getrusage(crate::resource::RUSAGE_CHILDREN, (&mut usage as *mut crate::resource::Rusage).cast()) } < 0 {
+            return -1;
+        }
+        from_usage(ch, &usage);
+    }
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -241,18 +224,16 @@ pub extern "C" fn vlimit(resource: c_int, value: c_int) -> c_int {
         _ => return fail(EINVAL),
     };
     let mut lim = Rlimit::default();
-    unsafe {
-        if getrlimit(res, &mut lim) < 0 {
-            return -1;
-        }
-        lim.rlim_cur = value as i64 as u64;
-        setrlimit(res, &lim)
+    if crate::resource::rs::getrlimit_into(res, &mut lim) < 0 {
+        return -1;
     }
+    lim.rlim_cur = value as i64 as u64;
+    crate::resource::rs::setrlimit_from(res, &lim)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn llseek(fd: c_int, offset: i64, whence: c_int) -> i64 {
-    unsafe { crate::unistd::lseek64(fd, offset, whence) }
+    crate::unistd::lseek(fd, offset, whence)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -302,13 +283,13 @@ unsafe extern "C" {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn clone(f: Option<unsafe extern "C" fn(*mut c_void) -> c_int>, stack: *mut c_void, flags: c_int, arg: *mut c_void, mut args: ...) -> c_int {
-    unsafe {
-        let ptid: *mut c_int = args.next_arg();
-        let tls: *mut c_void = args.next_arg();
-        let ctid: *mut c_int = args.next_arg();
-        let Some(f) = f else { return fail(EINVAL) };
-        rc(rl_clone_raw(f, stack, flags, arg, ptid, tls, ctid) as usize)
+    let mut opt = [core::ptr::null_mut::<c_void>(); 3];
+    for v in &mut opt {
+        *v = unsafe { args.next_arg::<*mut c_void>() };
     }
+    let [ptid, tls, ctid] = opt;
+    let Some(f) = f else { return fail(EINVAL) };
+    rc(unsafe { rl_clone_raw(f, stack, flags, arg, ptid.cast(), tls, ctid.cast()) } as usize)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -345,7 +326,7 @@ pub extern "C" fn pidfd_getpid(fd: c_int) -> c_int {
     let mut buf = [0u8; 1024];
     let mut len = 0usize;
     loop {
-        let r = unsafe { syscall3(nr::READ, f as usize, buf.as_mut_ptr().add(len) as usize, buf.len() - len) };
+        let r = crate::kernel::read_nocancel(f as usize, &mut buf[len..]);
         match syscall::check(r) {
             Ok(0) => break,
             Ok(m) => {
@@ -355,13 +336,13 @@ pub extern "C" fn pidfd_getpid(fd: c_int) -> c_int {
                 }
             }
             Err(e) => {
-                unsafe { syscall1(nr::CLOSE, f as usize) };
+                plain!(nr::CLOSE, f as usize);
                 errno::set(e.0);
                 return -1;
             }
         }
     }
-    unsafe { syscall1(nr::CLOSE, f as usize) };
+    plain!(nr::CLOSE, f as usize);
     let text = &buf[..len];
     let mut pid: Option<i32> = None;
     for line in text.split(|&c| c == b'\n') {

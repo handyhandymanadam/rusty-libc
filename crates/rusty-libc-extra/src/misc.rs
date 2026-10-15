@@ -1,3 +1,5 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
+use rusty_libc_core::sync_cell::SyncCell;
 use core::ffi::{c_char, c_int, c_long, c_longlong, c_void};
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -64,7 +66,7 @@ pub extern "C" fn tr_break() {}
 
 #[allow(non_upper_case_globals)]
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub static mut mallwatch: *mut c_void = core::ptr::null_mut();
+pub static mallwatch: SyncCell<*mut c_void> = SyncCell::new(core::ptr::null_mut());
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn muntrace() {}

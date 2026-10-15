@@ -36,10 +36,7 @@ pub fn chk_fail() -> ! {
 #[cold]
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __fortify_fail(msg: *const c_char) -> ! {
-    unsafe {
-        let n = rusty_libc_mem::strlen(msg);
-        fortify_fail(core::slice::from_raw_parts(msg.cast::<u8>(), n))
-    }
+    fortify_fail(unsafe { rusty_libc_core::ffi::cstr_bytes(msg) })
 }
 
 #[cold]

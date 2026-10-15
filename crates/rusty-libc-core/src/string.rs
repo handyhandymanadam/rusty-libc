@@ -1,3 +1,4 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use core::cmp::Ordering;
 use core::ffi::{CStr, c_char, c_int, c_void};
 
@@ -14,7 +15,9 @@ pub fn memcpy(dst: &mut [u8], src: &[u8]) {
 
 pub fn memmove(buf: &mut [u8], src: usize, dst: usize, len: usize) {
     assert!(src + len <= buf.len() && dst + len <= buf.len(), "memmove out of range");
-    unsafe { raw::memmove(buf.as_mut_ptr().add(dst).cast(), buf.as_ptr().add(src).cast(), len) };
+    let base = buf.as_mut_ptr();
+    let (d, s) = (base.wrapping_add(dst), base.wrapping_add(src).cast_const());
+    unsafe { raw::memmove(d.cast(), s.cast(), len) };
 }
 
 pub fn memset(dst: &mut [u8], byte: u8) {
@@ -26,6 +29,7 @@ pub fn memcmp(a: &[u8], b: &[u8]) -> Ordering {
     unsafe { raw::memcmp(a.as_ptr().cast(), b.as_ptr().cast(), a.len()) }.cmp(&0)
 }
 
+#[inline]
 pub fn memchr(hay: &[u8], byte: u8) -> Option<usize> {
     off(unsafe { raw::memchr(hay.as_ptr().cast(), c_int::from(byte), hay.len()) }, hay.as_ptr())
 }
@@ -34,6 +38,7 @@ pub fn memrchr(hay: &[u8], byte: u8) -> Option<usize> {
     off(unsafe { raw::memrchr(hay.as_ptr().cast(), c_int::from(byte), hay.len()) }, hay.as_ptr())
 }
 
+#[inline]
 pub fn memmem(hay: &[u8], needle: &[u8]) -> Option<usize> {
     off(
         unsafe { raw::memmem(hay.as_ptr().cast(), hay.len(), needle.as_ptr().cast(), needle.len()) },

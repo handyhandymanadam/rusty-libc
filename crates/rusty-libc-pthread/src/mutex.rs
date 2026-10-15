@@ -1,6 +1,5 @@
 use crate::sys::*;
 use crate::thread::RobustHead;
-use crate::thread::ensure_robust_registered;
 use core::ffi::c_int;
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use rusty_libc_core::syscall::syscall4;
@@ -15,7 +14,7 @@ const PRIO_INHERIT: i32 = 32;
 const PRIO_PROTECT: i32 = 64;
 const PSHARED_BIT: i32 = 128;
 const PRIO_CEILING_SHIFT: u32 = 19;
-const PRIO_CEILING_MASK: u32 = 0x7ff8_0000;
+const PRIO_CEILING_MASK: u32 = 0xfff8_0000;
 
 pub const MUTEX_INCONSISTENT: i32 = i32::MAX;
 pub const MUTEX_NOTRECOVERABLE: i32 = i32::MAX - 1;
@@ -102,12 +101,12 @@ fn lll_unlock(f: &AtomicU32, private: bool) {
     }
 }
 
-fn lll_clocklock_wait(f: &AtomicU32, clock: c_int, abs: *const Timespec, private: bool) -> c_int {
-    if !valid_nsec(unsafe { &*abs }) {
+fn lll_clocklock_wait(f: &AtomicU32, clock: c_int, abs: &Timespec, private: bool) -> c_int {
+    if !valid_nsec(abs) {
         return EINVAL;
     }
     while f.swap(2, Ordering::Acquire) != 0 {
-        let e = futex_wait_abs(f, 2, clock, abs, private);
+        let e = futex_wait_abs(f, 2, clock, Some(abs), private);
         if e == ETIMEDOUT || e == EINVAL || e == EOVERFLOW {
             return e;
         }
@@ -116,62 +115,67 @@ fn lll_clocklock_wait(f: &AtomicU32, clock: c_int, abs: *const Timespec, private
 }
 
 fn robust_head() -> *mut RobustHead {
-    unsafe {
-        let t = crate::thread::current_thread();
-        ensure_robust_registered(t);
-        &raw mut (*t).robust
-    }
+    crate::thread::field_of!(crate::thread::current_thread(), tcb.robust: RobustHead)
 }
 
 const QUEUE_PTR_ADJUST: usize = 8;
 
+macro_rules! field {
+    ($m:expr, $f:ident: $t:ty) => {
+        ($m).cast::<u8>().wrapping_add(core::mem::offset_of!(Mutex, $f)).cast::<$t>()
+    };
+}
+
+macro_rules! head_field {
+    ($h:expr, $f:ident) => {
+        ($h).cast::<u8>().wrapping_add(core::mem::offset_of!(RobustHead, $f)).cast::<*mut u8>()
+    };
+}
+
+fn entry_prev(entry: *mut u8) -> *mut *mut u8 {
+    ((entry as usize & !1) - QUEUE_PTR_ADJUST) as *mut *mut u8
+}
+
 unsafe fn enqueue(m: *mut Mutex, head: *mut RobustHead, pi: usize) {
-    unsafe {
-        let nextp = (((*head).list as usize & !1) - QUEUE_PTR_ADJUST) as *mut *mut u8;
-        *nextp = &raw mut (*m).list_prev as *mut u8;
-        (*m).list_next = (*head).list;
-        (*m).list_prev = head as *mut u8;
-        core::sync::atomic::compiler_fence(Ordering::SeqCst);
-        (*head).list = ((&raw mut (*m).list_next) as usize | pi) as *mut u8;
-    }
+    let list = head_field!(head, list);
+    let first = unsafe { *list };
+    unsafe { *entry_prev(first) = field!(m, list_prev: u8) };
+    unsafe { *field!(m, list_next: *mut u8) = first };
+    unsafe { *field!(m, list_prev: *mut u8) = head as *mut u8 };
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    unsafe { *list = (field!(m, list_next: u8) as usize | pi) as *mut u8 };
 }
 
 unsafe fn dequeue(m: *mut Mutex) {
-    unsafe {
-        let next = (((*m).list_next as usize & !1) - QUEUE_PTR_ADJUST) as *mut *mut u8;
-        *next = (*m).list_prev;
-        let prev = (((*m).list_prev as usize & !1) - QUEUE_PTR_ADJUST) as *mut *mut u8;
-        *prev.add(1) = (*m).list_next;
-        core::sync::atomic::compiler_fence(Ordering::SeqCst);
-        (*m).list_prev = core::ptr::null_mut();
-        (*m).list_next = core::ptr::null_mut();
-    }
+    let next = unsafe { *field!(m, list_next: *mut u8) };
+    let prev = unsafe { *field!(m, list_prev: *mut u8) };
+    unsafe { *entry_prev(next) = prev };
+    unsafe { *entry_prev(prev).wrapping_add(1) = next };
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    unsafe { *field!(m, list_prev: *mut u8) = core::ptr::null_mut() };
+    unsafe { *field!(m, list_next: *mut u8) = core::ptr::null_mut() };
 }
 
 #[inline]
 unsafe fn set_pending(head: *mut RobustHead, m: *mut Mutex, pi: usize) {
-    unsafe {
-        (*head).list_op_pending = ((&raw mut (*m).list_next) as usize | pi) as *mut u8;
-        core::sync::atomic::compiler_fence(Ordering::SeqCst);
-    }
+    unsafe { *head_field!(head, list_op_pending) = (field!(m, list_next: u8) as usize | pi) as *mut u8 };
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 
 #[inline]
 unsafe fn clear_pending(head: *mut RobustHead) {
-    unsafe {
-        core::sync::atomic::compiler_fence(Ordering::SeqCst);
-        (*head).list_op_pending = core::ptr::null_mut();
-    }
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    unsafe { *head_field!(head, list_op_pending) = core::ptr::null_mut() };
 }
 
 #[inline(always)]
 unsafe fn lockw<'a>(m: *mut Mutex) -> &'a AtomicU32 {
-    unsafe { &(*m).lock }
+    unsafe { &*field!(m, lock: AtomicU32) }
 }
 
 #[inline(always)]
 unsafe fn kind_of(m: *const Mutex) -> i32 {
-    unsafe { (*(&raw const (*m).kind as *const AtomicI32)).load(Ordering::Relaxed) }
+    unsafe { (*field!(m, kind: AtomicI32)).load(Ordering::Relaxed) }
 }
 
 fn max_spin() -> i32 {
@@ -179,20 +183,21 @@ fn max_spin() -> i32 {
 }
 
 #[derive(Clone, Copy)]
-pub struct Wait {
+pub struct Wait<'a> {
     pub clock: c_int,
-    pub abs: *const Timespec,
+    pub abs: Option<&'a Timespec>,
 }
 
-impl Wait {
-    pub const NONE: Wait = Wait { clock: CLOCK_REALTIME, abs: core::ptr::null() };
+impl Wait<'static> {
+    pub const NONE: Wait<'static> = Wait { clock: CLOCK_REALTIME, abs: None };
 }
 
-pub unsafe fn mutex_lock_common(m: *mut Mutex, w: Wait) -> c_int {
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+pub unsafe fn mutex_lock_common(m: *mut Mutex, w: Wait<'_>) -> c_int {
     unsafe {
         let kind = kind_of(m);
         let id = gettid();
-        let timed = !w.abs.is_null();
+        let timed = w.abs.is_some();
         if kind & !(KIND_MASK | PSHARED_BIT) == 0 {
             let private = private_of(kind);
             let ty = kind & KIND_MASK;
@@ -230,9 +235,9 @@ pub unsafe fn mutex_lock_common(m: *mut Mutex, w: Wait) -> c_int {
                     }
                     (*m).spins += ((spins - (*m).spins as i32) / 8) as i16;
                 }
-            } else if timed {
+            } else if let Some(abs) = w.abs {
                 if !lll_trylock_p(lockw(m), private) {
-                    let r = lll_clocklock_wait(lockw(m), w.clock, w.abs, private);
+                    let r = lll_clocklock_wait(lockw(m), w.clock, abs, private);
                     if r != 0 {
                         return r;
                     }
@@ -251,10 +256,11 @@ pub unsafe fn mutex_lock_common(m: *mut Mutex, w: Wait) -> c_int {
     }
 }
 
-unsafe fn lock_full(m: *mut Mutex, w: Wait, id: i32, kind: i32) -> c_int {
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+unsafe fn lock_full(m: *mut Mutex, w: Wait<'_>, id: i32, kind: i32) -> c_int {
     unsafe {
         let ty = kind & KIND_MASK;
-        let timed = !w.abs.is_null();
+        let timed = w.abs.is_some();
         let known = kind & !(KIND_MASK | ROBUST | PRIO_INHERIT | PRIO_PROTECT | PSHARED_BIT) == 0;
         if !known || (kind & PRIO_INHERIT != 0 && kind & PRIO_PROTECT != 0) {
             return EINVAL;
@@ -265,47 +271,10 @@ unsafe fn lock_full(m: *mut Mutex, w: Wait, id: i32, kind: i32) -> c_int {
             return lock_pi(m, w, id, kind);
         }
         if kind & PRIO_PROTECT != 0 {
-            let ceiling = ((lockw(m).load(Ordering::Relaxed) & PRIO_CEILING_MASK) >> PRIO_CEILING_SHIFT) as i32;
-            let mut sp = SchedParam::default();
-            rusty_libc_core::syscall::syscall2(SYS_SCHED_GETPARAM, 0, &mut sp as *mut SchedParam as usize);
-            if sp.sched_priority > ceiling {
+            if robust {
                 return EINVAL;
             }
-            if ty == PTHREAD_MUTEX_RECURSIVE_NP && (*m).owner == id {
-                if (*m).count.wrapping_add(1) == 0 {
-                    return EAGAIN;
-                }
-                (*m).count += 1;
-                return 0;
-            }
-            if ty == PTHREAD_MUTEX_ERRORCHECK_NP && (*m).owner == id {
-                return EDEADLK;
-            }
-            let f = lockw(m);
-            loop {
-                let old = f.load(Ordering::Relaxed);
-                let cbits = old & PRIO_CEILING_MASK;
-                let state = old & !(PRIO_CEILING_MASK);
-                if state == 0 {
-                    if f.compare_exchange(old, cbits | 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-                        break;
-                    }
-                    continue;
-                }
-                if state != 2 && f.compare_exchange(old, cbits | 2, Ordering::Relaxed, Ordering::Relaxed).is_err() {
-                    continue;
-                }
-                let e = if timed { futex_wait_abs(f, cbits | 2, w.clock, w.abs, private) } else { futex_wait(f, cbits | 2, private) };
-                if e == ETIMEDOUT || (timed && (e == EINVAL || e == EOVERFLOW)) {
-                    return e;
-                }
-            }
-            if ty == PTHREAD_MUTEX_RECURSIVE_NP {
-                (*m).count = 1;
-            }
-            (*m).owner = id;
-            (*m).nusers += 1;
-            return 0;
+            return lock_pp(m, w, id, kind, false);
         }
         if !robust {
             return EINVAL;
@@ -393,19 +362,20 @@ fn lll_robust_unlock(f: &AtomicU32, private: bool) {
     }
 }
 
-fn futex_lock_pi(f: &AtomicU32, w: Wait, private: bool) -> c_int {
+fn futex_lock_pi(f: &AtomicU32, w: Wait<'_>, private: bool) -> c_int {
     loop {
-        let e = if w.abs.is_null() {
-            errno_of(unsafe { syscall4(SYS_FUTEX, f as *const AtomicU32 as usize, FUTEX_LOCK_PI | pflag(private), 0, 0) })
-        } else {
-            if !valid_nsec(unsafe { &*w.abs }) || (w.clock != CLOCK_REALTIME && w.clock != CLOCK_MONOTONIC) {
-                return EINVAL;
+        let e = match w.abs {
+            None => errno_of(unsafe { syscall4(SYS_FUTEX, f as *const AtomicU32 as usize, FUTEX_LOCK_PI | pflag(private), 0, 0) }),
+            Some(abs) => {
+                if !valid_nsec(abs) || (w.clock != CLOCK_REALTIME && w.clock != CLOCK_MONOTONIC) {
+                    return EINVAL;
+                }
+                let mut op = FUTEX_LOCK_PI2 | pflag(private);
+                if w.clock == CLOCK_REALTIME {
+                    op |= FUTEX_CLOCK_REALTIME;
+                }
+                errno_of(unsafe { syscall4(SYS_FUTEX, f as *const AtomicU32 as usize, op, 0, abs as *const Timespec as usize) })
             }
-            let mut op = FUTEX_LOCK_PI2 | pflag(private);
-            if w.clock == CLOCK_REALTIME {
-                op |= FUTEX_CLOCK_REALTIME;
-            }
-            errno_of(unsafe { syscall4(SYS_FUTEX, f as *const AtomicU32 as usize, op, 0, w.abs as usize) })
         };
         if e != EINTR && e != EAGAIN {
             return e;
@@ -418,7 +388,8 @@ fn pflag(private: bool) -> usize {
     if private { FUTEX_PRIVATE_FLAG } else { 0 }
 }
 
-unsafe fn lock_pi(m: *mut Mutex, w: Wait, id: i32, kind: i32) -> c_int {
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+unsafe fn lock_pi(m: *mut Mutex, w: Wait<'_>, id: i32, kind: i32) -> c_int {
     unsafe {
         let ty = kind & KIND_MASK;
         let robust = kind & ROBUST != 0;
@@ -455,7 +426,7 @@ unsafe fn lock_pi(m: *mut Mutex, w: Wait, id: i32, kind: i32) -> c_int {
                 let e = futex_lock_pi(f, w, private);
                 if e == ESRCH || e == EDEADLK {
                     let z = AtomicU32::new(0);
-                    if w.abs.is_null() {
+                    if w.abs.is_none() {
                         loop {
                             futex_wait(&z, 0, private);
                         }
@@ -509,6 +480,7 @@ fn futex_unlock_pi(f: &AtomicU32, private: bool) {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
 pub unsafe extern "C" fn pthread_mutex_lock(m: *mut Mutex) -> c_int {
     unsafe {
         let kind = kind_of(m);
@@ -539,20 +511,21 @@ pub unsafe extern "C" fn pthread_mutex_lock(m: *mut Mutex) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_timedlock(m: *mut Mutex, abstime: *const Timespec) -> c_int {
-    unsafe { mutex_lock_common(m, Wait { clock: CLOCK_REALTIME, abs: abstime }) }
+    let abs = unsafe { abstime.as_ref() };
+    unsafe { mutex_lock_common(m, Wait { clock: CLOCK_REALTIME, abs }) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_clocklock(m: *mut Mutex, clockid: c_int, abstime: *const Timespec) -> c_int {
-    unsafe {
-        if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
-            return EINVAL;
-        }
-        mutex_lock_common(m, Wait { clock: clockid, abs: abstime })
+    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
+        return EINVAL;
     }
+    let abs = unsafe { abstime.as_ref() };
+    unsafe { mutex_lock_common(m, Wait { clock: clockid, abs }) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
 pub unsafe extern "C" fn pthread_mutex_trylock(m: *mut Mutex) -> c_int {
     unsafe {
         let kind = kind_of(m);
@@ -590,6 +563,7 @@ pub unsafe extern "C" fn pthread_mutex_trylock(m: *mut Mutex) -> c_int {
     }
 }
 
+#[allow(clippy::multiple_unsafe_ops_per_block)]
 unsafe fn trylock_full(m: *mut Mutex, id: i32, kind: i32) -> c_int {
     unsafe {
         let ty = kind & KIND_MASK;
@@ -659,22 +633,10 @@ unsafe fn trylock_full(m: *mut Mutex, id: i32, kind: i32) -> c_int {
             return 0;
         }
         if kind & PRIO_PROTECT != 0 {
-            if ty == PTHREAD_MUTEX_RECURSIVE_NP && (*m).owner == id {
-                if (*m).count.wrapping_add(1) == 0 {
-                    return EAGAIN;
-                }
-                (*m).count += 1;
-                return 0;
+            if robust {
+                return EINVAL;
             }
-            let old = f.load(Ordering::Relaxed);
-            let cbits = old & PRIO_CEILING_MASK;
-            if old & !PRIO_CEILING_MASK != 0 || f.compare_exchange(old, cbits | 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                return EBUSY;
-            }
-            (*m).count = 1;
-            (*m).owner = id;
-            (*m).nusers += 1;
-            return 0;
+            return trylock_pp(m, id, ty);
         }
         if !robust {
             return EINVAL;
@@ -729,6 +691,183 @@ unsafe fn trylock_full(m: *mut Mutex, id: i32, kind: i32) -> c_int {
     }
 }
 
+#[inline]
+fn cas_val(f: &AtomicU32, expected: u32, new: u32) -> u32 {
+    match f.compare_exchange(expected, new, Ordering::Acquire, Ordering::Relaxed) {
+        Ok(v) | Err(v) => v,
+    }
+}
+
+#[inline]
+fn ceiling_of(word: u32) -> c_int {
+    ((word & PRIO_CEILING_MASK) >> PRIO_CEILING_SHIFT) as c_int
+}
+
+#[cold]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+unsafe fn lock_pp(m: *mut Mutex, w: Wait<'_>, id: i32, kind: i32, cond: bool) -> c_int {
+    unsafe {
+        let ty = kind & KIND_MASK;
+        let private = private_of(kind);
+        let f = lockw(m);
+        let mut oldval = f.load(Ordering::Relaxed);
+        if (*m).owner == id {
+            if ty == PTHREAD_MUTEX_ERRORCHECK_NP {
+                return EDEADLK;
+            }
+            if ty == PTHREAD_MUTEX_RECURSIVE_NP {
+                if (*m).count.wrapping_add(1) == 0 {
+                    return EAGAIN;
+                }
+                (*m).count += 1;
+                return 0;
+            }
+        }
+        let mut oldprio = -1;
+        loop {
+            let ceiling = ceiling_of(oldval);
+            if crate::tpp::current_priority() > ceiling {
+                if oldprio != -1 {
+                    crate::tpp::change_priority(oldprio, -1);
+                }
+                return EINVAL;
+            }
+            let r = crate::tpp::change_priority(oldprio, ceiling);
+            if r != 0 {
+                return r;
+            }
+            let ceilval = (ceiling as u32) << PRIO_CEILING_SHIFT;
+            oldprio = ceiling;
+            oldval = cas_val(f, ceilval, ceilval | if cond { 2 } else { 1 });
+            if oldval == ceilval {
+                break;
+            }
+            loop {
+                oldval = cas_val(f, ceilval | 1, ceilval | 2);
+                if oldval & PRIO_CEILING_MASK != ceilval {
+                    break;
+                }
+                if oldval != ceilval {
+                    match w.abs {
+                        None => {
+                            futex_wait(f, ceilval | 2, private);
+                        }
+                        Some(abs) => {
+                            if !valid_nsec(abs) {
+                                crate::tpp::change_priority(oldprio, -1);
+                                return EINVAL;
+                            }
+                            let e = futex_wait_abs(f, ceilval | 2, w.clock, Some(abs), private);
+                            if e == ETIMEDOUT || e == EOVERFLOW {
+                                return e;
+                            }
+                        }
+                    }
+                }
+                if cas_val(f, ceilval, ceilval | 2) == ceilval {
+                    break;
+                }
+            }
+            if oldval & PRIO_CEILING_MASK == ceilval {
+                break;
+            }
+        }
+        (*m).count = 1;
+        (*m).owner = id;
+        if !cond {
+            (*m).nusers += 1;
+        }
+        0
+    }
+}
+
+#[cold]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+unsafe fn trylock_pp(m: *mut Mutex, id: i32, ty: i32) -> c_int {
+    unsafe {
+        let f = lockw(m);
+        let mut oldval = f.load(Ordering::Relaxed);
+        if (*m).owner == id {
+            if ty == PTHREAD_MUTEX_ERRORCHECK_NP {
+                return EDEADLK;
+            }
+            if ty == PTHREAD_MUTEX_RECURSIVE_NP {
+                if (*m).count.wrapping_add(1) == 0 {
+                    return EAGAIN;
+                }
+                (*m).count += 1;
+                return 0;
+            }
+        }
+        let mut oldprio = -1;
+        let mut ceilval;
+        loop {
+            let ceiling = ceiling_of(oldval);
+            if crate::tpp::current_priority() > ceiling {
+                if oldprio != -1 {
+                    crate::tpp::change_priority(oldprio, -1);
+                }
+                return EINVAL;
+            }
+            let r = crate::tpp::change_priority(oldprio, ceiling);
+            if r != 0 {
+                return r;
+            }
+            ceilval = (ceiling as u32) << PRIO_CEILING_SHIFT;
+            oldprio = ceiling;
+            oldval = cas_val(f, ceilval, ceilval | 1);
+            if oldval == ceilval || oldval & PRIO_CEILING_MASK == ceilval {
+                break;
+            }
+        }
+        if oldval != ceilval {
+            crate::tpp::change_priority(oldprio, -1);
+            return EBUSY;
+        }
+        (*m).owner = id;
+        (*m).nusers += 1;
+        (*m).count = 1;
+        0
+    }
+}
+
+#[cold]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+unsafe fn unlock_pp(m: *mut Mutex, decr: bool, id: i32, ty: i32, private: bool) -> c_int {
+    unsafe {
+        let f = lockw(m);
+        if ty == PTHREAD_MUTEX_RECURSIVE_NP {
+            if (*m).owner != id {
+                return EPERM;
+            }
+            (*m).count -= 1;
+            if (*m).count != 0 {
+                return 0;
+            }
+        } else if ty == PTHREAD_MUTEX_ERRORCHECK_NP && ((*m).owner != id || f.load(Ordering::Relaxed) & !PRIO_CEILING_MASK == 0) {
+            return EPERM;
+        }
+        (*m).owner = 0;
+        if decr {
+            (*m).nusers = (*m).nusers.wrapping_sub(1);
+        }
+        let mut oldval = f.load(Ordering::Relaxed);
+        let mut newval;
+        loop {
+            newval = oldval & PRIO_CEILING_MASK;
+            match f.compare_exchange_weak(oldval, newval, Ordering::Release, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(v) => oldval = v,
+            }
+        }
+        if oldval & !PRIO_CEILING_MASK > 1 {
+            futex_wake(f, 1, private);
+        }
+        crate::tpp::change_priority((newval >> PRIO_CEILING_SHIFT) as c_int, -1)
+    }
+}
+
+#[allow(clippy::multiple_unsafe_ops_per_block)]
 pub unsafe fn mutex_unlock_usercnt(m: *mut Mutex, decr: bool) -> c_int {
     unsafe {
         let kind = kind_of(m);
@@ -763,6 +902,7 @@ pub unsafe fn mutex_unlock_usercnt(m: *mut Mutex, decr: bool) -> c_int {
     }
 }
 
+#[allow(clippy::multiple_unsafe_ops_per_block)]
 unsafe fn unlock_full(m: *mut Mutex, decr: bool, id: i32, kind: i32) -> c_int {
     unsafe {
         let ty = kind & KIND_MASK;
@@ -774,28 +914,10 @@ unsafe fn unlock_full(m: *mut Mutex, decr: bool, id: i32, kind: i32) -> c_int {
         let robust = kind & ROBUST != 0;
         let f = lockw(m);
         if kind & PRIO_PROTECT != 0 {
-            if ty != PTHREAD_MUTEX_TIMED_NP && ty != PTHREAD_MUTEX_ADAPTIVE_NP && (*m).owner != id {
-                return EPERM;
+            if robust {
+                return EINVAL;
             }
-            if ty == PTHREAD_MUTEX_TIMED_NP || ty == PTHREAD_MUTEX_ADAPTIVE_NP {
-            }
-            if ty == PTHREAD_MUTEX_RECURSIVE_NP {
-                (*m).count -= 1;
-                if (*m).count != 0 {
-                    return 0;
-                }
-            }
-            (*m).owner = 0;
-            if decr {
-                (*m).nusers = (*m).nusers.wrapping_sub(1);
-            }
-            let old = f.load(Ordering::Relaxed);
-            let cbits = old & PRIO_CEILING_MASK;
-            let prev = f.swap(cbits, Ordering::Release);
-            if prev & !PRIO_CEILING_MASK == 2 {
-                futex_wake(f, 1, private);
-            }
-            return 0;
+            return unlock_pp(m, decr, id, ty, private);
         }
         if kind & PRIO_INHERIT != 0 {
             let held = if robust {
@@ -867,6 +989,7 @@ unsafe fn unlock_full(m: *mut Mutex, decr: bool, id: i32, kind: i32) -> c_int {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
 pub unsafe extern "C" fn pthread_mutex_unlock(m: *mut Mutex) -> c_int {
     unsafe {
         let kind = kind_of(m);
@@ -893,8 +1016,13 @@ pub unsafe extern "C" fn pthread_mutex_unlock(m: *mut Mutex) -> c_int {
     }
 }
 
+#[allow(clippy::multiple_unsafe_ops_per_block)]
 pub unsafe fn mutex_cond_lock(m: *mut Mutex) -> c_int {
     unsafe {
+        let kind = kind_of(m);
+        if kind & PRIO_PROTECT != 0 && kind & !(KIND_MASK | PRIO_PROTECT | PSHARED_BIT) == 0 {
+            return lock_pp(m, Wait::NONE, gettid(), kind, true);
+        }
         let r = mutex_lock_common(m, Wait::NONE);
         if r == 0 {
             (*m).nusers = (*m).nusers.wrapping_sub(1);
@@ -903,105 +1031,229 @@ pub unsafe fn mutex_cond_lock(m: *mut Mutex) -> c_int {
     }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_mutex_init(m: *mut Mutex, attr: *const MutexAttr) -> c_int {
-    unsafe {
-        let ak = if attr.is_null() { 0 } else { (*attr).kind };
-        core::ptr::write_bytes(m as *mut u8, 0, core::mem::size_of::<Mutex>());
-        let mut kind = ak & !ATTR_FLAG_BITS;
+impl MutexAttr {
+    fn mutex_words(&self) -> Result<(i32, u32), c_int> {
+        let ak = self.kind;
         let protocol = (ak & ATTR_PROTOCOL_MASK) >> ATTR_PROTOCOL_SHIFT;
+        if protocol >= 2 && ak & ATTR_ROBUST != 0 {
+            return Err(ENOTSUP);
+        }
+        let mut kind = ak & !ATTR_FLAG_BITS;
+        let mut lock = 0u32;
         match protocol {
-            0 => {}
             1 => kind |= PRIO_INHERIT,
             2 => {
                 kind |= PRIO_PROTECT;
-                let mut ceiling = ((ak & ATTR_PRIO_CEILING_MASK) >> ATTR_PRIO_CEILING_SHIFT) as u32;
+                let mut ceiling = (ak & ATTR_PRIO_CEILING_MASK) >> ATTR_PRIO_CEILING_SHIFT;
                 if ceiling == 0 {
-                    ceiling = 1;
+                    ceiling = ceiling.max(crate::tpp::fifo_min());
                 }
-                (*m).lock = AtomicU32::new(ceiling << PRIO_CEILING_SHIFT);
+                lock = (ceiling as u32) << PRIO_CEILING_SHIFT;
             }
-            _ => return ENOTSUP,
+            _ => {}
         }
         if ak & ATTR_ROBUST != 0 {
             kind |= ROBUST;
         }
-        if ak & ATTR_PSHARED != 0 {
+        if ak & (ATTR_PSHARED | ATTR_ROBUST) != 0 {
             kind |= PSHARED_BIT;
         }
-        (*m).kind = kind;
+        Ok((kind, lock))
+    }
+
+    pub fn kind_type(&self) -> c_int {
+        self.kind & !ATTR_FLAG_BITS
+    }
+
+    pub fn set_type(&mut self, kind: c_int) -> c_int {
+        if !(PTHREAD_MUTEX_TIMED_NP..=PTHREAD_MUTEX_ADAPTIVE_NP).contains(&kind) {
+            return EINVAL;
+        }
+        self.kind = (self.kind & ATTR_FLAG_BITS) | kind;
         0
     }
+
+    pub fn pshared(&self) -> c_int {
+        (self.kind & ATTR_PSHARED != 0) as c_int
+    }
+
+    pub fn set_pshared(&mut self, pshared: c_int) -> c_int {
+        match pshared {
+            0 => self.kind &= !ATTR_PSHARED,
+            1 => self.kind |= ATTR_PSHARED,
+            _ => return EINVAL,
+        }
+        0
+    }
+
+    pub fn robust(&self) -> c_int {
+        (self.kind & ATTR_ROBUST != 0) as c_int
+    }
+
+    pub fn set_robust(&mut self, robust: c_int) -> c_int {
+        match robust {
+            0 => self.kind &= !ATTR_ROBUST,
+            1 => self.kind |= ATTR_ROBUST,
+            _ => return EINVAL,
+        }
+        0
+    }
+
+    pub fn protocol(&self) -> c_int {
+        (self.kind & ATTR_PROTOCOL_MASK) >> ATTR_PROTOCOL_SHIFT
+    }
+
+    pub fn set_protocol(&mut self, protocol: c_int) -> c_int {
+        if !(0..=2).contains(&protocol) {
+            return EINVAL;
+        }
+        self.kind = (self.kind & !ATTR_PROTOCOL_MASK) | (protocol << ATTR_PROTOCOL_SHIFT);
+        0
+    }
+
+    pub fn prioceiling(&self) -> c_int {
+        let c = (self.kind & ATTR_PRIO_CEILING_MASK) >> ATTR_PRIO_CEILING_SHIFT;
+        if c == 0 { c.max(crate::tpp::fifo_min()) } else { c }
+    }
+
+    pub fn set_prioceiling(&mut self, ceiling: c_int) -> c_int {
+        let (min, max) = crate::tpp::fifo_range();
+        if ceiling < min || ceiling > max || ceiling & (ATTR_PRIO_CEILING_MASK >> ATTR_PRIO_CEILING_SHIFT) != ceiling {
+            return EINVAL;
+        }
+        self.kind = (self.kind & !ATTR_PRIO_CEILING_MASK) | (ceiling << ATTR_PRIO_CEILING_SHIFT);
+        0
+    }
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_mutex_init(m: *mut Mutex, attr: *const MutexAttr) -> c_int {
+    let (kind, lock) = match unsafe { attr.as_ref() } {
+        None => (0, 0),
+        Some(a) => match a.mutex_words() {
+            Ok(w) => w,
+            Err(e) => return e,
+        },
+    };
+    let new = Mutex { lock: AtomicU32::new(lock), count: 0, owner: 0, nusers: 0, kind, spins: 0, unused: 0, list_prev: core::ptr::null_mut(), list_next: core::ptr::null_mut() };
+    unsafe { core::ptr::write(m, new) };
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_destroy(m: *mut Mutex) -> c_int {
-    unsafe {
-        if (*m).kind & ROBUST == 0 && (*m).nusers != 0 {
-            return EBUSY;
-        }
-        (*m).kind = -1;
-        0
+    let kind = unsafe { *field!(m, kind: i32) };
+    if kind & ROBUST == 0 && unsafe { *field!(m, nusers: u32) } != 0 {
+        return EBUSY;
     }
+    unsafe { *field!(m, kind: i32) = -1 };
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_consistent(m: *mut Mutex) -> c_int {
-    unsafe {
-        let kind = (*m).kind;
-        if kind & ROBUST == 0 {
-            return EINVAL;
-        }
-        if (*m).owner != MUTEX_INCONSISTENT {
-            return EINVAL;
-        }
-        (*m).owner = gettid();
-        0
+    let kind = unsafe { *field!(m, kind: i32) };
+    if kind & ROBUST == 0 {
+        return EINVAL;
     }
+    if unsafe { *field!(m, owner: i32) } != MUTEX_INCONSISTENT {
+        return EINVAL;
+    }
+    unsafe { *field!(m, owner: i32) = gettid() };
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_getprioceiling(m: *const Mutex, ceiling: *mut c_int) -> c_int {
+    let kind = unsafe { *field!(m, kind: i32) };
+    if kind & PRIO_PROTECT == 0 {
+        return EINVAL;
+    }
+    let word = unsafe { &*field!(m, lock: AtomicU32) }.load(Ordering::Relaxed);
+    unsafe { *ceiling = ((word & PRIO_CEILING_MASK) >> PRIO_CEILING_SHIFT) as c_int };
+    0
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+pub unsafe extern "C" fn pthread_mutex_setprioceiling(m: *mut Mutex, ceiling: c_int, old: *mut c_int) -> c_int {
     unsafe {
-        if (*m).kind & PRIO_PROTECT == 0 {
+        let kind = kind_of(m);
+        if kind & PRIO_PROTECT == 0 {
             return EINVAL;
         }
-        *ceiling = ((((*m).lock.load(Ordering::Relaxed)) & PRIO_CEILING_MASK) >> PRIO_CEILING_SHIFT) as c_int;
+        let (min, max) = crate::tpp::fifo_range();
+        if ceiling < min || ceiling > max || ceiling & (ATTR_PRIO_CEILING_MASK >> ATTR_PRIO_CEILING_SHIFT) != ceiling {
+            return EINVAL;
+        }
+        let ty = kind & 127;
+        let mut locked = false;
+        if (*m).owner == gettid() {
+            if ty == PRIO_PROTECT | PTHREAD_MUTEX_ERRORCHECK_NP {
+                return EDEADLK;
+            }
+            if ty == PRIO_PROTECT | PTHREAD_MUTEX_RECURSIVE_NP {
+                locked = true;
+            }
+        }
+        let f = lockw(m);
+        let mut oldval = f.load(Ordering::Relaxed);
+        if !locked {
+            let ceilval = oldval & PRIO_CEILING_MASK;
+            oldval = cas_val(f, ceilval, ceilval | 1);
+            if oldval != ceilval {
+                loop {
+                    oldval = cas_val(f, ceilval | 1, ceilval | 2);
+                    if oldval & PRIO_CEILING_MASK != ceilval {
+                        break;
+                    }
+                    if oldval != ceilval {
+                        futex_wait(f, ceilval | 2, private_of(kind));
+                    }
+                    if cas_val(f, ceilval, ceilval | 2) == ceilval {
+                        break;
+                    }
+                }
+            }
+        }
+        let oldprio = ceiling_of(oldval);
+        if locked {
+            let r = crate::tpp::change_priority(oldprio, ceiling);
+            if r != 0 {
+                return r;
+            }
+        }
+        if !old.is_null() {
+            *old = oldprio;
+        }
+        let newlock = if locked { f.load(Ordering::Relaxed) & !PRIO_CEILING_MASK } else { 0 };
+        f.store(newlock | ((ceiling as u32) << PRIO_CEILING_SHIFT), Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::SeqCst);
+        futex_wake(f, i32::MAX, private_of(kind));
         0
     }
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn pthread_mutex_setprioceiling(m: *mut Mutex, ceiling: c_int, old: *mut c_int) -> c_int {
-    unsafe {
-        if (*m).kind & PRIO_PROTECT == 0 {
-            return EINVAL;
-        }
-        let min = rusty_libc_core::syscall::syscall1(147, 1) as c_int;
-        let max = rusty_libc_core::syscall::syscall1(146, 1) as c_int;
-        if ceiling < min || ceiling > max {
-            return EINVAL;
-        }
-        let r = pthread_mutex_lock(m);
-        if r != 0 {
-            return r;
-        }
-        let f = &(*m).lock;
-        let cur = f.load(Ordering::Relaxed);
-        if !old.is_null() {
-            *old = ((cur & PRIO_CEILING_MASK) >> PRIO_CEILING_SHIFT) as c_int;
-        }
-        f.store((cur & !PRIO_CEILING_MASK) | ((ceiling as u32) << PRIO_CEILING_SHIFT), Ordering::Relaxed);
-        pthread_mutex_unlock(m)
-    }
+macro_rules! attr_mut {
+    ($p:expr) => {{
+        unsafe { arg_mut($p) }
+    }};
+}
+macro_rules! attr_ref {
+    ($p:expr) => {{
+        unsafe { arg($p) }
+    }};
+}
+macro_rules! out {
+    ($p:expr) => {{
+        unsafe { arg_mut($p) }
+    }};
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_init(a: *mut MutexAttr) -> c_int {
-    unsafe {
-        (*a).kind = 0;
-        0
-    }
+    unsafe { core::ptr::write(a, MutexAttr { kind: 0 }) };
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -1011,31 +1263,24 @@ pub unsafe extern "C" fn pthread_mutexattr_destroy(_a: *mut MutexAttr) -> c_int 
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_gettype(a: *const MutexAttr, kind: *mut c_int) -> c_int {
-    unsafe {
-        *kind = (*a).kind & !ATTR_FLAG_BITS;
-        0
-    }
+    *out!(kind) = attr_ref!(a).kind_type();
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_settype(a: *mut MutexAttr, kind: c_int) -> c_int {
-    unsafe {
-        if !(PTHREAD_MUTEX_TIMED_NP..=PTHREAD_MUTEX_ADAPTIVE_NP).contains(&kind) {
-            return EINVAL;
-        }
-        (*a).kind = ((*a).kind & ATTR_FLAG_BITS) | kind;
-        0
-    }
+    attr_mut!(a).set_type(kind)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_getkind_np(a: *const MutexAttr, kind: *mut c_int) -> c_int {
-    unsafe { pthread_mutexattr_gettype(a, kind) }
+    *out!(kind) = attr_ref!(a).kind_type();
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_setkind_np(a: *mut MutexAttr, kind: c_int) -> c_int {
-    unsafe { pthread_mutexattr_settype(a, kind) }
+    attr_mut!(a).set_type(kind)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -1043,22 +1288,13 @@ pub extern "C" fn pthread_kill_other_threads_np() {}
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_getpshared(a: *const MutexAttr, pshared: *mut c_int) -> c_int {
-    unsafe {
-        *pshared = ((*a).kind & ATTR_PSHARED != 0) as c_int;
-        0
-    }
+    *out!(pshared) = attr_ref!(a).pshared();
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_setpshared(a: *mut MutexAttr, pshared: c_int) -> c_int {
-    unsafe {
-        match pshared {
-            0 => (*a).kind &= !ATTR_PSHARED,
-            1 => (*a).kind |= ATTR_PSHARED,
-            _ => return EINVAL,
-        }
-        0
-    }
+    attr_mut!(a).set_pshared(pshared)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -1068,72 +1304,46 @@ pub unsafe extern "C" fn pthread_mutex_consistent_np(m: *mut Mutex) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_getrobust_np(a: *const MutexAttr, robust: *mut c_int) -> c_int {
-    unsafe { pthread_mutexattr_getrobust(a, robust) }
+    *out!(robust) = attr_ref!(a).robust();
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_setrobust_np(a: *mut MutexAttr, robust: c_int) -> c_int {
-    unsafe { pthread_mutexattr_setrobust(a, robust) }
+    attr_mut!(a).set_robust(robust)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_getrobust(a: *const MutexAttr, robust: *mut c_int) -> c_int {
-    unsafe {
-        *robust = ((*a).kind & ATTR_ROBUST != 0) as c_int;
-        0
-    }
+    *out!(robust) = attr_ref!(a).robust();
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_setrobust(a: *mut MutexAttr, robust: c_int) -> c_int {
-    unsafe {
-        match robust {
-            0 => (*a).kind &= !ATTR_ROBUST,
-            1 => (*a).kind |= ATTR_ROBUST,
-            _ => return EINVAL,
-        }
-        0
-    }
+    attr_mut!(a).set_robust(robust)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_getprotocol(a: *const MutexAttr, protocol: *mut c_int) -> c_int {
-    unsafe {
-        *protocol = ((*a).kind & ATTR_PROTOCOL_MASK) >> ATTR_PROTOCOL_SHIFT;
-        0
-    }
+    *out!(protocol) = attr_ref!(a).protocol();
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_setprotocol(a: *mut MutexAttr, protocol: c_int) -> c_int {
-    unsafe {
-        if !(0..=2).contains(&protocol) {
-            return EINVAL;
-        }
-        (*a).kind = ((*a).kind & !ATTR_PROTOCOL_MASK) | (protocol << ATTR_PROTOCOL_SHIFT);
-        0
-    }
+    attr_mut!(a).set_protocol(protocol)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_getprioceiling(a: *const MutexAttr, ceiling: *mut c_int) -> c_int {
-    unsafe {
-        let c = ((*a).kind & ATTR_PRIO_CEILING_MASK) >> ATTR_PRIO_CEILING_SHIFT;
-        *ceiling = if c == 0 { rusty_libc_core::syscall::syscall1(147, 1) as c_int } else { c };
-        0
-    }
+    let c = attr_ref!(a).prioceiling();
+    *out!(ceiling) = c;
+    0
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_setprioceiling(a: *mut MutexAttr, ceiling: c_int) -> c_int {
-    unsafe {
-        let min = rusty_libc_core::syscall::syscall1(147, 1) as c_int;
-        let max = rusty_libc_core::syscall::syscall1(146, 1) as c_int;
-        if ceiling < min || ceiling > max {
-            return EINVAL;
-        }
-        (*a).kind = ((*a).kind & !ATTR_PRIO_CEILING_MASK) | (ceiling << ATTR_PRIO_CEILING_SHIFT);
-        0
-    }
+    attr_mut!(a).set_prioceiling(ceiling)
 }
 

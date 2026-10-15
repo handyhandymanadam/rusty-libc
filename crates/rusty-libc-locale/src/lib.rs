@@ -1,4 +1,5 @@
 #![no_std]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 #![no_builtins]
 #![allow(clippy::missing_safety_doc, clippy::too_many_arguments, clippy::manual_is_multiple_of, clippy::ptr_eq, clippy::unnecessary_cast)]
 
@@ -7,9 +8,10 @@ mod builtin_tables;
 mod charsets;
 mod collate;
 pub mod coll;
-pub use collate::{equiv_runs_wc, primary_mb, primary_wc};
+pub use collate::{equiv_runs_wc, primary_bytes, primary_mb, primary_wc, primary_wide, strcoll_bytes, strxfrm_bytes, wcscoll_wide, wcsxfrm_wide};
 mod data;
 mod find;
+mod mem;
 mod gettext;
 mod other;
 mod catgets;
@@ -20,11 +22,13 @@ pub use gettext::{bind_textdomain_codeset, bindtextdomain, dcgettext, dcngettext
 
 use core::ffi::{c_char, c_int};
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use find::{CAT_NAMES, NameBuf, cstr_bytes};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use find::{CAT_NAMES, NameBuf};
 use rusty_libc_core::errno;
-use rusty_libc_core::lock::RawMutex;
-use rusty_libc_core::locale::{self as core_locale, CatData};
+use rusty_libc_core::ffi;
+use rusty_libc_core::lock::{Guard, Locked, RawMutex};
+use rusty_libc_core::sync_cell::SyncCell;
+use rusty_libc_core::locale::{self as core_locale, CatData, Loc};
 use rusty_libc_wchar::{Charset, set_charset};
 
 pub const LC_CTYPE: c_int = 0;
@@ -70,33 +74,34 @@ pub struct Lconv {
     pub int_p_sign_posn: c_char,
     pub int_n_sign_posn: c_char,
 }
-unsafe impl Sync for Lconv {}
 
 const CHAR_MAX: c_char = 127;
 
 static LOCK: RawMutex = RawMutex::new();
 static C_NAME: [u8; 2] = *b"C\0";
 
-static mut G_NAMES: [*const u8; NCAT] = [C_NAME.as_ptr(); NCAT];
+static G_NAMES: [AtomicPtr<u8>; NCAT] = [const { AtomicPtr::new(C_NAME.as_ptr().cast_mut()) }; NCAT];
+
+#[inline(always)]
+fn g_name(cat: usize) -> *const u8 {
+    G_NAMES[cat].load(Ordering::Acquire)
+}
+
+#[inline]
+unsafe fn name_bytes<'a>(p: *const u8) -> &'a [u8] {
+    unsafe { ffi::cstr_bytes_scalar(p) }
+}
 
 fn dup_name(s: &[u8]) -> *const u8 {
     if s == b"C" {
         return C_NAME.as_ptr();
     }
-    unsafe {
-        let p = rusty_libc_malloc::malloc(s.len() + 1) as *mut u8;
-        if p.is_null() {
-            return core::ptr::null();
-        }
-        core::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
-        *p.add(s.len()) = 0;
-        p
-    }
+    mem::dup_cstr(s)
 }
 
 fn free_name(p: *const u8) {
     if !p.is_null() && p != C_NAME.as_ptr() {
-        unsafe { rusty_libc_malloc::free(p as *mut _) };
+        unsafe { mem::free(p.cast_mut()) };
     }
 }
 
@@ -116,21 +121,22 @@ fn composite(names: &[&[u8]; NCAT], first: usize) -> *const u8 {
             len += CAT_NAMES[i].len() + 1 + names[i].len() + 1;
         }
     }
-    let p = unsafe { rusty_libc_malloc::malloc(len) } as *mut u8;
+    let p = mem::malloc(len);
     if p.is_null() {
         return core::ptr::null();
     }
+    let out = unsafe { mem::block(p, len) };
     let mut at = 0;
     for i in 0..NCAT {
         if i == LC_ALL as usize {
             continue;
         }
         for part in [CAT_NAMES[i].as_bytes(), b"=", names[i], b";"] {
-            unsafe { core::ptr::copy_nonoverlapping(part.as_ptr(), p.add(at), part.len()) };
+            out[at..at + part.len()].copy_from_slice(part);
             at += part.len();
         }
     }
-    unsafe { *p.add(at - 1) = 0 };
+    out[at - 1] = 0;
     p
 }
 
@@ -156,8 +162,14 @@ fn split_composite<'a>(locale: &'a [u8], out: &mut [&'a [u8]; NCAT], have: &mut 
     true
 }
 
-fn charset_of(d: *const CatData) -> Charset {
-    let code = unsafe { (*d).flags } >> core_locale::F_CHARSET_SHIFT & 0xff;
+type Cats = [Option<&'static CatData>; NCAT];
+
+fn raw(d: Option<&'static CatData>) -> *const CatData {
+    d.map_or(core::ptr::null(), |d| d as *const CatData)
+}
+
+fn charset_of(d: &CatData) -> Charset {
+    let code = d.flags() >> core_locale::F_CHARSET_SHIFT & 0xff;
     match code {
         0 => Charset::C,
         1 => Charset::Utf8,
@@ -165,19 +177,18 @@ fn charset_of(d: *const CatData) -> Charset {
     }
 }
 
-fn tolower_hook(c: i32, loc: usize) -> i32 {
-    core_locale::tolower_in(core_locale::of_locale(loc, LC_CTYPE as usize), c)
+fn tolower_hook(c: i32, loc: Loc) -> i32 {
+    core_locale::tolower_in(data::locale_cat(loc, LC_CTYPE as usize), c)
 }
 
-fn note_special(cats: &[*const CatData; NCAT]) {
+fn note_special(cats: &Cats) {
     let d = cats[LC_CTYPE as usize];
-    let special_ctype = !d.is_null() && unsafe { (*d).flags } & core_locale::F_CTYPE_SPECIAL != 0;
-    let c = cats[LC_COLLATE as usize];
-    let collating = !c.is_null() && unsafe { (*c).flags } & core_locale::F_PLAIN == 0;
-    if !d.is_null() && unsafe { (*d).flags } & core_locale::F_WIDE_TABLES != 0 {
+    let special_ctype = d.is_some_and(|d| d.flags() & core_locale::F_CTYPE_SPECIAL != 0);
+    let collating = cats[LC_COLLATE as usize].is_some_and(|c| c.flags() & core_locale::F_PLAIN == 0);
+    if d.is_some_and(|d| d.flags() & core_locale::F_WIDE_TABLES != 0) {
         core_locale::WIDE_SPECIAL.store(true, core::sync::atomic::Ordering::Release);
     }
-    if !d.is_null() && matches!(charset_of(d), Charset::Other) {
+    if d.is_some_and(|d| matches!(charset_of(d), Charset::Other)) {
         other::install();
     }
     if special_ctype {
@@ -192,33 +203,83 @@ fn note_special(cats: &[*const CatData; NCAT]) {
     }
 }
 
-fn refresh_wide_compat(ctype: *const CatData) {
-    use rusty_libc_wchar::wctype::{iswctype, towlower, towupper, wctype};
-    if ctype.is_null() || core_locale::ctype_tables(ctype).is_none() {
+struct WideCompat {
+    class: [u32; 256],
+    lower: [u32; 384],
+    upper: [u32; 384],
+}
+
+struct WideCached {
+    key: usize,
+    generation: usize,
+    tables: &'static mut WideCompat,
+}
+
+const WIDE_CACHE: usize = 8;
+
+static WIDE_CACHED: Locked<([Option<WideCached>; WIDE_CACHE], usize)> = Locked::new(([const { None }; WIDE_CACHE], 0));
+
+fn refresh_wide_compat(ctype: Option<&'static CatData>) {
+    static WIDE_FROM: AtomicPtr<CatData> = AtomicPtr::new(null_mut());
+    static WIDE_GEN: AtomicUsize = AtomicUsize::new(0);
+    if core_locale::ctype_tables(ctype).is_none() {
+        WIDE_FROM.store(null_mut(), Ordering::Relaxed);
         rusty_libc_ctype::set_wide_compat(None);
         return;
     }
-    const NAMES: [&core::ffi::CStr; 12] = [c"upper", c"lower", c"alpha", c"digit", c"xdigit", c"space", c"print", c"graph", c"blank", c"cntrl", c"punct", c"alnum"];
-    let mut class = [0u32; 256];
-    let mut lower = [0u32; 384];
-    let mut upper = [0u32; 384];
-    unsafe {
-        let descs: [core::ffi::c_ulong; 12] = core::array::from_fn(|i| wctype(NAMES[i].as_ptr()));
-        for wc in 0..256u32 {
-            let mut bits = 0u32;
-            for (bit, &d) in descs.iter().enumerate() {
-                if iswctype(wc, d) != 0 {
-                    bits |= wide_bit(bit as u32);
+    let key = ctype.map_or(null_mut(), |d| core::ptr::from_ref(d).cast_mut());
+    let gen_now = data::FREED_GEN.load(Ordering::Acquire);
+    let own_thread_locale = !core::ptr::eq(core_locale::current(core_locale::LC_CTYPE).map_or(core::ptr::null(), core::ptr::from_ref), key);
+    let cacheable = !key.is_null() && !own_thread_locale;
+    if cacheable && WIDE_FROM.load(Ordering::Relaxed) == key && WIDE_GEN.load(Ordering::Relaxed) == gen_now {
+        return;
+    }
+    WIDE_CACHED.with(|(slots, next)| {
+        if cacheable && let Some(c) = slots.iter().flatten().find(|c| c.key == key as usize && c.generation == gen_now) {
+            rusty_libc_ctype::set_wide_compat(Some((&c.tables.class, &c.tables.lower, &c.tables.upper)));
+            return;
+        }
+        let mut fresh = WideCompat { class: [0; 256], lower: [0; 384], upper: [0; 384] };
+        compute_wide_compat(&mut fresh);
+        rusty_libc_ctype::set_wide_compat(Some((&fresh.class, &fresh.lower, &fresh.upper)));
+        if cacheable {
+            let slot = &mut slots[*next];
+            match slot {
+                Some(c) => {
+                    *c.tables = fresh;
+                    c.key = key as usize;
+                    c.generation = gen_now;
+                }
+                None => {
+                    if let Some(tables) = mem::leak(fresh) {
+                        *slot = Some(WideCached { key: key as usize, generation: gen_now, tables });
+                    }
                 }
             }
-            class[wc as usize] = bits;
+            *next = (*next + 1) % WIDE_CACHE;
         }
-        for wc in 0..256u32 {
-            lower[wc as usize] = towlower(wc);
-            upper[wc as usize] = towupper(wc);
+    });
+    WIDE_FROM.store(if cacheable { key } else { null_mut() }, Ordering::Relaxed);
+    WIDE_GEN.store(gen_now, Ordering::Relaxed);
+}
+
+fn compute_wide_compat(t: &mut WideCompat) {
+    use rusty_libc_wchar::wctype::{class_by_name, in_class, to_lower, to_upper};
+    const NAMES: [&[u8]; 12] = [b"upper", b"lower", b"alpha", b"digit", b"xdigit", b"space", b"print", b"graph", b"blank", b"cntrl", b"punct", b"alnum"];
+    let descs: [core::ffi::c_ulong; 12] = core::array::from_fn(|i| class_by_name(NAMES[i]));
+    for wc in 0..256u32 {
+        let mut bits = 0u32;
+        for (bit, &d) in descs.iter().enumerate() {
+            if in_class(wc, d) {
+                bits |= wide_bit(bit as u32);
+            }
         }
+        t.class[wc as usize] = bits;
     }
-    rusty_libc_ctype::set_wide_compat(Some((&class, &lower, &upper)));
+    for wc in 0..256u32 {
+        t.lower[wc as usize] = to_lower(wc);
+        t.upper[wc as usize] = to_upper(wc);
+    }
 }
 
 const fn wide_bit(bit: u32) -> u32 {
@@ -231,25 +292,26 @@ const fn wide_bit(bit: u32) -> u32 {
     }
 }
 
-fn publish_global(cats: &[*const CatData; NCAT]) {
+fn publish_global(cats: &Cats) {
     note_special(cats);
     for (i, &d) in cats.iter().enumerate() {
         if i != LC_ALL as usize {
             core_locale::set_global(i, d);
         }
     }
-    set_charset(charset_of(cats[LC_CTYPE as usize]));
+    if let Some(d) = cats[LC_CTYPE as usize] {
+        set_charset(charset_of(d));
+    }
     rusty_libc_ctype::refresh_compat_vars();
     refresh_wide_compat(cats[LC_CTYPE as usize]);
     gettext::bump_cat_cntr();
 }
 
-fn global_data(cat: usize) -> *const CatData {
+fn global_data(cat: usize) -> Option<&'static CatData> {
     if cat == LC_ALL as usize {
-        return core::ptr::null();
+        return None;
     }
-    let p = core_locale::global(cat);
-    if p.is_null() { data::builtin(false, cat) } else { p }
+    Some(data::global_cat(cat).unwrap_or_else(|| data::builtin(false, cat)))
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -259,19 +321,19 @@ pub unsafe extern "C" fn setlocale(category: c_int, locale: *const c_char) -> *m
         return null_mut();
     }
     if locale.is_null() {
-        return unsafe { (*core::ptr::addr_of!(G_NAMES))[category as usize] as *mut c_char };
+        return g_name(category as usize) as *mut c_char;
     }
-    unsafe { setlocale_set(category as usize, locale) }
+    let arg = unsafe { ffi::cstr_bytes_scalar(locale) };
+    setlocale_set(category as usize, arg)
 }
 
 #[inline(never)]
-unsafe fn setlocale_set(cat: usize, locale: *const c_char) -> *mut c_char {
+pub fn setlocale_set(cat: usize, arg: &[u8]) -> *mut c_char {
     let g = LOCK.guard();
     let _ = &g;
-    let arg = cstr_bytes(locale.cast());
-    let names = unsafe { &mut *core::ptr::addr_of_mut!(G_NAMES) };
-    if arg == cstr_bytes(names[cat]) {
-        return names[cat] as *mut c_char;
+    let names = &G_NAMES;
+    if arg == unsafe { name_bytes(g_name(cat)) } {
+        return g_name(cat) as *mut c_char;
     }
     let lp = locpath();
     if cat == LC_ALL as usize {
@@ -310,19 +372,20 @@ unsafe fn setlocale_set(cat: usize, locale: *const c_char) -> *mut c_char {
             errno::set(12);
             return null_mut();
         }
-        let mut cats = [core::ptr::null::<CatData>(); NCAT];
+        let mut cats: Cats = [None; NCAT];
         for c in 0..NCAT {
             if let Some(f) = &found[c] {
-                cats[c] = f.data;
-                let old = names[c];
-                names[c] = dup_name(refs[c]);
+                cats[c] = Some(f.data);
+                let old = g_name(c);
+                names[c].store(dup_name(refs[c]).cast_mut(), Ordering::Release);
                 free_name(old);
             }
         }
-        free_name(names[LC_ALL as usize]);
-        names[LC_ALL as usize] = comp;
+        free_name(g_name(LC_ALL as usize));
+        names[LC_ALL as usize].store(comp.cast_mut(), Ordering::Release);
         publish_global(&cats);
         gettext::note_locale_changed();
+        gettext::note_messages_locale(unsafe { name_bytes(g_name(LC_MESSAGES as usize)) });
         return comp as *mut c_char;
     }
     let f = match find::find_locale(cat, arg, lp) {
@@ -332,7 +395,7 @@ unsafe fn setlocale_set(cat: usize, locale: *const c_char) -> *mut c_char {
             return null_mut();
         }
     };
-    let mut all: [&[u8]; NCAT] = core::array::from_fn(|c| cstr_bytes(names[c]));
+    let mut all: [&[u8]; NCAT] = core::array::from_fn(|c| unsafe { name_bytes(g_name(c)) });
     all[cat] = f.name.as_bytes();
     let comp = composite(&all, cat);
     if comp.is_null() {
@@ -340,24 +403,31 @@ unsafe fn setlocale_set(cat: usize, locale: *const c_char) -> *mut c_char {
         return null_mut();
     }
     let newname = dup_name(f.name.as_bytes());
-    let old = names[cat];
-    names[cat] = newname;
+    let old = g_name(cat);
+    names[cat].store(newname.cast_mut(), Ordering::Release);
     free_name(old);
-    free_name(names[LC_ALL as usize]);
-    names[LC_ALL as usize] = comp;
-    let mut cats: [*const CatData; NCAT] = core::array::from_fn(global_data);
-    cats[cat] = f.data;
+    free_name(g_name(LC_ALL as usize));
+    names[LC_ALL as usize].store(comp.cast_mut(), Ordering::Release);
+    let mut cats: Cats = core::array::from_fn(global_data);
+    cats[cat] = Some(f.data);
     publish_global(&cats);
     gettext::note_locale_changed();
+    gettext::note_messages_locale(unsafe { name_bytes(g_name(LC_MESSAGES as usize)) });
     newname as *mut c_char
 }
 
-fn cur_data(cat: usize, loc: usize) -> *const CatData {
-    let p = core_locale::of_locale(loc, cat);
-    if p.is_null() { data::builtin(false, cat) } else { p }
+pub(crate) fn messages_name() -> &'static [u8] {
+    unsafe { name_bytes(g_name(LC_MESSAGES as usize)) }
 }
 
-static mut LCONV: Lconv = C_LCONV_INIT;
+fn cur_data(cat: usize, loc: Loc) -> &'static CatData {
+    match data::locale_cat(loc, cat) {
+        Some(d) => d,
+        None => data::builtin(false, cat),
+    }
+}
+
+static LCONV: SyncCell<Lconv> = SyncCell::new(C_LCONV_INIT);
 const C_LCONV_INIT: Lconv = Lconv {
     decimal_point: c".".as_ptr(),
     thousands_sep: c"".as_ptr(),
@@ -387,101 +457,92 @@ const C_LCONV_INIT: Lconv = Lconv {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn localeconv() -> *const Lconv {
-    let n = cur_data(LC_NUMERIC as usize, 0);
-    let m = cur_data(LC_MONETARY as usize, 0);
-    unsafe {
-        let r = &mut *core::ptr::addr_of_mut!(LCONV);
-        if LCONV_KEY[0].load(Ordering::Acquire) != n as usize || LCONV_KEY[1].load(Ordering::Acquire) != m as usize {
-            fill_lconv_from(r, n, m);
-            LCONV_KEY[0].store(n as usize, Ordering::Release);
-            LCONV_KEY[1].store(m as usize, Ordering::Release);
-        }
-        r
+    let n = cur_data(LC_NUMERIC as usize, Loc::CURRENT);
+    let m = cur_data(LC_MONETARY as usize, Loc::CURRENT);
+    let (nk, mk) = (n as *const CatData as usize, m as *const CatData as usize);
+    if LCONV_KEY[0].load(Ordering::Acquire) != nk || LCONV_KEY[1].load(Ordering::Acquire) != mk {
+        refill_lconv(n, m);
     }
+    LCONV.as_ptr()
+}
+
+#[cold]
+#[inline(never)]
+fn refill_lconv(n: &'static CatData, m: &'static CatData) {
+    unsafe { LCONV.write(lconv_from(n, m)) };
+    LCONV_KEY[0].store(n as *const CatData as usize, Ordering::Release);
+    LCONV_KEY[1].store(m as *const CatData as usize, Ordering::Release);
 }
 
 static LCONV_KEY: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 
-pub fn lconv_of(loc: usize) -> Lconv {
-    let mut r = C_LCONV_INIT;
-    fill_lconv(&mut r, loc);
-    r
+pub fn lconv_of(loc: Loc) -> Lconv {
+    lconv_from(cur_data(LC_NUMERIC as usize, loc), cur_data(LC_MONETARY as usize, loc))
 }
 
-fn fill_lconv(r: &mut Lconv, loc: usize) {
-    fill_lconv_from(r, cur_data(LC_NUMERIC as usize, loc), cur_data(LC_MONETARY as usize, loc));
-}
-
-fn fill_lconv_from(r: &mut Lconv, n: *const CatData, m: *const CatData) {
-    unsafe {
-        let n = &*n;
-        let m = &*m;
-        let nostop = |p: *const u8| -> *const c_char { if *p == 127 || *p == 255 { c"".as_ptr() } else { p.cast() } };
-        r.decimal_point = n.cstr(0).cast();
-        r.thousands_sep = n.cstr(1).cast();
-        r.grouping = nostop(n.cstr(2));
-        r.int_curr_symbol = m.cstr(0).cast();
-        r.currency_symbol = m.cstr(1).cast();
-        r.mon_decimal_point = m.cstr(2).cast();
-        r.mon_thousands_sep = m.cstr(3).cast();
-        r.mon_grouping = nostop(m.cstr(4));
-        r.positive_sign = m.cstr(5).cast();
-        r.negative_sign = m.cstr(6).cast();
-        let b = |i: usize| -> c_char {
-            let v = m.byte(i);
-            if v == 255 { CHAR_MAX } else { v as c_char }
-        };
-        r.int_frac_digits = b(7);
-        r.frac_digits = b(8);
-        r.p_cs_precedes = b(9);
-        r.p_sep_by_space = b(10);
-        r.n_cs_precedes = b(11);
-        r.n_sep_by_space = b(12);
-        r.p_sign_posn = b(13);
-        r.n_sign_posn = b(14);
-        r.int_p_cs_precedes = b(16);
-        r.int_p_sep_by_space = b(17);
-        r.int_n_cs_precedes = b(18);
-        r.int_n_sep_by_space = b(19);
-        r.int_p_sign_posn = b(20);
-        r.int_n_sign_posn = b(21);
+fn lconv_from(n: &CatData, m: &CatData) -> Lconv {
+    let nostop = |d: &CatData, i: usize| -> *const c_char { if matches!(d.byte(i), 127 | 255) { c"".as_ptr() } else { d.cstr(i).cast() } };
+    let b = |i: usize| -> c_char {
+        let v = m.byte(i);
+        if v == 255 { CHAR_MAX } else { v as c_char }
+    };
+    Lconv {
+        decimal_point: n.cstr(0).cast(),
+        thousands_sep: n.cstr(1).cast(),
+        grouping: nostop(n, 2),
+        int_curr_symbol: m.cstr(0).cast(),
+        currency_symbol: m.cstr(1).cast(),
+        mon_decimal_point: m.cstr(2).cast(),
+        mon_thousands_sep: m.cstr(3).cast(),
+        mon_grouping: nostop(m, 4),
+        positive_sign: m.cstr(5).cast(),
+        negative_sign: m.cstr(6).cast(),
+        int_frac_digits: b(7),
+        frac_digits: b(8),
+        p_cs_precedes: b(9),
+        p_sep_by_space: b(10),
+        n_cs_precedes: b(11),
+        n_sep_by_space: b(12),
+        p_sign_posn: b(13),
+        n_sign_posn: b(14),
+        int_p_cs_precedes: b(16),
+        int_p_sep_by_space: b(17),
+        int_n_cs_precedes: b(18),
+        int_n_sep_by_space: b(19),
+        int_p_sign_posn: b(20),
+        int_n_sign_posn: b(21),
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn nl_langinfo(item: c_int) -> *const c_char {
-    nl_langinfo_l(item, core_locale::thread() as *mut LocaleStruct)
+    langinfo(item, Loc::CURRENT)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub extern "C" fn nl_langinfo_l(item: c_int, loc: *mut LocaleStruct) -> *const c_char {
+pub unsafe extern "C" fn nl_langinfo_l(item: c_int, loc: *mut LocaleStruct) -> *const c_char {
+    langinfo(item, unsafe { Loc::from_raw(loc as usize) })
+}
+
+pub fn langinfo(item: c_int, loc: Loc) -> *const c_char {
     let cat = (item >> 16) as usize;
     if item < 0 || cat >= NCAT || cat == LC_ALL as usize {
         return c"".as_ptr();
     }
     let index = (item & 0xffff) as usize;
     if index == 0xffff {
-        return name_of(loc as usize, cat).cast();
+        return name_of(loc, cat).cast();
     }
-    let d = unsafe { &*cur_data(cat, loc as usize) };
-    if index >= d.nstrings as usize {
-        return c"".as_ptr();
-    }
-    unsafe { *d.values.add(index) as *const c_char }
+    cur_data(cat, loc).cstr(index).cast()
 }
 
-pub(crate) fn name_of(loc: usize, cat: usize) -> *const u8 {
-    if loc == 0 {
-        let t = core_locale::thread();
-        if t.is_null() {
-            return unsafe { (*core::ptr::addr_of!(G_NAMES))[cat] };
-        }
-        return unsafe { (*(t as *const LocaleStruct)).names[cat].cast() };
+pub(crate) fn name_of(loc: Loc, cat: usize) -> *const u8 {
+    let obj = if loc == Loc::CURRENT { core_locale::thread() as usize } else { loc.raw() };
+    if obj == 0 || obj == LC_GLOBAL_LOCALE {
+        return g_name(cat);
     }
-    if loc == LC_GLOBAL_LOCALE {
-        return unsafe { (*core::ptr::addr_of!(G_NAMES))[cat] };
-    }
-    unsafe { (*(loc as *const LocaleStruct)).names[cat].cast() }
+    let l = obj as *const LocaleStruct;
+    unsafe { (*l).names[cat].cast() }
 }
 
 #[repr(C)]
@@ -495,16 +556,17 @@ pub struct LocaleStruct {
 
 const LC_GLOBAL_LOCALE: usize = usize::MAX;
 
-static mut C_LOCOBJ: LocaleStruct = LocaleStruct {
+static C_LOCOBJ: SyncCell<LocaleStruct> = SyncCell::new(LocaleStruct {
     locales: [core::ptr::null(); NCAT],
     ctype_b: core::ptr::null(),
     ctype_tolower: core::ptr::null(),
     ctype_toupper: core::ptr::null(),
     names: [core::ptr::null(); NCAT],
-};
+});
+static C_LOCOBJ_READY: AtomicBool = AtomicBool::new(false);
 
 fn fill_pointers(l: &mut LocaleStruct) {
-    match core_locale::ctype_tables(l.locales[LC_CTYPE as usize]) {
+    match core_locale::ctype_tables(unsafe { data::published(l.locales[LC_CTYPE as usize]) }) {
         Some(t) => {
             l.ctype_b = t.class;
             l.ctype_tolower = t.lower;
@@ -519,61 +581,72 @@ fn fill_pointers(l: &mut LocaleStruct) {
     }
 }
 
-fn c_locobj() -> *mut LocaleStruct {
-    unsafe {
-        let l = &mut *core::ptr::addr_of_mut!(C_LOCOBJ);
-        if l.locales[0].is_null() {
-            for c in 0..NCAT {
-                if c != LC_ALL as usize {
-                    l.locales[c] = data::builtin(false, c);
-                    l.names[c] = C_NAME.as_ptr().cast();
-                }
-            }
-            fill_pointers(l);
-        }
-        l
+#[inline]
+fn c_locobj(_g: &Guard<'_>) -> *mut LocaleStruct {
+    if !C_LOCOBJ_READY.load(Ordering::Acquire) {
+        c_locobj_fill();
     }
+    C_LOCOBJ.as_ptr()
 }
 
-fn snapshot(loc: usize) -> ([*const CatData; NCAT], [NameBuf; NCAT]) {
-    let mut cats = [core::ptr::null::<CatData>(); NCAT];
+#[cold]
+#[inline(never)]
+fn c_locobj_fill() {
+    let mut l = LocaleStruct { locales: [core::ptr::null(); NCAT], ctype_b: core::ptr::null(), ctype_tolower: core::ptr::null(), ctype_toupper: core::ptr::null(), names: [core::ptr::null(); NCAT] };
+    for c in 0..NCAT {
+        if c != LC_ALL as usize {
+            l.locales[c] = data::builtin(false, c);
+            l.names[c] = C_NAME.as_ptr().cast();
+        }
+    }
+    fill_pointers(&mut l);
+    unsafe { C_LOCOBJ.write(l) };
+    C_LOCOBJ_READY.store(true, Ordering::Release);
+}
+
+fn snapshot(loc: Loc) -> (Cats, [NameBuf; NCAT]) {
+    let mut cats: Cats = [None; NCAT];
     let mut names = [NameBuf::new(b"C"); NCAT];
     for c in 0..NCAT {
         if c != LC_ALL as usize {
-            cats[c] = cur_data(c, loc);
-            names[c] = NameBuf::new(cstr_bytes(name_of(loc, c)));
+            cats[c] = Some(cur_data(c, loc));
+            names[c] = NameBuf::new(unsafe { name_bytes(name_of(loc, c)) });
         }
     }
     (cats, names)
 }
 
-fn alloc_locale(cats: &[*const CatData; NCAT], names: &[&[u8]; NCAT]) -> *mut LocaleStruct {
+fn alloc_locale(cats: &Cats, names: &[&[u8]; NCAT]) -> *mut LocaleStruct {
     note_special(cats);
+    const SZ: usize = core::mem::size_of::<LocaleStruct>();
     let total: usize = (0..NCAT).filter(|&c| c != LC_ALL as usize && names[c] != b"C").map(|c| names[c].len() + 1).sum();
-    unsafe {
-        let p = rusty_libc_malloc::calloc(1, core::mem::size_of::<LocaleStruct>() + total) as *mut LocaleStruct;
-        if p.is_null() {
-            errno::set(12);
-            return null_mut();
-        }
-        let mut area = (p as *mut u8).add(core::mem::size_of::<LocaleStruct>());
-        for c in 0..NCAT {
-            if c == LC_ALL as usize {
-                continue;
-            }
-            (*p).locales[c] = cats[c];
-            if names[c] == b"C" {
-                (*p).names[c] = C_NAME.as_ptr().cast();
-            } else {
-                core::ptr::copy_nonoverlapping(names[c].as_ptr(), area, names[c].len());
-                *area.add(names[c].len()) = 0;
-                (*p).names[c] = area.cast();
-                area = area.add(names[c].len() + 1);
-            }
-        }
-        fill_pointers(&mut *p);
-        p
+    let p = mem::calloc(1, SZ + total);
+    if p.is_null() {
+        errno::set(12);
+        return null_mut();
     }
+    let area_ptr = p.wrapping_add(SZ);
+    let area = unsafe { mem::block(area_ptr, total) };
+    let mut l = LocaleStruct { locales: [core::ptr::null(); NCAT], ctype_b: core::ptr::null(), ctype_tolower: core::ptr::null(), ctype_toupper: core::ptr::null(), names: [core::ptr::null(); NCAT] };
+    let mut at = 0;
+    for c in 0..NCAT {
+        if c == LC_ALL as usize {
+            continue;
+        }
+        l.locales[c] = raw(cats[c]);
+        if names[c] == b"C" {
+            l.names[c] = C_NAME.as_ptr().cast();
+        } else {
+            area[at..at + names[c].len()].copy_from_slice(names[c]);
+            area[at + names[c].len()] = 0;
+            l.names[c] = area_ptr.wrapping_add(at).cast();
+            at += names[c].len() + 1;
+        }
+    }
+    fill_pointers(&mut l);
+    let p = p.cast::<LocaleStruct>();
+    unsafe { p.write(l) };
+    p
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -584,18 +657,20 @@ pub unsafe extern "C" fn newlocale(mask: c_int, locale: *const c_char, base: *mu
         errno::set(errno::EINVAL);
         return null_mut();
     }
+    let arg = unsafe { ffi::cstr_bytes_scalar(locale) };
+    unsafe { newlocale_core(mask, arg, base as usize) }
+}
+
+unsafe fn newlocale_core(mask: c_int, arg: &[u8], base: usize) -> *mut LocaleStruct {
+    const ALL: c_int = 0x1fbf;
     let g = LOCK.guard();
-    let _ = &g;
-    let mut base = base;
-    let cl = c_locobj();
-    if base == cl {
-        base = null_mut();
-    }
-    let arg = cstr_bytes(locale.cast());
-    if (base.is_null() || mask == ALL) && (mask == 0 || arg == b"C") {
+    let cl = c_locobj(&g);
+    let base = if base == cl as usize { 0 } else { base };
+    if (base == 0 || mask == ALL) && (mask == 0 || arg == b"C") {
         return cl;
     }
-    let (mut cats, bnames) = if base.is_null() { snapshot(cl as usize) } else { snapshot(base as usize) };
+    let from = unsafe { Loc::from_raw(if base == 0 { cl as usize } else { base }) };
+    let (mut cats, bnames) = snapshot(from);
     let mut resolved = bnames;
     if mask != 0 {
         let mut newnames: [&[u8]; NCAT] = [arg; NCAT];
@@ -613,7 +688,7 @@ pub unsafe extern "C" fn newlocale(mask: c_int, locale: *const c_char, base: *mu
             }
             match find::find_locale(c, newnames[c], lp) {
                 Ok(f) => {
-                    cats[c] = f.data;
+                    cats[c] = Some(f.data);
                     resolved[c] = f.name;
                 }
                 Err(e) => {
@@ -624,9 +699,10 @@ pub unsafe extern "C" fn newlocale(mask: c_int, locale: *const c_char, base: *mu
         }
     }
     let refs: [&[u8]; NCAT] = core::array::from_fn(|c| resolved[c].as_bytes());
+    gettext::note_messages_locale(refs[LC_MESSAGES as usize]);
     let r = alloc_locale(&cats, &refs);
-    if !r.is_null() && !base.is_null() && base as usize != LC_GLOBAL_LOCALE {
-        unsafe { rusty_libc_malloc::free(base.cast()) };
+    if !r.is_null() && base != 0 && base != LC_GLOBAL_LOCALE {
+        unsafe { mem::free(base as *mut LocaleStruct) };
     }
     r
 }
@@ -638,11 +714,10 @@ pub unsafe extern "C" fn duplocale(loc: *mut LocaleStruct) -> *mut LocaleStruct 
         return null_mut();
     }
     let g = LOCK.guard();
-    let _ = &g;
-    if loc == c_locobj() {
+    if loc == c_locobj(&g) {
         return loc;
     }
-    let (cats, names) = snapshot(loc as usize);
+    let (cats, names) = snapshot(unsafe { Loc::from_raw(loc as usize) });
     let refs: [&[u8]; NCAT] = core::array::from_fn(|c| names[c].as_bytes());
     alloc_locale(&cats, &refs)
 }
@@ -651,9 +726,8 @@ pub unsafe extern "C" fn duplocale(loc: *mut LocaleStruct) -> *mut LocaleStruct 
 pub unsafe extern "C" fn freelocale(loc: *mut LocaleStruct) {
     if !loc.is_null() && loc as usize != LC_GLOBAL_LOCALE {
         let g = LOCK.guard();
-        let _ = &g;
-        if loc != c_locobj() {
-            unsafe { rusty_libc_malloc::free(loc.cast()) };
+        if loc != c_locobj(&g) {
+            unsafe { mem::free(loc) };
         }
     }
 }
@@ -664,21 +738,16 @@ pub unsafe extern "C" fn uselocale(loc: *mut LocaleStruct) -> *mut LocaleStruct 
     let old = if t.is_null() { LC_GLOBAL_LOCALE as *mut LocaleStruct } else { t as *mut LocaleStruct };
     if !loc.is_null() {
         if loc as usize == LC_GLOBAL_LOCALE {
-            core_locale::set_thread(core::ptr::null());
+            unsafe { core_locale::set_thread(core::ptr::null()) };
         } else {
-            core_locale::set_thread(loc as *const *const CatData);
+            unsafe { core_locale::set_thread(loc as *const *const CatData) };
         }
     }
     old
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn __uselocale(loc: *mut LocaleStruct) -> *mut LocaleStruct {
-    unsafe { uselocale(loc) }
-}
-
-
 rusty_libc_core::tail_alias!(__newlocale => newlocale);
+rusty_libc_core::tail_alias!(__uselocale => uselocale);
 rusty_libc_core::tail_alias!(__duplocale => duplocale);
 rusty_libc_core::tail_alias!(__freelocale => freelocale);
 rusty_libc_core::tail_alias!(__nl_langinfo_l => nl_langinfo_l);

@@ -1,8 +1,8 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::types::*;
-use crate::util::cstrlen;
 use core::ffi::{c_char, c_int, c_uint, c_void};
-use rusty_libc_core::errno;
 use rusty_libc_core::syscall::{check, syscall3};
+use rusty_libc_core::{errno, ffi};
 
 const NETLINK_ROUTE: c_int = 0;
 const RTM_NEWLINK: u16 = 16;
@@ -60,7 +60,12 @@ impl Heap {
         true
     }
     fn bytes(&self) -> &[u8] {
-        if self.p.is_null() { &[] } else { unsafe { core::slice::from_raw_parts(self.p, self.len) } }
+        unsafe { ffi::bytes(self.p, self.len) }
+    }
+    fn extend(&mut self, b: &[u8]) {
+        assert!(self.len + b.len() <= self.cap);
+        unsafe { ffi::bytes_mut(self.p.wrapping_add(self.len), b.len()) }.copy_from_slice(b);
+        self.len += b.len();
     }
 }
 
@@ -73,7 +78,7 @@ impl Drop for Heap {
 }
 
 fn netlink_dump(typ: u16) -> Result<Heap, i32> {
-    let fd = unsafe { crate::sock::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE) };
+    let fd = crate::sock::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
     if fd < 0 {
         return Err(errno::get());
     }
@@ -96,7 +101,18 @@ fn netlink_dump(typ: u16) -> Result<Heap, i32> {
         let mut heap = Heap::new();
         let mut buf = [0u8; 16384];
         loop {
-            let n = unsafe { crate::sock::recv(fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0) };
+            let mut nladdr = sockaddr_nl { nl_family: 0, nl_pad: 0, nl_pid: 0, nl_groups: 0 };
+            let mut iov = iovec { iov_base: buf.as_mut_ptr() as *mut c_void, iov_len: buf.len() };
+            let mut msg = msghdr {
+                msg_name: &mut nladdr as *mut _ as *mut c_void,
+                msg_namelen: 12,
+                msg_iov: &mut iov,
+                msg_iovlen: 1,
+                msg_control: core::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            };
+            let n = unsafe { crate::sock::recvmsg(fd, &mut msg, 0) };
             if n < 0 {
                 let e = errno::get();
                 if e == EINTR {
@@ -126,8 +142,7 @@ fn netlink_dump(typ: u16) -> Result<Heap, i32> {
                 if !heap.reserve(len) {
                     return Err(ENOMEM);
                 }
-                unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr().add(off), heap.p.add(heap.len), len) };
-                heap.len += len;
+                heap.extend(&buf[off..off + len]);
                 off += (len + 3) & !3;
             }
             if done {
@@ -135,7 +150,7 @@ fn netlink_dump(typ: u16) -> Result<Heap, i32> {
             }
         }
     })();
-    unsafe { rusty_libc_core::syscall::syscall1(rusty_libc_core::syscall::SYS_CLOSE, fd as usize) };
+    let _ = rusty_libc_core::unistd::close(fd);
     r
 }
 
@@ -233,8 +248,8 @@ pub fn check_pf() -> (bool, bool) {
 }
 
 fn ifreq_call(req: usize, ifr: &mut [u8; 40]) -> c_int {
-    let fd = unsafe { crate::sock::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0) };
-    let fd = if fd < 0 { unsafe { crate::sock::socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0) } } else { fd };
+    let fd = crate::sock::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    let fd = if fd < 0 { crate::sock::socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0) } else { fd };
     if fd < 0 {
         return -1;
     }
@@ -244,7 +259,7 @@ fn ifreq_call(req: usize, ifr: &mut [u8; 40]) -> c_int {
         Ok(_) => 0,
         Err(e) => e.0,
     };
-    unsafe { rusty_libc_core::syscall::syscall1(rusty_libc_core::syscall::SYS_CLOSE, fd as usize) };
+    let _ = rusty_libc_core::unistd::close(fd);
     if saved != 0 {
         errno::set(saved);
         -1
@@ -313,10 +328,11 @@ pub fn scopeid_pton(addr: &[u8; 16], s: &[u8]) -> Option<u32> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __inet6_scopeid_pton(address: *const in6_addr, scope: *const c_char, result: *mut u32) -> c_int {
-    let (a, s) = unsafe { ((*address).s6_addr, core::slice::from_raw_parts(scope as *const u8, cstrlen(scope))) };
+    let a = unsafe { (*address).s6_addr };
+    let s = unsafe { ffi::cstr_bytes(scope) };
     match scopeid_pton(&a, s) {
         Some(id) => {
-            unsafe { *result = id };
+            unsafe { result.write(id) };
             0
         }
         None => {
@@ -328,7 +344,7 @@ pub unsafe extern "C" fn __inet6_scopeid_pton(address: *const in6_addr, scope: *
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn if_nametoindex(name: *const c_char) -> c_uint {
-    let s = unsafe { core::slice::from_raw_parts(name as *const u8, cstrlen(name)) };
+    let s = unsafe { ffi::cstr_bytes(name) };
     name_to_index(s).unwrap_or(0)
 }
 
@@ -342,10 +358,9 @@ pub unsafe extern "C" fn if_indextoname(index: c_uint, buf: *mut c_char) -> *mut
         }
         return core::ptr::null_mut();
     }
-    unsafe {
-        core::ptr::copy_nonoverlapping(ifr.as_ptr(), buf as *mut u8, IFNAMSIZ);
-        *buf.add(IFNAMSIZ - 1) = 0;
-    }
+    let b = unsafe { ffi::bytes_mut(buf.cast::<u8>(), IFNAMSIZ) };
+    b.copy_from_slice(&ifr[..IFNAMSIZ]);
+    b[IFNAMSIZ - 1] = 0;
     buf
 }
 
@@ -372,31 +387,25 @@ pub unsafe extern "C" fn if_nameindex() -> *mut if_nameindex {
         return core::ptr::null_mut();
     }
     let arr = blk as *mut if_nameindex;
-    let mut names = unsafe { blk.add((n + 1) * esz) };
+    let names_at = blk.wrapping_add((n + 1) * esz);
+    unsafe { names_at.write_bytes(0, n * IFNAMSIZ) };
+    let names = unsafe { ffi::bytes_mut(names_at, n * IFNAMSIZ) };
     let mut i = 0usize;
     for (ty, m) in messages(d.bytes()) {
         if ty != RTM_NEWLINK || m.len() < 16 {
             continue;
         }
-        let idx = rd32(m, 4);
-        unsafe {
-            (*arr.add(i)).if_index = idx;
-            (*arr.add(i)).if_name = names as *mut c_char;
-            core::ptr::write_bytes(names, 0, IFNAMSIZ);
-        }
+        let entry = if_nameindex { if_index: rd32(m, 4), if_name: names_at.wrapping_add(i * IFNAMSIZ).cast::<c_char>() };
+        unsafe { arr.wrapping_add(i).write(entry) };
         for (t, v) in attrs(m, 16) {
             if t == IFLA_IFNAME {
                 let l = v.iter().position(|&c| c == 0).unwrap_or(v.len()).min(IFNAMSIZ - 1);
-                unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), names, l) };
+                names[i * IFNAMSIZ..i * IFNAMSIZ + l].copy_from_slice(&v[..l]);
             }
         }
-        names = unsafe { names.add(IFNAMSIZ) };
         i += 1;
     }
-    unsafe {
-        (*arr.add(i)).if_index = 0;
-        (*arr.add(i)).if_name = core::ptr::null_mut();
-    }
+    unsafe { arr.wrapping_add(i).write(if_nameindex { if_index: 0, if_name: core::ptr::null_mut() }) };
     arr
 }
 
@@ -409,6 +418,45 @@ pub unsafe extern "C" fn if_freenameindex(p: *mut if_nameindex) {
 
 const SLOT: usize = 256;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+union SockSlot {
+    in4: sockaddr_in,
+    in6: sockaddr_in6,
+    ll: sockaddr_ll,
+    raw: [u8; 28],
+}
+
+#[repr(C)]
+struct Slot {
+    ia: ifaddrs,
+    name: [u8; IFNAMSIZ],
+    addr: SockSlot,
+    mask: SockSlot,
+    bc: SockSlot,
+    data: [u8; STATS_SIZE],
+    pad: [u8; 8],
+}
+
+const _: () = assert!(
+    core::mem::size_of::<Slot>() == SLOT
+        && core::mem::offset_of!(Slot, name) == 56
+        && core::mem::offset_of!(Slot, addr) == 72
+        && core::mem::offset_of!(Slot, mask) == 100
+        && core::mem::offset_of!(Slot, bc) == 128
+        && core::mem::offset_of!(Slot, data) == 156
+);
+
+fn name_part(v: &[u8]) -> &[u8] {
+    &v[..v.iter().position(|&c| c == 0).unwrap_or(v.len()).min(IFNAMSIZ - 1)]
+}
+
+fn packet_addr(index: u32, hatype: u16, v: &[u8]) -> sockaddr_ll {
+    let l = v.len().min(8);
+    let mut a = [0u8; 8];
+    a[..l].copy_from_slice(&v[..l]);
+    sockaddr_ll { sll_family: AF_PACKET as u16, sll_protocol: 0, sll_ifindex: index as c_int, sll_hatype: hatype, sll_pkttype: 0, sll_halen: l as u8, sll_addr: a }
+}
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getifaddrs(ifap: *mut *mut ifaddrs) -> c_int {
@@ -438,35 +486,29 @@ pub unsafe extern "C" fn getifaddrs(ifap: *mut *mut ifaddrs) -> c_int {
         }
     }
     if count == 0 {
-        unsafe { *ifap = core::ptr::null_mut() };
+        unsafe { ifap.write(core::ptr::null_mut()) };
         return 0;
     }
-    let blk = unsafe { rusty_libc_malloc::calloc(count, SLOT) } as *mut u8;
+    let blk = unsafe { rusty_libc_malloc::calloc(count, SLOT) } as *mut Slot;
     if blk.is_null() {
         errno::set(ENOMEM);
         return -1;
     }
-    let mut slot = 0usize;
-    let mut prev: *mut ifaddrs = core::ptr::null_mut();
-    let mut first: *mut ifaddrs = core::ptr::null_mut();
-    let setup = |slot: usize| -> (*mut ifaddrs, *mut u8, *mut u8, *mut u8, *mut u8, *mut u8) {
-        let base = unsafe { blk.add(slot * SLOT) };
-        let ia = base as *mut ifaddrs;
-        let name = unsafe { base.add(56) };
-        let a = unsafe { base.add(72) };
-        let mk = unsafe { base.add(100) };
-        let bc = unsafe { base.add(128) };
-        let data = unsafe { base.add(156) };
-        (ia, name, a, mk, bc, data)
-    };
+    let slots = unsafe { ffi::slice_mut(blk, count) };
+    let at = |i: usize, off: usize| blk.cast::<u8>().wrapping_add(i * SLOT + off);
+    const NAME: usize = core::mem::offset_of!(Slot, name);
+    const ADDR: usize = core::mem::offset_of!(Slot, addr);
+    const MASK: usize = core::mem::offset_of!(Slot, mask);
+    const BC: usize = core::mem::offset_of!(Slot, bc);
+    const DATA: usize = core::mem::offset_of!(Slot, data);
     let link_tab = |idx: u32| -> Option<([u8; IFNAMSIZ], u32)> {
         for (ty, m) in messages(links.bytes()) {
             if ty == RTM_NEWLINK && m.len() >= 16 && rd32(m, 4) == idx {
                 let mut name = [0u8; IFNAMSIZ];
                 for (t, v) in attrs(m, 16) {
                     if t == IFLA_IFNAME {
-                        let l = v.iter().position(|&c| c == 0).unwrap_or(v.len()).min(IFNAMSIZ - 1);
-                        name[..l].copy_from_slice(&v[..l]);
+                        let n = name_part(v);
+                        name[..n.len()].copy_from_slice(n);
                     }
                 }
                 return Some((name, rd32(m, 8)));
@@ -474,59 +516,44 @@ pub unsafe extern "C" fn getifaddrs(ifap: *mut *mut ifaddrs) -> c_int {
         }
         None
     };
-    let mut link = |ia: *mut ifaddrs| {
-        if prev.is_null() {
-            first = ia;
-        } else {
-            unsafe { (*prev).ifa_next = ia };
-        }
-        prev = ia;
-    };
+    let mut used = 0usize;
     for (ty, m) in messages(links.bytes()) {
         if ty != RTM_NEWLINK || m.len() < 16 {
             continue;
         }
-        let (ia, name, a, _mk, bc, data) = setup(slot);
-        slot += 1;
+        let i = used;
+        let s = &mut slots[i];
+        used += 1;
         let hatype = rd16(m, 2);
         let index = rd32(m, 4);
         let flags = rd32(m, 8);
-        unsafe {
-            (*ia).ifa_name = name as *mut c_char;
-            (*ia).ifa_flags = flags;
-        }
+        s.ia.ifa_name = at(i, NAME).cast::<c_char>();
+        s.ia.ifa_flags = flags;
         for (t, v) in attrs(m, 16) {
             match t {
                 IFLA_IFNAME => {
-                    let l = v.iter().position(|&c| c == 0).unwrap_or(v.len()).min(IFNAMSIZ - 1);
-                    unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), name, l) };
+                    let n = name_part(v);
+                    s.name[..n.len()].copy_from_slice(n);
                 }
-                IFLA_ADDRESS => unsafe {
-                    let l = v.len().min(8);
-                    *(a as *mut sockaddr_ll) = sockaddr_ll { sll_family: AF_PACKET as u16, sll_protocol: 0, sll_ifindex: index as c_int, sll_hatype: hatype, sll_pkttype: 0, sll_halen: 0, sll_addr: [0; 8] };
-                    (*ia).ifa_addr = a as *mut sockaddr;
-                    (*(a as *mut sockaddr_ll)).sll_halen = l as u8;
-                    core::ptr::copy_nonoverlapping(v.as_ptr(), (&raw mut (*(a as *mut sockaddr_ll)).sll_addr) as *mut u8, l);
-                },
-                IFLA_BROADCAST => unsafe {
-                    let l = v.len().min(8);
-                    let b = bc as *mut sockaddr_ll;
-                    *b = sockaddr_ll { sll_family: AF_PACKET as u16, sll_protocol: 0, sll_ifindex: index as c_int, sll_hatype: hatype, sll_pkttype: 0, sll_halen: l as u8, sll_addr: [0; 8] };
-                    core::ptr::copy_nonoverlapping(v.as_ptr(), (&raw mut (*b).sll_addr) as *mut u8, l);
+                IFLA_ADDRESS => {
+                    s.addr.ll = packet_addr(index, hatype, v);
+                    s.ia.ifa_addr = at(i, ADDR).cast::<sockaddr>();
+                }
+                IFLA_BROADCAST => {
+                    s.bc.ll = packet_addr(index, hatype, v);
                     if flags & IFF_POINTOPOINT != 0 {
-                        (*ia).ifa_ifu.ifu_dstaddr = b as *mut sockaddr;
+                        s.ia.ifa_ifu.ifu_dstaddr = at(i, BC).cast::<sockaddr>();
                     } else {
-                        (*ia).ifa_ifu.ifu_broadaddr = b as *mut sockaddr;
+                        s.ia.ifa_ifu.ifu_broadaddr = at(i, BC).cast::<sockaddr>();
                     }
-                },
-                IFLA_STATS if v.len() >= STATS_SIZE => unsafe {
-                    core::ptr::copy_nonoverlapping(v.as_ptr(), data, STATS_SIZE);
-                    (*ia).ifa_data = data as *mut c_void;
-                },
+                }
+                IFLA_STATS if v.len() >= STATS_SIZE => {
+                    s.data.copy_from_slice(&v[..STATS_SIZE]);
+                    s.ia.ifa_data = at(i, DATA).cast::<c_void>();
+                }
                 _ => {}
             }
         }
-        link(ia);
     }
     for (ty, m) in messages(addrs.bytes()) {
         if ty != RTM_NEWADDR || m.len() < 8 {
@@ -536,16 +563,15 @@ pub unsafe extern "C" fn getifaddrs(ifap: *mut *mut ifaddrs) -> c_int {
         if fam != AF_INET && fam != AF_INET6 {
             continue;
         }
-        let (ia, name, a, mk, bc, _data) = setup(slot);
-        slot += 1;
+        let i = used;
+        let s = &mut slots[i];
+        used += 1;
         let prefix = m[1] as usize;
         let index = rd32(m, 4);
         let (lname, lflags) = link_tab(index).unwrap_or(([0; IFNAMSIZ], 0));
-        unsafe {
-            core::ptr::copy_nonoverlapping(lname.as_ptr(), name, IFNAMSIZ);
-            (*ia).ifa_name = name as *mut c_char;
-            (*ia).ifa_flags = lflags;
-        }
+        s.name = lname;
+        s.ia.ifa_name = at(i, NAME).cast::<c_char>();
+        s.ia.ifa_flags = lflags;
         let want = if fam == AF_INET { 4 } else { 16 };
         let mut addr: Option<[u8; 16]> = None;
         let mut dst: Option<[u8; 16]> = None;
@@ -572,50 +598,48 @@ pub unsafe extern "C" fn getifaddrs(ifap: *mut *mut ifaddrs) -> c_int {
                     addr = Some(pad(v));
                 }
                 IFA_BROADCAST => dst = Some(pad(v)),
-                IFA_LABEL => unsafe {
-                    let l = v.iter().position(|&c| c == 0).unwrap_or(v.len()).min(IFNAMSIZ - 1);
-                    core::ptr::write_bytes(name, 0, IFNAMSIZ);
-                    core::ptr::copy_nonoverlapping(v.as_ptr(), name, l);
-                },
+                IFA_LABEL => {
+                    let n = name_part(v);
+                    s.name = [0; IFNAMSIZ];
+                    s.name[..n.len()].copy_from_slice(n);
+                }
                 _ => {}
             }
         }
         let scope_for = |b: &[u8; 16]| -> u32 {
             if fam == AF_INET6 && ((b[0] == 0xfe && b[1] & 0xc0 == 0x80) || (b[0] == 0xff && b[1] & 0xf == 2)) { index } else { 0 }
         };
-        let fill = |p: *mut u8, b: &[u8; 16]| unsafe {
+        let fill = |p: &mut SockSlot, b: &[u8; 16]| {
             if fam == AF_INET {
-                let s = p as *mut sockaddr_in;
-                *s = sockaddr_in { sin_family: AF_INET as u16, sin_port: 0, sin_addr: in_addr { s_addr: u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) }, sin_zero: [0; 8] };
+                p.in4 = sockaddr_in { sin_family: AF_INET as u16, sin_port: 0, sin_addr: in_addr { s_addr: u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) }, sin_zero: [0; 8] };
             } else {
-                let s = p as *mut sockaddr_in6;
-                *s = sockaddr_in6 { sin6_family: AF_INET6 as u16, sin6_port: 0, sin6_flowinfo: 0, sin6_addr: in6_addr { s6_addr: *b }, sin6_scope_id: scope_for(b) };
+                p.in6 = sockaddr_in6 { sin6_family: AF_INET6 as u16, sin6_port: 0, sin6_flowinfo: 0, sin6_addr: in6_addr { s6_addr: *b }, sin6_scope_id: scope_for(b) };
             }
         };
-        unsafe {
-            if let Some(ad) = addr {
-                fill(a, &ad);
-                (*ia).ifa_addr = a as *mut sockaddr;
-                let mut mask = [0u8; 16];
-                for i in 0..prefix.min(want * 8) {
-                    mask[i / 8] |= 0x80 >> (i % 8);
-                }
-                if fam == AF_INET {
-                    fill(mk, &mask);
-                } else {
-                    let s = mk as *mut sockaddr_in6;
-                    *s = sockaddr_in6 { sin6_family: AF_INET6 as u16, sin6_port: 0, sin6_flowinfo: 0, sin6_addr: in6_addr { s6_addr: mask }, sin6_scope_id: 0 };
-                }
-                (*ia).ifa_netmask = mk as *mut sockaddr;
+        if let Some(ad) = addr {
+            fill(&mut s.addr, &ad);
+            s.ia.ifa_addr = at(i, ADDR).cast::<sockaddr>();
+            let mut mask = [0u8; 16];
+            for k in 0..prefix.min(want * 8) {
+                mask[k / 8] |= 0x80 >> (k % 8);
             }
-            if let Some(d) = dst {
-                fill(bc, &d);
-                (*ia).ifa_ifu.ifu_broadaddr = bc as *mut sockaddr;
+            if fam == AF_INET {
+                fill(&mut s.mask, &mask);
+            } else {
+                s.mask.in6 = sockaddr_in6 { sin6_family: AF_INET6 as u16, sin6_port: 0, sin6_flowinfo: 0, sin6_addr: in6_addr { s6_addr: mask }, sin6_scope_id: 0 };
             }
+            s.ia.ifa_netmask = at(i, MASK).cast::<sockaddr>();
         }
-        link(ia);
+        if let Some(d) = dst {
+            fill(&mut s.bc, &d);
+            s.ia.ifa_ifu.ifu_broadaddr = at(i, BC).cast::<sockaddr>();
+        }
     }
-    unsafe { *ifap = first };
+    for i in 1..used {
+        slots[i - 1].ia.ifa_next = at(i, 0).cast::<ifaddrs>();
+    }
+    let first = if used > 0 { blk.cast::<ifaddrs>() } else { core::ptr::null_mut() };
+    unsafe { ifap.write(first) };
     0
 }
 

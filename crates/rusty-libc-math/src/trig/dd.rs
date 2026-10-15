@@ -71,7 +71,11 @@ pub fn fma_i<const F: bool>(a: f64, b: f64, c: f64) -> f64 {
     #[cfg(target_arch = "x86_64")]
     if F {
         use core::arch::x86_64::{_mm_cvtsd_f64, _mm_fmadd_sd, _mm_set_sd};
-        return unsafe { _mm_cvtsd_f64(_mm_fmadd_sd(_mm_set_sd(a), _mm_set_sd(b), _mm_set_sd(c))) };
+        let a = unsafe { _mm_set_sd(a) };
+        let b = unsafe { _mm_set_sd(b) };
+        let c = unsafe { _mm_set_sd(c) };
+        let r = unsafe { _mm_fmadd_sd(a, b, c) };
+        return unsafe { _mm_cvtsd_f64(r) };
     }
     crate::rounding::fma_impl::fma_emul(a, b, c)
 }
@@ -91,7 +95,10 @@ pub fn sqrt(x: f64) -> f64 {
     #[cfg(target_arch = "x86_64")]
     {
         use core::arch::x86_64::{_mm_cvtsd_f64, _mm_set_sd, _mm_sqrt_sd};
-        unsafe { _mm_cvtsd_f64(_mm_sqrt_sd(_mm_set_sd(0.0), _mm_set_sd(x))) }
+        let z = unsafe { _mm_set_sd(0.0) };
+        let v = unsafe { _mm_set_sd(x) };
+        let r = unsafe { _mm_sqrt_sd(z, v) };
+        unsafe { _mm_cvtsd_f64(r) }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -249,12 +256,12 @@ fn write_mxcsr(v: u32) {
 #[inline(always)]
 pub fn is_nearest() -> bool {
     use core::arch::x86_64::{_mm_add_pd, _mm_cmpeq_pd, _mm_movemask_pd, _mm_set_pd};
-    unsafe {
-        let mut one = _mm_set_pd(-1.0, 1.0);
-        core::arch::asm!("/* {o} */", o = inout(xmm_reg) one, options(nomem, nostack, preserves_flags));
-        let h = _mm_set_pd(-f64::from_bits(0x3ca0_0000_0200_0000), f64::from_bits(0x3ca0_0000_0200_0000));
-        _mm_movemask_pd(_mm_cmpeq_pd(_mm_add_pd(one, h), one)) == 0
-    }
+    let mut one = unsafe { _mm_set_pd(-1.0, 1.0) };
+    unsafe { core::arch::asm!("/* {o} */", o = inout(xmm_reg) one, options(nomem, nostack, preserves_flags)) };
+    let h = unsafe { _mm_set_pd(-f64::from_bits(0x3ca0_0000_0200_0000), f64::from_bits(0x3ca0_0000_0200_0000)) };
+    let sum = unsafe { _mm_add_pd(one, h) };
+    let eq = unsafe { _mm_cmpeq_pd(sum, one) };
+    unsafe { _mm_movemask_pd(eq) == 0 }
 }
 
 #[inline(always)]
@@ -331,4 +338,22 @@ impl Drop for NearestGuard {
     #[cfg(not(target_arch = "x86_64"))]
     #[inline(always)]
     fn drop(&mut self) {}
+}
+
+#[inline(always)]
+pub fn round_even_avx(t: f64) -> f64 {
+    crate::rounding::roundsd_roundeven(t)
+}
+
+#[inline(always)]
+pub fn round_half_away(t: f64) -> f64 {
+    let half = f64::from_bits(0x3fe0_0000_0000_0000 | (t.to_bits() & 0x8000_0000_0000_0000));
+    ((t + half) as i64) as f64
+}
+
+#[inline(always)]
+pub fn round_half_away_exact(t: f64) -> f64 {
+    let i = t as i64;
+    let d = t - i as f64;
+    (i + (d >= 0.5) as i64 - (d <= -0.5) as i64) as f64
 }

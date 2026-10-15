@@ -1,7 +1,9 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::inet;
 use crate::types::*;
 use crate::util::{Buf, Spin, eq_nocase, is_space};
 use core::ffi::{c_char, c_int};
+use rusty_libc_core::sync_cell::SyncCell;
 use rusty_libc_core::syscall;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -69,30 +71,98 @@ fn db_path(db: Db) -> Buf<320> {
     etc_path(db.file())
 }
 
+pub(crate) struct ZBuf {
+    p: *mut u8,
+    cap: usize,
+}
+
+unsafe impl Send for ZBuf {}
+
+impl ZBuf {
+    pub(crate) const fn new() -> ZBuf {
+        ZBuf { p: core::ptr::null_mut(), cap: 0 }
+    }
+    pub(crate) fn cap(&self) -> usize {
+        self.cap
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.p.is_null()
+    }
+    pub(crate) fn grow(&mut self, ncap: usize) -> bool {
+        let nb = unsafe { rusty_libc_malloc::realloc(self.p as *mut core::ffi::c_void, ncap) } as *mut u8;
+        if nb.is_null() {
+            return false;
+        }
+        if ncap > self.cap {
+            unsafe { nb.wrapping_add(self.cap).write_bytes(0, ncap - self.cap) };
+        }
+        self.p = nb;
+        self.cap = ncap;
+        true
+    }
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        unsafe { rusty_libc_core::ffi::bytes(self.p, self.cap) }
+    }
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { rusty_libc_core::ffi::bytes_mut(self.p, self.cap) }
+    }
+}
+
+impl Drop for ZBuf {
+    fn drop(&mut self) {
+        if !self.p.is_null() {
+            unsafe { rusty_libc_malloc::free(self.p as *mut core::ffi::c_void) };
+        }
+    }
+}
+
+pub(crate) fn c_dup(s: &[u8]) -> *mut u8 {
+    let p = unsafe { rusty_libc_malloc::malloc(s.len() + 1) } as *mut u8;
+    if !p.is_null() {
+        unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len()) };
+        unsafe { p.wrapping_add(s.len()).write(0) };
+    }
+    p
+}
+
+pub(crate) fn heap_new<T>(v: T) -> *mut T {
+    let p = unsafe { rusty_libc_malloc::malloc(core::mem::size_of::<T>()) } as *mut T;
+    if !p.is_null() {
+        unsafe { p.write(v) };
+    }
+    p
+}
+
 pub struct LineReader {
     fd: c_int,
     buf: [u8; 4096],
     pos: usize,
     len: usize,
     eof: bool,
-    big: *mut u8,
-    big_cap: usize,
+    big: ZBuf,
     last_big: Option<usize>,
     last_start: usize,
     last_nl: bool,
     held: Option<usize>,
 }
 
-unsafe impl Send for LineReader {}
+#[derive(Clone, Copy)]
+enum Span {
+    Buf(usize, usize),
+    Big(usize),
+}
+
 
 impl LineReader {
     pub const fn closed() -> LineReader {
-        LineReader { fd: -1, buf: [0; 4096], pos: 0, len: 0, eof: false, big: core::ptr::null_mut(), big_cap: 0, last_big: None, last_start: 0, last_nl: true, held: None }
+        LineReader { fd: -1, buf: [0; 4096], pos: 0, len: 0, eof: false, big: ZBuf::new(), last_big: None, last_start: 0, last_nl: true, held: None }
     }
 
     pub fn open(path: &Buf<320>) -> Result<LineReader, i32> {
         let mut r = LineReader::closed();
-        let fd = unsafe { rusty_libc_core::unistd::open(path.b.as_ptr() as *const c_char, 0o2000000, 0) };
+        let path = path.as_bytes();
+        debug_assert!(path.last() == Some(&0));
+        let fd = unsafe { rusty_libc_core::unistd::open(path.as_ptr() as *const c_char, 0o2000000, 0) };
         match fd {
             Ok(fd) => {
                 r.fd = fd;
@@ -111,10 +181,8 @@ impl LineReader {
             let _ = rusty_libc_core::unistd::close(self.fd);
             self.fd = -1;
         }
-        if !self.big.is_null() {
-            unsafe { rusty_libc_malloc::free(self.big as *mut core::ffi::c_void) };
-            self.big = core::ptr::null_mut();
-            self.big_cap = 0;
+        if !self.big.is_empty() {
+            self.big = ZBuf::new();
         }
         self.pos = 0;
         self.len = 0;
@@ -163,10 +231,26 @@ impl LineReader {
         }
     }
 
+    fn big(&self, n: usize) -> &[u8] {
+        &self.big.as_slice()[..n]
+    }
+
+    fn span(&self, sp: Span) -> &[u8] {
+        match sp {
+            Span::Buf(s, e) => &self.buf[s..e],
+            Span::Big(n) => self.big(n),
+        }
+    }
+
     pub fn next_line(&mut self) -> Option<&[u8]> {
+        let sp = self.next_span()?;
+        Some(self.span(sp))
+    }
+
+    fn next_span(&mut self) -> Option<Span> {
         if let Some(n) = self.held.take() {
             self.last_big = Some(n);
-            return Some(unsafe { core::slice::from_raw_parts(self.big, n) });
+            return Some(Span::Big(n));
         }
         if self.pos >= self.len && !self.fill() {
             return None;
@@ -177,7 +261,7 @@ impl LineReader {
             self.last_big = None;
             self.last_start = s;
             self.last_nl = true;
-            return Some(&self.buf[s..s + i]);
+            return Some(Span::Buf(s, s + i));
         }
         let mut used = 0usize;
         let mut ended_by_newline = false;
@@ -186,20 +270,17 @@ impl LineReader {
             let chunk_end = self.len;
             let nl = self.buf[chunk_start..chunk_end].iter().position(|&c| c == b'\n');
             let take = nl.unwrap_or(chunk_end - chunk_start);
-            if used + take > self.big_cap {
-                let ncap = (used + take).max(self.big_cap * 2).max(8192);
-                let nb = unsafe { rusty_libc_malloc::realloc(self.big as *mut core::ffi::c_void, ncap) } as *mut u8;
-                if nb.is_null() {
+            if used + take > self.big.cap() {
+                let ncap = (used + take).max(self.big.cap() * 2).max(8192);
+                if !self.big.grow(ncap) {
                     self.pos = chunk_end;
                     if nl.is_some() || !self.fill() {
-                        return Some(&[]);
+                        return Some(Span::Buf(0, 0));
                     }
                     continue;
                 }
-                self.big = nb;
-                self.big_cap = ncap;
             }
-            unsafe { core::ptr::copy_nonoverlapping(self.buf.as_ptr().add(chunk_start), self.big.add(used), take) };
+            self.big.as_mut_slice()[used..used + take].copy_from_slice(&self.buf[chunk_start..chunk_start + take]);
             used += take;
             if nl.is_some() {
                 self.pos = chunk_start + take + 1;
@@ -213,21 +294,20 @@ impl LineReader {
         }
         self.last_nl = ended_by_newline;
         self.last_big = Some(used);
-        Some(unsafe { core::slice::from_raw_parts(self.big, used) })
+        Some(Span::Big(used))
     }
 
     pub fn next_raw(&mut self) -> Option<(&[u8], usize)> {
-        let line = self.next_line()?;
-        let (p, n) = (line.as_ptr(), line.len());
-        let line = unsafe { core::slice::from_raw_parts(p, n) };
-        Some((line, n + self.last_nl as usize))
+        let sp = self.next_span()?;
+        let nl = self.last_nl as usize;
+        let line = self.span(sp);
+        Some((line, line.len() + nl))
     }
 
     pub fn next_entry(&mut self) -> Option<&[u8]> {
-        loop {
-            let line = self.next_line()?;
-            let (p, n) = (line.as_ptr(), line.len());
-            let line = unsafe { core::slice::from_raw_parts(p, n) };
+        let (sp, s, e) = loop {
+            let sp = self.next_span()?;
+            let line = self.span(sp);
             let mut s = 0;
             while s < line.len() && is_space(line[s]) {
                 s += 1;
@@ -239,8 +319,9 @@ impl LineReader {
             if let Some(h) = line[s..].iter().position(|&c| c == b'#') {
                 e = s + h;
             }
-            return Some(&line[s..e]);
-        }
+            break (sp, s, e);
+        };
+        Some(&self.span(sp)[s..e])
     }
 }
 
@@ -260,33 +341,32 @@ pub fn entry_body(line: &[u8]) -> Option<&[u8]> {
 }
 
 impl LineReader {
-    pub unsafe fn fgets(&mut self, dst: *mut u8, n: usize) -> bool {
-        unsafe {
-            if n == 0 {
-                return false;
-            }
-            let mut got = 0usize;
-            while got + 1 < n {
-                if self.pos >= self.len && !self.fill() {
-                    break;
-                }
-                let avail = &self.buf[self.pos..self.len];
-                let room = n - 1 - got;
-                let take = avail.len().min(room);
-                let (chunk, nl) = match avail[..take].iter().position(|&c| c == b'\n') {
-                    Some(i) => (i + 1, true),
-                    None => (take, false),
-                };
-                core::ptr::copy_nonoverlapping(avail.as_ptr(), dst.add(got), chunk);
-                got += chunk;
-                self.pos += chunk;
-                if nl {
-                    break;
-                }
-            }
-            *dst.add(got) = 0;
-            got > 0
+    pub fn fgets(&mut self, dst: &mut [u8]) -> bool {
+        let n = dst.len();
+        if n == 0 {
+            return false;
         }
+        let mut got = 0usize;
+        while got + 1 < n {
+            if self.pos >= self.len && !self.fill() {
+                break;
+            }
+            let avail = &self.buf[self.pos..self.len];
+            let room = n - 1 - got;
+            let take = avail.len().min(room);
+            let (chunk, nl) = match avail[..take].iter().position(|&c| c == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (take, false),
+            };
+            dst[got..got + chunk].copy_from_slice(&avail[..chunk]);
+            got += chunk;
+            self.pos += chunk;
+            if nl {
+                break;
+            }
+        }
+        dst[got] = 0;
+        got > 0
     }
 
     pub fn getc(&mut self) -> i32 {
@@ -315,6 +395,7 @@ impl Drop for LineReader {
     }
 }
 
+#[derive(Clone)]
 pub struct Fields<'a> {
     s: &'a [u8],
 }
@@ -492,9 +573,11 @@ pub fn parse_net_line(line: &[u8]) -> Option<NetLine<'_>> {
     let addr = f.next()?;
     let dots = addr.iter().filter(|&&c| c == b'.').count();
     let n = (dots + 1).min(4) as u32;
-    let mut tmp = Buf::<64>::from(addr)?;
-    tmp.push(0);
-    let mut net = unsafe { inet::inet_network(tmp.b.as_ptr() as *const c_char) };
+    if addr.len() > 64 {
+        return None;
+    }
+    let cs = &addr[..addr.iter().position(|&c| c == 0).unwrap_or(addr.len())];
+    let mut net = inet::network_parse(cs).unwrap_or(INADDR_NONE);
     if net == INADDR_NONE {
         return None;
     }
@@ -615,31 +698,12 @@ pub fn order_for(name: &[u8]) -> Option<Order> {
 
 pub(crate) fn file_sig(path: &Buf<320>) -> [u64; 3] {
     let mut st = [0u64; 18];
-    let r = unsafe { syscall::syscall2(syscall::SYS_STAT, path.b.as_ptr() as usize, st.as_mut_ptr() as usize) };
+    debug_assert!(path.as_bytes().last() == Some(&0));
+    let r = unsafe { rusty_libc_core::syscall::sys_stat(path.b.as_ptr() as usize, st.as_mut_ptr() as usize) };
     if syscall::check(r).is_err() {
         return [u64::MAX; 3];
     }
     [st[1], st[11] ^ (st[6] << 32), st[12]]
-}
-
-struct Cached<T: Copy> {
-    path: Buf<320>,
-    sig: [u64; 3],
-    val: T,
-    valid: bool,
-}
-
-impl<T: Copy> Cached<T> {
-    fn get(&mut self, path: &Buf<320>, load: impl FnOnce() -> T) -> T {
-        let sig = file_sig(path);
-        if !self.valid || self.path.as_bytes() != path.as_bytes() || self.sig != sig {
-            self.val = load();
-            self.path = *path;
-            self.sig = sig;
-            self.valid = true;
-        }
-        self.val
-    }
 }
 
 static HCONF_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -654,32 +718,39 @@ pub fn hconf_init() {
         path.push_all(p);
         path.push(0);
     }
-    let h = unsafe { &mut *(&raw mut _res_hconf) };
+    unsafe { _res_hconf.with_unsync(|h| hconf_fill(h, &path)) };
+    let init = _res_hconf.as_ptr().cast::<core::sync::atomic::AtomicI32>();
+    unsafe { &*init }.store(1, core::sync::atomic::Ordering::Release);
+}
+
+fn hconf_fill(h: &mut Hconf, path: &Buf<320>) {
     *h = Hconf::ZERO;
-    match LineReader::open(&path) {
+    let fname = &path.as_bytes()[..path.as_bytes().len() - 1];
+    match LineReader::open(path) {
         Ok(mut r) => {
             let mut buf = [0u8; 256];
-            while unsafe { r.fgets(buf.as_mut_ptr(), buf.len()) } {
+            let mut line_num = 0;
+            while r.fgets(&mut buf) {
+                line_num += 1;
                 let n = buf.iter().position(|&c| c == 0 || c == b'\n').unwrap_or(buf.len());
-                hconf_line(h, &buf[..n]);
+                hconf_line(h, fname, line_num, &buf[..n]);
             }
         }
         Err(e) => rusty_libc_core::errno::set(e),
     }
     if let Some(v) = crate::util::getenv(b"RESOLV_MULTI") {
-        hconf_bool(h, v, HCONF_FLAG_MULTI);
+        hconf_bool(h, b"RESOLV_MULTI", 1, v, HCONF_FLAG_MULTI);
     }
     if let Some(v) = crate::util::getenv(b"RESOLV_REORDER") {
-        hconf_bool(h, v, HCONF_FLAG_REORDER);
+        hconf_bool(h, b"RESOLV_REORDER", 1, v, HCONF_FLAG_REORDER);
     }
     if let Some(v) = crate::util::getenv(b"RESOLV_ADD_TRIM_DOMAINS") {
-        hconf_trim(h, v);
+        hconf_trim(h, b"RESOLV_ADD_TRIM_DOMAINS", 1, v);
     }
     if let Some(v) = crate::util::getenv(b"RESOLV_OVERRIDE_TRIM_DOMAINS") {
         h.num_trimdomains = 0;
-        hconf_trim(h, v);
+        hconf_trim(h, b"RESOLV_OVERRIDE_TRIM_DOMAINS", 1, v);
     }
-    unsafe { (&raw mut _res_hconf.initialized).cast::<core::sync::atomic::AtomicI32>().as_ref().unwrap().store(1, core::sync::atomic::Ordering::Release) };
 }
 
 #[repr(C)]
@@ -701,7 +772,12 @@ const HCONF_FLAG_MULTI: u32 = 1 << 4;
 
 #[allow(non_upper_case_globals)]
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub static mut _res_hconf: Hconf = Hconf::ZERO;
+pub static _res_hconf: SyncCell<Hconf> = SyncCell::new(Hconf::ZERO);
+
+fn hconf() -> &'static Hconf {
+    hconf_init();
+    unsafe { &*_res_hconf.as_ptr() }
+}
 
 fn hconf_word(s: &[u8]) -> usize {
     s.iter().position(|&c| is_space(c) || c == b'#' || c == b',').unwrap_or(s.len())
@@ -711,63 +787,245 @@ fn hconf_ws(s: &[u8]) -> &[u8] {
     &s[s.iter().position(|&c| !is_space(c)).unwrap_or(s.len())..]
 }
 
-fn hconf_bool(h: &mut Hconf, v: &[u8], flag: u32) -> Option<usize> {
+fn hconf_warn(fmt: &'static core::ffi::CStr, args: &[HcArg]) {
+    let mut words = [0u64; 4];
+    for (i, a) in args.iter().enumerate() {
+        words[i] = match a {
+            HcArg::S(s) => s.as_ptr() as u64,
+            HcArg::D(d) => *d as u64,
+        };
+    }
+    let mut out = [0u8; 1024];
+    let mut n = 0;
+    let mut put = |b: &[u8]| {
+        let k = b.len().min(out.len() - n);
+        out[n..n + k].copy_from_slice(&b[..k]);
+        n += k;
+    };
+    if !rusty_libc_core::i18n::tr_format(fmt, &words[..args.len()], &mut put) {
+        let mut ai = 0;
+        let f = fmt.to_bytes();
+        let mut i = 0;
+        while i < f.len() {
+            if f[i] == b'%' && i + 1 < f.len() && (f[i + 1] == b's' || f[i + 1] == b'd') {
+                match args.get(ai) {
+                    Some(HcArg::S(s)) => put(&s[..s.len() - 1]),
+                    Some(HcArg::D(d)) => {
+                        let mut b = [0u8; 12];
+                        let mut k = b.len();
+                        let mut v = *d as u32;
+                        loop {
+                            k -= 1;
+                            b[k] = b'0' + (v % 10) as u8;
+                            v /= 10;
+                            if v == 0 {
+                                break;
+                            }
+                        }
+                        put(&b[k..]);
+                    }
+                    None => {}
+                }
+                ai += 1;
+                i += 2;
+            } else {
+                put(&f[i..i + 1]);
+                i += 1;
+            }
+        }
+    }
+    let _ = rusty_libc_sys_write(&out[..n]);
+}
+
+fn rusty_libc_sys_write(b: &[u8]) -> isize {
+    unsafe { syscall::syscall3(syscall::SYS_WRITE, 2, b.as_ptr() as usize, b.len()) as isize }
+}
+
+enum HcArg<'a> {
+    S(&'a [u8]),
+    D(c_int),
+}
+
+fn hc_cstr(s: &[u8]) -> Buf<320> {
+    let mut b = Buf::<320>::new();
+    b.push_all(&s[..s.len().min(300)]);
+    b.push(0);
+    b
+}
+
+fn hconf_bool<'a>(h: &mut Hconf, fname: &[u8], line: c_int, v: &'a [u8], flag: u32) -> Option<&'a [u8]> {
     if v.len() >= 2 && eq_nocase(&v[..2], b"on") {
         h.flags |= flag;
-        Some(2)
+        Some(&v[2..])
     } else if v.len() >= 3 && eq_nocase(&v[..3], b"off") {
         h.flags &= !flag;
-        Some(3)
+        Some(&v[3..])
     } else {
+        let (f, a) = (hc_cstr(fname), hc_cstr(v));
+        hconf_warn(c"%s: line %d: expected `on' or `off', found `%s'\n", &[HcArg::S(f.as_bytes()), HcArg::D(line), HcArg::S(a.as_bytes())]);
         None
     }
 }
 
-fn hconf_trim(h: &mut Hconf, mut a: &[u8]) {
+fn hconf_trim<'a>(h: &mut Hconf, fname: &[u8], line: c_int, mut a: &'a [u8]) -> Option<&'a [u8]> {
     loop {
         let n = hconf_word(a);
         if h.num_trimdomains >= 4 {
-            return;
+            let f = hc_cstr(fname);
+            hconf_warn(c"%s: line %d: cannot specify more than %d trim domains", &[HcArg::S(f.as_bytes()), HcArg::D(line), HcArg::D(4)]);
+            return None;
         }
-        let p = unsafe { rusty_libc_malloc::malloc(n + 1) } as *mut u8;
-        if !p.is_null() {
-            unsafe {
-                core::ptr::copy_nonoverlapping(a.as_ptr(), p, n);
-                *p.add(n) = 0;
-            }
-        }
+        let p = c_dup(&a[..n]);
         h.trimdomain[h.num_trimdomains as usize] = p as *const c_char;
         h.num_trimdomains += 1;
         a = hconf_ws(&a[n..]);
         if let Some(&(b',' | b';' | b':')) = a.first() {
             a = hconf_ws(&a[1..]);
             if a.is_empty() || a[0] == b'#' {
-                return;
+                let f = hc_cstr(fname);
+                hconf_warn(c"%s: line %d: list delimiter not followed by domain", &[HcArg::S(f.as_bytes()), HcArg::D(line)]);
+                return None;
             }
         }
         if a.is_empty() || a[0] == b'#' {
-            return;
+            return Some(a);
         }
     }
 }
 
-fn hconf_line(h: &mut Hconf, line: &[u8]) {
-    let l = hconf_ws(line);
+fn hconf_line(h: &mut Hconf, fname: &[u8], line: c_int, text: &[u8]) {
+    let l = hconf_ws(text);
     if l.is_empty() || l[0] == b'#' {
         return;
     }
     let n = hconf_word(l);
     let (cmd, rest) = (&l[..n], hconf_ws(&l[n..]));
-    if eq_nocase(cmd, b"trim") {
-        hconf_trim(h, rest);
+    let after = if eq_nocase(cmd, b"order") {
+        return;
+    } else if eq_nocase(cmd, b"trim") {
+        hconf_trim(h, fname, line, rest)
     } else if eq_nocase(cmd, b"multi") {
-        hconf_bool(h, rest, HCONF_FLAG_MULTI);
+        hconf_bool(h, fname, line, rest, HCONF_FLAG_MULTI)
     } else if eq_nocase(cmd, b"reorder") {
-        hconf_bool(h, rest, HCONF_FLAG_REORDER);
+        hconf_bool(h, fname, line, rest, HCONF_FLAG_REORDER)
+    } else {
+        let (f, a) = (hc_cstr(fname), hc_cstr(l));
+        hconf_warn(c"%s: line %d: bad command `%s'\n", &[HcArg::S(f.as_bytes()), HcArg::D(line), HcArg::S(a.as_bytes())]);
+        return;
+    };
+    if let Some(r) = after {
+        let r = hconf_ws(r);
+        if !r.is_empty() && r[0] != b'#' {
+            let (f, a) = (hc_cstr(fname), hc_cstr(r));
+            hconf_warn(c"%s: line %d: ignoring trailing garbage `%s'\n", &[HcArg::S(f.as_bytes()), HcArg::D(line), HcArg::S(a.as_bytes())]);
+        }
     }
 }
 
-static HOST_MULTI: Spin<Cached<bool>> = Spin::new(Cached { path: Buf::new(), sig: [0; 3], val: false, valid: false });
+pub fn host_conf_multi() -> bool {
+    hconf().flags & HCONF_FLAG_MULTI != 0
+}
+
+pub unsafe fn trim_domains(hp: *mut crate::types::hostent) {
+    let h = hconf();
+    if h.num_trimdomains == 0 {
+        return;
+    }
+    let trims = &h.trimdomain[..h.num_trimdomains as usize];
+    let he = unsafe { &*hp };
+    trim_name(unsafe { cstr_mut(he.h_name) }, trims);
+    let mut a = he.h_aliases;
+    loop {
+        let p = unsafe { *a };
+        if p.is_null() {
+            break;
+        }
+        trim_name(unsafe { cstr_mut(p) }, trims);
+        a = a.wrapping_add(1);
+    }
+}
+
+unsafe fn cstr_mut<'a>(p: *mut c_char) -> &'a mut [u8] {
+    let n = unsafe { crate::util::cstrlen(p) };
+    unsafe { core::slice::from_raw_parts_mut(p as *mut u8, n + 1) }
+}
+
+fn trim_name(name: &mut [u8], trims: &[*const c_char]) {
+    let len = name.len() - 1;
+    for &t in trims {
+        let Some(t) = (unsafe { rusty_libc_core::ffi::cstr(t) }) else { continue };
+        let t = t.to_bytes();
+        if len > t.len() && eq_nocase(&name[len - t.len()..len], t) {
+            name[len - t.len()] = 0;
+            break;
+        }
+    }
+}
+
+pub unsafe fn reorder_addrs(hp: *mut crate::types::hostent) {
+    if hconf().flags & HCONF_FLAG_REORDER == 0 {
+        return;
+    }
+    let he = unsafe { &*hp };
+    if he.h_addrtype != crate::types::AF_INET {
+        return;
+    }
+    let mut ifs = [(0u32, 0u32); 64];
+    let n = local_ipv4_nets(&mut ifs);
+    if n == 0 {
+        return;
+    }
+    let list = he.h_addr_list;
+    let mut count = 0;
+    while !unsafe { *list.wrapping_add(count) }.is_null() {
+        count += 1;
+    }
+    let addrs = unsafe { core::slice::from_raw_parts_mut(list, count) };
+    for i in 0..count {
+        let a = u32::from_ne_bytes(unsafe { *(addrs[i] as *const [u8; 4]) });
+        if ifs[..n].iter().any(|&(addr, mask)| (a ^ addr) & mask == 0) {
+            addrs.swap(0, i);
+            return;
+        }
+    }
+}
+
+fn local_ipv4_nets(out: &mut [(u32, u32); 64]) -> usize {
+    static NETS: Spin<([(u32, u32); 64], usize)> = Spin::new(([(0, 0); 64], 0));
+    let mut g = NETS.lock();
+    if g.1 == 0 {
+        let save = rusty_libc_core::errno::get();
+        let sd = unsafe { syscall::syscall3(41 , 2 , 2 | 0o2000000 , 0) } as isize;
+        if sd >= 0 {
+            let mut reqs = [0u8; 40 * 64];
+            let mut ifc = [0u64; 2];
+            ifc[0] = reqs.len() as u64;
+            ifc[1] = reqs.as_mut_ptr() as u64;
+            if unsafe { syscall::syscall3(syscall::SYS_IOCTL, sd as usize, 0x8912 , ifc.as_mut_ptr() as usize) } as isize >= 0 {
+                let count = (ifc[0] as u32 as usize) / 40;
+                let mut k = 0;
+                for i in 0..count.min(64) {
+                    let r = &mut reqs[i * 40..i * 40 + 40];
+                    if u16::from_ne_bytes([r[16], r[17]]) != 2 {
+                        continue;
+                    }
+                    let addr = u32::from_ne_bytes([r[20], r[21], r[22], r[23]]);
+                    if (unsafe { syscall::syscall3(syscall::SYS_IOCTL, sd as usize, 0x891b , r.as_mut_ptr() as usize) } as isize) < 0 {
+                        continue;
+                    }
+                    let mask = u32::from_ne_bytes([r[20], r[21], r[22], r[23]]);
+                    g.0[k] = (addr, mask);
+                    k += 1;
+                }
+                g.1 = k;
+            }
+            unsafe { syscall::syscall1(syscall::SYS_CLOSE, sd as usize) };
+        }
+        rusty_libc_core::errno::set(save);
+    }
+    *out = g.0;
+    g.1
+}
 
 pub fn validate_service_line(spec: &[u8]) -> bool {
     rusty_libc_core::nssmod::parse_sources(spec).is_some()
@@ -779,7 +1037,12 @@ const NSS_DATABASES: [&[u8]; 17] = [
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __nss_configure_lookup(dbname: *const c_char, string: *const c_char) -> c_int {
-    let (db, line) = unsafe { (core::slice::from_raw_parts(dbname as *const u8, crate::util::cstrlen(dbname)), core::slice::from_raw_parts(string as *const u8, crate::util::cstrlen(string))) };
+    use crate::netdb::{CIn, Str};
+    let (db, line) = unsafe { (Str(dbname), Str(string)).conv() };
+    configure_lookup(db.to_bytes(), line.to_bytes())
+}
+
+pub fn configure_lookup(db: &[u8], line: &[u8]) -> c_int {
     if !NSS_DATABASES.contains(&db) {
         return -1;
     }
@@ -796,38 +1059,6 @@ pub unsafe extern "C" fn __nss_configure_lookup(dbname: *const c_char, string: *
 
 pub fn hosts_order() -> Order {
     convert(&rusty_libc_core::nssmod::order(b"hosts"), true)
-}
-
-pub fn host_conf_multi() -> bool {
-    let path = etc_path(b"/host.conf");
-    let mut multi = HOST_MULTI.lock().get(&path, || {
-        let mut multi = false;
-        if let Ok(mut r) = LineReader::open(&path) {
-            while let Some(line) = r.next_entry() {
-                let mut f = fields(line);
-                if let (Some(k), Some(v)) = (f.next(), f.next()) {
-                    if eq_nocase(k, b"multi") {
-                        multi = bool_word(v).unwrap_or(multi);
-                    }
-                }
-            }
-        }
-        multi
-    });
-    if let Some(v) = crate::util::getenv(b"RESOLV_MULTI") {
-        multi = bool_word(v).unwrap_or(multi);
-    }
-    multi
-}
-
-fn bool_word(v: &[u8]) -> Option<bool> {
-    if eq_nocase(v, b"on") || eq_nocase(v, b"yes") || eq_nocase(v, b"true") || v == b"1" {
-        Some(true)
-    } else if eq_nocase(v, b"off") || eq_nocase(v, b"no") || eq_nocase(v, b"false") || v == b"0" {
-        Some(false)
-    } else {
-        None
-    }
 }
 
 pub fn open_db(db: Db) -> Result<LineReader, i32> {

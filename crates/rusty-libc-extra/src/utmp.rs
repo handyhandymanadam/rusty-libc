@@ -1,3 +1,4 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use crate::consts::*;
 use core::ffi::{CStr, c_char, c_int};
 use core::ptr::null_mut;
@@ -5,6 +6,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use rusty_libc_core::errno;
 use rusty_libc_core::lock::Locked;
 use rusty_libc_core::syscall::{self, syscall1, syscall2, syscall3, syscall4};
+use rusty_libc_core::unistd as un;
 
 pub const UT_LINESIZE: usize = 32;
 pub const UT_NAMESIZE: usize = 32;
@@ -105,40 +107,61 @@ fn sys_err(r: usize) -> c_int {
     if r > usize::MAX - 4095 { (r as isize).wrapping_neg() as c_int } else { 0 }
 }
 
+fn raw<T: Into<i64>>(r: Result<T, rusty_libc_core::Errno>) -> i64 {
+    match r {
+        Ok(v) => v.into(),
+        Err(e) => -(e.0 as i64),
+    }
+}
+
+fn alarm(secs: usize) -> usize {
+    unsafe { syscall1(SYS_ALARM, secs) }
+}
+
+fn fcntl_setlkw(fd: c_int, fl: &Flock) -> usize {
+    unsafe { syscall3(syscall::SYS_FCNTL, fd as usize, F_SETLKW, fl as *const Flock as usize) }
+}
+
+fn open_raw(path: &CStr, flags: usize) -> usize {
+    unsafe { rusty_libc_core::syscall::sys_open(path.as_ptr() as usize, flags, 0) }
+}
+
+fn pread_record(fd: c_int, buf: &mut Utmp, off: i64) -> usize {
+    unsafe { syscall4(SYS_PREAD64, fd as usize, buf as *mut Utmp as usize, 384, off as usize) }
+}
+
 extern "C" fn timeout_handler(_sig: c_int) {}
 
 fn try_file_lock(fd: c_int, ty: i16) -> bool {
     use rusty_libc_signal::action::sigaction_rs;
     use rusty_libc_signal::types::{Sigaction, Sigset};
-    unsafe {
-        let old_timeout = syscall1(SYS_ALARM, 0);
-        let act = Sigaction { sa_handler: timeout_handler as extern "C" fn(c_int) as usize, sa_mask: Sigset::EMPTY, sa_flags: 0, sa_restorer: 0 };
-        let old_action = sigaction_rs(SIGALRM, Some(&act));
-        syscall1(SYS_ALARM, LOCK_TIMEOUT.load(Ordering::Relaxed) as usize);
-        let fl = Flock { l_type: ty, l_whence: 0, l_start: 0, l_len: 0, l_pid: 0 };
-        let r = syscall3(syscall::SYS_FCNTL, fd as usize, F_SETLKW, &fl as *const Flock as usize);
-        let failed = sys_err(r) != 0;
-        let saved = errno::get();
-        let e = sys_err(r);
-        syscall1(SYS_ALARM, 0);
-        if let Ok(old) = old_action {
-            let _ = sigaction_rs(SIGALRM, Some(&old));
-        }
-        if old_timeout != 0 {
-            syscall1(SYS_ALARM, old_timeout);
-        }
-        errno::set(if failed { e } else { saved });
-        failed
+    let old_timeout = alarm(0);
+    let act = Sigaction { sa_handler: timeout_handler as extern "C" fn(c_int) as usize, sa_mask: Sigset::EMPTY, sa_flags: 0, sa_restorer: 0 };
+    let old_action = sigaction_rs(SIGALRM, Some(&act));
+    alarm(LOCK_TIMEOUT.load(Ordering::Relaxed) as usize);
+    let fl = Flock { l_type: ty, l_whence: 0, l_start: 0, l_len: 0, l_pid: 0 };
+    let r = fcntl_setlkw(fd, &fl);
+    let failed = sys_err(r) != 0;
+    let saved = errno::get();
+    let e = sys_err(r);
+    alarm(0);
+    if let Ok(old) = old_action {
+        let _ = sigaction_rs(SIGALRM, Some(&old));
     }
+    if old_timeout != 0 {
+        alarm(old_timeout);
+    }
+    errno::set(if failed { e } else { saved });
+    failed
 }
 
 fn file_unlock(fd: c_int) {
     let fl = Flock { l_type: F_UNLCK, l_whence: 0, l_start: 0, l_len: 0, l_pid: 0 };
-    unsafe { syscall3(syscall::SYS_FCNTL, fd as usize, F_SETLKW, &fl as *const Flock as usize) };
+    fcntl_setlkw(fd, &fl);
 }
 
 fn access_ok(path: &CStr) -> bool {
-    let e = unsafe { sys_err(syscall2(SYS_ACCESS_NR, path.as_ptr() as usize, 0)) };
+    let e = sys_err(unsafe { syscall2(SYS_ACCESS_NR, path.as_ptr() as usize, 0) });
     if e != 0 {
         errno::set(e);
     }
@@ -163,14 +186,13 @@ fn transform(name: &CStr) -> &CStr {
     }
 }
 
-unsafe fn pwrite_all_at(fd: c_int, data: &[u8], off: i64) -> isize {
-    unsafe {
-        let r = syscall3(syscall::SYS_LSEEK, fd as usize, off as usize, 0);
-        if sys_err(r) != 0 {
-            return -1;
-        }
-        let w = syscall3(syscall::SYS_WRITE, fd as usize, data.as_ptr() as usize, data.len());
-        if sys_err(w) != 0 { -1 } else { w as isize }
+fn pwrite_all_at(fd: c_int, data: &[u8], off: i64) -> isize {
+    if un::lseek(fd, off, 0).is_err() {
+        return -1;
+    }
+    match un::write_nocancel(fd, data) {
+        Ok(w) => w as isize,
+        Err(_) => -1,
     }
 }
 
@@ -203,7 +225,7 @@ impl UtmpDb {
     }
 
     fn file_name(&self) -> &CStr {
-        if self.name.is_null() { PATH_UTMP } else { unsafe { CStr::from_ptr(self.name) } }
+        if self.name.is_null() { PATH_UTMP } else { unsafe { rusty_libc_core::ffi::cstr_nonnull(self.name) } }
     }
 
     pub fn set_name(&mut self, file: &CStr) -> bool {
@@ -228,7 +250,7 @@ impl UtmpDb {
         if self.fd < 0 {
             self.writable = false;
             let name = transform(self.file_name());
-            let r = unsafe { syscall3(syscall::SYS_OPEN, name.as_ptr() as usize, O_RDONLY | O_CLOEXEC, 0) };
+            let r = open_raw(name, O_RDONLY | O_CLOEXEC);
             let e = sys_err(r);
             if e != 0 {
                 errno::set(e);
@@ -236,7 +258,7 @@ impl UtmpDb {
             }
             self.fd = r as c_int;
         }
-        unsafe { syscall3(syscall::SYS_LSEEK, self.fd as usize, 0, 0) };
+        let _ = un::lseek(self.fd, 0, 0);
         self.offset = 0;
         true
     }
@@ -247,7 +269,7 @@ impl UtmpDb {
 
     fn read_last_entry(&mut self) -> isize {
         let mut buf = Utmp::ZERO;
-        let r = unsafe { syscall4(SYS_PREAD64, self.fd as usize, &mut buf as *mut Utmp as usize, 384, self.offset as usize) };
+        let r = pread_record(self.fd, &mut buf, self.offset);
         let e = sys_err(r);
         if e != 0 {
             errno::set(e);
@@ -355,21 +377,20 @@ impl UtmpDb {
         }
         if !self.writable {
             let name = transform(self.file_name());
-            let r = unsafe { syscall3(syscall::SYS_OPEN, name.as_ptr() as usize, O_RDWR | O_CLOEXEC, 0) };
+            let r = open_raw(name, O_RDWR | O_CLOEXEC);
             let e = sys_err(r);
             if e != 0 {
                 errno::set(e);
                 return false;
             }
             let new_fd = r as c_int;
-            let d = unsafe { syscall2(syscall::SYS_DUP2, new_fd as usize, self.fd as usize) };
-            let e = sys_err(d);
+            let e = rusty_libc_core::unistd::dup2(new_fd, self.fd).err().map_or(0, |e| e.0);
             if e != 0 {
-                unsafe { syscall1(syscall::SYS_CLOSE, new_fd as usize) };
+                let _ = rusty_libc_core::unistd::close(new_fd);
                 errno::set(e);
                 return false;
             }
-            unsafe { syscall1(syscall::SYS_CLOSE, new_fd as usize) };
+            let _ = rusty_libc_core::unistd::close(new_fd);
             self.writable = true;
         }
         if try_file_lock(self.fd, F_WRLCK) {
@@ -389,19 +410,19 @@ impl UtmpDb {
             found = self.getut_nolock(data);
         }
         let write_offset = if !found {
-            let end = unsafe { syscall3(syscall::SYS_LSEEK, self.fd as usize, 0, 2) } as i64;
+            let end = raw(un::lseek(self.fd, 0, 2));
             end / 384 * 384
         } else {
             self.offset - 384
         };
-        let w = unsafe { pwrite_all_at(self.fd, bytes_of(data), write_offset) };
+        let w = pwrite_all_at(self.fd, bytes_of(data), write_offset);
         if w < 0 {
             file_unlock(self.fd);
             return false;
         }
         if w != 384 {
             if !found {
-                unsafe { syscall2(syscall::SYS_FTRUNCATE, self.fd as usize, write_offset as usize) };
+                let _ = rusty_libc_core::unistd::ftruncate(self.fd, write_offset as i64);
             }
             file_unlock(self.fd);
             errno::set(ENOSPC);
@@ -414,7 +435,7 @@ impl UtmpDb {
 
     pub fn endutent(&mut self) {
         if self.fd >= 0 {
-            unsafe { syscall1(syscall::SYS_CLOSE, self.fd as usize) };
+            let _ = rusty_libc_core::unistd::close(self.fd);
             self.fd = -1;
         }
     }
@@ -423,41 +444,38 @@ impl UtmpDb {
 const ENOSPC: i32 = 28;
 
 pub fn updwtmp_file(file: &CStr, utmp: &Utmp) -> c_int {
-    unsafe {
-        let name = transform(file);
-        let r = syscall3(syscall::SYS_OPEN, name.as_ptr() as usize, O_WRONLY | O_CLOEXEC, 0);
-        let e = sys_err(r);
-        if e != 0 {
-            errno::set(e);
-            return -1;
-        }
-        let fd = r as c_int;
-        if try_file_lock(fd, F_WRLCK) {
-            syscall1(syscall::SYS_CLOSE, fd as usize);
-            return -1;
-        }
-        let mut result = -1;
-        let mut offset = syscall3(syscall::SYS_LSEEK, fd as usize, 0, 2) as i64;
-        let mut ok = true;
-        if offset % 384 != 0 {
-            offset -= offset % 384;
-            syscall2(syscall::SYS_FTRUNCATE, fd as usize, offset as usize);
-            if sys_err(syscall3(syscall::SYS_LSEEK, fd as usize, 0, 2)) != 0 {
-                ok = false;
-            }
-        }
-        if ok {
-            let w = syscall3(syscall::SYS_WRITE, fd as usize, bytes_of(utmp).as_ptr() as usize, 384);
-            if w != 384 {
-                syscall2(syscall::SYS_FTRUNCATE, fd as usize, offset as usize);
-            } else {
-                result = 0;
-            }
-        }
-        file_unlock(fd);
-        syscall1(syscall::SYS_CLOSE, fd as usize);
-        result
+    let name = transform(file);
+    let r = open_raw(name, O_WRONLY | O_CLOEXEC);
+    let e = sys_err(r);
+    if e != 0 {
+        errno::set(e);
+        return -1;
     }
+    let fd = r as c_int;
+    if try_file_lock(fd, F_WRLCK) {
+        let _ = un::close(fd);
+        return -1;
+    }
+    let mut result = -1;
+    let mut offset = raw(un::lseek(fd, 0, 2));
+    let mut ok = true;
+    if offset % 384 != 0 {
+        offset -= offset % 384;
+        let _ = un::ftruncate(fd, offset);
+        if un::lseek(fd, 0, 2).is_err() {
+            ok = false;
+        }
+    }
+    if ok {
+        if raw(un::write_nocancel(fd, bytes_of(utmp)).map(|n| n as i64)) != 384 {
+            let _ = un::ftruncate(fd, offset);
+        } else {
+            result = 0;
+        }
+    }
+    file_unlock(fd);
+    let _ = un::close(fd);
+    result
 }
 
 fn copy_name(dst: &mut [u8], src: &CStr) {
@@ -469,13 +487,11 @@ fn copy_name(dst: &mut [u8], src: &CStr) {
 
 fn now() -> (u32, i32) {
     let mut ts = [0i64; 2];
-    unsafe { syscall2(SYS_CLOCK_GETTIME_NR, 0, ts.as_mut_ptr() as usize) };
+    unsafe { rusty_libc_core::vdso::clock_gettime_raw(0, ts.as_mut_ptr().cast()) };
     (ts[0] as u32, (ts[1] / 1000) as i32)
 }
 
-fn getpid() -> i32 {
-    unsafe { syscall::syscall0(syscall::SYS_GETPID) as i32 }
-}
+use rusty_libc_core::unistd::getpid;
 
 pub fn logwtmp_to(wtmp_file: &CStr, line: &CStr, name: &CStr, host: &CStr) {
     let mut ut = Utmp::ZERO;
@@ -552,12 +568,12 @@ static BUF_ENT: AtomicPtr<Utmp> = AtomicPtr::new(null_mut());
 static BUF_ID: AtomicPtr<Utmp> = AtomicPtr::new(null_mut());
 static BUF_LINE: AtomicPtr<Utmp> = AtomicPtr::new(null_mut());
 
-unsafe fn static_buffer(slot: &AtomicPtr<Utmp>) -> *mut Utmp {
+fn static_buffer(slot: &AtomicPtr<Utmp>) -> *mut Utmp {
     let b = slot.load(Ordering::Acquire);
     if !b.is_null() {
         return b;
     }
-    let n = unsafe { rusty_libc_malloc::malloc(size_of::<Utmp>()) } as *mut Utmp;
+    let n = crate::mntent::malloc(size_of::<Utmp>()).cast::<Utmp>();
     if n.is_null() {
         return n;
     }
@@ -570,9 +586,32 @@ unsafe fn static_buffer(slot: &AtomicPtr<Utmp>) -> *mut Utmp {
     }
 }
 
+unsafe fn rec<'a>(p: *const Utmp) -> &'a Utmp {
+    unsafe { &*p }
+}
+
+unsafe fn cs<'a>(p: *const c_char) -> &'a CStr {
+    unsafe { rusty_libc_core::ffi::cstr_nonnull(p) }
+}
+
+unsafe fn store_r(found: Option<Utmp>, buffer: *mut Utmp, result: *mut *mut Utmp) -> c_int {
+    match found {
+        Some(u) => {
+            unsafe { buffer.write(u) };
+            unsafe { result.write(buffer) };
+            0
+        }
+        None => {
+            unsafe { result.write(null_mut()) };
+            -1
+        }
+    }
+}
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn utmpname(file: *const c_char) -> c_int {
-    GLOBAL.with(|db| if db.set_name(unsafe { CStr::from_ptr(file) }) { 0 } else { -1 })
+    let file = unsafe { cs(file) };
+    GLOBAL.with(|db| if db.set_name(file) { 0 } else { -1 })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -589,151 +628,119 @@ pub extern "C" fn endutent() {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getutent_r(buffer: *mut Utmp, result: *mut *mut Utmp) -> c_int {
-    unsafe {
-        match GLOBAL.with(|db| db.getutent()) {
-            Ok(Some(u)) => {
-                *buffer = u;
-                *result = buffer;
-                0
-            }
-            _ => {
-                *result = null_mut();
-                -1
-            }
-        }
-    }
+    let found = GLOBAL.with(|db| db.getutent()).ok().flatten();
+    unsafe { store_r(found, buffer, result) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getutid_r(id: *const Utmp, buffer: *mut Utmp, result: *mut *mut Utmp) -> c_int {
-    unsafe {
-        match GLOBAL.with(|db| db.getutid(&*id)) {
-            Ok(u) => {
-                *buffer = u;
-                *result = buffer;
-                0
-            }
-            Err(_) => {
-                *result = null_mut();
-                -1
-            }
-        }
-    }
+    let id = unsafe { rec(id) };
+    let found = GLOBAL.with(|db| db.getutid(id)).ok();
+    unsafe { store_r(found, buffer, result) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getutline_r(line: *const Utmp, buffer: *mut Utmp, result: *mut *mut Utmp) -> c_int {
-    unsafe {
-        match GLOBAL.with(|db| db.getutline(&*line)) {
-            Ok(u) => {
-                *buffer = u;
-                *result = buffer;
-                0
-            }
-            Err(_) => {
-                *result = null_mut();
-                -1
-            }
-        }
-    }
+    let line = unsafe { rec(line) };
+    let found = GLOBAL.with(|db| db.getutline(line)).ok();
+    unsafe { store_r(found, buffer, result) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getutent() -> *mut Utmp {
-    unsafe {
-        let b = static_buffer(&BUF_ENT);
-        if b.is_null() {
-            return b;
-        }
-        let mut r = null_mut();
-        if getutent_r(b, &mut r) < 0 { null_mut() } else { r }
+    let b = static_buffer(&BUF_ENT);
+    if b.is_null() {
+        return b;
     }
+    let mut r = null_mut();
+    if unsafe { getutent_r(b, &mut r) } < 0 { null_mut() } else { r }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getutid(id: *const Utmp) -> *mut Utmp {
-    unsafe {
-        let b = static_buffer(&BUF_ID);
-        if b.is_null() {
-            return b;
-        }
-        let mut r = null_mut();
-        if getutid_r(id, b, &mut r) < 0 { null_mut() } else { r }
+    let b = static_buffer(&BUF_ID);
+    if b.is_null() {
+        return b;
     }
+    let mut r = null_mut();
+    if unsafe { getutid_r(id, b, &mut r) } < 0 { null_mut() } else { r }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getutline(line: *const Utmp) -> *mut Utmp {
-    unsafe {
-        let b = static_buffer(&BUF_LINE);
-        if b.is_null() {
-            return b;
-        }
-        let mut r = null_mut();
-        if getutline_r(line, b, &mut r) < 0 { null_mut() } else { r }
+    let b = static_buffer(&BUF_LINE);
+    if b.is_null() {
+        return b;
     }
+    let mut r = null_mut();
+    if unsafe { getutline_r(line, b, &mut r) } < 0 { null_mut() } else { r }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pututline(utmp_ptr: *const Utmp) -> *mut Utmp {
-    unsafe { if GLOBAL.with(|db| db.pututline(&*utmp_ptr)) { utmp_ptr as *mut Utmp } else { null_mut() } }
+    let data = unsafe { rec(utmp_ptr) };
+    if GLOBAL.with(|db| db.pututline(data)) { utmp_ptr as *mut Utmp } else { null_mut() }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn updwtmp(wtmp_file: *const c_char, utmp: *const Utmp) {
-    unsafe {
-        updwtmp_file(CStr::from_ptr(wtmp_file), &*utmp);
-    }
+    let file = unsafe { cs(wtmp_file) };
+    updwtmp_file(file, unsafe { rec(utmp) });
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn logwtmp(line: *const c_char, name: *const c_char, host: *const c_char) {
-    unsafe { logwtmp_to(PATH_WTMP, CStr::from_ptr(line), CStr::from_ptr(name), CStr::from_ptr(host)) }
+    let line = unsafe { cs(line) };
+    let name = unsafe { cs(name) };
+    let host = unsafe { cs(host) };
+    logwtmp_to(PATH_WTMP, line, name, host)
+}
+
+pub fn login_global(entry: &Utmp) {
+    let mut copy = *entry;
+    copy.ut_type = USER_PROCESS;
+    copy.ut_pid = getpid();
+    copy.ut_line = login_line();
+    if GLOBAL.with(|db| db.set_name(PATH_UTMP)) {
+        setutent();
+        GLOBAL.with(|db| db.pututline(&copy));
+        endutent();
+    }
+    updwtmp_file(PATH_WTMP, &copy);
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn login(entry: *const Utmp) {
-    unsafe {
-        let mut copy = *entry;
-        copy.ut_type = USER_PROCESS;
-        copy.ut_pid = getpid();
-        copy.ut_line = login_line();
-        if utmpname(PATH_UTMP.as_ptr()) == 0 {
-            setutent();
-            pututline(&copy);
-            endutent();
-        }
-        updwtmp_file(PATH_WTMP, &copy);
+    login_global(unsafe { rec(entry) })
+}
+
+pub fn logout_global(line: &CStr) -> c_int {
+    if !GLOBAL.with(|db| db.set_name(PATH_UTMP)) {
+        return 0;
     }
+    setutent();
+    let mut tmp = Utmp::ZERO;
+    tmp.ut_type = USER_PROCESS;
+    copy_name(&mut tmp.ut_line, line);
+    let mut result = 0;
+    if let Ok(mut buf) = GLOBAL.with(|db| db.getutline(&tmp)) {
+        buf.ut_user = [0; UT_NAMESIZE];
+        buf.ut_host = [0; UT_HOSTSIZE];
+        let (s, us) = now();
+        buf.tv_sec = s;
+        buf.tv_usec = us;
+        buf.ut_type = DEAD_PROCESS;
+        if GLOBAL.with(|db| db.pututline(&buf)) {
+            result = 1;
+        }
+    }
+    endutent();
+    result
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn logout(ut_line: *const c_char) -> c_int {
-    unsafe {
-        if utmpname(PATH_UTMP.as_ptr()) == -1 {
-            return 0;
-        }
-        setutent();
-        let mut tmp = Utmp::ZERO;
-        tmp.ut_type = USER_PROCESS;
-        copy_name(&mut tmp.ut_line, CStr::from_ptr(ut_line));
-        let mut result = 0;
-        let mut buf = Utmp::ZERO;
-        let mut r = null_mut();
-        if getutline_r(&tmp, &mut buf, &mut r) >= 0 {
-            buf.ut_user = [0; UT_NAMESIZE];
-            buf.ut_host = [0; UT_HOSTSIZE];
-            let (s, us) = now();
-            buf.tv_sec = s;
-            buf.tv_usec = us;
-            buf.ut_type = DEAD_PROCESS;
-            if !pututline(&buf).is_null() {
-                result = 1;
-            }
-        }
-        endutent();
-        result
-    }
+    logout_global(unsafe { cs(ut_line) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -778,10 +785,11 @@ pub unsafe extern "C" fn updwtmpx(wtmpx_file: *const c_char, utmpx: *const Utmpx
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getutmp(utmpx: *const Utmpx, utmp: *mut Utmp) {
-    unsafe { *utmp = (*utmpx).0 }
+    let v = unsafe { rec(utmpx.cast::<Utmp>()) };
+    unsafe { core::ptr::copy(v, utmp, 1) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getutmpx(utmp: *const Utmp, utmpx: *mut Utmpx) {
-    unsafe { (*utmpx).0 = *utmp }
+    unsafe { getutmp(utmp.cast::<Utmpx>(), utmpx.cast::<Utmp>()) }
 }

@@ -1,9 +1,10 @@
-use crate::consts::*;
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use core::ffi::{CStr, VaList, c_char, c_int};
 use core::ptr::null;
 use rusty_libc_core::errno;
 use rusty_libc_core::lock::Locked;
-use rusty_libc_core::syscall::{self, syscall1, syscall3, syscall6};
+use rusty_libc_core::syscall::{syscall3, syscall6};
+use rusty_libc_core::unistd as un;
 use rusty_libc_stdio::fmt::Sink;
 
 pub const LOG_EMERG: c_int = 0;
@@ -32,7 +33,6 @@ const EPROTOTYPE: c_int = 91;
 const SYS_SOCKET: usize = 41;
 const SYS_CONNECT: usize = 42;
 const SYS_SENDTO: usize = 44;
-const SYS_GETPID_NR2: usize = 39;
 
 fn sys_err(r: usize) -> c_int {
     if r > usize::MAX - 4095 { (r as isize).wrapping_neg() as c_int } else { 0 }
@@ -58,11 +58,22 @@ impl MsgBuf {
     fn new() -> MsgBuf {
         MsgBuf { stack: [0; 1024], heap: core::ptr::null_mut(), len: 0, cap: 1024, failed: false }
     }
-    fn ptr(&self) -> *const u8 {
-        if self.heap.is_null() { self.stack.as_ptr() } else { self.heap }
+    fn all(&self) -> &[u8] {
+        if self.heap.is_null() {
+            &self.stack
+        } else {
+            unsafe { rusty_libc_core::ffi::bytes(self.heap, self.cap) }
+        }
+    }
+    fn all_mut(&mut self) -> &mut [u8] {
+        if self.heap.is_null() {
+            &mut self.stack
+        } else {
+            unsafe { rusty_libc_core::ffi::bytes_mut(self.heap, self.cap) }
+        }
     }
     fn bytes(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.ptr(), self.len) }
+        &self.all()[..self.len]
     }
     fn push(&mut self, b: &[u8]) -> bool {
         if self.len + b.len() > self.cap {
@@ -70,19 +81,19 @@ impl MsgBuf {
             while cap < self.len + b.len() {
                 cap *= 2;
             }
-            unsafe {
-                let n = rusty_libc_malloc::malloc(cap) as *mut u8;
-                if n.is_null() {
-                    self.failed = true;
-                    return false;
-                }
-                core::ptr::copy_nonoverlapping(self.ptr(), n, self.len);
-                rusty_libc_malloc::free(self.heap.cast());
-                self.heap = n;
+            let n = crate::mntent::malloc(cap);
+            if n.is_null() {
+                self.failed = true;
+                return false;
             }
+            let new = unsafe { rusty_libc_core::ffi::bytes_mut(n, cap) };
+            new[..self.len].copy_from_slice(self.bytes());
+            unsafe { rusty_libc_malloc::free(self.heap.cast()) };
+            self.heap = n;
             self.cap = cap;
         }
-        unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), (if self.heap.is_null() { self.stack.as_mut_ptr() } else { self.heap }).add(self.len), b.len()) };
+        let len = self.len;
+        self.all_mut()[len..len + b.len()].copy_from_slice(b);
         self.len += b.len();
         true
     }
@@ -139,12 +150,22 @@ fn timestamp(t: i64) -> Option<[u8; 16]> {
 
 fn now_seconds() -> i64 {
     let mut ts = [0i64; 2];
-    unsafe { syscall::syscall2(SYS_CLOCK_GETTIME_NR, 0, ts.as_mut_ptr() as usize) };
+    unsafe { rusty_libc_core::vdso::clock_gettime_raw(0, ts.as_mut_ptr().cast()) };
     ts[0]
 }
 
-fn getpid() -> i32 {
-    unsafe { syscall::syscall0(SYS_GETPID_NR2) as i32 }
+use rusty_libc_core::unistd::getpid;
+
+fn socket_unix(ty: c_int) -> usize {
+    unsafe { syscall3(SYS_SOCKET, 1, ty as usize, 0) }
+}
+
+fn connect_raw(fd: c_int, addr: &[u8; 110]) -> usize {
+    unsafe { syscall3(SYS_CONNECT, fd as usize, addr.as_ptr() as usize, 110) }
+}
+
+fn send_raw(fd: c_int, data: &[u8]) -> usize {
+    unsafe { syscall6(SYS_SENDTO, fd as usize, data.as_ptr() as usize, data.len(), MSG_NOSIGNAL, 0, 0) }
 }
 
 pub struct Syslog {
@@ -180,8 +201,8 @@ fn program_name() -> *const c_char {
             out(reg) addr,
             options(nostack, readonly, preserves_flags)
         );
-        if addr == 0 { null() } else { *(addr as *const *const c_char) }
     }
+    if addr == 0 { null() } else { unsafe { *(addr as *const *const c_char) } }
 }
 
 pub const PATH_LOG: &CStr = c"/dev/log";
@@ -212,7 +233,7 @@ impl Syslog {
         let mut retry = 0;
         while retry < 2 {
             if self.log_file == -1 && self.log_stat & LOG_NDELAY != 0 {
-                let r = unsafe { syscall3(SYS_SOCKET, 1, (self.log_type | SOCK_CLOEXEC) as usize, 0) };
+                let r = socket_unix(self.log_type | SOCK_CLOEXEC);
                 let e = sys_err(r);
                 if e != 0 {
                     errno::set(e);
@@ -225,12 +246,12 @@ impl Syslog {
                 let mut addr = [0u8; 110];
                 addr[0] = 1;
                 addr[2..110].copy_from_slice(&self.path);
-                let r = unsafe { syscall3(SYS_CONNECT, self.log_file as usize, addr.as_ptr() as usize, 110) };
+                let r = connect_raw(self.log_file, &addr);
                 let e = sys_err(r);
                 if e != 0 {
                     let fd = self.log_file;
                     self.log_file = -1;
-                    unsafe { syscall1(syscall::SYS_CLOSE, fd as usize) };
+                    let _ = rusty_libc_core::unistd::close(fd);
                     errno::set(old_errno);
                     if e == EPROTOTYPE {
                         self.log_type = if self.log_type == SOCK_DGRAM { SOCK_STREAM } else { SOCK_DGRAM };
@@ -249,12 +270,12 @@ impl Syslog {
         if !self.connected {
             return;
         }
-        unsafe { syscall1(syscall::SYS_CLOSE, self.log_file as usize) };
+        let _ = rusty_libc_core::unistd::close(self.log_file);
         self.log_file = -1;
         self.connected = false;
     }
 
-    pub fn openlog(&mut self, ident: *const c_char, logstat: c_int, logfac: c_int) {
+    pub unsafe fn openlog(&mut self, ident: *const c_char, logstat: c_int, logfac: c_int) {
         self.openlog_internal(ident, logstat, logfac);
     }
 
@@ -272,15 +293,16 @@ impl Syslog {
         old
     }
 
-    fn send(&self, buf: &MsgBuf, extra_nul: bool) -> bool {
+    fn send(&self, buf: &mut MsgBuf, extra_nul: bool) -> bool {
         let mut n = buf.len;
         if extra_nul {
             n += 1;
         }
         if extra_nul {
-            unsafe { *(buf.ptr() as *mut u8).add(buf.len) = 0 };
+            let len = buf.len;
+            buf.all_mut()[len] = 0;
         }
-        let r = unsafe { syscall6(SYS_SENDTO, self.log_file as usize, buf.ptr() as usize, n, MSG_NOSIGNAL, 0, 0) };
+        let r = send_raw(self.log_file, &buf.all()[..n]);
         let e = sys_err(r);
         if e != 0 {
             errno::set(e);
@@ -341,7 +363,7 @@ impl Syslog {
                 if tag.is_null() {
                     buf.push(b"(null)");
                 } else {
-                    buf.push(unsafe { CStr::from_ptr(tag) }.to_bytes());
+                    buf.push(unsafe { rusty_libc_core::ffi::cstr_bytes(tag) });
                 }
                 if pid != 0 {
                     buf.push(b"[");
@@ -367,7 +389,9 @@ impl Syslog {
             if buf.bytes()[total - 1] != b'\n' {
                 out.push(b"\n");
             }
-            unsafe { syscall3(syscall::SYS_WRITE, 2, out.ptr() as usize, out.len) };
+            if let Err(e) = un::write_nocancel(2, out.bytes()) {
+                errno::set(e.0);
+            }
         }
         if !self.connected {
             self.openlog_internal(null(), self.log_stat | LOG_NDELAY, self.log_facility);
@@ -375,28 +399,24 @@ impl Syslog {
         buf.push(b"\0");
         buf.len -= 1;
         let stream = self.log_type == SOCK_STREAM;
-        let mut sent = self.connected && self.send(&buf, stream);
+        let mut sent = self.connected && self.send(&mut buf, stream);
         if !sent {
             if self.connected {
                 self.closelog_internal();
                 self.openlog_internal(null(), self.log_stat | LOG_NDELAY, self.log_facility);
             }
             let stream = self.log_type == SOCK_STREAM;
-            sent = self.connected && self.send(&buf, stream);
+            sent = self.connected && self.send(&mut buf, stream);
             if !sent {
                 self.closelog_internal();
                 if self.log_stat & LOG_CONS != 0 {
                     let saved = errno::get();
-                    let r = unsafe { syscall3(syscall::SYS_OPEN, c"/dev/console".as_ptr() as usize, 1 | 0o400 | 0o2000000, 0) };
-                    if sys_err(r) == 0 {
-                        let fd = r;
+                    if let Ok(fd) = unsafe { un::open(c"/dev/console".as_ptr(), 1 | 0o400 | 0o2000000, 0) } {
                         let mut out = MsgBuf::new();
                         out.push(&buf.bytes()[msgoff..]);
                         out.push(b"\r\n");
-                        unsafe {
-                            syscall3(syscall::SYS_WRITE, fd, out.ptr() as usize, out.len);
-                            syscall1(syscall::SYS_CLOSE, fd);
-                        }
+                        let _ = un::write_nocancel(fd, out.bytes());
+                        let _ = un::close(fd);
                     }
                     errno::set(saved);
                 }
@@ -423,19 +443,17 @@ fn push_hex(buf: &mut MsgBuf, mut v: u32) {
 }
 
 unsafe fn format_into(buf: &mut MsgBuf, fmt: *const c_char, ap: &mut VaList, check: Option<unsafe fn(*const c_char)>) -> bool {
-    unsafe {
-        if let Some(c) = check {
-            c(fmt);
-        }
-        rusty_libc_stdio::printf_api::run(buf, fmt, ap) >= 0
+    if let Some(c) = check {
+        unsafe { c(fmt) };
     }
+    unsafe { rusty_libc_stdio::printf_api::run(buf, fmt, ap) >= 0 }
 }
 
 static GLOBAL: Locked<Syslog> = Locked::new(Syslog::with_path(b"/dev/log"));
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn openlog(ident: *const c_char, logopt: c_int, facility: c_int) {
-    GLOBAL.with(|s| s.openlog(ident, logopt, facility));
+    GLOBAL.with(|s| unsafe { s.openlog(ident, logopt, facility) });
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -463,13 +481,11 @@ pub fn syslog_text(pri: c_int, text: &[u8]) {
 }
 
 pub unsafe fn vsyslog_checked(pri: c_int, fmt: *const c_char, ap: &mut VaList, check: Option<unsafe fn(*const c_char)>) {
-    unsafe {
-        let saved = errno::get();
-        let mut pri = pri;
-        if pri & !(LOG_PRIMASK | LOG_FACMASK) != 0 {
-            syslog(INTERNALLOG, c"syslog: unknown facility/priority: %x".as_ptr(), pri as u32 as c_int);
-            pri &= LOG_PRIMASK | LOG_FACMASK;
-        }
-        GLOBAL.with(|s| s.log_inner(pri, saved, &mut |buf: &mut MsgBuf| format_into(buf, fmt, ap, check)));
+    let saved = errno::get();
+    let mut pri = pri;
+    if pri & !(LOG_PRIMASK | LOG_FACMASK) != 0 {
+        unsafe { syslog(INTERNALLOG, c"syslog: unknown facility/priority: %x".as_ptr(), pri as u32 as c_int) };
+        pri &= LOG_PRIMASK | LOG_FACMASK;
     }
+    GLOBAL.with(|s| s.log_inner(pri, saved, &mut |buf: &mut MsgBuf| unsafe { format_into(buf, fmt, ap, check) }));
 }

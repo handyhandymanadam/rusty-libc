@@ -1,3 +1,5 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
+
 use crate::types::*;
 use crate::vars::*;
 use core::ffi::{c_char, c_int, c_ulong};
@@ -5,6 +7,7 @@ use core::ffi::{c_char, c_int, c_ulong};
 pub const RQCRED_SIZE: usize = 400;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct SvcCallout {
     pub sc_next: *mut SvcCallout,
     pub sc_prog: rpcprog_t,
@@ -13,252 +16,292 @@ pub struct SvcCallout {
     pub sc_mapped: bool_t,
 }
 
+#[inline(always)]
+unsafe fn ops<'a>(x: *mut SVCXPRT) -> &'a xp_ops {
+    let p = unsafe { (*x).xp_ops };
+    unsafe { &*p }
+}
+
 #[inline]
 pub unsafe fn svc_recv(x: *mut SVCXPRT, msg: *mut rpc_msg) -> bool_t {
-    ((*(*x).xp_ops).xp_recv.unwrap())(x, msg)
+    let f = unsafe { ops(x) }.xp_recv.unwrap();
+    unsafe { f(x, msg) }
 }
 
 #[inline]
 pub unsafe fn svc_stat(x: *mut SVCXPRT) -> c_int {
-    ((*(*x).xp_ops).xp_stat.unwrap())(x)
+    let f = unsafe { ops(x) }.xp_stat.unwrap();
+    unsafe { f(x) }
 }
 
 #[inline]
 pub unsafe fn svc_getargs(x: *mut SVCXPRT, xargs: xdrproc_t, argsp: caddr_t) -> bool_t {
-    ((*(*x).xp_ops).xp_getargs.unwrap())(x, xargs, argsp)
+    let f = unsafe { ops(x) }.xp_getargs.unwrap();
+    unsafe { f(x, xargs, argsp) }
 }
 
 #[inline]
 pub unsafe fn svc_reply(x: *mut SVCXPRT, msg: *mut rpc_msg) -> bool_t {
-    ((*(*x).xp_ops).xp_reply.unwrap())(x, msg)
+    let f = unsafe { ops(x) }.xp_reply.unwrap();
+    unsafe { f(x, msg) }
 }
 
 #[inline]
 pub unsafe fn svc_freeargs(x: *mut SVCXPRT, xargs: xdrproc_t, argsp: caddr_t) -> bool_t {
-    ((*(*x).xp_ops).xp_freeargs.unwrap())(x, xargs, argsp)
+    let f = unsafe { ops(x) }.xp_freeargs.unwrap();
+    unsafe { f(x, xargs, argsp) }
 }
 
 #[inline]
 pub unsafe fn svc_destroy(x: *mut SVCXPRT) {
-    ((*(*x).xp_ops).xp_destroy.unwrap())(x)
+    let f = unsafe { ops(x) }.xp_destroy.unwrap();
+    unsafe { f(x) }
+}
+
+fn pollset() -> (*mut pollfd, c_int) {
+    let p = crate::vars::__rpc_thread_svc_pollfd();
+    let n = crate::vars::__rpc_thread_svc_max_pollfd();
+    let arr = unsafe { *p };
+    (arr, unsafe { *n })
+}
+
+fn set_pollset(arr: *mut pollfd, n: c_int) {
+    let p = crate::vars::__rpc_thread_svc_pollfd();
+    let m = crate::vars::__rpc_thread_svc_max_pollfd();
+    unsafe { *p = arr };
+    unsafe { *m = n };
+}
+
+unsafe fn pollfds<'a>() -> &'a mut [pollfd] {
+    let (arr, n) = pollset();
+    unsafe { rusty_libc_core::ffi::slice_mut(arr, n.max(0) as usize) }
+}
+
+fn fdset_change(fd: usize, on: bool) {
+    let set = crate::vars::__rpc_thread_svc_fdset();
+    let w = unsafe { &mut (*set).fds_bits[fd / 64] };
+    if on {
+        *w |= 1 << (fd % 64);
+    } else {
+        *w &= !(1 << (fd % 64));
+    }
+}
+
+unsafe fn xports<'a>() -> Option<&'a mut [*mut SVCXPRT]> {
+    let t = tv_svc_xports();
+    if t.is_null() {
+        return None;
+    }
+    Some(unsafe { rusty_libc_core::ffi::slice_mut(t, _rpc_dtablesize() as usize) })
 }
 
 #[inline]
-unsafe fn fd_set_bit(set: *mut fd_set, fd: usize) {
-    (*set).fds_bits[fd / 64] |= 1 << (fd % 64);
-}
-
-#[inline]
-unsafe fn fd_clr_bit(set: *mut fd_set, fd: usize) {
-    (*set).fds_bits[fd / 64] &= !(1 << (fd % 64));
+unsafe fn callout(s: *mut SvcCallout) -> SvcCallout {
+    unsafe { *s }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn xprt_register(xprt: *mut SVCXPRT) {
-    let sock = (*xprt).xp_sock;
-    let tvp = thread_vars();
-    if (*tvp).svc_xports.is_null() {
-        (*tvp).svc_xports = calloc(_rpc_dtablesize() as usize, core::mem::size_of::<*mut SVCXPRT>()) as *mut *mut SVCXPRT;
-        if (*tvp).svc_xports.is_null() {
+    let sock = unsafe { (*xprt).xp_sock };
+    if tv_svc_xports().is_null() {
+        set_tv_svc_xports(alloc_zeroed(_rpc_dtablesize() as usize, core::mem::size_of::<*mut SVCXPRT>()) as *mut *mut SVCXPRT);
+        if tv_svc_xports().is_null() {
             return;
         }
     }
     if sock < _rpc_dtablesize() {
-        *(*tvp).svc_xports.add(sock as usize) = xprt;
+        if let Some(t) = unsafe { xports() } {
+            t[sock as usize] = xprt;
+        }
         if (sock as usize) < FD_SETSIZE {
-            fd_set_bit(crate::vars::__rpc_thread_svc_fdset(), sock as usize);
+            fdset_change(sock as usize, true);
         }
-        let pfd = crate::vars::__rpc_thread_svc_pollfd();
-        let maxp = crate::vars::__rpc_thread_svc_max_pollfd();
-        for i in 0..*maxp {
-            let p = (*pfd).add(i as usize);
-            if (*p).fd == -1 {
-                (*p).fd = sock;
-                (*p).events = POLLIN | POLLPRI | POLLRDNORM | POLLRDBAND;
-                return;
-            }
+        if let Some(p) = unsafe { pollfds() }.iter_mut().find(|p| p.fd == -1) {
+            p.fd = sock;
+            p.events = POLLIN | POLLPRI | POLLRDNORM | POLLRDBAND;
+            return;
         }
-        let new = rusty_libc_malloc::realloc((*pfd).cast(), core::mem::size_of::<pollfd>() * (*maxp as usize + 1)) as *mut pollfd;
+        let (arr, n) = pollset();
+        let new = unsafe { rusty_libc_malloc::realloc(arr.cast(), core::mem::size_of::<pollfd>() * (n as usize + 1)) as *mut pollfd };
         if new.is_null() {
             return;
         }
-        *pfd = new;
-        *maxp += 1;
-        let p = new.add(*maxp as usize - 1);
-        (*p).fd = sock;
-        (*p).events = POLLIN | POLLPRI | POLLRDNORM | POLLRDBAND;
+        set_pollset(new, n + 1);
+        unsafe { new.wrapping_add(n as usize).write(pollfd { fd: sock, events: POLLIN | POLLPRI | POLLRDNORM | POLLRDBAND, revents: 0 }) };
     }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn xprt_unregister(xprt: *mut SVCXPRT) {
-    let sock = (*xprt).xp_sock;
-    let tvp = thread_vars();
-    if sock < _rpc_dtablesize() && !(*tvp).svc_xports.is_null() && *(*tvp).svc_xports.add(sock as usize) == xprt {
-        *(*tvp).svc_xports.add(sock as usize) = core::ptr::null_mut();
-        if (sock as usize) < FD_SETSIZE {
-            fd_clr_bit(crate::vars::__rpc_thread_svc_fdset(), sock as usize);
+    let sock = unsafe { (*xprt).xp_sock };
+    if sock < _rpc_dtablesize() {
+        let Some(t) = (unsafe { xports() }) else { return };
+        if t[sock as usize] != xprt {
+            return;
         }
-        let pfd = crate::vars::__rpc_thread_svc_pollfd();
-        let maxp = crate::vars::__rpc_thread_svc_max_pollfd();
-        for i in 0..*maxp {
-            let p = (*pfd).add(i as usize);
-            if (*p).fd == sock {
-                (*p).fd = -1;
+        t[sock as usize] = core::ptr::null_mut();
+        if (sock as usize) < FD_SETSIZE {
+            fdset_change(sock as usize, false);
+        }
+        for p in unsafe { pollfds() }.iter_mut() {
+            if p.fd == sock {
+                p.fd = -1;
             }
         }
     }
 }
 
-unsafe fn svc_find(prog: rpcprog_t, vers: rpcvers_t, prev: *mut *mut SvcCallout) -> *mut SvcCallout {
+fn svc_find(prog: rpcprog_t, vers: rpcvers_t) -> (*mut SvcCallout, *mut SvcCallout) {
     let mut p: *mut SvcCallout = core::ptr::null_mut();
-    let mut s = (*thread_vars()).svc_head;
+    let mut s = tv_svc_head();
     while !s.is_null() {
-        if (*s).sc_prog == prog && (*s).sc_vers == vers {
+        let c = unsafe { callout(s) };
+        if c.sc_prog == prog && c.sc_vers == vers {
             break;
         }
         p = s;
-        s = (*s).sc_next;
+        s = c.sc_next;
     }
-    *prev = p;
-    s
+    (s, p)
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn svc_register(xprt: *mut SVCXPRT, prog: rpcprog_t, vers: rpcvers_t, dispatch: dispatch_fn_t, protocol: rpcprot_t) -> bool_t {
-    let mut prev: *mut SvcCallout = core::ptr::null_mut();
-    let mut s = svc_find(prog, vers, &mut prev);
+    let (mut s, _) = svc_find(prog, vers);
     if !s.is_null() {
-        if (*s).sc_dispatch.map(|f| f as usize) != dispatch.map(|f| f as usize) {
+        if unsafe { callout(s) }.sc_dispatch.map(|f| f as usize) != dispatch.map(|f| f as usize) {
             return FALSE;
         }
     } else {
-        s = mem_alloc(core::mem::size_of::<SvcCallout>()) as *mut SvcCallout;
+        s = alloc(core::mem::size_of::<SvcCallout>()) as *mut SvcCallout;
         if s.is_null() {
             return FALSE;
         }
-        (*s).sc_prog = prog;
-        (*s).sc_vers = vers;
-        (*s).sc_dispatch = dispatch;
-        (*s).sc_next = (*thread_vars()).svc_head;
-        (*s).sc_mapped = FALSE;
-        (*thread_vars()).svc_head = s;
+        unsafe { s.write(SvcCallout { sc_next: tv_svc_head(), sc_prog: prog, sc_vers: vers, sc_dispatch: dispatch, sc_mapped: FALSE }) };
+        set_tv_svc_head(s);
     }
     if protocol != 0 {
-        if crate::pmap::pmap_set(prog, vers, protocol as c_int, (*xprt).xp_port) == 0 {
+        let port = unsafe { (*xprt).xp_port };
+        if crate::pmap::pmap_set(prog, vers, protocol as c_int, port) == 0 {
             return FALSE;
         }
-        (*s).sc_mapped = TRUE;
+        unsafe { (*s).sc_mapped = TRUE };
     }
     TRUE
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn svc_unregister(prog: rpcprog_t, vers: rpcvers_t) {
-    let mut prev: *mut SvcCallout = core::ptr::null_mut();
-    let s = svc_find(prog, vers, &mut prev);
+pub extern "C" fn svc_unregister(prog: rpcprog_t, vers: rpcvers_t) {
+    let (s, prev) = svc_find(prog, vers);
     if s.is_null() {
         return;
     }
-    let is_mapped = (*s).sc_mapped != 0;
+    let c = unsafe { callout(s) };
+    let is_mapped = c.sc_mapped != 0;
     if prev.is_null() {
-        (*thread_vars()).svc_head = (*s).sc_next;
+        set_tv_svc_head(c.sc_next);
     } else {
-        (*prev).sc_next = (*s).sc_next;
+        unsafe { (*prev).sc_next = c.sc_next };
     }
-    (*s).sc_next = core::ptr::null_mut();
-    mem_free(s.cast());
+    unsafe { mem_free(s.cast()) };
     if is_mapped {
         crate::pmap::pmap_unset(prog, vers);
     }
 }
 
-pub unsafe fn thread_svc_cleanup() {
+pub fn thread_svc_cleanup() {
     loop {
-        let svcp = (*thread_vars()).svc_head;
+        let svcp = tv_svc_head();
         if svcp.is_null() {
             break;
         }
-        svc_unregister((*svcp).sc_prog, (*svcp).sc_vers);
+        let c = unsafe { callout(svcp) };
+        svc_unregister(c.sc_prog, c.sc_vers);
     }
+}
+
+fn reply_msg(stat: c_int) -> rpc_msg {
+    let mut rply = rpc_msg::zeroed();
+    rply.rm_direction = REPLY;
+    rply.ru.rmb_mut().rp_stat = stat;
+    rply
+}
+
+#[inline]
+unsafe fn verf_of(xprt: *mut SVCXPRT) -> opaque_auth {
+    unsafe { (*xprt).xp_verf }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn svc_sendreply(xprt: *mut SVCXPRT, xdr_results: xdrproc_t, xdr_location: caddr_t) -> bool_t {
-    let mut rply = rpc_msg::zeroed();
-    rply.rm_direction = REPLY;
-    rply.ru.RM_rmb.rp_stat = MSG_ACCEPTED;
-    let ar = &mut rply.ru.RM_rmb.ru.RP_ar;
-    ar.ar_verf = (*xprt).xp_verf;
+    let mut rply = reply_msg(MSG_ACCEPTED);
+    let ar = rply.ru.rmb_mut().ru.ar_mut();
+    ar.ar_verf = unsafe { verf_of(xprt) };
     ar.ar_stat = SUCCESS;
     ar.ru.AR_results = ar_results { where_: xdr_location, proc_: xdr_results };
-    svc_reply(xprt, &mut rply)
+    unsafe { svc_reply(xprt, &mut rply) }
 }
 
 unsafe fn accepted_error(xprt: *mut SVCXPRT, stat: c_int) {
-    let mut rply = rpc_msg::zeroed();
-    rply.rm_direction = REPLY;
-    rply.ru.RM_rmb.rp_stat = MSG_ACCEPTED;
-    rply.ru.RM_rmb.ru.RP_ar.ar_verf = (*xprt).xp_verf;
-    rply.ru.RM_rmb.ru.RP_ar.ar_stat = stat;
-    svc_reply(xprt, &mut rply);
+    let mut rply = reply_msg(MSG_ACCEPTED);
+    let ar = rply.ru.rmb_mut().ru.ar_mut();
+    ar.ar_verf = unsafe { verf_of(xprt) };
+    ar.ar_stat = stat;
+    unsafe { svc_reply(xprt, &mut rply) };
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn svcerr_noproc(xprt: *mut SVCXPRT) {
-    accepted_error(xprt, PROC_UNAVAIL)
+    unsafe { accepted_error(xprt, PROC_UNAVAIL) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn svcerr_decode(xprt: *mut SVCXPRT) {
-    accepted_error(xprt, GARBAGE_ARGS)
+    unsafe { accepted_error(xprt, GARBAGE_ARGS) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn svcerr_systemerr(xprt: *mut SVCXPRT) {
-    accepted_error(xprt, SYSTEM_ERR)
+    unsafe { accepted_error(xprt, SYSTEM_ERR) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn svcerr_auth(xprt: *mut SVCXPRT, why: c_int) {
-    let mut rply = rpc_msg::zeroed();
-    rply.rm_direction = REPLY;
-    rply.ru.RM_rmb.rp_stat = MSG_DENIED;
-    rply.ru.RM_rmb.ru.RP_dr.rj_stat = AUTH_ERROR;
-    rply.ru.RM_rmb.ru.RP_dr.ru.RJ_why = why;
-    svc_reply(xprt, &mut rply);
+    let mut rply = reply_msg(MSG_DENIED);
+    let dr = rply.ru.rmb_mut().ru.dr_mut();
+    dr.rj_stat = AUTH_ERROR;
+    *dr.ru.why_mut() = why;
+    unsafe { svc_reply(xprt, &mut rply) };
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn svcerr_weakauth(xprt: *mut SVCXPRT) {
-    svcerr_auth(xprt, AUTH_TOOWEAK)
+    unsafe { svcerr_auth(xprt, AUTH_TOOWEAK) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn svcerr_noprog(xprt: *mut SVCXPRT) {
-    accepted_error(xprt, PROG_UNAVAIL)
+    unsafe { accepted_error(xprt, PROG_UNAVAIL) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn svcerr_progvers(xprt: *mut SVCXPRT, low_vers: rpcvers_t, high_vers: rpcvers_t) {
-    let mut rply = rpc_msg::zeroed();
-    rply.rm_direction = REPLY;
-    rply.ru.RM_rmb.rp_stat = MSG_ACCEPTED;
-    rply.ru.RM_rmb.ru.RP_ar.ar_verf = (*xprt).xp_verf;
-    rply.ru.RM_rmb.ru.RP_ar.ar_stat = PROG_MISMATCH;
-    rply.ru.RM_rmb.ru.RP_ar.ru.AR_versions = rpc_vers { low: low_vers, high: high_vers };
-    svc_reply(xprt, &mut rply);
+    let mut rply = reply_msg(MSG_ACCEPTED);
+    let ar = rply.ru.rmb_mut().ru.ar_mut();
+    ar.ar_verf = unsafe { verf_of(xprt) };
+    ar.ar_stat = PROG_MISMATCH;
+    ar.ru.AR_versions = rpc_vers { low: low_vers, high: high_vers };
+    unsafe { svc_reply(xprt, &mut rply) };
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn svc_getreq(rdfds: c_int) {
+pub extern "C" fn svc_getreq(rdfds: c_int) {
     let mut readfds = fd_set::ZERO;
     readfds.fds_bits[0] = rdfds as c_ulong as i64;
-    svc_getreqset(&mut readfds);
+    getreqset(&readfds);
 }
 
-#[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn svc_getreqset(readfds: *mut fd_set) {
+pub fn getreqset(readfds: &fd_set) {
     let mut setsize = _rpc_dtablesize() as usize;
     if setsize > FD_SETSIZE {
         setsize = FD_SETSIZE;
@@ -266,7 +309,7 @@ pub unsafe extern "C" fn svc_getreqset(readfds: *mut fd_set) {
     let mut sock = 0;
     let mut idx = 0;
     while sock < setsize {
-        let mut mask = (*readfds).fds_bits[idx] as u64;
+        let mut mask = readfds.fds_bits[idx] as u64;
         idx += 1;
         while mask != 0 {
             let bit = mask.trailing_zeros() as usize;
@@ -278,19 +321,26 @@ pub unsafe extern "C" fn svc_getreqset(readfds: *mut fd_set) {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn svc_getreqset(readfds: *mut fd_set) {
+    getreqset(unsafe { &*readfds })
+}
+
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+#[inline]
 pub unsafe extern "C" fn svc_getreq_poll(pfdp: *mut pollfd, pollretval: c_int) {
     if pollretval == 0 {
         return;
     }
     let mut fds_found = 0;
-    let maxp = *crate::vars::__rpc_thread_svc_max_pollfd();
-    for i in 0..maxp {
-        let p = pfdp.add(i as usize);
-        if (*p).fd != -1 && (*p).revents != 0 {
-            if (*p).revents & POLLNVAL != 0 {
-                xprt_unregister(*(*thread_vars()).svc_xports.add((*p).fd as usize));
+    let (_, maxp) = pollset();
+    for i in 0..maxp.max(0) as usize {
+        let p = unsafe { pfdp.wrapping_add(i).read() };
+        if p.fd != -1 && p.revents != 0 {
+            if p.revents & POLLNVAL != 0 {
+                let x = unsafe { xports() }.and_then(|t| t.get(p.fd as usize).copied()).unwrap_or(core::ptr::null_mut());
+                unsafe { xprt_unregister(x) };
             } else {
-                svc_getreq_common((*p).fd);
+                svc_getreq_common(p.fd);
             }
             fds_found += 1;
             if fds_found >= pollretval {
@@ -301,72 +351,66 @@ pub unsafe extern "C" fn svc_getreq_poll(pfdp: *mut pollfd, pollretval: c_int) {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn svc_getreq_common(fd: c_int) {
+pub extern "C" fn svc_getreq_common(fd: c_int) {
     let mut msg = rpc_msg::zeroed();
-    let mut cred_area = [0 as c_char; 2 * MAX_AUTH_BYTES as usize + RQCRED_SIZE];
-    msg.ru.RM_cmb.cb_cred.oa_base = cred_area.as_mut_ptr();
-    msg.ru.RM_cmb.cb_verf.oa_base = cred_area.as_mut_ptr().add(MAX_AUTH_BYTES as usize);
-    let xports = (*thread_vars()).svc_xports;
-    if xports.is_null() {
-        return;
-    }
-    let xprt = *xports.add(fd as usize);
+    let mut cred_area = [0u8; 2 * MAX_AUTH_BYTES as usize + RQCRED_SIZE];
+    let base = cred_area.as_mut_ptr();
+    let cb = msg.ru.cmb_mut();
+    cb.cb_cred.oa_base = base.cast();
+    cb.cb_verf.oa_base = base.wrapping_add(MAX_AUTH_BYTES as usize).cast();
+    let Some(xprt) = (unsafe { xports() }).and_then(|t| t.get(fd as usize).copied()) else { return };
     if xprt.is_null() {
         return;
     }
     loop {
-        if svc_recv(xprt, &mut msg) != 0 {
-            let mut r = svc_req {
-                rq_prog: msg.ru.RM_cmb.cb_prog,
-                rq_vers: msg.ru.RM_cmb.cb_vers,
-                rq_proc: msg.ru.RM_cmb.cb_proc,
-                rq_cred: msg.ru.RM_cmb.cb_cred,
-                rq_clntcred: cred_area.as_mut_ptr().add(2 * MAX_AUTH_BYTES as usize),
-                rq_xprt: xprt,
-            };
+        if unsafe { svc_recv(xprt, &mut msg) } != 0 {
+            let cb = *msg.ru.cmb();
+            let mut r = svc_req { rq_prog: cb.cb_prog, rq_vers: cb.cb_vers, rq_proc: cb.cb_proc, rq_cred: cb.cb_cred, rq_clntcred: base.wrapping_add(2 * MAX_AUTH_BYTES as usize).cast(), rq_xprt: xprt };
             'call: {
-                if msg.ru.RM_cmb.cb_cred.oa_flavor == AUTH_NULL {
-                    (*r.rq_xprt).xp_verf.oa_flavor = (*(&raw const _null_auth)).oa_flavor;
-                    (*r.rq_xprt).xp_verf.oa_length = 0;
+                if cb.cb_cred.oa_flavor == AUTH_NULL {
+                    let x = unsafe { &mut *xprt };
+                    x.xp_verf.oa_flavor = null_auth().oa_flavor;
+                    x.xp_verf.oa_length = 0;
                 } else {
-                    let why = crate::auth::_authenticate(&mut r, &mut msg);
+                    let why = unsafe { crate::auth::_authenticate(&mut r, &mut msg) };
                     if why != AUTH_OK {
-                        svcerr_auth(xprt, why);
+                        unsafe { svcerr_auth(xprt, why) };
                         break 'call;
                     }
                 }
                 let mut prog_found = false;
                 let mut low_vers: rpcvers_t = rpcvers_t::MAX;
                 let mut high_vers: rpcvers_t = 0;
-                let mut s = (*thread_vars()).svc_head;
+                let mut s = tv_svc_head();
                 while !s.is_null() {
-                    if (*s).sc_prog == r.rq_prog {
-                        if (*s).sc_vers == r.rq_vers {
-                            if let Some(d) = (*s).sc_dispatch {
-                                d(&mut r, xprt);
+                    let c = unsafe { callout(s) };
+                    if c.sc_prog == r.rq_prog {
+                        if c.sc_vers == r.rq_vers {
+                            if let Some(d) = c.sc_dispatch {
+                                unsafe { d(&mut r, xprt) };
                             }
                             break 'call;
                         }
                         prog_found = true;
-                        if (*s).sc_vers < low_vers {
-                            low_vers = (*s).sc_vers;
+                        if c.sc_vers < low_vers {
+                            low_vers = c.sc_vers;
                         }
-                        if (*s).sc_vers > high_vers {
-                            high_vers = (*s).sc_vers;
+                        if c.sc_vers > high_vers {
+                            high_vers = c.sc_vers;
                         }
                     }
-                    s = (*s).sc_next;
+                    s = c.sc_next;
                 }
                 if prog_found {
-                    svcerr_progvers(xprt, low_vers, high_vers);
+                    unsafe { svcerr_progvers(xprt, low_vers, high_vers) };
                 } else {
-                    svcerr_noprog(xprt);
+                    unsafe { svcerr_noprog(xprt) };
                 }
             }
         }
-        let stat = svc_stat(xprt);
+        let stat = unsafe { svc_stat(xprt) };
         if stat == XPRT_DIED {
-            svc_destroy(xprt);
+            unsafe { svc_destroy(xprt) };
             break;
         }
         if stat != XPRT_MOREREQS {
@@ -377,9 +421,7 @@ pub unsafe extern "C" fn svc_getreq_common(fd: c_int) {
 
 pub fn svc_wait_on_error() {
     let ts = rusty_libc_time::clock::Timespec { tv_sec: 0, tv_nsec: 50_000_000 };
-    unsafe {
-        rusty_libc_time::clock::nanosleep(&ts, core::ptr::null_mut());
-    }
+    unsafe { rusty_libc_time::clock::nanosleep(&ts, core::ptr::null_mut()) };
 }
 
 pub fn svc_accept_failed() {
@@ -389,57 +431,57 @@ pub fn svc_accept_failed() {
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn svc_exit() {
-    let pfd = crate::vars::__rpc_thread_svc_pollfd();
-    mem_free((*pfd).cast());
-    *pfd = core::ptr::null_mut();
-    *crate::vars::__rpc_thread_svc_max_pollfd() = 0;
+pub extern "C" fn svc_exit() {
+    let (arr, _) = pollset();
+    unsafe { mem_free(arr.cast()) };
+    set_pollset(core::ptr::null_mut(), 0);
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
-pub unsafe extern "C" fn svc_run() {
+pub extern "C" fn svc_run() {
     let mut my_pollfd: *mut pollfd = core::ptr::null_mut();
     let mut last_max_pollfd = 0;
     loop {
-        let max_pollfd = *crate::vars::__rpc_thread_svc_max_pollfd();
-        let svcp = *crate::vars::__rpc_thread_svc_pollfd();
+        let (svcp, max_pollfd) = pollset();
         if max_pollfd == 0 && svcp.is_null() {
             break;
         }
         if last_max_pollfd != max_pollfd {
-            let new_pollfd = rusty_libc_malloc::realloc(my_pollfd.cast(), core::mem::size_of::<pollfd>() * max_pollfd as usize) as *mut pollfd;
+            let new_pollfd = unsafe { rusty_libc_malloc::realloc(my_pollfd.cast(), core::mem::size_of::<pollfd>() * max_pollfd as usize) as *mut pollfd };
             if new_pollfd.is_null() {
-                perror("svc_run: - out of memory");
+                perror_msg("svc_run: - out of memory");
                 break;
             }
             my_pollfd = new_pollfd;
             last_max_pollfd = max_pollfd;
         }
-        for i in 0..max_pollfd as usize {
-            (*my_pollfd.add(i)).fd = (*svcp.add(i)).fd;
-            (*my_pollfd.add(i)).events = (*svcp.add(i)).events;
-            (*my_pollfd.add(i)).revents = 0;
+        let n = max_pollfd.max(0) as usize;
+        for i in 0..n {
+            let p = unsafe { svcp.wrapping_add(i).read() };
+            unsafe { my_pollfd.wrapping_add(i).write(pollfd { fd: p.fd, events: p.events, revents: 0 }) };
         }
-        let i = sys_poll(my_pollfd, max_pollfd as usize, -1);
+        let mine = unsafe { rusty_libc_core::ffi::slice_mut(my_pollfd, n) };
+        let i = poll_fds(mine, -1);
         match i {
             -1 => {
                 if get_errno() == EINTR {
                     continue;
                 }
-                perror("svc_run: - poll failed");
+                perror_msg("svc_run: - poll failed");
                 break;
             }
             0 => continue,
             _ => {
-                svc_getreq_poll(my_pollfd, i);
+                unsafe { svc_getreq_poll(my_pollfd, i) };
                 continue;
             }
         }
     }
-    mem_free(my_pollfd.cast());
+    unsafe { mem_free(my_pollfd.cast()) };
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct ProgList {
     p_progname: Option<unsafe extern "C" fn(*mut c_char) -> *mut c_char>,
     p_prognum: c_int,
@@ -449,7 +491,7 @@ struct ProgList {
     p_nxt: *mut ProgList,
 }
 
-unsafe fn msg_out(parts: &[&[u8]]) {
+fn msg_out(parts: &[&[u8]]) {
     let mut b = StackBuf::<256>::new();
     for p in parts {
         b.push(p);
@@ -460,75 +502,71 @@ unsafe fn msg_out(parts: &[&[u8]]) {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn registerrpc(prognum: c_ulong, versnum: c_ulong, procnum: c_ulong, progname: Option<unsafe extern "C" fn(*mut c_char) -> *mut c_char>, inproc: xdrproc_t, outproc: xdrproc_t) -> c_int {
     use core::fmt::Write;
-    let tvp = thread_vars();
     if procnum == NULLPROC {
         msg_out(&[b"can't reassign procedure number 0\n"]);
         return -1;
     }
-    if (*tvp).svcsimple_transp.is_null() {
-        (*tvp).svcsimple_transp = crate::svc_udp::svcudp_create(RPC_ANYSOCK);
-        if (*tvp).svcsimple_transp.is_null() {
+    if tv_svcsimple_transp().is_null() {
+        set_tv_svcsimple_transp(crate::svc_udp::svcudp_create(RPC_ANYSOCK));
+        if tv_svcsimple_transp().is_null() {
             msg_out(&[b"couldn't create an rpc server\n"]);
             return -1;
         }
     }
     crate::pmap::pmap_unset(prognum, versnum);
-    if svc_register((*tvp).svcsimple_transp, prognum, versnum, Some(universal), IPPROTO_UDP as rpcprot_t) == 0 {
+    if unsafe { svc_register(tv_svcsimple_transp(), prognum, versnum, Some(universal), IPPROTO_UDP as rpcprot_t) } == 0 {
         let mut b = StackBuf::<128>::new();
         let _ = write!(b, "couldn't register prog {} vers {}\n", prognum as i64, versnum as i64);
         msg_out(&[b.as_bytes()]);
         return -1;
     }
-    let pl = mem_alloc(core::mem::size_of::<ProgList>()) as *mut ProgList;
+    let pl = alloc(core::mem::size_of::<ProgList>()) as *mut ProgList;
     if pl.is_null() {
         msg_out(&[b"registerrpc: out of memory\n"]);
         return -1;
     }
-    (*pl).p_progname = progname;
-    (*pl).p_prognum = prognum as c_int;
-    (*pl).p_procnum = procnum as c_int;
-    (*pl).p_inproc = inproc;
-    (*pl).p_outproc = outproc;
-    (*pl).p_nxt = (*tvp).svcsimple_proglst as *mut ProgList;
-    (*tvp).svcsimple_proglst = pl.cast();
+    unsafe { pl.write(ProgList { p_progname: progname, p_prognum: prognum as c_int, p_procnum: procnum as c_int, p_inproc: inproc, p_outproc: outproc, p_nxt: tv_svcsimple_proglst().cast() }) };
+    set_tv_svcsimple_proglst(pl.cast());
     0
 }
 
 unsafe extern "C" fn universal(rqstp: *mut svc_req, transp_l: *mut SVCXPRT) {
     use core::fmt::Write;
-    let tvp = thread_vars();
-    if (*rqstp).rq_proc == NULLPROC {
-        if svc_sendreply(transp_l, crate::xproc!(crate::xdr::xdr_void as unsafe extern "C" fn() -> bool_t), core::ptr::null_mut()) == FALSE {
-            sys_write(2, b"xxx\n".as_ptr(), 4);
+    let rq = unsafe { &*rqstp };
+    let void_proc = crate::xproc!(crate::xdr::xdr_void as unsafe extern "C" fn() -> bool_t);
+    if rq.rq_proc == NULLPROC {
+        if unsafe { svc_sendreply(transp_l, void_proc, core::ptr::null_mut()) } == FALSE {
+            write_fd(2, b"xxx\n");
             rusty_libc_core::process::exit(1);
         }
         return;
     }
-    let prog = (*rqstp).rq_prog as c_int;
-    let proc_ = (*rqstp).rq_proc as c_int;
-    let mut pl = (*tvp).svcsimple_proglst as *mut ProgList;
+    let prog = rq.rq_prog as c_int;
+    let proc_ = rq.rq_proc as c_int;
+    let mut pl = tv_svcsimple_proglst() as *mut ProgList;
     while !pl.is_null() {
-        if (*pl).p_prognum == prog && (*pl).p_procnum == proc_ {
-            let mut xdrbuf = [0 as c_char; UDPMSGSIZE as usize];
-            if svc_getargs(transp_l, (*pl).p_inproc, xdrbuf.as_mut_ptr()) == 0 {
-                svcerr_decode(transp_l);
+        let e = unsafe { *pl };
+        if e.p_prognum == prog && e.p_procnum == proc_ {
+            let mut xdrbuf = [0u8; UDPMSGSIZE as usize];
+            let xb = xdrbuf.as_mut_ptr().cast::<c_char>();
+            if unsafe { svc_getargs(transp_l, e.p_inproc, xb) } == 0 {
+                unsafe { svcerr_decode(transp_l) };
                 return;
             }
-            let outdata = ((*pl).p_progname.unwrap())(xdrbuf.as_mut_ptr());
-            let void_proc = crate::xproc!(crate::xdr::xdr_void as unsafe extern "C" fn() -> bool_t).map(|f| f as usize);
-            if outdata.is_null() && (*pl).p_outproc.map(|f| f as usize) != void_proc {
+            let outdata = unsafe { (e.p_progname.unwrap())(xb) };
+            if outdata.is_null() && e.p_outproc.map(|f| f as usize) != void_proc.map(|f| f as usize) {
                 return;
             }
-            if svc_sendreply(transp_l, (*pl).p_outproc, outdata) == 0 {
+            if unsafe { svc_sendreply(transp_l, e.p_outproc, outdata) } == 0 {
                 let mut b = StackBuf::<128>::new();
-                let _ = write!(b, "trouble replying to prog {}\n", (*pl).p_prognum);
+                let _ = write!(b, "trouble replying to prog {}\n", e.p_prognum);
                 msg_out(&[b.as_bytes()]);
                 rusty_libc_core::process::exit(1);
             }
-            svc_freeargs(transp_l, (*pl).p_inproc, xdrbuf.as_mut_ptr());
+            unsafe { svc_freeargs(transp_l, e.p_inproc, xb) };
             return;
         }
-        pl = (*pl).p_nxt;
+        pl = e.p_nxt;
     }
     let mut b = StackBuf::<128>::new();
     let _ = write!(b, "never registered prog {}\n", prog);
@@ -536,15 +574,14 @@ unsafe extern "C" fn universal(rqstp: *mut svc_req, transp_l: *mut SVCXPRT) {
     rusty_libc_core::process::exit(1);
 }
 
-pub unsafe fn thread_svc_free() {
-    let tvp = thread_vars();
-    mem_free((*tvp).svc_xports.cast());
-    (*tvp).svc_xports = core::ptr::null_mut();
-    let mut pl = (*tvp).svcsimple_proglst as *mut ProgList;
+pub fn thread_svc_free() {
+    unsafe { mem_free(tv_svc_xports().cast()) };
+    set_tv_svc_xports(core::ptr::null_mut());
+    let mut pl = tv_svcsimple_proglst() as *mut ProgList;
     while !pl.is_null() {
-        let n = (*pl).p_nxt;
-        mem_free(pl.cast());
+        let n = unsafe { (*pl).p_nxt };
+        unsafe { mem_free(pl.cast()) };
         pl = n;
     }
-    (*tvp).svcsimple_proglst = core::ptr::null_mut();
+    set_tv_svcsimple_proglst(core::ptr::null_mut());
 }

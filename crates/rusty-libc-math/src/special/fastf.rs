@@ -97,6 +97,11 @@ fn poly12_row<const F: bool>(g: &[f64; 12], h: f64) -> f64 {
 }
 
 #[inline(always)]
+fn in_row(v: f64, h: f64, half: f64) -> f64 {
+    if f64::from_bits(h.to_bits() & 0x7fff_ffff_ffff_ffff) <= half { v } else { f64::NAN }
+}
+
+#[inline(always)]
 fn erf_row(ax: f64) -> (usize, f64) {
     let t = ax * 16.0 + MAGIC;
     ((t.to_bits() & 0xff) as usize, ax - (t - MAGIC) * 0.0625)
@@ -107,11 +112,11 @@ pub(super) fn erf_erfc_lo<const F: bool>(ax: f64) -> (f64, f64) {
     let (k, h) = erf_row(ax);
     let q = &ERF_Q[ERF_OFF[k] as usize..ERF_OFF[k + 1] as usize];
     let hq = poly12::<F>(q, h) * h;
-    (ERF_E0[k][0] + hq, ERF_EC0[k][0] - hq)
+    (in_row(ERF_E0[k][0] + hq, h, 1.0 / 32.0), in_row(ERF_EC0[k][0] - hq, h, 1.0 / 32.0))
 }
 
 #[inline(always)]
-pub(super) fn erf_lo<const F: bool>(ax: f64) -> f64 {
+pub(super) fn erf_lo_unchecked<const F: bool>(ax: f64) -> (f64, f64) {
     let t = ax * 16.0 + MAGIC;
     let k = (t.to_bits() & 0xff) as usize;
     let h = ax - (t - MAGIC) * 0.0625;
@@ -123,18 +128,18 @@ pub(super) fn erf_lo<const F: bool>(ax: f64) -> f64 {
     let a3 = fma::<F>(h, r[8], r[7]);
     let b0 = fma::<F>(h2, a1, a0);
     let b1 = fma::<F>(h2, a3, a2);
-    fma::<F>(h, fma::<F>(h2 * h2, b1, b0), r[0])
+    (fma::<F>(h, fma::<F>(h2 * h2, b1, b0), r[0]), h)
 }
 
 #[inline(always)]
-pub(super) fn erfc_tail_lo<const F: bool>(x: f64) -> f64 {
+pub(super) fn erfc_tail_lo_unchecked<const F: bool>(x: f64) -> (f64, f64) {
     let t = (x - 6.0) * 2.0 + MAGIC;
     let j = (t.to_bits() & 0xff) as usize;
     let h = x - (6.0 + (t - MAGIC) * 0.5);
     let r = poly12_row::<F>(&ERFC_TAIL_ROWS[j], h);
     let sq = x * x;
     let e = fma::<F>(x, x, -sq);
-    r * crate::exp::dexp::exp_impl::<F>(-sq) * (1.0 - e)
+    (r * crate::exp::dexp::exp_impl::<F>(-sq) * (1.0 - e), h)
 }
 
 #[inline(always)]

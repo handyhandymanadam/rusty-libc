@@ -249,14 +249,37 @@ fn asm_x87(label: &str, target: &str, idx: usize, shape: char) -> Vec<String> {
     l
 }
 
+fn pack_names(names: &[&str]) -> (String, Vec<(usize, usize)>) {
+    let mut blob = String::new();
+    let mut at = Vec::new();
+    for n in names {
+        let off = match blob.find(n) {
+            Some(o) => o,
+            None => {
+                blob.push_str(n);
+                blob.len() - n.len()
+            }
+        };
+        assert!(off <= u16::MAX as usize && n.len() <= u8::MAX as usize);
+        at.push((off, n.len()));
+    }
+    (blob, at)
+}
+
 pub fn svid(root: &Path) {
     let ents = entries(root);
-    let mut out: Vec<String> = vec![format!("pub static DESCS: [Desc; {}] = [", ents.len())];
-    for e in &ents {
+    let stems: Vec<&str> = ents.iter().map(|e| e.stem).collect();
+    let (blob, at) = pack_names(&stems);
+    let mut out: Vec<String> = vec![
+        format!("pub static DESC_STEMS: [u8; {}] = *b\"{}\";", blob.len(), blob),
+        "".into(),
+        format!("pub static DESCS: [Desc; {}] = [", ents.len()),
+    ];
+    for (e, (off, len)) in ents.iter().zip(&at) {
         let skip = !e.finite && MODERN_RAW.contains(&(e.stem, e.t));
         out.push(format!(
-            "    Desc {{ stem: \"{}\", ty: Ty::{}, finite: {}, shape: b'{}', modern_raw: {} }},",
-            e.stem, e.t.to_ascii_uppercase(), e.finite, e.shape, skip
+            "    Desc {{ stem: Name({}, {}), ty: Ty::{}, finite: {}, shape: b'{}', modern_raw: {} }},",
+            off, len, e.t.to_ascii_uppercase(), e.finite, e.shape, skip
         ));
     }
     out.push("];".into());
@@ -267,15 +290,24 @@ pub fn svid(root: &Path) {
     }
     out.push(");".into());
     fs::write(root.join("crates/rusty-libc-cabi/src/compat_svid_gen.rs"), out.join("\n") + "\n").unwrap();
-    let mut raw: Vec<String> = vec!["pub static RAW: &[Raw] = &[".into()];
+    let mut rows: Vec<Vec<String>> = Vec::new();
     if let Ok(t) = fs::read_to_string(root.join("tools/svid_raw_table.txt")) {
         for line in t.lines() {
             if line.starts_with('#') || line.trim().is_empty() {
                 continue;
             }
-            let f: Vec<&str> = line.split_whitespace().collect();
-            raw.push(format!("    Raw {{ name: \"{}\", ty: Ty::{}, errno: b'{}', nan: b'{}' }},", f[0], f[1].to_ascii_uppercase(), f[2], f[3]));
+            rows.push(line.split_whitespace().map(String::from).collect());
         }
+    }
+    let names: Vec<&str> = rows.iter().map(|f| f[0].as_str()).collect();
+    let (blob, at) = pack_names(&names);
+    let mut raw: Vec<String> = vec![
+        format!("pub static RAW_NAMES: [u8; {}] = *b\"{}\";", blob.len(), blob),
+        "".into(),
+        format!("pub static RAW: [Raw; {}] = [", rows.len()),
+    ];
+    for (f, (off, len)) in rows.iter().zip(&at) {
+        raw.push(format!("    Raw {{ name: Name({}, {}), ty: Ty::{}, errno: b'{}', nan: b'{}' }},", off, len, f[1].to_ascii_uppercase(), f[2], f[3]));
     }
     raw.push("];".into());
     fs::write(root.join("crates/rusty-libc-cabi/src/compat_svid_raw.rs"), raw.join("\n") + "\n").unwrap();
@@ -477,8 +509,12 @@ pub fn compat_symver(root: &Path, defined: Option<&str>) {
     out.push("".into());
     out.push("pub mod data {".into());
     out.push("    core::arch::global_asm!(".into());
-    out.push("        \".pushsection .data.rl_compat,\\\"aw\\\",@progbits\",".into());
-    out.extend(data_lines);
+    let (strs, ptrs): (Vec<String>, Vec<String>) = data_lines.into_iter().partition(|l| l.contains(": .asciz "));
+    out.push("        \".pushsection .data.rel.ro.rl_compat,\\\"aw\\\",@progbits\",".into());
+    out.extend(ptrs);
+    out.push("        \".popsection\",".into());
+    out.push("        \".pushsection .rodata.rl_compat,\\\"a\\\",@progbits\",".into());
+    out.extend(strs);
     out.push("        \".popsection\",".into());
     out.push("    );".into());
     out.push("}".into());

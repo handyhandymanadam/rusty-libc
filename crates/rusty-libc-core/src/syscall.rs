@@ -1,8 +1,12 @@
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use core::arch::asm;
 
 pub const SYS_READ: usize = 0;
-pub const SYS_WRITE: usize = 1;
 pub const SYS_OPEN: usize = 2;
+pub const SYS_STAT: usize = 4;
+pub const SYS_LSTAT: usize = 6;
+pub const SYS_FORK: usize = 57;
+pub const SYS_WRITE: usize = 1;
 pub const SYS_CLOSE: usize = 3;
 pub const SYS_FSTAT: usize = 5;
 pub const SYS_LSEEK: usize = 8;
@@ -11,13 +15,15 @@ pub const SYS_PIPE2: usize = 293;
 pub const SYS_DUP: usize = 32;
 pub const SYS_DUP3: usize = 292;
 pub const SYS_ACCESS: usize = 21;
-pub const SYS_STAT: usize = 4;
-pub const SYS_LSTAT: usize = 6;
+pub const SYS_NEWFSTATAT: usize = 262;
 pub const SYS_RENAMEAT: usize = 264;
 pub const SYS_RENAMEAT2: usize = 316;
 pub const SYS_GETPPID: usize = 110;
 pub const SYS_GETUID: usize = 102;
 pub const SYS_GETEUID: usize = 107;
+pub const SYS_GETGID: usize = 104;
+pub const SYS_GETEGID: usize = 108;
+pub const SYS_KILL: usize = 62;
 pub const SYS_RENAME: usize = 82;
 pub const SYS_UNLINK: usize = 87;
 pub const SYS_RMDIR: usize = 84;
@@ -25,7 +31,7 @@ pub const SYS_FTRUNCATE: usize = 77;
 pub const SYS_FCNTL: usize = 72;
 pub const SYS_DUP2: usize = 33;
 pub const SYS_OPENAT: usize = 257;
-pub const SYS_FORK: usize = 57;
+pub const SYS_CLONE: usize = 56;
 pub const SYS_EXECVE: usize = 59;
 pub const SYS_WAIT4: usize = 61;
 pub const SYS_MMAP: usize = 9;
@@ -41,6 +47,22 @@ pub const SYS_GETTID: usize = 186;
 pub const SYS_TGKILL: usize = 234;
 pub const SYS_EXIT_GROUP: usize = 231;
 pub const SYS_GETRANDOM: usize = 318;
+pub const AT_FDCWD: usize = -100isize as usize;
+
+#[inline(always)]
+pub unsafe fn sys_open(path: usize, flags: usize, mode: usize) -> usize {
+    unsafe { syscall4(SYS_OPENAT, AT_FDCWD, path, flags, mode) }
+}
+
+#[inline(always)]
+pub unsafe fn sys_stat(path: usize, buf: usize) -> usize {
+    unsafe { syscall4(SYS_NEWFSTATAT, AT_FDCWD, path, buf, 0) }
+}
+
+#[inline(always)]
+pub unsafe fn sys_lstat(path: usize, buf: usize) -> usize {
+    unsafe { syscall4(SYS_NEWFSTATAT, AT_FDCWD, path, buf, 0x100 ) }
+}
 
 pub fn check(ret: usize) -> Result<usize, crate::Errno> {
     if ret > usize::MAX - 4095 {

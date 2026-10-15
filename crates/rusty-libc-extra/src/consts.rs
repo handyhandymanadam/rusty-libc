@@ -42,4 +42,3 @@ pub const SYS_WAITID: usize = 247;
 pub const SYS_PRLIMIT64: usize = 302;
 pub const SYS_CLOSE_RANGE: usize = 436;
 pub const TIOCSPGRP: usize = 0x5410;
-pub const SYS_CLOCK_GETTIME_NR: usize = 228;

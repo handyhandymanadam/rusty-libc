@@ -330,7 +330,7 @@ pub(crate) fn exp10f_impl<const F: bool>(x: f32) -> f32 {
             return may_uflowf(false);
         }
     }
-    super::dexp::exp10_impl::<F>(x as f64) as f32
+    super::ffast::exp10f_slow(x)
 }
 
 #[inline(always)]
@@ -345,11 +345,21 @@ pub(crate) fn expm1f_impl<const F: bool>(x: f32) -> f32 {
         return r;
     }
     if (0x3200_0000..0x42b0_0000).contains(&ab) {
-        let xd = x as f64;
-        if xd.abs() < 0.0625 {
-            return crate::trig::hyp::expm1_poly::<F>(xd) as f32;
-        }
-        return (super::dexp::exp_impl::<F>(xd) - 1.0) as f32;
+        return match super::ffast::round_cr_x(expm1f_raw::<F>(x), EXPM1F_MARGIN) {
+            Some(r) => r,
+            None => super::ffast::expm1f_slow(x),
+        };
     }
     to_f32_checked(super::dexp::expm1_impl::<F>(x as f64), x)
+}
+
+pub(crate) const EXPM1F_MARGIN: u64 = 1 << 8;
+
+#[inline(always)]
+pub(crate) fn expm1f_raw<const F: bool>(x: f32) -> f64 {
+    let xd = x as f64;
+    if xd.abs() < 0.0625 {
+        return crate::trig::hyp::expm1_poly::<F>(xd);
+    }
+    super::dexp::exp_impl::<F>(xd) - 1.0
 }

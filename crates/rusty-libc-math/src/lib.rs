@@ -2,6 +2,7 @@
 #![feature(f128)]
 #![feature(core_float_math)]
 #![allow(clippy::missing_safety_doc)]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 
 pub(crate) const SVID: bool = cfg!(feature = "svid");
 

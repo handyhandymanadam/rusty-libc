@@ -152,17 +152,15 @@ pub(crate) fn have_fma() -> bool {
 #[inline(never)]
 fn detect_fma(state: &AtomicU8) -> bool {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
-    let ok = unsafe {
-        let max = __cpuid(0).eax;
-        if max < 1 {
-            false
-        } else {
-            let c = __cpuid_count(1, 0).ecx;
-            let fma = c & (1 << 12) != 0;
-            let osxsave = c & (1 << 27) != 0;
-            let avx = c & (1 << 28) != 0;
-            fma && osxsave && avx && xcr0_has_ymm() && !crate::rounding::fp::force_nofma()
-        }
+    let max = __cpuid(0).eax;
+    let ok = if max < 1 {
+        false
+    } else {
+        let c = __cpuid_count(1, 0).ecx;
+        let fma = c & (1 << 12) != 0;
+        let osxsave = c & (1 << 27) != 0;
+        let avx = c & (1 << 28) != 0;
+        fma && osxsave && avx && unsafe { xcr0_has_ymm() } && !crate::rounding::fp::force_nofma()
     };
     state.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
     ok
@@ -202,7 +200,11 @@ pub(crate) fn fma_i<const F: bool>(a: f64, b: f64, c: f64) -> f64 {
     #[cfg(target_arch = "x86_64")]
     if F {
         use core::arch::x86_64::{_mm_cvtsd_f64, _mm_fmadd_sd, _mm_set_sd};
-        return unsafe { _mm_cvtsd_f64(_mm_fmadd_sd(_mm_set_sd(a), _mm_set_sd(b), _mm_set_sd(c))) };
+        let a = unsafe { _mm_set_sd(a) };
+        let b = unsafe { _mm_set_sd(b) };
+        let c = unsafe { _mm_set_sd(c) };
+        let r = unsafe { _mm_fmadd_sd(a, b, c) };
+        return unsafe { _mm_cvtsd_f64(r) };
     }
     crate::rounding::fma_impl::fma_emul(a, b, c)
 }
