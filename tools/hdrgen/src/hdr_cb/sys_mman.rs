@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("MAP_32BIT", V::Hex(0x40)),
         ("MAP_ABOVE4G", V::Hex(0x80)),
@@ -97,6 +98,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("PKEY_DISABLE_WRITE", V::Hex(0x2)),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Consts(&[
         ("MAP_FAILED", V::Txt("((void *)-1)")),
     ]),

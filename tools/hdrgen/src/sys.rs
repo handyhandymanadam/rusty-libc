@@ -1,3 +1,6 @@
+//! Header data for rusty-libc-sys (port of tools/sys_headers.py and tools/sys_types.py): which function lives in
+//! which glibc header, which Rust structs cbindgen turns into C structs, the shared types every header may need.
+
 use crate::text::{contains_word, replace_word, word_positions};
 use regex_lite::Regex;
 use std::collections::BTreeMap;
@@ -8,6 +11,7 @@ fn w(s: &str) -> Vec<&str> {
     s.split_whitespace().collect()
 }
 
+/// glibc's own placement; a function that glibc declares in two headers is listed in both
 pub fn sys_fns() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         ("unistd", w("access acct alarm brk chdir chown chroot close close_range closefrom confstr copy_file_range
@@ -79,6 +83,7 @@ pub fn sys_fns() -> Vec<(&'static str, Vec<&'static str>)> {
 
 pub const CONST_ONLY: [&str; 2] = ["sys/syscall", "sys/ttydefaults"];
 
+/// header -> [(source file, Rust name, C name)]
 fn sys_structs(hdr: &str) -> Vec<(&'static str, &'static str, &'static str)> {
     match hdr {
         "sys/stat" => vec![("stat", "Stat", "stat")],
@@ -107,6 +112,7 @@ const OPAQUE: [(&str, &str); 12] = [
     ("termios", "struct_termios"), ("winsize", "struct_winsize"),
 ];
 
+// (function regex, parameter regex, Rust type it replaces, new type)
 const RULES: &[(&str, &str, &str, &str)] = &[
     (".", "mode", "u32", "mode_t"), (".", "dev", "u64", "dev_t"),
     ("^(umask|getumask)$", "->|mask", "u32", "mode_t"),
@@ -188,6 +194,7 @@ fn clean_params(p: &str) -> String {
     p
 }
 
+/// Top-level comma split.
 fn split_params(p: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
@@ -238,6 +245,7 @@ impl Sys {
         let mut sigs = BTreeMap::new();
         let mut names: Vec<String> = fs::read_dir(&self.root).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
         names.sort();
+        // functions of a sys header that live in another crate (gethostid needs the resolver of rusty-libc-net)
         let mut paths: Vec<std::path::PathBuf> = names.iter().filter(|n| n.ends_with(".rs") && *n != "lib.rs").map(|n| self.root.join(n)).collect();
         paths.push(self.root.join("../../rusty-libc-net/src/hostid.rs"));
         for path in paths {
@@ -302,6 +310,7 @@ impl Sys {
         format!("#[unsafe(no_mangle)]\npub unsafe extern \"C\" fn {name}({}){r} {{}}\n", ps.join(", "))
     }
 
+    /// Rust text cbindgen reads for `hdr` (functions and structs of rusty-libc-sys).
     pub fn header_source(&self, hdr: &str) -> String {
         let mut parts: Vec<String> = Vec::new();
         let mut ren: Vec<(&str, &str)> = Vec::new();
@@ -333,6 +342,8 @@ impl Sys {
         Regex::new(r"\bmut\s+args\b").unwrap().replace_all(&src, "args").to_string()
     }
 }
+
+// ---------------------------------------------------------------- shared types (sys_types.py)
 
 struct Ty {
     name: &'static str,
@@ -408,6 +419,7 @@ fn types_block(body: &str, force: &[&str]) -> String {
         if order.contains(&i) {
             return;
         }
+        // python marks "wanted" before recursing; a cycle is impossible here
         for dep in &all[i].needs {
             want(all, dep, order);
         }
@@ -426,7 +438,7 @@ fn types_block(body: &str, force: &[&str]) -> String {
                 let trimmed = after.trim_start();
                 if trimmed.len() < after.len() && trimmed.starts_with(rest) {
                     let e = &trimmed[rest.len()..];
-                    if e.bytes().next().map_or(true, |c| !(c.is_ascii_alphanumeric() || c == b'_')) {
+                    if e.bytes().next().is_none_or(|c| !(c.is_ascii_alphanumeric() || c == b'_')) {
                         f = true;
                         break;
                     }
@@ -450,6 +462,7 @@ fn types_block(body: &str, force: &[&str]) -> String {
     out.join("\n")
 }
 
+/// cbindgen output -> final header: `struct_x` -> `struct x`, then the shared types.
 pub fn finish(text: &str, hdr: &str) -> String {
     let text = Regex::new(r"\bstruct_(\w+)\b").unwrap().replace_all(text, "struct $1").to_string();
     let block = types_block(&text, &force(hdr));

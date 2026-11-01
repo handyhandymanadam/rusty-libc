@@ -1,3 +1,7 @@
+//! The exact `_Float128` functions: classification, sign, rounding to integers, conversion to integer
+//! types, exponent and scaling, next-after, maxima and minima, remainders, payloads and total order.
+//! They work on the bits of the number (112 fraction bits, 15-bit exponent); behaviour follows glibc
+//! 2.43 (tests/c/f128_diff.c compares results, errno and exception flags).
 use super::arith::{self, cmp};
 use super::*;
 use crate::fenv::{FE_DIVBYZERO, FE_INEXACT, FE_INVALID};
@@ -11,6 +15,9 @@ fn mk(neg: bool, field: u32, frac: u128) -> F128 {
     F128((if neg { SIGN } else { 0 }) | ((field as u128) << 112) | frac)
 }
 
+// ---- classification ----
+
+/// FP_NAN 0, FP_INFINITE 1, FP_ZERO 2, FP_SUBNORMAL 3, FP_NORMAL 4.
 pub fn fpclassify(x: F128) -> i32 {
     if x.is_nan() {
         0
@@ -24,6 +31,7 @@ pub fn fpclassify(x: F128) -> i32 {
         4
     }
 }
+/// 8 for a negative number (the value the compiler's `signbit` yields for this type).
 pub fn signbit(x: F128) -> i32 {
     if x.is_neg() { 8 } else { 0 }
 }
@@ -39,6 +47,7 @@ pub fn finite(x: F128) -> i32 {
 pub fn issignaling(x: F128) -> i32 {
     x.is_snan() as i32
 }
+/// `x == y` as a signaling comparison: a NaN operand raises invalid.
 pub fn iseqsig(x: F128, y: F128) -> i32 {
     if x.is_nan() || y.is_nan() {
         raise(FE_INVALID);
@@ -56,6 +65,8 @@ q_to!(__finitef128, finite, i32);
 q_to!(__issignalingf128, issignaling, i32);
 q_to2!(__iseqsigf128, iseqsig, i32);
 
+// ---- sign ----
+
 pub fn fabs(x: F128) -> F128 {
     x.abs()
 }
@@ -64,6 +75,8 @@ pub fn copysign(x: F128, y: F128) -> F128 {
 }
 q_un!(fabsf128, fabs);
 q_bin!(copysignf128, copysign);
+
+// ---- rounding to integral values ----
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Rm {
@@ -88,17 +101,21 @@ fn rm_resolve(rm: Rm) -> Rm {
     }
 }
 
+/// Unbiased exponent of a finite nonzero x (subnormals normalized) and its 113-bit significand with
+/// the leading one at bit 112.
 pub(crate) fn normalized(x: F128) -> (i32, u128) {
     let e = x.exp_field() as i32;
     let f = x.frac();
     if e == 0 {
-        let lz = f.leading_zeros() as i32 - 15;
+        let lz = f.leading_zeros() as i32 - 15; // the leading one moves up to bit 112
         (-16382 - lz, f << lz)
     } else {
         (e - 16383, f | (1 << 112))
     }
 }
 
+/// Round to an integral value in the given way. Returns the value and whether it differs from x. NaN: the
+/// quiet NaN (invalid for a signaling one).
 pub(crate) fn round_int(x: F128, rm: Rm) -> (F128, bool) {
     if x.is_nan() {
         return (nan1(x), false);
@@ -120,7 +137,7 @@ pub(crate) fn round_int(x: F128, rm: Rm) -> (F128, bool) {
         };
         return (if up { F128::one(neg) } else { F128::zero(neg) }, true);
     }
-    let fb = (112 - ue) as u32;
+    let fb = (112 - ue) as u32; // fraction bits in the significand, 1 ..= 113
     let mask = (1u128 << fb) - 1;
     let (trunc, frac, half, unit) = (m & !mask, m & mask, 1u128 << (fb - 1), 1u128 << fb);
     if frac == 0 {
@@ -139,6 +156,7 @@ pub(crate) fn round_int(x: F128, rm: Rm) -> (F128, bool) {
     if v == 0 {
         return (F128::zero(neg), true);
     }
+    // v is a multiple of 2^fb: renormalize so the leading one is at bit 112
     let bl = 128 - v.leading_zeros() as i32;
     let new_ue = ue + (bl - 113);
     let frac = if bl <= 113 { (v << (113 - bl)) & FRAC } else { (v >> (bl - 113)) & FRAC };
@@ -160,6 +178,7 @@ pub fn round(x: F128) -> F128 {
 pub fn roundeven(x: F128) -> F128 {
     round_int(x, Rm::Even).0
 }
+/// rint: the current rounding mode, inexact raised when the value was not integral.
 pub fn rint(x: F128) -> F128 {
     let (r, inexact) = round_int(x, Rm::Cur);
     if inexact {
@@ -178,6 +197,9 @@ q_un!(roundevenf128, roundeven);
 q_un!(rintf128, rint);
 q_un!(nearbyintf128, nearbyint);
 
+// ---- conversion to integer types ----
+
+/// The integer the value rounds to in way `rm`, or `None` when it does not fit in 64 bits (or is a NaN).
 fn to_i64(x: F128, rm: Rm) -> Option<i64> {
     if x.is_nan() || x.is_inf() {
         return None;
@@ -190,7 +212,7 @@ fn to_i64(x: F128, rm: Rm) -> Option<i64> {
     if ue > 63 || (ue == 63 && !(r.is_neg() && m == 1 << 112)) {
         return None;
     }
-    let v = (m >> (112 - ue)) as u64;
+    let v = (m >> (112 - ue)) as u64; // ue <= 63: at most 64 bits
     Some(if r.is_neg() { (v as i64).wrapping_neg() } else { v as i64 })
 }
 
@@ -201,6 +223,7 @@ fn saturate(x: F128) -> i64 {
 pub fn lrint(x: F128) -> i64 {
     match to_i64(x, Rm::Cur) {
         Some(v) => {
+            // rint's inexact
             if round_int(x, Rm::Cur).1 {
                 raise(FE_INEXACT);
             }
@@ -227,6 +250,10 @@ q_to!(llrintf128, lrint, i64);
 q_to!(lroundf128, lround, i64);
 q_to!(llroundf128, lround, i64);
 
+/// fromfp family (C23 as in glibc 2.43: the result is the rounded value, a binary128): `round` is
+/// FP_INT_UPWARD (0), DOWNWARD (1), TOWARDZERO (2), TONEARESTFROMZERO (3), TONEAREST (4), anything else
+/// truncates. `signed`: result type; `exact`: raise inexact for a non-integral input. Out of range, NaN,
+/// infinity or width 0: a domain error (NaN, EDOM, invalid).
 fn fromfp(x: F128, round: i32, width: u32, signed: bool, exact: bool) -> F128 {
     let max_width = if signed { 16385 } else { 16384 };
     let width = width.min(max_width);
@@ -284,6 +311,8 @@ macro_rules! q_fromfp {
 }
 q_fromfp! { fromfpf128, fromfp_; ufromfpf128, ufromfp_; fromfpxf128, fromfpx_; ufromfpxf128, ufromfpx_; }
 
+// ---- exponent and scaling ----
+
 pub fn ilogb(x: F128) -> i32 {
     if x.is_zero() || x.is_nan() {
         raise(FE_INVALID);
@@ -315,6 +344,7 @@ pub fn logb(x: F128) -> F128 {
         return nan1(x);
     }
     if x.is_zero() {
+        // -infinity with divide-by-zero; errno is left alone
         fenv::raise_exceptions(FE_DIVBYZERO as u32);
         return F128::NEG_INF;
     }
@@ -327,6 +357,7 @@ q_to!(ilogbf128, ilogb, i32);
 q_to!(llogbf128, llogb, i64);
 q_un!(logbf128, logb);
 
+/// frexp: the significand in [1/2, 1) and the exponent (0 for zero, NaN, infinity).
 pub fn frexp(x: F128, e: &mut i32) -> F128 {
     *e = 0;
     if x.is_nan() || x.is_inf() || x.is_zero() {
@@ -341,10 +372,12 @@ pub fn frexp(x: F128, e: &mut i32) -> F128 {
 pub unsafe extern "C" fn frexpf128(x: f128, e: *mut i32) -> f128 {
     let mut ev = 0;
     let r = frexp(F128(x.to_bits()), &mut ev);
+    // SAFETY: the C contract: `e` points to a writable int.
     unsafe { e.write(ev) };
     r.to_f128()
 }
 
+/// modf: the fractional part, the integral part into `ip`.
 pub fn modf(x: F128, ip: &mut F128) -> F128 {
     if x.is_nan() {
         let n = nan1(x);
@@ -363,6 +396,7 @@ pub fn modf(x: F128, ip: &mut F128) -> F128 {
     if normalized(x).0 >= 112 {
         return F128::zero(x.is_neg());
     }
+    // x - i is exact
     arith::sub(x, i).with_sign(x.is_neg())
 }
 
@@ -370,10 +404,12 @@ pub fn modf(x: F128, ip: &mut F128) -> F128 {
 pub unsafe extern "C" fn modff128(x: f128, ip: *mut f128) -> f128 {
     let mut i = F128::ZERO;
     let r = modf(F128(x.to_bits()), &mut i);
+    // SAFETY: the C contract: `ip` points to a writable _Float128.
     unsafe { ip.write(i.to_f128()) };
     r.to_f128()
 }
 
+/// x * 2^n with a single rounding; ERANGE when the result overflows or underflows to zero.
 pub fn scalbn(x: F128, n: i64) -> F128 {
     if x.is_nan() {
         return nan1(x);
@@ -397,6 +433,8 @@ fn scalbn_i(x: F128, n: i32) -> F128 {
     scalbn(x, n as i64)
 }
 
+// ---- nextafter ----
+
 fn step(x: F128, up: bool) -> F128 {
     if x.is_zero() {
         return mk(!up, 0, 1);
@@ -406,6 +444,8 @@ fn step(x: F128, up: bool) -> F128 {
     F128((if neg { SIGN } else { 0 }) | if neg == up { o - 1 } else { o + 1 })
 }
 
+/// Flags and errno of a step from finite nonzero x to r, as glibc raises them: overflow (x + x) and ERANGE when r
+/// is infinite, underflow (x * x) and ERANGE when r is subnormal or zero.
 fn finish_next(x: F128, r: F128) -> F128 {
     if r.is_inf() {
         let _ = arith::add(x, x);
@@ -426,7 +466,7 @@ pub fn nextafter(x: F128, y: F128) -> F128 {
     }
     if x.is_zero() {
         let r = mk(y.is_neg(), 0, 1);
-        let _ = arith::mul(r, r);
+        let _ = arith::mul(r, r); // underflow and inexact
         return r;
     }
     let up = cmp(x, y) == Ordering::Less;
@@ -454,6 +494,9 @@ q_bin!(nextafterf128, nextafter);
 q_un!(nextupf128, nextup);
 q_un!(nextdownf128, nextdown);
 
+// ---- maxima and minima ----
+
+/// The larger (smaller) of two non-NaN values, with +0 larger than -0.
 fn pick(x: F128, y: F128, max: bool) -> F128 {
     match cmp(x, y) {
         Ordering::Greater => if max { x } else { y },
@@ -478,6 +521,8 @@ fn pick_mag(x: F128, y: F128, max: bool) -> F128 {
     }
 }
 
+/// One or both arguments are NaN: the other number is returned (invalid is raised for a signaling NaN);
+/// two NaNs give a quiet NaN.
 fn missing(x: F128, y: F128) -> F128 {
     if x.is_nan() && y.is_nan() {
         return nan2(x, y);
@@ -488,6 +533,7 @@ fn missing(x: F128, y: F128) -> F128 {
     if x.is_nan() { y } else { x }
 }
 
+/// fmax/fmin: a NaN argument is ignored unless both are NaN; signaling NaNs give a quiet NaN and invalid.
 fn fmax_fmin(x: F128, y: F128, max: bool) -> F128 {
     if x.is_snan() || y.is_snan() {
         return nan2(x, y);
@@ -595,6 +641,7 @@ q_bin!(fminimum_magf128, fminimum_mag_);
 q_bin!(fmaximum_mag_numf128, fmaximum_mag_num_);
 q_bin!(fminimum_mag_numf128, fminimum_mag_num_);
 
+/// fdim: x - y when x > y, else +0; ERANGE when the difference overflows.
 pub fn fdim(x: F128, y: F128) -> F128 {
     if x.is_nan() || y.is_nan() {
         return nan2(x, y);
@@ -610,6 +657,8 @@ pub fn fdim(x: F128, y: F128) -> F128 {
 }
 q_bin!(fdimf128, fdim);
 
+// ---- sqrt, fma, fmod, remainder, hypot ----
+
 pub fn sqrt(x: F128) -> F128 {
     if x.is_neg() && !x.is_zero() && !x.is_nan() {
         set_errno(EDOM);
@@ -617,11 +666,14 @@ pub fn sqrt(x: F128) -> F128 {
     arith::sqrt(x)
 }
 pub fn fma(x: F128, y: F128, z: F128) -> F128 {
+    // glibc's binary128 fma sets no errno
     arith::fma(x, y, z)
 }
 q_un!(sqrtf128, sqrt);
 q_tern!(fmaf128, fma);
 
+/// Long division of the significands of |x| and |y| (finite, nonzero, exponent of x at least that of y): the
+/// remainder `r` (value `r * 2^(ey - 112)`, `r < my`) and the low 32 bits of the integer quotient.
 fn long_div(mx: u128, ex: i32, my: u128, ey: i32) -> (u128, u32) {
     let mut r = mx;
     let mut q: u32 = 0;
@@ -640,6 +692,8 @@ fn long_div(mx: u128, ex: i32, my: u128, ey: i32) -> (u128, u32) {
     (r, (q << 1) | bit)
 }
 
+/// A positive finite number from a remainder significand `r` at the scale of exponent `ey` (value
+/// `r * 2^(ey - 112)`), exact; zero for r = 0.
 fn from_scaled(r: u128, ey: i32) -> F128 {
     if r == 0 {
         return F128::ZERO;
@@ -648,6 +702,8 @@ fn from_scaled(r: u128, ey: i32) -> F128 {
     build(ey - lz, r << lz)
 }
 
+/// A positive finite number from an unbiased exponent and a 113-bit significand (leading one at bit 112), exact
+/// (subnormal when the exponent is below the normal range).
 fn build(e: i32, m: u128) -> F128 {
     if e >= -16382 {
         mk(false, (e + 16383) as u32, m & FRAC)
@@ -676,8 +732,12 @@ pub fn fmod(x: F128, y: F128) -> F128 {
     from_scaled(r, ey).with_sign(x.is_neg())
 }
 
+/// remainder (IEEE): x - n*y with n the integer nearest x/y, ties to even; `quo` gets the low bits of n with the
+/// sign of x/y.
+/// remquo: the remainder and what goes to `*quo` (`None`: left as it was).
 pub fn remquo(x: F128, y: F128) -> (F128, Option<i32>) {
     if x.is_nan() || y.is_nan() {
+        // glibc computes (x * y) / (x * y): the soft-float product's NaN, the larger fraction (x on a tie)
         if x.is_snan() || y.is_snan() {
             raise(FE_INVALID);
         }
@@ -685,6 +745,7 @@ pub fn remquo(x: F128, y: F128) -> (F128, Option<i32>) {
         return (pick.quieted(), None);
     }
     if x.is_inf() || y.is_zero() {
+        // invalid, no errno, and `quo` is left as it was
         return (invalid(), None);
     }
     if y.is_inf() || x.is_zero() {
@@ -693,10 +754,13 @@ pub fn remquo(x: F128, y: F128) -> (F128, Option<i32>) {
     let sxy = x.is_neg() != y.is_neg();
     let (ex, mx) = normalized(x.abs());
     let (ey, my) = normalized(y.abs());
+    // (magnitude of the remainder, whether it has the opposite sign of x, the quotient)
     let (mag, flip, q): (F128, bool, u32) = if ex < ey - 1 {
         (x.abs(), false, 0)
     } else if ex == ey - 1 {
+        // |x| in [|y|/2, |y|): compare 2|x| = mx * 2^(ey - 112) with |y|
         if mx > my {
+            // x - y is negative: |y| - |x|, quotient 1
             (arith::sub(y.abs(), x.abs()), true, 0)
         } else {
             (x.abs(), false, 0)
@@ -710,6 +774,8 @@ pub fn remquo(x: F128, y: F128) -> (F128, Option<i32>) {
             (from_scaled(r, ey), false, q)
         }
     };
+    // glibc reduces x modulo 8y first and then counts: the low three bits of the floor quotient, plus one
+    // when the remainder was rounded up (so the value runs from 0 to 8)
     let m = ((q & 7) + flip as u32) as i32;
     let qo = if sxy { -m } else { m };
     (if mag.is_zero() { F128::zero(x.is_neg()) } else { mag.with_sign(x.is_neg() != flip) }, Some(qo))
@@ -717,6 +783,7 @@ pub fn remquo(x: F128, y: F128) -> (F128, Option<i32>) {
 
 pub fn remainder(x: F128, y: F128) -> F128 {
     let (r, _) = remquo(x, y);
+    // glibc's remainder wrapper: EDOM for the NaN of a domain error
     if r.is_nan() && !x.is_nan() && !y.is_nan() {
         set_errno(EDOM);
     }
@@ -726,20 +793,27 @@ pub fn remainder(x: F128, y: F128) -> F128 {
 q_bin!(fmodf128, fmod);
 q_bin!(remainderf128, remainder);
 
+/// # Safety
+/// `quo` is valid.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn remquof128(x: f128, y: f128, quo: *mut i32) -> f128 {
     let (r, q) = remquo(F128(x.to_bits()), F128(y.to_bits()));
     if let Some(q) = q {
+        // SAFETY: the C contract: `quo` points to a writable int (written only when glibc writes it).
         unsafe { quo.write(q) };
     }
     r.to_f128()
 }
 
+/// hypot: sqrt(x^2 + y^2) without intermediate overflow or underflow; an infinite argument gives +inf even beside
+/// a NaN.
 pub fn hypot(x: F128, y: F128) -> F128 {
     if !x.is_finite() || !y.is_finite() {
         if (x.is_inf() || y.is_inf()) && !x.is_snan() && !y.is_snan() {
             return F128::INF;
         }
+        // glibc returns x + y here: the soft-float sum picks the NaN (the larger fraction; on a tie x, which the
+        // sum with the operands exchanged gives)
         return arith::add(y, x);
     }
     if x.is_zero() {
@@ -750,6 +824,7 @@ pub fn hypot(x: F128, y: F128) -> F128 {
     }
     let (a, b) = (x.to_ext(), y.to_ext());
     let s = a.mul(a).add(b.mul(b)).sqrt();
+    // is the result exact (a Pythagorean triple)? compare the square of the rounded result with the exact sum
     let guess = finish_ext(&s, Exact::Yes);
     let exact = !guess.is_inf() && !guess.is_zero() && {
         let g = guess.to_ext();
@@ -766,6 +841,10 @@ pub fn hypot(x: F128, y: F128) -> F128 {
 }
 q_bin!(hypotf128, hypot);
 
+// ---- payloads, canonical form, total order ----
+
+/// The payload number a NaN tag string stands for (`strtoull`-style with base detection; digits beyond the
+/// payload field are cut off).
 fn nan_payload(tag: &[u8]) -> u128 {
     if !tag.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_') {
         return 0;
@@ -793,17 +872,24 @@ fn nan_payload(tag: &[u8]) -> u128 {
     v as u128
 }
 
+/// nan: a quiet NaN whose payload is the number in `t` (the tag without its NUL).
 pub fn nan_(t: &[u8]) -> F128 {
     F128(EXPM | QUIET | (nan_payload(t) & (QUIET - 1)))
 }
 
+/// # Safety
+/// `tag` is a C string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn nanf128(tag: *const core::ffi::c_char) -> f128 {
+    // SAFETY: the C contract: `tag` points to a NUL-terminated string (NULL faults, as in glibc).
     nan_(unsafe { rusty_libc_core::ffi::cstr_bytes_scalar(tag) }).to_f128()
 }
 
+/// # Safety
+/// `p` is valid.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getpayloadf128(p: *const f128) -> f128 {
+    // SAFETY: the C contract: `p` points to a readable _Float128.
     let x = F128(unsafe { p.read() }.to_bits());
     if !x.is_nan() {
         return F128::NEG_ONE.to_f128();
@@ -812,9 +898,11 @@ pub unsafe extern "C" fn getpayloadf128(p: *const f128) -> f128 {
     if pl == 0 {
         return F128::ZERO.to_f128();
     }
+    // exact conversion of a 111-bit integer
     arith::from_u128(pl).to_f128()
 }
 
+/// setpayload / setpayloadsig: (the C result, the value for `*res`).
 fn setpay(p: F128, sig: bool) -> (i32, F128) {
     let bad = || (1, F128::ZERO);
     if p.is_nan() || p.is_inf() || p.is_neg() {
@@ -839,43 +927,65 @@ fn setpay(p: F128, sig: bool) -> (i32, F128) {
     (0, F128(EXPM | v | if sig { 0 } else { QUIET }))
 }
 
+/// # Safety
+/// `res` is valid.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setpayloadf128(res: *mut f128, p: f128) -> i32 {
     let (r, v) = setpay(F128(p.to_bits()), false);
+    // SAFETY: the C contract: `res` points to a writable _Float128.
     unsafe { res.write(v.to_f128()) };
     r
 }
 
+/// # Safety
+/// `res` is valid.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setpayloadsigf128(res: *mut f128, p: f128) -> i32 {
     let (r, v) = setpay(F128(p.to_bits()), true);
+    // SAFETY: the C contract: `res` points to a writable _Float128.
     unsafe { res.write(v.to_f128()) };
     r
 }
 
+/// canonicalize: copy x to *cx; a signaling NaN becomes a quiet one. Every encoding of this format is
+/// canonical, so the result is 0.
+///
+/// # Safety
+/// Both pointers are valid.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn canonicalizef128(cx: *mut f128, x: *const f128) -> i32 {
+    // SAFETY: the C contract: `x` points to a readable _Float128.
     let v = F128(unsafe { x.read() }.to_bits());
     let r = if v.is_nan() { nan1(v) } else { v }.to_f128();
+    // SAFETY: the C contract: `cx` points to a writable _Float128 (it may be `x`: read first).
     unsafe { cx.write(r) };
     0
 }
 
+/// Total order of two values (IEEE 754 totalOrder) by their encodings.
 fn total_order(x: F128, y: F128) -> bool {
     let key = |v: F128| if v.is_neg() { !v.0 } else { v.0 | SIGN };
     key(x) <= key(y)
 }
 
+/// # Safety
+/// Both pointers are valid.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn totalorderf128(x: *const f128, y: *const f128) -> i32 {
+    // SAFETY: the C contract: `x` points to a readable _Float128.
     let x = F128(unsafe { x.read() }.to_bits());
+    // SAFETY: the C contract: `y` points to a readable _Float128.
     let y = F128(unsafe { y.read() }.to_bits());
     total_order(x, y) as i32
 }
 
+/// # Safety
+/// Both pointers are valid.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn totalordermagf128(x: *const f128, y: *const f128) -> i32 {
+    // SAFETY: the C contract: `x` points to a readable _Float128.
     let x = F128(unsafe { x.read() }.to_bits());
+    // SAFETY: the C contract: `y` points to a readable _Float128.
     let y = F128(unsafe { y.read() }.to_bits());
     total_order(x.abs(), y.abs()) as i32
 }

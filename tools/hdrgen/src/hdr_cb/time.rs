@@ -31,6 +31,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("TIME_THREAD_ACTIVE", V::Dec(4)),
     ]),
     Item::Blank,
+    Item::Comment("/* tzname, daylight and timezone are aliases of the __ names that are generated below */"),
     Item::Decl("extern char *tzname[2];"),
     Item::Decl("extern int daylight;"),
     Item::Decl("extern long timezone;"),

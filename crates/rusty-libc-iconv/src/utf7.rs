@@ -1,3 +1,5 @@
+//! UTF-7 (RFC 2152) and its IMAP variant (RFC 3501 modified UTF-7), with glibc's state handling:
+//! the decoder keeps the pending base64 bits, the encoder the bits not yet written.
 use crate::engine::*;
 
 fn shift_char(imap: bool) -> u32 {
@@ -54,6 +56,7 @@ fn base64(i: u32, imap: bool) -> u8 {
     }
 }
 
+/// UTF-7 decoder state: glibc's `__count >> 3` (shift) and `__value.__wch`.
 #[derive(Clone, Copy, Default)]
 pub struct DecState {
     pub count: u32,
@@ -265,6 +268,7 @@ pub fn enc(count: &mut u32, imap: bool, flags: u32, inp: &[u32], ip: &mut usize,
     })
 }
 
+/// Flush: finish the base64 run and return to the direct state.
 pub fn emit_reset(count: &mut u32, imap: bool, out: &mut [u8], op: &mut usize) -> St {
     let state = *count;
     if state & 0x18 != 0 {

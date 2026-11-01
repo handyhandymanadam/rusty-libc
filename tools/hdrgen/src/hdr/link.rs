@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "link.h",
     items: &[
+        Item::Comment(r#"/* link.h for the Rust libc (crates/rusty-libc-extra/src/dlfcn.rs): the link map, dl_iterate_phdr and _dl_find_object;
+   the ELF types come from elf.h. */"#),
         Item::Guard { name: "_RLIBC_LINK_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),
@@ -14,27 +16,33 @@ pub static HDR: Header = Header {
             Item::Raw(Reason::GlibcMacro, "#define _ElfW(e, w, t) _ElfW_1 (e, w, _##t)"),
             Item::Raw(Reason::GlibcMacro, "#define _ElfW_1(e, w, t) e##w##t"),
             Item::Blank,
-            Item::Block { head: "struct link_map ", body: &["", "  Elf64_Addr l_addr;", "  char *l_name;", "  Elf64_Dyn *l_ld;", "  struct link_map *l_next, *l_prev;", ""], tail: "" },
+            Item::Comment("/* The list of loaded objects (the public part). */"),
+            Item::Block { head: "struct link_map ", body: &["", "  Elf64_Addr l_addr;            /* difference between the addresses in the ELF file and in memory */", "  char *l_name;                 /* absolute file name of the object */", "  Elf64_Dyn *l_ld;              /* the dynamic section of the object */", "  struct link_map *l_next, *l_prev;", ""], tail: "" },
             Item::Blank,
             Item::ExternBegin,
             Item::Blank,
-            Item::Block { head: "struct dl_phdr_info ", body: &["", "  Elf64_Addr dlpi_addr;", "  const char *dlpi_name;", "  const Elf64_Phdr *dlpi_phdr;", "  Elf64_Half dlpi_phnum;", "  unsigned long long int dlpi_adds;", "  unsigned long long int dlpi_subs;", "  size_t dlpi_tls_modid;", "  void *dlpi_tls_data;", ""], tail: "" },
+            Item::Block { head: "struct dl_phdr_info ", body: &["", "  Elf64_Addr dlpi_addr;", "  const char *dlpi_name;", "  const Elf64_Phdr *dlpi_phdr;", "  Elf64_Half dlpi_phnum;", "  unsigned long long int dlpi_adds;   /* incremented when a new object is mapped */", "  unsigned long long int dlpi_subs;   /* incremented when an object is unmapped */", "  size_t dlpi_tls_modid;", "  void *dlpi_tls_data;", ""], tail: "" },
             Item::Blank,
             Item::Gate(&[
                 Branch { head: "ifdef _GNU_SOURCE", items: &[
+                    Item::Comment("/* Which object holds an address (glibc 2.35): used by the unwinder to find .eh_frame. */"),
                     Item::Block { head: "struct dl_find_object ", body: &["", "  unsigned long long int dlfo_flags;", "  void *dlfo_map_start;", "  void *dlfo_map_end;", "  struct link_map *dlfo_link_map;", "  void *dlfo_eh_frame;", "  unsigned long long int __dflo_reserved[7];", ""], tail: "" },
                     Item::Decl("extern int _dl_find_object (void *__address, struct dl_find_object *__result);"),
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* Call CALLBACK for each loaded object (here: the program) until it returns non-zero. */"),
             Item::Decl("extern int dl_iterate_phdr (int (*__callback) (struct dl_phdr_info *, size_t, void *), void *__data);"),
             Item::Blank,
-            Item::Block { head: "struct r_debug ", body: &["", "  int r_version;", "  struct link_map *r_map;", "  Elf64_Addr r_brk;", "  enum { RT_CONSISTENT, RT_ADD, RT_DELETE } r_state;", "  Elf64_Addr r_ldbase;", ""], tail: "" },
-            Item::Block { head: "struct r_debug_extended ", body: &["", "  int r_version;", "  struct link_map *r_map;", "  Elf64_Addr r_brk;", "  enum { RTX_CONSISTENT, RTX_ADD, RTX_DELETE } r_state;", "  Elf64_Addr r_ldbase;", "  struct r_debug_extended *r_next;", ""], tail: "" },
+            Item::Comment("/* The rendezvous structure the dynamic linker shares with a debugger (the program's DT_DEBUG entry points at it). */"),
+            Item::Block { head: "struct r_debug ", body: &["", "  int r_version;                /* 1 */", "  struct link_map *r_map;       /* the list of loaded objects */", "  Elf64_Addr r_brk;             /* the debugger puts a breakpoint here; called after every change of the list */", "  enum { RT_CONSISTENT, RT_ADD, RT_DELETE } r_state;", "  Elf64_Addr r_ldbase;          /* the base address of the dynamic linker */", ""], tail: "" },
+            Item::Block { head: "struct r_debug_extended ", body: &["       /* the same, with the next namespace's rendezvous structure */", "  int r_version;", "  struct link_map *r_map;", "  Elf64_Addr r_brk;", "  enum { RTX_CONSISTENT, RTX_ADD, RTX_DELETE } r_state;", "  Elf64_Addr r_ldbase;", "  struct r_debug_extended *r_next;", ""], tail: "" },
             Item::Decl("extern struct r_debug _r_debug;"),
             Item::Blank,
+            Item::Comment("/* The program's (or the library's own) dynamic section. */"),
             Item::Decl("extern Elf64_Dyn _DYNAMIC[];"),
             Item::Blank,
+            Item::Comment("/* rtld-audit interface (see rtld-audit(7)): the constants audit libraries use. */"),
             Item::Consts(&[
                 ("LAV_CURRENT", V::Dec(2)),
                 ("LA_ACT_CONSISTENT", V::Dec(0)),

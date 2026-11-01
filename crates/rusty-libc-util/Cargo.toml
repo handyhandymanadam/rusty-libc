@@ -10,9 +10,16 @@ rusty-libc-mem = { path = "../rusty-libc-mem" }
 rusty-libc-malloc = { path = "../rusty-libc-malloc" }
 rusty-libc-ctype = { path = "../rusty-libc-ctype" }
 rusty-libc-stdlib = { path = "../rusty-libc-stdlib" }
+# fnmatch in multibyte locales: wide classification, collation sequences, equivalence classes.
 rusty-libc-wchar = { path = "../rusty-libc-wchar" }
 rusty-libc-locale = { path = "../rusty-libc-locale" }
+# err.h and assert format through the stdio printf engine (allowed for this crate).
 rusty-libc-stdio = { path = "../rusty-libc-stdio" }
 
+[dev-dependencies]
+libc = "0.2"
+rusty-libc-malloc = { path = "../rusty-libc-malloc", features = ["no-brk"] }
+
 [features]
+# Export the C symbols. Off for host tests so they never replace the host libc.
 export = []

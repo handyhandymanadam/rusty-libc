@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+# Export the C symbols (memcpy, memset, ...). Off for host tests so they never replace the host libc.
 export = []
 
+[dev-dependencies]
+libc = "0.2"

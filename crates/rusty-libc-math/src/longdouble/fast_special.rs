@@ -1,3 +1,7 @@
+//! Double-double fast paths of the special functions (erfl, erfcl, lgammal, tgammal, j0l, j1l, y0l,
+//! y1l): polynomial tables (gen_special.py) on short intervals, evaluated in double-double and
+//! rounded by `fast::to_f80`, which hands back `None` when the double-double value is too close to a
+//! rounding boundary to decide (the caller then runs the 128-bit `Ext` computation). See fast.rs.
 use super::common::*;
 use super::fast::*;
 use super::fast_tables::{INV_PI_DD, LN_PI_DD, PI_DD, PIO2_DD, TWO_OVER_PI_DD};
@@ -8,9 +12,16 @@ use crate::trig::dd::{D, fast_two_sum, fma, two_prod, two_sum};
 
 const F: bool = true;
 
+/// sum q_k t^k for the coefficient rows (hi: N coefficients, lo: the first K low parts) at the
+/// double-double t = th + tl; the first K coefficients are double-double, the rest plain (tl
+/// enters only the double-double steps: through the plain ones it would count below 2^-82).
+/// Evaluated in blocks of four double-double Horner steps that run side by side, joined with
+/// T = t^4 (the plain tail as one Horner chain): a dependent chain of four steps and one join
+/// instead of K steps.
 #[inline(always)]
 fn poly_dd<const N: usize, const K: usize>(hi: &[f64; N], lo: &[f64; K], th: f64, tl: f64) -> D {
     const B: usize = 4;
+    // the tail beyond the double-double coefficients
     let tail = plain_tail::<N, K>(hi, th);
     let step = |acc: D, k: usize| -> D {
         let (ph, pe) = two_prod::<F>(acc.0, th);
@@ -18,6 +29,7 @@ fn poly_dd<const N: usize, const K: usize>(hi: &[f64; N], lo: &[f64; K], th: f64
         let (s, se) = two_sum(ph, hi[k]);
         fast_two_sum(s, se + (pl + lo[k]))
     };
+    // block value of the coefficients [from, to) with `start` the value above them
     let block = |from: usize, to: usize, start: D| -> D {
         let mut acc = start;
         let mut k = to;
@@ -28,16 +40,19 @@ fn poly_dd<const N: usize, const K: usize>(hi: &[f64; N], lo: &[f64; K], th: f64
         acc
     };
     let nb = K.div_ceil(B);
+    // the top block starts from the plain tail
     let mut p = block(B * (nb - 1), K, (tail, 0.0));
     if nb == 1 {
         return p;
     }
+    // T = t^4 as a double-double
     let (t2h, t2e) = two_prod::<F>(th, th);
     let t2 = fast_two_sum(t2h, fma::<F>(2.0 * th, tl, t2e));
     let t4 = mul_dd(t2, t2);
     let mut j = nb - 1;
     while j > 0 {
         j -= 1;
+        // block j: coefficients [B j, B j + B), starting from the top one
         let top = B * j + B - 1;
         let bj = block(B * j, B * j + B - 1, (hi[top], lo[top]));
         let m = mul_dd(t4, p);
@@ -46,6 +61,7 @@ fn poly_dd<const N: usize, const K: usize>(hi: &[f64; N], lo: &[f64; K], th: f64
     p
 }
 
+/// The plain tail hi[K..N] at th (Horner; zero when there is none).
 #[inline(always)]
 fn plain_tail<const N: usize, const K: usize>(hi: &[f64; N], th: f64) -> f64 {
     let mut p = hi[N - 1];
@@ -57,15 +73,18 @@ fn plain_tail<const N: usize, const K: usize>(hi: &[f64; N], th: f64) -> f64 {
     if N == K { 0.0 } else { p }
 }
 
+/// dd * dd (the product's low parts: only what matters at 2^-100).
 #[inline(always)]
 fn mul_dd(a: D, b: D) -> D {
     let (p, pe) = two_prod::<F>(a.0, b.0);
     fast_two_sum(p, fma::<F>(a.0, b.1, fma::<F>(a.1, b.0, pe)))
 }
 
+/// erf(x) for 0 < x < 7 (a double-double ax): `(hi, lo)`.
 #[inline(always)]
 fn erf_pos(ax: D) -> D {
     if ax.0 < 0.25 {
+        // x * sum c_k z^k, z = x^2 as a double-double: dd steps for k = 4..0
         let (zh, zl) = two_prod::<F>(ax.0, ax.0);
         let z = (zh, fma::<F>(2.0 * ax.0, ax.1, zl));
         let mut p = ERF_TAYLOR_HI[13];
@@ -85,7 +104,7 @@ fn erf_pos(ax: D) -> D {
         }
         return mul_dd(ax, acc);
     }
-    let k = (ax.0 * 8.0) as usize;
+    let k = (ax.0 * 8.0) as usize; // interval [k/8, (k+1)/8), k >= 2
     let c = (2 * k + 1) as f64 * (1.0 / 16.0);
     let row = k - 2;
     let t = ax.0 - c;
@@ -100,6 +119,7 @@ fn erfl_body(x: F80) -> Option<F80> {
     }
     let (ax, neg) = abs_dd(xh, xl);
     if ax.0 >= 7.0 {
+        // 1 - erf < 2^-70: rounds to 1
         raise_inexact();
         return Some(f80_from_bits(1 << 63, 0x3fff | if neg { 0x8000 } else { 0 }));
     }
@@ -121,9 +141,11 @@ fn erfcl_body(x: F80) -> Option<F80> {
     let (ax, neg) = abs_dd(xh, xl);
     if neg || ax.0 < 13.0 / 16.0 {
         if ax.0 >= 7.0 {
+            // 2 - erfc(|x|) with erfc < 2^-70: rounds to 2
             raise_inexact();
             return Some(f80_from_bits(1 << 63, 0x4000));
         }
+        // erfc = 1 -+ erf(|x|), no cancellation worse than 3 bits
         let r = erf_pos(ax);
         let (s, er) = if neg { two_sum(1.0, r.0) } else { two_sum(1.0, -r.0) };
         let (hi, lo) = fast_two_sum(s, er + if neg { r.1 } else { -r.1 });
@@ -132,6 +154,7 @@ fn erfcl_body(x: F80) -> Option<F80> {
     if ax.0 >= 106.0 {
         return None;
     }
+    // erfc = e^(-x^2) Gs(x), Gs = erfc e^(x^2) from the table
     let (zh, zl) = two_prod::<F>(ax.0, ax.0);
     let zl = fma::<F>(2.0 * ax.0, ax.1, zl);
     let ((eh, el), _, k) = exp_dd(-zh, -zl);
@@ -152,6 +175,9 @@ pub fn erfcl(x: F80) -> Option<F80> {
     erfcl_body(x)
 }
 
+// ---- ln Gamma and Gamma for positive arguments ---------------------------------------------------
+
+/// ln Gamma(u) for a double-double u in [1/2, 4) (the table of ln Gamma / ((x - 1)(x - 2))).
 #[inline(always)]
 fn lgamma_a(u: D) -> D {
     let bits = u.0.to_bits();
@@ -159,7 +185,9 @@ fn lgamma_a(u: D) -> D {
     let j = ((bits >> 47) & 31) as usize;
     let row = ((ex + 1) * 32) as usize + j;
     let t = u.0 - pow2(ex) * (1.0 + (2 * j + 1) as f64 * (1.0 / 64.0));
+    // (the rows meet the dominance condition of poly_dd_dom: checked by the fast tests)
     let f = poly_dd_dom::<{ LGAMMA_D_DEG + 1 }, { LGAMMA_D_K }>(&LGAMMA_D_HI[row], &LGAMMA_D_LO[row], t, u.1);
+    // (u - 1)(u - 2), both exact as double-doubles
     let (a, ae) = two_sum(u.0, -1.0);
     let um1 = fast_two_sum(a, ae + u.1);
     let (b, be) = two_sum(u.0, -2.0);
@@ -167,13 +195,18 @@ fn lgamma_a(u: D) -> D {
     mul_dd(f, mul_dd(um1, um2))
 }
 
+/// ln Gamma(x) for a double-double x with 2^-100 < x < 2^400, relative error about 2^-85 of the
+/// larger of the result and 1/16.
 #[inline(always)]
 fn lgamma_pos(x: D) -> D {
     let xh = x.0;
     if xh >= 256.0 {
+        // Stirling: (x - 1/2) ln x - x + ln(2 pi)/2 + s_1/x + s_2/x^3 + ...
         let w = div_dd((1.0, 0.0), x);
         let (zh, zl) = two_prod::<F>(w.0, w.0);
         let w2 = (zh, fma::<F>(2.0 * w.0, w.1, zl));
+        // s_3 + s_4 w^2 + ... (plain), then two double-double steps for s_2 and s_1
+        // (Estrin over the 18 coefficients 2..19: depth 5 instead of a chain of 17)
         let z = w2.0;
         let c = |i: usize| STIRLING_HI[2 + i];
         let a0 = fma::<F>(z, c(1), c(0));
@@ -206,6 +239,7 @@ fn lgamma_pos(x: D) -> D {
         let (ah, ae) = two_sum(x.0, -0.5);
         let xm = fast_two_sum(ah, ae + x.1);
         let prod = mul_dd(xm, lnx);
+        // prod - x + C + S
         let (t1, t2) = two_sum(prod.0, -x.0);
         let (t3, t4) = two_sum(t1, HALF_LN_2PI_DD.0);
         let (t5, t6) = two_sum(t3, s.0);
@@ -213,8 +247,9 @@ fn lgamma_pos(x: D) -> D {
         return fast_two_sum(t5, low);
     }
     if xh >= 4.0 {
+        // rows of relative width 1/32 on [4, 256)
         let bits = xh.to_bits();
-        let ex = (bits >> 52) as i32 - 1023;
+        let ex = (bits >> 52) as i32 - 1023; // 2 .. 7
         let j = ((bits >> 47) & 31) as usize;
         let row = ((ex - 2) * 32) as usize + j;
         let c = pow2(ex) * (1.0 + (2 * j + 1) as f64 * (1.0 / 64.0));
@@ -224,6 +259,7 @@ fn lgamma_pos(x: D) -> D {
     if xh >= 0.5 {
         return lgamma_a(x);
     }
+    // ln Gamma(x) = ln Gamma(1 + x) - ln x
     let (s, e) = two_sum(1.0, xh);
     let u = fast_two_sum(s, e + x.1);
     let a = lgamma_a(u);
@@ -232,19 +268,27 @@ fn lgamma_pos(x: D) -> D {
     fast_two_sum(r, re + (a.1 - l.1))
 }
 
+/// ln|Gamma(x)| of a negative non-integer double-double x (ax = |x| < 2^50) by the reflection formula
+/// ln|Gamma(x)| = ln(pi) - ln|sin(pi x)| - ln Gamma(1 - x): `(value, Gamma(x) < 0)`; `None` when x
+/// is next to an integer so closely that sin is not a double-double of the needed accuracy, or the
+/// value is close to a zero of ln|Gamma|.
 #[inline(always)]
 fn lgamma_neg(ax: D) -> Option<(D, bool)> {
     let m0 = rnd(ax.0);
     let (rh, rl) = two_sum(ax.0 - m0, ax.1);
+    // m0 rounds the high part alone, so r can exceed 1/2 by the low part (a tie at the high part, or
+    // any value when |x| >= 2^40): move to the next integer then (r - 1 is exact)
     let up = rh > 0.5 || (rh == 0.5 && rl > 0.0);
     let dn = rh < -0.5 || (rh == -0.5 && rl < 0.0);
     let m = if up { m0 + 1.0 } else if dn { m0 - 1.0 } else { m0 };
     let rh = if up { rh - 1.0 } else if dn { rh + 1.0 } else { rh };
+    // |x| = m + r, |r| <= 1/2; floor(|x|) = m or m - 1; Gamma(x) < 0 when floor(|x|) is even
     let floor_even = ((m as i64) - (rh < 0.0) as i64) & 1 == 0;
     let (ar, _) = abs_dd(rh, rl);
     if ar.0 == 0.0 {
         return None;
     }
+    // sin(pi ar) = sin(pi ar) for ar <= 1/4, cos(pi (1/2 - ar)) above
     let (arg, use_cos) = if ar.0 <= 0.25 { (ar, false) } else { ((0.5 - ar.0, -ar.1), true) };
     let a = mul_dd(PI_DD, arg);
     let (s, c) = sincos_small(a.0, a.1);
@@ -253,10 +297,12 @@ fn lgamma_neg(ax: D) -> Option<(D, bool)> {
     let (us, ue) = two_sum(1.0, ax.0);
     let u = fast_two_sum(us, ue + ax.1);
     let g = lgamma_pos(u);
+    // ln(pi) - ln(v) - ln Gamma(1 + |x|)
     let t = add_dd(LN_PI_DD, (-l.0, -l.1));
     Some((add_dd(t, (-g.0, -g.1)), floor_even))
 }
 
+/// lgammal: the value and whether Gamma(x) is negative.
 #[inline(always)]
 fn lgammal_any_body(x: F80) -> Option<(F80, bool)> {
     let (xh, xl, e) = split(x)?;
@@ -279,6 +325,7 @@ fn lgammal_any_body(x: F80) -> Option<(F80, bool)> {
 
 #[inline(always)]
 pub fn lgammal_any(x: F80) -> Option<(F80, bool)> {
+    // exact zeros at 1 and 2, poles (divide-by-zero only) at the negative integers: no inexact from the attempt
     if is_int(x) {
         guarded(|| lgammal_any_body(x))
     } else {
@@ -286,6 +333,7 @@ pub fn lgammal_any(x: F80) -> Option<(F80, bool)> {
     }
 }
 
+/// tgammal: exp(ln|Gamma|) with the sign of Gamma.
 #[inline(always)]
 fn tgammal_any_body(x: F80) -> Option<F80> {
     let (xh, xl, e) = split(x)?;
@@ -303,6 +351,7 @@ fn tgammal_any_body(x: F80) -> Option<F80> {
 
 #[inline(always)]
 pub fn tgammal_any(x: F80) -> Option<F80> {
+    // exact at the positive integers, invalid at the negative ones: no inexact from the attempt
     if is_int(x) {
         guarded(|| tgammal_any_body(x))
     } else {
@@ -310,13 +359,18 @@ pub fn tgammal_any(x: F80) -> Option<F80> {
     }
 }
 
+// ---- Bessel functions of the first and second kind, orders 0 and 1 --------------------------------
+
+/// J0 for 0 < x < 40 from the unit-interval table.
 #[inline(always)]
 fn j0_table(ax: D) -> D {
     let row = ax.0 as usize;
+    // x - c is not exact when x < c / 2 (the first interval): keep its rounding error in the low part
     let (th, te) = two_sum(ax.0, -(row as f64 + 0.5));
     poly_dd::<{ BJ0_DEG + 1 }, { BJ0_K }>(&BJ0_HI[row], &BJ0_LO[row], th, te + ax.1)
 }
 
+/// J1 for 0 < x < 40: the odd Taylor series below 1, the table above.
 #[inline(always)]
 fn j1_table(ax: D) -> D {
     if ax.0 < 1.0 {
@@ -343,6 +397,8 @@ fn j1_table(ax: D) -> D {
     poly_dd::<{ BJ1_DEG + 1 }, { BJ1_K }>(&BJ1_HI[row], &BJ1_LO[row], ax.0 - (row as f64 + 1.5), ax.1)
 }
 
+/// Hankel series: P (order nu) and Q x as polynomials in z = 1/x^2 (z a double-double): the
+/// coefficients of z^0..z^2 are exact doubles, the rest plain.
 #[inline(always)]
 fn hankel<const N: usize>(c: &[f64; N], z: D) -> D {
     let mut p = c[N - 1];
@@ -363,12 +419,15 @@ fn hankel<const N: usize>(c: &[f64; N], z: D) -> D {
     acc
 }
 
+/// dd + dd and dd - dd (only the high-accuracy sum matters: a few operations).
 #[inline(always)]
 fn add_dd(a: D, b: D) -> D {
     let (s, e) = two_sum(a.0, b.0);
     fast_two_sum(s, e + (a.1 + b.1))
 }
 
+/// The pieces of the large-argument forms for x >= 40: `(amp, A, B, sin x, cos x)` with
+/// amp = sqrt(1/(pi x)), A = P + Q, B = P - Q (the Hankel coefficient arrays of the order).
 #[inline(always)]
 fn asym_parts<const NP: usize, const NQ: usize>(ax: D, pc: &[f64; NP], qc: &[f64; NQ]) -> Option<(D, D, D, D, D)> {
     let (sin, cos) = sincos_dd(ax.0, ax.1)?;
@@ -378,10 +437,12 @@ fn asym_parts<const NP: usize, const NQ: usize>(ax: D, pc: &[f64; NP], qc: &[f64
     let qv = mul_dd(w, hankel(qc, z));
     let a = add_dd(pv, qv);
     let b = add_dd(pv, (-qv.0, -qv.1));
+    // amp = sqrt(1/(pi x))
     let amp = sqrt_of(mul_dd(w, INV_PI_DD));
     Some((amp, a, b, sin, cos))
 }
 
+/// amp (u + v) from two products of double-doubles: u = x1 y1, v = x2 y2 (signs in the callers).
 #[inline(always)]
 fn combine(amp: D, x1: D, y1: D, sg2: f64, x2: D, y2: D) -> D {
     let u = mul_dd(x1, y1);
@@ -390,6 +451,7 @@ fn combine(amp: D, x1: D, y1: D, sg2: f64, x2: D, y2: D) -> D {
     mul_dd(amp, s)
 }
 
+/// Rounds a Bessel value unless it is a near-zero (small against `scale`).
 #[inline(always)]
 fn finish_bessel(r: D, scale: f64, neg: bool) -> Option<F80> {
     if r.0.abs() < scale {
@@ -402,6 +464,7 @@ fn finish_bessel(r: D, scale: f64, neg: bool) -> Option<F80> {
 #[inline(always)]
 fn bessel_args(x: F80, odd_or_even: bool) -> Option<(D, bool)> {
     let (xh, xl, e) = split(x)?;
+    // a negative argument of y0, y1 is a domain error: not ours, and the flags stay untouched
     if !(-100..20).contains(&e) || (!odd_or_even && xh < 0.0) || !ready() {
         return None;
     }
@@ -417,6 +480,7 @@ fn j0l_body(x: F80) -> Option<F80> {
         return finish_bessel(j0_table(ax), NEAR_ZERO, false);
     }
     let (amp, a, b, sin, cos) = asym_parts(ax, &P0_HI, &Q0_HI)?;
+    // J0 = amp (A cos x + B sin x)
     let r = combine(amp, a, cos, 1.0, b, sin);
     finish_bessel(r, amp.0 * (1.0 / 256.0), false)
 }
@@ -433,6 +497,7 @@ fn j1l_body(x: F80) -> Option<F80> {
         return finish_bessel(j1_table(ax), NEAR_ZERO * ax.0.min(1.0), neg);
     }
     let (amp, a, b, sin, cos) = asym_parts(ax, &P1_HI, &Q1_HI)?;
+    // J1 = amp (A sin x - B cos x)
     let r = combine(amp, a, sin, -1.0, b, cos);
     finish_bessel(r, amp.0 * (1.0 / 256.0), neg)
 }
@@ -442,6 +507,7 @@ pub fn j1l(x: F80) -> Option<F80> {
     j1l_body(x)
 }
 
+/// ln(x/2) for a double-double x > 0.
 #[inline(always)]
 fn ln_half(ax: D) -> D {
     ln_of_dd(0.5 * ax.0, 0.5 * ax.1)
@@ -454,6 +520,7 @@ fn y0l_body(x: F80) -> Option<F80> {
         return None;
     }
     if ax.0 < 4.0 {
+        // Y0 = (2/pi) ln(x/2) J0 + R0
         let row = ax.0 as usize;
         let j = j0_table(ax);
         let (th, te) = two_sum(ax.0, -(row as f64 + 0.5));
@@ -468,6 +535,7 @@ fn y0l_body(x: F80) -> Option<F80> {
         return finish_bessel(r, NEAR_ZERO, false);
     }
     let (amp, a, b, sin, cos) = asym_parts(ax, &P0_HI, &Q0_HI)?;
+    // Y0 = amp (A sin x - B cos x)
     let r = combine(amp, a, sin, -1.0, b, cos);
     finish_bessel(r, amp.0 * (1.0 / 256.0), false)
 }
@@ -484,6 +552,7 @@ fn y1l_body(x: F80) -> Option<F80> {
         return None;
     }
     if ax.0 < 4.0 {
+        // Y1 = -2/(pi x) + (2/pi) ln(x/2) J1 + R1
         let row = ax.0 as usize;
         let j = j1_table(ax);
         let (th, te) = two_sum(ax.0, -(row as f64 + 0.5));
@@ -501,6 +570,7 @@ fn y1l_body(x: F80) -> Option<F80> {
         return finish_bessel(r, NEAR_ZERO, false);
     }
     let (amp, a, b, sin, cos) = asym_parts(ax, &P1_HI, &Q1_HI)?;
+    // Y1 = -amp (B sin x + A cos x)
     let r = combine(amp, b, sin, 1.0, a, cos);
     finish_bessel((-r.0, -r.1), amp.0 * (1.0 / 256.0), false)
 }
@@ -513,11 +583,15 @@ pub fn y1l(x: F80) -> Option<F80> {
 pub const TAU_SPECIAL: f64 = 1.0 / 1024.0;
 
 
+// ---- asinl ---------------------------------------------------------------------------------------
+
+/// Coefficient i of the plain tail hi[K..N], `None` past its end.
 #[inline(always)]
 fn tail_c<const N: usize, const K: usize>(hi: &[f64; N], i: usize) -> Option<f64> {
     if K + i < N { Some(hi[K + i]) } else { None }
 }
 
+/// a + b p, where a missing b leaves a.
 #[inline(always)]
 fn tail_join(a: Option<f64>, b: Option<f64>, p: f64) -> Option<f64> {
     match (a, b) {
@@ -527,6 +601,10 @@ fn tail_join(a: Option<f64>, b: Option<f64>, p: f64) -> Option<f64> {
     }
 }
 
+/// The plain coefficients hi[K..N] (at most 16) at t by Estrin's scheme (pairs joined with t, t^2, t^4, t^8): a
+/// dependency chain of about log2(N - K) fused multiply-adds instead of N - K - 1. Zero when there are none. The tree is
+/// fixed and the missing leaves are `None`, which the constant sizes fold away (no array, no loop). Plain functions,
+/// not closures: a closure need not be inlined, and out of line it loses the caller's FMA target feature.
 #[inline(always)]
 fn estrin_tail<const N: usize, const K: usize>(hi: &[f64; N], t: f64) -> f64 {
     const { assert!(N - K <= 16) };
@@ -546,6 +624,10 @@ fn estrin_tail<const N: usize, const K: usize>(hi: &[f64; N], t: f64) -> f64 {
     tail_join(s0, s1, t8).unwrap_or(0.0)
 }
 
+/// sum q_k t^k like `poly_dd`, for rows whose coefficients dominate: |hi[k]| >= |t| * |sum_(j>k) q_j t^(j-k-1)| for every
+/// k < K (or hi[k] is below 2^-400, where what the shortcut drops is that small). Each double-double Horner step then
+/// joins the coefficient and the product by `fast_two_sum` and leaves the pair unnormalized (the next step only
+/// multiplies it), and the plain tail runs by Estrin: about half the dependency chain of `poly_dd`.
 #[inline(always)]
 fn poly_dd_dom<const N: usize, const K: usize>(hi: &[f64; N], lo: &[f64; K], th: f64, tl: f64) -> D {
     let mut h = estrin_tail::<N, K>(hi, th);
@@ -557,33 +639,64 @@ fn poly_dd_dom<const N: usize, const K: usize>(hi: &[f64; N], lo: &[f64; K], th:
         let pe = fma::<F>(h, th, -ph);
         let s = hi[k] + ph;
         let e = (hi[k] - s) + ph;
+        // the low part: l t + (h tl + pe + lo_k + e), with one dependent step (fma) on the previous l
         l = fma::<F>(l, th, fma::<F>(h, tl, pe + lo[k]) + e);
         h = s;
     }
     fast_two_sum(h, l)
 }
 
+/// asin(a) for a double-double 0 <= a < 0.75 (rows of width 1/256 centred on j/256, degree 10; the rows meet the
+/// dominance condition of `poly_dd_dom`: checked by the fast tests).
 #[inline(always)]
 fn asin_rows(a: D) -> D {
+    // j = round(256 a) from the low bits of the magic-number sum (no float-to-integer conversion)
     let sum = a.0 * 256.0 + 6755399441055744.0;
     let row = (sum.to_bits() & 0xff) as usize;
     let j = sum - 6755399441055744.0;
     let (th, tl) = if row == 0 {
         (a.0, a.1)
     } else {
+        // a.0 - j/256 is exact: j/256 is within a factor 2 of a.0
         two_sum(a.0 - j * (1.0 / 256.0), a.1)
     };
     poly_dd_dom::<{ ASIN_TAB_DEG + 1 }, { ASIN_TAB_K }>(&ASIN_TAB_HI[row], &ASIN_TAB_LO[row], th, tl)
 }
 
+/// The lgamma row tables (hi parts), their double-double coefficient counts and the largest |t| of a row, for the tests:
+/// (rows on [1/2, 4), rows on [4, 256)).
+#[cfg(test)]
+pub(crate) fn lgamma_rows_tables() -> [(&'static [[f64; 14]], usize, fn(usize) -> f64); 2] {
+    [
+        (&LGAMMA_D_HI[..], LGAMMA_D_K, |r| pow2(r as i32 / 32 - 1) / 64.0),
+        (&LGAMMA_C_HI[..], LGAMMA_C_K, |r| pow2(r as i32 / 32 + 2) / 64.0),
+    ]
+}
+
+/// ln Gamma of a positive double-double, unrounded, for the error tests.
+#[cfg(test)]
+pub(crate) fn lgamma_pos_dd(x: D) -> D {
+    lgamma_pos(x)
+}
+
+/// The table and tail sizes of the asin rows, for the tests.
+#[cfg(test)]
+pub(crate) fn asin_rows_table() -> (&'static [[f64; ASIN_TAB_DEG + 1]], usize) {
+    (&ASIN_TAB_HI[..], ASIN_TAB_K)
+}
+
+/// asin(sqrt((1 - a)/2)) for a double-double 0.75 <= a < 1: half of (pi/2 - asin(a)) = acos(a)/2.
 #[inline(always)]
 fn asin_half_rest(ax: D) -> D {
+    // 1 - ah is exact (ah in [0.75, 1)); p = (1 - a)/2
     let (s1, e1) = two_sum(1.0 - ax.0, -ax.1);
     let p = fast_two_sum(s1, e1);
     let y = sqrt_of((0.5 * p.0, 0.5 * p.1));
     asin_rows(y)
 }
 
+/// acos(a) (neg: acos(-a)) for a double-double 0 < a < 1 as the unrounded double-double, from the asin rows:
+/// a < 0.75: pi/2 -+ asin(a); above: 2 asin(sqrt((1 - a)/2)) (pi minus that for negative arguments).
 #[inline(always)]
 pub(crate) fn acos_dd(ax: D, neg: bool) -> D {
     if ax.0 < 0.75 {
@@ -602,6 +715,7 @@ pub(crate) fn acos_dd(ax: D, neg: bool) -> D {
     }
 }
 
+/// acosl on the asin rows (|x| >= 2^-37; the caller handles smaller ones).
 #[inline(always)]
 pub fn acosl(x: F80) -> Option<F80> {
     let (xh, xl, e) = split(x)?;
@@ -613,6 +727,7 @@ pub fn acosl(x: F80) -> Option<F80> {
     to_f80(r.0, r.1, 0, TAU_ATAN)
 }
 
+/// asin(|x|) for 0 < |x| < 1 as the unrounded double-double (`None` where `asinl` hands over), for the error tests.
 #[inline(always)]
 pub(crate) fn asin_dd(ax: D) -> D {
     if ax.0 < 0.75 {
@@ -624,9 +739,12 @@ pub(crate) fn asin_dd(ax: D) -> D {
     }
 }
 
+/// asinl: |x| < 0.75 straight from the rows, above that asin(x) = pi/2 - 2 asin(sqrt((1 - x)/2)).
 #[inline(always)]
 pub fn asinl(x: F80) -> Option<F80> {
     let (xh, xl, e) = split(x)?;
+    // below 2^-37 the result is within 2^-74 (relative) of x: always too close to a long double for the rounding test
+    // (and the rows' t^11 would underflow in double)
     if xh.abs() >= 1.0 || e < -37 || !ready() {
         return None;
     }
@@ -636,19 +754,32 @@ pub fn asinl(x: F80) -> Option<F80> {
     to_f80(hi, lo, 0, TAU_ATAN)
 }
 
+// ---- atanl ----------------------------------------------------------------------------
+
+/// atan(a) for a double-double 0 <= a <= 1 + 2^-52 (rows of width 1/256 centred on j/256, degree 9; they meet the
+/// dominance condition of `poly_dd_dom`: checked by the fast tests).
 #[inline(always)]
 pub(crate) fn atan_rows(a: D) -> D {
+    // j = round(256 a) from the low bits of the magic-number sum (no float-to-integer conversion)
     let sum = a.0 * 256.0 + 6755399441055744.0;
     let row = (sum.to_bits() & 0x1ff) as usize;
     let j = sum - 6755399441055744.0;
     let (th, tl) = if row == 0 {
         (a.0, a.1)
     } else {
+        // a.0 - j/256 is exact: j/256 is within a factor 2 of a.0
         two_sum(a.0 - j * (1.0 / 256.0), a.1)
     };
     poly_dd_dom::<{ ATAN_TAB_DEG + 1 }, { ATAN_TAB_K }>(&ATAN_TAB_HI[row], &ATAN_TAB_LO[row], th, tl)
 }
 
+/// The table and tail sizes of the atan rows, for the tests.
+#[cfg(test)]
+pub(crate) fn atan_rows_table() -> (&'static [[f64; ATAN_TAB_DEG + 1]], usize) {
+    (&ATAN_TAB_HI[..], ATAN_TAB_K)
+}
+
+/// atan(a) for a double-double a > 0 (a <= 2^38): the rows for a <= 1, above that pi/2 - atan(1/a).
 #[inline(always)]
 pub(crate) fn atan_dd(ax: D) -> D {
     if ax.0 <= 1.0 {
@@ -660,6 +791,7 @@ pub(crate) fn atan_dd(ax: D) -> D {
     }
 }
 
+/// atanl for 2^-37 <= |x| < 2^38 (the caller handles the rest).
 #[inline(always)]
 pub fn atanl(x: F80) -> Option<F80> {
     let (xh, xl, e) = split(x)?;

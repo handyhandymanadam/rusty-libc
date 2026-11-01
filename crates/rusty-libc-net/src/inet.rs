@@ -1,3 +1,6 @@
+//! arpa/inet.h and the functions of netinet/in.h: byte order, `inet_aton` and friends, `inet_pton`,
+//! `inet_ntop`, `in6addr_any`, `in6addr_loopback`. The text forms accepted and produced are glibc 2.43's
+//! (checked against the host's glibc on random and edge-case inputs by the unit tests).
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::types::*;
 use crate::util::{Buf, is_space};
@@ -5,6 +8,8 @@ use core::ffi::{c_char, c_int, c_void};
 use rusty_libc_core::errno;
 use rusty_libc_core::ffi;
 use rusty_libc_core::sync_cell::SyncCell;
+
+// ---------------------------------------------------------------- byte order
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn htons(x: u16) -> u16 {
@@ -23,11 +28,17 @@ pub extern "C" fn ntohl(x: u32) -> u32 {
     u32::from_be(x)
 }
 
+// ---------------------------------------------------------------- in6addr_*
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub static in6addr_any: in6_addr = in6_addr { s6_addr: [0; 16] };
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub static in6addr_loopback: in6_addr = in6_addr { s6_addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] };
 
+// ---------------------------------------------------------------- IPv4 text to binary (BSD forms)
+
+/// `strtoul(s, &end, 0)` for a string that starts with a digit: (value, bytes used), or None on overflow of
+/// 64 bits (glibc's `ERANGE` case).
 fn strtoul0(s: &[u8]) -> Option<(u64, usize)> {
     let (base, mut i) = if s.len() >= 3 && s[0] == b'0' && (s[1] | 0x20) == b'x' && s[2].is_ascii_hexdigit() {
         (16u64, 2)
@@ -53,6 +64,9 @@ fn strtoul0(s: &[u8]) -> Option<(u64, usize)> {
     Some((v, i))
 }
 
+/// Parse the BSD address forms (`a`, `a.b`, `a.b.c`, `a.b.c.d`, each number decimal, octal or hex).
+/// Returns the address (network order bytes) and the index of the first character not used, or None.
+/// Trailing white space, and anything after it, is left for the caller (glibc's `inet_aton` accepts it).
 pub fn parse_aton(s: &[u8]) -> Option<([u8; 4], usize)> {
     const MAX: [u64; 4] = [0xffff_ffff, 0xff_ffff, 0xffff, 0xff];
     let mut res = [0u8; 4];
@@ -89,11 +103,17 @@ pub fn parse_aton(s: &[u8]) -> Option<([u8; 4], usize)> {
     }
 }
 
+/// glibc's `inet_aton` on a C string.
+///
+/// # Safety
+/// `cp` is a C string; `addr` is null or writable.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_aton(cp: *const c_char, addr: *mut in_addr) -> c_int {
+    // SAFETY: `cp` is a C string (the caller's contract).
     let s = unsafe { ffi::cstr_bytes(cp) };
     match parse_aton(s) {
         Some((a, _)) => {
+            // SAFETY: `addr` is NULL or writable (the caller's contract).
             if let Some(addr) = unsafe { ffi::out(addr) } {
                 addr.s_addr = u32::from_ne_bytes(a);
             }
@@ -103,8 +123,11 @@ pub unsafe extern "C" fn inet_aton(cp: *const c_char, addr: *mut in_addr) -> c_i
     }
 }
 
+/// # Safety
+/// `cp` is a C string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_addr(cp: *const c_char) -> in_addr_t {
+    // SAFETY: `cp` is a C string (the caller's contract).
     let s = unsafe { ffi::cstr_bytes(cp) };
     match parse_aton(s) {
         Some((a, _)) => u32::from_ne_bytes(a),
@@ -112,8 +135,13 @@ pub unsafe extern "C" fn inet_addr(cp: *const c_char) -> in_addr_t {
     }
 }
 
+/// `inet_network`: the address as a host-order number, with each part a single byte (so "1.2" is 0x0102).
+///
+/// # Safety
+/// `cp` is a C string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_network(cp: *const c_char) -> in_addr_t {
+    // SAFETY: `cp` is a C string (the caller's contract).
     let s = unsafe { ffi::cstr_bytes(cp) };
     network_parse(s).unwrap_or(INADDR_NONE)
 }
@@ -194,6 +222,8 @@ fn in_class_b(a: u32) -> bool {
     a & 0xc000_0000 == 0x8000_0000
 }
 
+/// # Safety
+/// Plain function.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn inet_lnaof(i: in_addr) -> in_addr_t {
     let a = u32::from_be(i.s_addr);
@@ -232,10 +262,13 @@ pub extern "C" fn inet_makeaddr(net: in_addr_t, host: in_addr_t) -> in_addr {
     in_addr { s_addr: v.to_be() }
 }
 
+// ---------------------------------------------------------------- inet_pton / inet_ntop
+
+/// Strict dotted quad (no leading zeros, exactly four parts, no trailing text).
 pub fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
     let mut tmp = [0u8; 4];
     let mut idx = 0usize;
-    let mut cur = 0u32;
+    let mut cur = 0u32; // the octet being read (kept in a register, stored when its dot or the end comes)
     let mut saw_digit = false;
     let mut octets = 0;
     for &ch in s {
@@ -274,6 +307,7 @@ pub fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
 }
 
 fn hexval(c: u8) -> Option<u32> {
+    // table lookup: 0xff marks a byte that is no hex digit
     const T: [u8; 256] = {
         let mut t = [0xffu8; 256];
         let mut i = 0;
@@ -293,6 +327,7 @@ fn hexval(c: u8) -> Option<u32> {
     if v == 0xff { None } else { Some(v as u32) }
 }
 
+/// IPv6 text form (RFC 4291 2.2, with an embedded dotted quad at the end).
 pub fn parse_ipv6(s: &[u8]) -> Option<[u8; 16]> {
     let mut tmp = [0u8; 16];
     let mut tp = 0usize;
@@ -368,6 +403,7 @@ pub fn parse_ipv6(s: &[u8]) -> Option<[u8; 16]> {
             return None;
         }
         let n = tp - cp;
+        // move the tail to the end, zero the gap
         for k in 0..n {
             tmp[16 - 1 - k] = tmp[tp - 1 - k];
         }
@@ -379,6 +415,7 @@ pub fn parse_ipv6(s: &[u8]) -> Option<[u8; 16]> {
     if tp != 16 { None } else { Some(tmp) }
 }
 
+/// Dotted-quad text of `a` into `out` (at most 15 characters); the length.
 #[inline]
 pub(crate) fn ipv4_text(a: &[u8; 4], out: &mut [u8; 16]) -> usize {
     let mut n = 0;
@@ -404,6 +441,7 @@ pub(crate) fn ipv4_text(a: &[u8; 4], out: &mut [u8; 16]) -> usize {
     n
 }
 
+/// Dotted-quad text.
 pub fn format_ipv4(a: &[u8; 4]) -> Buf<48> {
     let mut t = [0u8; 16];
     let n = ipv4_text(a, &mut t);
@@ -412,6 +450,8 @@ pub fn format_ipv4(a: &[u8; 4]) -> Buf<48> {
     o
 }
 
+/// IPv6 text in glibc's form: lower case, longest run of zero groups (at least two) as `::` (the first
+/// longest), `::a.b.c.d` for IPv4-compatible and `::ffff:a.b.c.d` for IPv4-mapped addresses.
 pub fn format_ipv6(a: &[u8; 16]) -> Buf<48> {
     let mut t = [0u8; 64];
     let n = ipv6_text(a, &mut t);
@@ -420,6 +460,8 @@ pub fn format_ipv6(a: &[u8; 16]) -> Buf<48> {
     o
 }
 
+/// The text of `format_ipv6` into `out` (at most 45 characters); the length. Every single-byte store indexes with `n & 63`:
+/// `n` never exceeds 45, so the mask changes nothing, but it lets the compiler drop the bounds checks of this hot loop.
 #[inline]
 fn ipv6_text(a: &[u8; 16], out: &mut [u8; 64]) -> usize {
     const D: &[u8; 16] = b"0123456789abcdef";
@@ -451,6 +493,7 @@ fn ipv6_text(a: &[u8; 16], out: &mut [u8; 64]) -> usize {
     }
     let mut n = 0usize;
     let mut i = 0i32;
+    // 8 groups of at most 4 digits and 7 colons are at most 39 bytes; the dotted tail replaces the last two groups
     while i < 8 {
         if best_base != -1 && i >= best_base && i < best_base + best_len {
             if i == best_base {
@@ -495,6 +538,8 @@ fn ipv6_text(a: &[u8; 16], out: &mut [u8; 64]) -> usize {
     n
 }
 
+/// `inet_ntop` on Rust types: the text of the address in `src` (4 bytes for `AF_INET`, 16 for `AF_INET6`) into `dst` with a
+/// NUL; the text length, or `EAFNOSUPPORT` / `ENOSPC` (nothing written then).
 pub fn ntop(af: c_int, src: &[u8], dst: &mut [u8]) -> Result<usize, c_int> {
     let mut t = [0u8; 64];
     let n = match af {
@@ -511,13 +556,15 @@ pub fn ntop(af: c_int, src: &[u8], dst: &mut [u8]) -> Result<usize, c_int> {
     copy_text(&t[..n], dst)
 }
 
+/// The dotted quad of `a` and a NUL into `d`, which has room for the longest text; the length.
 #[inline]
 fn ntop4_in_place(a: &[u8; 4], d: &mut [u8; 16]) -> usize {
     let n = ipv4_text(a, d);
-    d[n & 15] = 0;
+    d[n & 15] = 0; // n <= 15: the mask only drops the bounds check
     n
 }
 
+/// `text` and a NUL into `dst`, or ENOSPC (nothing written).
 #[inline]
 fn copy_text(text: &[u8], dst: &mut [u8]) -> Result<usize, c_int> {
     let n = text.len();
@@ -529,49 +576,71 @@ fn copy_text(text: &[u8], dst: &mut [u8]) -> Result<usize, c_int> {
     Ok(n)
 }
 
+/// # Safety
+/// `src` points to an address of family `af`; `dst` to `size` writable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_ntop(af: c_int, src: *const c_void, dst: *mut c_char, size: socklen_t) -> *const c_char {
-    let mut t = [0u8; 64];
-    let n = match af {
+    // The text goes to a local buffer only when `dst` may be too small: the buffer is declared on those paths alone, so the
+    // in-place paths do not zero it first.
+    let finish = |text: &[u8]| {
+        // The longest text is 45 bytes and a NUL, so a view of at most 64 bytes decides ENOSPC as the full `size` would.
+        // SAFETY: the caller passes `size` writable bytes at `dst` that nothing else uses during the call.
+        let d = unsafe { ffi::bytes_mut(dst.cast::<u8>(), (size as usize).min(64)) };
+        match copy_text(text, d) {
+            Ok(_) => dst.cast_const(),
+            Err(e) => {
+                errno::set(e);
+                core::ptr::null()
+            }
+        }
+    };
+    match af {
         AF_INET => {
+            // SAFETY: the caller passes an IPv4 address (4 bytes) at `src`.
             let a = unsafe { &*src.cast::<[u8; 4]>() };
             if size >= 16 {
+                // room for the longest text: write it in place
+                // SAFETY: the caller passes `size` (at least 16) writable bytes at `dst`, unused by others during the call.
                 ntop4_in_place(a, unsafe { &mut *dst.cast::<[u8; 16]>() });
                 return dst;
             }
-            ipv4_text(a, t.first_chunk_mut::<16>().unwrap())
+            let mut t = [0u8; 16];
+            let n = ipv4_text(a, &mut t);
+            finish(&t[..n])
         }
         AF_INET6 => {
+            // SAFETY: the caller passes an IPv6 address (16 bytes) at `src`.
             let a = unsafe { &*src.cast::<[u8; 16]>() };
             if size >= 64 {
+                // room for anything ipv6_text writes: write it in place (it stores only the text, then the NUL below)
+                // SAFETY: the caller passes `size` (at least 64) writable bytes at `dst`, unused by others during the call.
                 let d = unsafe { &mut *dst.cast::<[u8; 64]>() };
                 let n = ipv6_text(a, d);
                 d[n & 63] = 0;
                 return dst;
             }
-            ipv6_text(a, &mut t)
+            let mut t = [0u8; 64];
+            let n = ipv6_text(a, &mut t);
+            finish(&t[..n])
         }
         _ => {
             errno::set(EAFNOSUPPORT);
-            return core::ptr::null();
-        }
-    };
-    let d = unsafe { ffi::bytes_mut(dst.cast::<u8>(), (size as usize).min(64)) };
-    match copy_text(&t[..n], d) {
-        Ok(_) => dst,
-        Err(e) => {
-            errno::set(e);
             core::ptr::null()
         }
     }
 }
 
+/// # Safety
+/// `src` is a C string; `dst` points to a writable address of family `af` (4 or 16 bytes).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_pton(af: c_int, src: *const c_char, dst: *mut c_void) -> c_int {
+    // SAFETY: `src` is a C string (the caller's contract).
     let s = unsafe { ffi::cstr_bytes(src) };
+    // SAFETY: as for `__inet_pton_length`; `s` is `src`'s bytes.
     unsafe { pton_raw(af, s, dst) }
 }
 
+/// `inet_pton` on Rust types: the binary address (4 or 16 bytes used) or None when `s` is not one, or `EAFNOSUPPORT`.
 pub fn pton(af: c_int, s: &[u8]) -> Result<Option<([u8; 16], usize)>, c_int> {
     match af {
         AF_INET => Ok(parse_ipv4(s).map(|a| {
@@ -584,10 +653,15 @@ pub fn pton(af: c_int, s: &[u8]) -> Result<Option<([u8; 16], usize)>, c_int> {
     }
 }
 
+/// The C shell of `inet_pton`: parse `s`, store into `dst`, return 1, 0 or -1 with errno.
+///
+/// # Safety
+/// `dst` points to 4 (`AF_INET`) or 16 (`AF_INET6`) writable bytes.
 unsafe fn pton_raw(af: c_int, s: &[u8], dst: *mut c_void) -> c_int {
     match af {
         AF_INET => match parse_ipv4(s) {
             Some(a) => {
+                // SAFETY: `dst` has room for an IPv4 address (the caller's contract).
                 unsafe { dst.cast::<[u8; 4]>().write_unaligned(a) };
                 1
             }
@@ -595,6 +669,7 @@ unsafe fn pton_raw(af: c_int, s: &[u8], dst: *mut c_void) -> c_int {
         },
         AF_INET6 => match parse_ipv6(s) {
             Some(a) => {
+                // SAFETY: `dst` has room for an IPv6 address (the caller's contract).
                 unsafe { dst.cast::<[u8; 16]>().write_unaligned(a) };
                 1
             }
@@ -607,18 +682,29 @@ unsafe fn pton_raw(af: c_int, s: &[u8], dst: *mut c_void) -> c_int {
     }
 }
 
+/// `inet_pton` on a counted string.
+///
+/// # Safety
+/// `src` points to `len` readable bytes; `dst` as for `inet_pton`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __inet_pton_length(af: c_int, src: *const c_char, len: usize, dst: *mut c_void) -> c_int {
+    // SAFETY: the caller passes `len` readable bytes at `src`.
     let s = unsafe { ffi::bytes(src.cast::<u8>(), len) };
+    // SAFETY: forwarded contract for `dst`.
     unsafe { pton_raw(af, s, dst) }
 }
 
+/// Per thread (`#[thread_local]`, so no other thread can reach it); the pointer handed to C is valid until the thread's next
+/// `inet_ntoa`.
 #[thread_local]
 static NTOA_BUF: SyncCell<[u8; 16]> = SyncCell::new([0; 16]);
 
+/// `inet_ntoa`: dotted quad in a per-thread static buffer.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn inet_ntoa(i: in_addr) -> *mut c_char {
     let a = i.s_addr.to_ne_bytes();
+    // SAFETY: the buffer is this thread's own and no reference to it outlives this call (C only gets the raw pointer, and
+    // its contract ends at the thread's next call, which is this one).
     unsafe {
         NTOA_BUF.with_unsync(|b| {
             let n = ipv4_text(&a, b.first_chunk_mut::<16>().unwrap());
@@ -628,18 +714,28 @@ pub extern "C" fn inet_ntoa(i: in_addr) -> *mut c_char {
     NTOA_BUF.as_ptr().cast::<c_char>()
 }
 
+// ---------------------------------------------------------------- inet_nsap_*
+
 fn xtob(c: u8) -> u8 {
     c - if c.is_ascii_digit() { b'0' } else { b'7' }
 }
 
+/// # Safety
+/// `ascii` is a C string; `binary` has room for `maxlen` bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_nsap_addr(ascii: *const c_char, binary: *mut u8, maxlen: c_int) -> u32 {
+    // SAFETY: `ascii` is a C string (the caller's contract).
     let s = unsafe { ffi::cstr_bytes(ascii) };
+    // At most one byte per two characters is written, so a limit above `s.len() / 2 + 1` (a negative `maxlen` is a huge
+    // unsigned one, as glibc compares it) never stops the loop before the string's end does.
     let n = (maxlen as u32 as usize).min(s.len() / 2 + 1);
+    // SAFETY: `binary` has room for `maxlen` bytes, at least `n`; nothing else uses them meanwhile (the caller's contract).
     let out = unsafe { ffi::bytes_mut(binary, n) };
     nsap_addr(s, out) as u32
 }
 
+/// `inet_nsap_addr` on Rust types: hex pairs of `s` (with `.`, `+`, `/` skipped) into `out`; the bytes written, or 0 on a
+/// bad character (bytes before it may have been written, as in glibc).
 pub fn nsap_addr(s: &[u8], out: &mut [u8]) -> usize {
     let mut len = 0usize;
     let mut i = 0usize;
@@ -671,25 +767,33 @@ pub fn nsap_addr(s: &[u8], out: &mut [u8]) -> usize {
 
 static NSAP_BUF: crate::util::Spin<[u8; 255 * 2 + 128]> = crate::util::Spin::new([0; 255 * 2 + 128]);
 
+/// # Safety
+/// `binary` points to `binlen` bytes; `ascii` is null or has room for `2 * binlen + binlen / 2 + 1` bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_nsap_ntoa(binlen: c_int, binary: *const u8, ascii: *mut c_char) -> *mut c_char {
     let n = binlen.clamp(0, 255) as usize;
+    // SAFETY: `binary` points to `binlen` bytes (the caller's contract; a negative length reads nothing).
     let bin = unsafe { ffi::bytes(binary, n) };
     let need = nsap_ntoa_len(n);
     if ascii.is_null() {
         let mut guard = NSAP_BUF.lock();
         nsap_ntoa(bin, &mut guard[..need]);
+        // the static buffer, as glibc returns it (valid until the next call with NULL)
         guard.as_mut_ptr().cast::<c_char>()
     } else {
+        // SAFETY: `ascii` has room for `2 * binlen + binlen / 2 + 1` bytes (the caller's contract), which is `need`.
         nsap_ntoa(bin, unsafe { ffi::bytes_mut(ascii.cast::<u8>(), need) });
         ascii
     }
 }
 
+/// Text length of `inet_nsap_ntoa` for `n` bytes, the NUL included.
 fn nsap_ntoa_len(n: usize) -> usize {
     2 * n + n / 2 + 1
 }
 
+/// `inet_nsap_ntoa` on Rust types: upper-case hex of `bin` with a `.` after every second byte but the last, then a NUL, into
+/// `out` (at least [`nsap_ntoa_len`] bytes).
 pub fn nsap_ntoa(bin: &[u8], out: &mut [u8]) {
     let hexd = |n: u8| n + if n < 10 { b'0' } else { b'7' };
     let mut o = 0usize;

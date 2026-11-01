@@ -2,12 +2,16 @@
 name = "rusty-libc-ldso"
 version = "0.0.0"
 edition = "2024"
-license = "LGPL-2.1-or-later"
+license = "MIT"
 
+# Built by tools/build-shared.sh (staticlib, then linked by ld into ld-linux-x86-64.so.2); not a workspace member:
+# it is a no_std program with its own panic handler and memcpy, which host `cargo test --workspace` cannot take.
 [workspace]
 
 [lib]
 crate-type = ["staticlib"]
+test = false
+doctest = false
 
 [profile.dev]
 panic = "abort"

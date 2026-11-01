@@ -1,3 +1,5 @@
+# Symbols our ld.so exports beyond what glibc's ld-linux-x86-64.so.2 does (under GLIBC_PRIVATE, looked up unversioned by libc.so.6).
+# `hdrgen versions` adds them to crates/rusty-libc-cabi/shared/ld.map.
 __libc_ldso_tls_info
 __libc_ldso_tls_init_block
 __libc_ldso_tls_free_block

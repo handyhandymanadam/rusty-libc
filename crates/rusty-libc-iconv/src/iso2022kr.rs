@@ -1,3 +1,5 @@
+//! ISO-2022-KR (RFC 1557): ASCII and KS C 5601, switched with SO and SI; the encoder starts the
+//! text with the header `ESC $ ) C`.
 use crate::engine::*;
 use crate::iso2022jp::{KSC5601, SetRes, dec_set, ksc5601};
 
@@ -5,6 +7,7 @@ const ESC: u8 = 0x1b;
 const SO: u8 = 0x0e;
 const SI: u8 = 0x0f;
 
+/// 0 = ASCII, 8 = KS C 5601 (glibc's values).
 pub type KrState = u8;
 
 pub fn dec(set: &mut KrState, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u32], op: &mut usize, irr: &mut usize) -> St {
@@ -39,6 +42,7 @@ pub fn dec(set: &mut KrState, flags: u32, inp: &[u8], ip: &mut usize, out: &mut 
     })
 }
 
+/// The header, written at the start of the first conversion call after opening or flushing.
 pub fn enc_prepare(ctx: &Ctx, out: &mut [u8], op: &mut usize) -> Option<St> {
     if ctx.inv == 0 {
         if *op + 4 > out.len() {

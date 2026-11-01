@@ -1,7 +1,8 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
-    Item::Decl("typedef unsigned long int __cpu_mask;"),
+    Item::Decl("typedef unsigned long int __cpu_mask;   /* glibc's bits/cpu-set.h */"),
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("SCHED_OTHER", V::Dec(0)),
         ("SCHED_FIFO", V::Dec(1)),
@@ -53,6 +54,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("CPU_SETSIZE", V::Dec(1024)),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Block { head: "typedef struct ", body: &["", "  unsigned long __bits[16];", ""], tail: " cpu_set_t" },
     Item::Consts(&[
         ("CPU_SETSIZE", V::Dec(1024)),

@@ -1,7 +1,19 @@
+//! The `_Float128` complex functions of complex.h: cabsf128, cargf128, crealf128, cimagf128, conjf128,
+//! cprojf128, cexpf128, clogf128, clog10f128, cpowf128, csqrtf128 and the circular and hyperbolic
+//! functions with their inverses.
+//!
+//! The case structure, special values and evaluation regions are glibc 2.43's complex templates
+//! (LGPL-2.1-or-later), the same ones the double, float and long double versions use: they live in
+//! `longdouble/cplx/*.rs` written generically over `CF`, and this module gives them binary128 as the
+//! type (`Q128`: soft-float arithmetic and this crate's `_Float128` exp, log, sincos, ...).
+//!
+//! ABI: a `_Float128 _Complex` argument is 32 bytes in memory (class MEMORY, passed on the stack, aligned
+//! to 16) and the result comes back through a hidden pointer; `Cq` is that layout (two binary128 patterns).
 use super::*;
 use crate::longdouble::cplx::{cfp::{CF, W, quiet}, explog, inverse, trighyp};
 use core::cmp::Ordering;
 
+/// A binary128 value as the complex templates' number type.
 #[derive(Clone, Copy, Debug)]
 pub struct Q128(pub F128);
 
@@ -16,6 +28,7 @@ impl PartialOrd for Q128 {
     }
 }
 
+/// Raise "invalid" for a signaling NaN, as a comparison does.
 fn snan_invalid(x: F128) {
     if x.is_snan() {
         fenv::raise_exceptions(FE_INVALID as u32);
@@ -32,6 +45,7 @@ impl CF for Q128 {
     const EPS: Q128 = q(0x3f8f << 112);
     const MANT_DIG: i32 = 113;
     const MAX_EXP: i32 = 16384;
+    // 2^57 + 1
     const SPLIT: Q128 = q((0x4038 << 112) | (1 << 55));
     const PI: Q128 = q(0x4000921fb54442d18469898cc51701b8);
     const PI_2: Q128 = q(0x3fff921fb54442d18469898cc51701b8);
@@ -72,6 +86,8 @@ impl CF for Q128 {
     fn sqrt_(self) -> Q128 {
         Q128(basic::sqrt(self.0))
     }
+    // glibc's classification of a soft-float value goes through comparisons, which raise "invalid" for a
+    // signaling NaN: so does its complex code, and so do these.
     fn is_nan_(self) -> bool {
         snan_invalid(self.0);
         self.0.is_nan()
@@ -127,6 +143,7 @@ impl CF for Q128 {
     }
 }
 
+/// `_Float128 _Complex` as C lays it out in memory: real part first.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Cq {
@@ -168,6 +185,8 @@ cq_func!(casinhf128, inverse::casinh);
 cq_func!(cacoshf128, inverse::cacosh);
 cq_func!(catanhf128, inverse::catanh);
 
+/// glibc's catan classifies the imaginary part only when the real part is not infinite, so a signaling
+/// NaN there raises no "invalid" (the same adjustment the long double version makes).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn catanf128(z: Cq) -> Cq {
     let (re, im) = split(z);
@@ -181,13 +200,17 @@ pub extern "C" fn catanf128(z: Cq) -> Cq {
     join(r)
 }
 
+/// `_Float128 _Complex conjf128(_Float128 _Complex)`: negate the imaginary part.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn conjf128(z: Cq) -> Cq {
     Cq { re: z.re, im: z.im ^ SIGN }
 }
 
+/// The projection onto the Riemann sphere: any infinite part gives (inf, copysign(0, im)).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn cprojf128(z: Cq) -> Cq {
+    // (isinf on a soft-float value is a comparison: "invalid" for a signaling NaN, the second test only if the
+    // first one fails)
     let is_inf = |bits: u128| {
         snan_invalid(F128(bits));
         F128(bits).is_inf()
@@ -199,6 +222,7 @@ pub extern "C" fn cprojf128(z: Cq) -> Cq {
     }
 }
 
+/// x ^ c = cexp (c * clog (x)).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn cpowf128(x: Cq, c: Cq) -> Cq {
     let (xr, xi) = split(x);

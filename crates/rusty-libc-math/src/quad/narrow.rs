@@ -1,16 +1,31 @@
+//! The narrowing operations of ISO/IEC TS 18661-1 and C23: `fadd`, `fsub`, `fmul`, `fdiv`, `ffma`,
+//! `fsqrt` (double operands, float result), `f32addf64`, ..., `f64xaddf128`: the operation is done on
+//! the exact values and rounded once to the result type, so there is no double rounding. The
+//! operands are held as binary128 (every binary32, binary64 and x87 value converts exactly).
+//! errno: ERANGE when finite operands give an infinity or a nonzero exact value rounds to zero, EDOM
+//! when a NaN appears from numbers, as glibc's wrappers do; `fma` does not set errno. Which NaN comes
+//! out when operands are NaNs depends on how glibc computes the function (see [`Rule`]).
 use super::arith::{div_exact, fma_exact, sqrt_exact};
 use super::*;
 use crate::longdouble::common::F80;
 use crate::longdouble::ext::{F32F, F64F, F80F, Rnd, rnd_to_f32_bits, rnd_to_f64_bits, rnd_to_f80, round_wide};
 
+/// Which NaN an operation returns when operands are NaNs: what the machine or the library that glibc
+/// uses does. All quiet the NaN and raise invalid for a signaling one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Rule {
+    /// SSE arithmetic: the first operand that is a NaN.
     Hw,
+    /// Soft-float (binary128 operands): the NaN with the larger fraction (the quiet bit counts), the
+    /// later operand on a tie.
     SoftFp,
+    /// As [`Rule::SoftFp`], but the first operand on a tie (soft-float multiplication).
     SoftFpMul,
+    /// glibc's `ffma` and `f32xfmaf64`: the second operand first, then the first, then the third.
     Ffma,
 }
 
+/// The result of an operation with a NaN operand, `None` without one.
 pub(super) fn pick_nan(rule: Rule, ops: &[F128]) -> Option<F128> {
     if !ops.iter().any(|o| o.is_nan()) {
         return None;
@@ -36,8 +51,11 @@ pub(super) fn pick_nan(rule: Rule, ops: &[F128]) -> Option<F128> {
     pick.map(F128::quieted)
 }
 
+/// What an operation produced before the final rounding.
 enum Pre {
+    /// The exact finite nonzero result.
     Wide(Wide),
+    /// An exact special or exactly representable result: zero, infinity, NaN, or an operand.
     Val(F128),
 }
 
@@ -45,6 +63,7 @@ fn zero_sign() -> bool {
     fenv::round_mode() == RoundMode::Downward
 }
 
+/// The result of `x + y` (or `x - y`) before narrowing.
 fn pre_add(x: F128, y: F128, sub: bool, rule: Rule) -> Pre {
     let yneg = y.is_neg() ^ sub;
     if let Some(n) = pick_nan(rule, &[x, y]) {
@@ -91,6 +110,7 @@ fn pre_sqrt(x: F128, rule: Rule) -> Pre {
 }
 
 fn pre_fma(x: F128, y: F128, z: F128, rule: Rule) -> Pre {
+    // soft-float multiply-add: a NaN product (x or y, as for a multiplication) wins over a NaN z
     let rule = if rule == Rule::SoftFp { Rule::SoftFpMul } else { rule };
     let product_nan = rule == Rule::SoftFpMul && (x.is_nan() || y.is_nan());
     let pick = if product_nan { pick_nan(rule, &[x, y]) } else { pick_nan(rule, &[x, y, z]) };
@@ -98,6 +118,8 @@ fn pre_fma(x: F128, y: F128, z: F128, rule: Rule) -> Pre {
         fenv::raise_exceptions(FE_INVALID as u32);
     }
     if let Some(n) = pick {
+        // an invalid product is reported even when a NaN decides the result (soft-float); the hardware fma that glibc's
+        // ffma uses (vfmadd213sd) reports nothing when the addend is a quiet NaN
         if rule != Rule::Ffma && ((x.is_inf() && y.is_zero()) || (x.is_zero() && y.is_inf())) {
             fenv::raise_exceptions(FE_INVALID as u32);
         }
@@ -112,6 +134,7 @@ fn pre_fma(x: F128, y: F128, z: F128, rule: Rule) -> Pre {
     }
 }
 
+/// The result format.
 #[derive(Clone, Copy)]
 enum To {
     F32,
@@ -119,6 +142,7 @@ enum To {
     F80,
 }
 
+/// The narrowed result as a pattern of bits; the x87 case keeps the 16 bytes in a [`F80`].
 #[derive(Clone, Copy)]
 enum Out {
     B32(u32),
@@ -158,6 +182,7 @@ fn rnd_out(r: &Rnd, to: To) -> Out {
     }
 }
 
+/// Round the pre-result to the target format, raise flags, set errno (`errno` false for fma).
 fn narrow(pre: Pre, to: To, inputs: &[F128], errno: bool) -> Out {
     match pre {
         Pre::Wide(w) => {
@@ -231,6 +256,8 @@ narrow_family!(
     F80, To::F80, un80; to80_add to80_sub to80_mul to80_div to80_fma to80_sqrt,
 );
 
+// ---- the C entry points ----
+
 macro_rules! wide_args2 {
     ($($name:ident, $imp:ident, $ret:ty;)*) => {$(
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -248,11 +275,14 @@ macro_rules! wide_args1 {
     )*};
 }
 
+// double operands, float result: fadd and the _Float32 from _Float64/_Float32x names
 wide_args2! {
     fadd, to32_add, f32; fsub, to32_sub, f32; fmul, to32_mul, f32; fdiv, to32_div, f32;
     f32addf64, to32_add, f32; f32subf64, to32_sub, f32; f32mulf64, to32_mul, f32; f32divf64, to32_div, f32;
     f32addf32x, to32_add, f32; f32subf32x, to32_sub, f32; f32mulf32x, to32_mul, f32; f32divf32x, to32_div, f32;
 }
+// On a CPU without FMA3 glibc computes these with its software fma (a different NaN sign and payload and different flags
+// for non-finite operands than the hardware instruction): `soft_special_for_narrow` is that case, else the exact path.
 macro_rules! ffma_names {
     ($($name:ident;)*) => {$(
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -266,12 +296,15 @@ macro_rules! ffma_names {
 }
 ffma_names! { ffma; f32fmaf64; f32fmaf32x; }
 
+/// The double result of glibc's software fma narrowed to float (`cvtsd2ss`). No errno: glibc's `CHECK_NARROW_FMA` is empty.
 fn narrow_to_f32(r: f64) -> f32 {
     let out: f32;
+    // SAFETY: SSE2 is part of the x86_64 baseline; the asm touches registers only.
     unsafe { core::arch::asm!("cvtsd2ss {0}, {1}", out(xmm_reg) out, in(xmm_reg) r, options(nomem, nostack, preserves_flags)) };
     out
 }
 wide_args1! { fsqrt, to32_sqrt, f32; f32sqrtf64, to32_sqrt, f32; f32sqrtf32x, to32_sqrt, f32; }
+// double operands, double result (_Float32x from _Float64): the operation itself, one rounding
 wide_args2! { f32xaddf64, to64_add, f64; f32xsubf64, to64_sub, f64; f32xmulf64, to64_mul, f64; f32xdivf64, to64_div, f64; }
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn f32xfmaf64(x: f64, y: f64, z: f64) -> f64 {
@@ -282,6 +315,7 @@ pub extern "C" fn f32xfmaf64(x: f64, y: f64, z: f64) -> f64 {
 }
 wide_args1! { f32xsqrtf64, to64_sqrt, f64; }
 
+// _Float128 operands: soft-float NaN rule
 macro_rules! soft2 {
     ($($name:ident, $imp:ident, $ret:ty;)*) => {$(
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -314,6 +348,7 @@ soft2! {
 soft3! { f32fmaf128, to32_fma, f32; f32xfmaf128, to64_fma, f64; f64fmaf128, to64_fma, f64; }
 soft1! { f32sqrtf128, to32_sqrt, f32; f32xsqrtf128, to64_sqrt, f64; f64sqrtf128, to64_sqrt, f64; }
 
+// the x87 results come back in st(0)
 fn to80_add_soft(x: F128, y: F128) -> F80 {
     to80_add(x, y, Rule::SoftFp)
 }

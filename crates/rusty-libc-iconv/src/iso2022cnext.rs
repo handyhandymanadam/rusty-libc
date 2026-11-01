@@ -1,3 +1,11 @@
+//! ISO-2022-CN-EXT: ISO-2022-CN plus ISO-IR-165 for SO (`ESC $ ) E`) and CNS 11643 planes 3 to 7
+//! for single characters after `ESC O` (SS3, announced by `ESC $ + I` .. `ESC $ + M`).
+//!
+//! Written from the observable behaviour of glibc's module (checked against it call by call by the
+//! tests): the state word is glibc's `(set | announcements) << 3`, the quirks are kept (an error
+//! in an SS2 character is reported after the `ESC N`, not before; the encoder's `used` set of the
+//! first attempt decides which other sets are tried; a character that is only in ISO-IR-165 is
+//! never chosen as the first try because glibc compares an announcement mask with a set number).
 use crate::engine::*;
 use crate::iso2022cn::{cns1, cns2, dec_cns};
 use crate::iso2022jp::{GB2312, SetRes, dec_set, gb2312};
@@ -7,6 +15,7 @@ const ESC: u8 = 0x1b;
 const SO: u8 = 0x0e;
 const SI: u8 = 0x0f;
 
+// the SO sets (low three bits), the SS2 sets (bits 3-4) and the SS3 sets (bits 5-7)
 const ASCII_SET: u32 = 0;
 const GB2312_SET: u32 = 1;
 const CNS1_SET: u32 = 3;
@@ -16,6 +25,7 @@ const CNS3_SET: u32 = 3 << 5;
 const CNS7_SET: u32 = 7 << 5;
 const CURRENT_MASK: u32 = 7 | (3 << 3) | (7 << 5);
 
+// announcements (the same numbers shifted left by 8)
 const GB2312_ANN: u32 = 1 << 8;
 const CNS1_ANN: u32 = 3 << 8;
 const IR165_ANN: u32 = 4 << 8;
@@ -24,6 +34,7 @@ const CNS2_ANN: u32 = 3 << 11;
 const SS2_ANN: u32 = 3 << 11;
 const SS3_ANN: u32 = 7 << 13;
 
+/// Glibc's `count`: `(set | ann) << 3`.
 pub type CnExtState = u32;
 
 #[inline]
@@ -42,28 +53,30 @@ fn ir165_dec(s: &[u8]) -> SetRes {
     if b1 <= 0x20 || b1 >= 0x7f || b2 <= 0x20 || b2 >= 0x7f {
         return SetRes::Unknown;
     }
-    match isoir165::MB.dec2(1, b1, b2) {
+    match isoir165::mb().dec2(1, b1, b2) {
         Some(c) => SetRes::Char(c),
         None => SetRes::Unknown,
     }
 }
 
 fn ir165_enc(c: u32) -> Option<[u8; 2]> {
-    let x = isoir165::MB.enc(c)?;
+    let x = isoir165::mb().enc(c)?;
     if x.len == 2 { Some([x.bytes[0], x.bytes[1]]) } else { None }
 }
 
+/// A character of CNS 11643 plane `plane` (3..=7) from its two bytes (each 0x21..0x7e).
 fn dec_plane(plane: u8, b1: u8, b2: u8) -> Option<u32> {
     if b1 <= 0x20 || b1 >= 0x7f || b2 <= 0x20 || b2 >= 0x7f {
         return None;
     }
-    let m = &euc_tw::MB;
-    let si = m.sets.iter().position(|st| st.prefix == [0x8e, 0xa0 + plane])?;
+    let m = euc_tw::mb();
+    let si = m.sets.iter().position(|st| st.prefix() == [0x8e, 0xa0 + plane])?;
     m.dec2(si, b1 | 0x80, b2 | 0x80)
 }
 
+/// A character's code in a plane 3..=7, as (plane, two bytes).
 fn enc_plane(c: u32) -> Option<(u32, [u8; 2])> {
-    let x = euc_tw::MB.enc(c)?;
+    let x = euc_tw::mb().enc(c)?;
     if x.len == 4 && x.bytes[0] == 0x8e && (0xa3..=0xa7).contains(&x.bytes[1]) {
         Some(((x.bytes[1] - 0xa0) as u32, [x.bytes[2] - 0x80, x.bytes[3] - 0x80]))
     } else {
@@ -87,6 +100,7 @@ pub fn dec(st: &mut CnExtState, flags: u32, inp: &[u8], ip: &mut usize, out: &mu
                 return Body::Incomplete;
             }
             if s[1] == b'$' {
+                // (a third byte that starts no announcement needs no fourth: n may be 3)
                 let (kind, f) = (s[2], if n >= 4 { s[3] } else { 0 });
                 let ok = match kind {
                     b')' => matches!(f, b'A' | b'E' | b'G'),
@@ -108,6 +122,7 @@ pub fn dec(st: &mut CnExtState, flags: u32, inp: &[u8], ip: &mut usize, out: &mu
             }
         } else if ch == SO {
             return match ann & SO_ANN {
+                // (glibc has moved past the SO before it notices that no set was announced)
                 0 => Body::IllegalAfter(1, 1),
                 a => {
                     set = a >> 8;
@@ -121,6 +136,7 @@ pub fn dec(st: &mut CnExtState, flags: u32, inp: &[u8], ip: &mut usize, out: &mu
             return Body::Skip(1);
         }
         if ch == ESC && s[1] == 0x4e {
+            // CNS plane 2: a failure is reported with the input after the ESC N
             return match dec_cns(true, &s[2..4]) {
                 SetRes::Char(c) => Body::Char(c, 4),
                 _ => Body::IllegalAfter(2, 2),
@@ -192,6 +208,7 @@ pub fn enc(st: &mut CnExtState, flags: u32, inp: &[u32], ip: &mut usize, out: &m
                 buf = Some(c);
                 used = CNS2_SET;
             } else {
+                // another SO set, then the planes 3..=7
                 if used != GB2312_SET {
                     buf = gb2312(ch);
                     if buf.is_some() {
@@ -224,6 +241,7 @@ pub fn enc(st: &mut CnExtState, flags: u32, inp: &[u32], ip: &mut usize, out: &m
         let buf = buf.unwrap();
         let mut n = 0usize;
         if set != used {
+            // announce the set once per line
             let (need, esc): (bool, &[u8; 2]) = if (used & 7) != 0 {
                 ((ann & SO_ANN) != (used << 8), match used {
                     GB2312_SET => b")A",

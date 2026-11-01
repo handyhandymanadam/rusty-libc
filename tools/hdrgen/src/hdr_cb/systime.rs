@@ -8,6 +8,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
     Item::Raw(Reason::GlibcMacro, "#define TIMEVAL_TO_TIMESPEC(tv, ts) { (ts)->tv_sec = (tv)->tv_sec; (ts)->tv_nsec = (tv)->tv_usec * 1000; }"),
     Item::Raw(Reason::GlibcMacro, "#define TIMESPEC_TO_TIMEVAL(tv, ts) { (tv)->tv_sec = (ts)->tv_sec; (tv)->tv_usec = (ts)->tv_nsec / 1000; }"),
     Item::Blank,
+    Item::Comment("/* obsolete; only for gettimeofday and settimeofday */"),
     Item::Block { head: "struct timezone ", body: &["", "  int tz_minuteswest;", "  int tz_dsttime;", ""], tail: "" },
     Item::Blank,
     Item::Block { head: "struct itimerval ", body: &["", "  struct timeval it_interval;", "  struct timeval it_value;", ""], tail: "" },

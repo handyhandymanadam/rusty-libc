@@ -1,3 +1,6 @@
+//! threads.h (C11): thrd_*, mtx_*, cnd_*, tss_*, call_once. Thin layers over the pthread functions,
+//! with glibc's error mapping. thrd_t is the pthread_t, mtx_t the pthread_mutex_t, cnd_t the
+//! pthread_cond_t, tss_t the pthread_key_t, once_flag the pthread_once_t.
 use crate::sys::*;
 use crate::*;
 use core::ffi::{c_int, c_void};
@@ -32,7 +35,12 @@ pub type cnd_t = pthread_cond_t;
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn thrd_create(thr: *mut thrd_t, func: thrd_start_t, arg: *mut c_void) -> c_int {
+    // `func` is called through the pthread start routine: an int result is stored in the exit
+    // value, the same way glibc keeps it. The signatures agree on x86-64 (the result is in rax and
+    // the upper half is ignored when read back as int).
+    // SAFETY: both are `extern "C"` functions of one pointer argument returning in rax (see above).
     let f = unsafe { core::mem::transmute::<thrd_start_t, unsafe extern "C" fn(*mut c_void) -> *mut c_void>(func) };
+    // SAFETY: `thr` is a writable thrd_t (C contract); the default attributes.
     map(unsafe { pthread_create(thr as *mut pthread_t, core::ptr::null(), f, arg) })
 }
 
@@ -48,6 +56,7 @@ pub extern "C" fn thrd_current() -> thrd_t {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn thrd_sleep(req: *const timespec, rem: *mut timespec) -> c_int {
+    // SAFETY: the kernel reads `req` and writes `rem` (NULL or valid: C contract), as glibc passes them.
     let r = unsafe { sys_cp(SYS_CLOCK_NANOSLEEP, 0, 0, req as usize, rem as usize, 0, 0) };
     match errno_of(r) {
         0 => 0,
@@ -63,19 +72,23 @@ pub extern "C" fn thrd_yield() {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn thrd_exit(res: c_int) -> ! {
+    // SAFETY: ends the calling thread.
     unsafe { pthread_exit(res as isize as *mut c_void) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn thrd_detach(thr: thrd_t) -> c_int {
+    // SAFETY: `thr` is a live thread handle (C contract).
     map(unsafe { crate::thread::detach(thr) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn thrd_join(thr: thrd_t, res: *mut c_int) -> c_int {
     let mut v: *mut c_void = core::ptr::null_mut();
+    // SAFETY: `thr` is a live thread handle (C contract).
     let e = unsafe { crate::thread::join_common(thr, Some(&mut v), CLOCK_REALTIME, None, true) };
     if e == 0 {
+        // SAFETY: `res` is NULL or a writable int (C contract).
         if let Some(r) = unsafe { res.as_mut() } {
             *r = v as isize as c_int;
         }
@@ -89,42 +102,51 @@ pub unsafe extern "C" fn mtx_init(m: *mut mtx_t, ty: c_int) -> c_int {
     if ty & MTX_RECURSIVE != 0 {
         a.set_type(mutex::PTHREAD_MUTEX_RECURSIVE_NP);
     }
+    // SAFETY: `m` is writable memory for one mtx_t (C contract).
     map(unsafe { pthread_mutex_init(m, &a) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn mtx_lock(m: *mut mtx_t) -> c_int {
+    // SAFETY: `m` is an initialised mtx_t (C contract).
     map(unsafe { pthread_mutex_lock(m) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn mtx_timedlock(m: *mut mtx_t, ts: *const timespec) -> c_int {
+    // SAFETY: `m` is an initialised mtx_t and `ts` NULL or a valid timespec (C contract).
     map(unsafe { pthread_mutex_timedlock(m, ts) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn mtx_trylock(m: *mut mtx_t) -> c_int {
+    // SAFETY: `m` is an initialised mtx_t (C contract).
     map(unsafe { pthread_mutex_trylock(m) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn mtx_unlock(m: *mut mtx_t) -> c_int {
+    // SAFETY: `m` is an initialised mtx_t (C contract).
     map(unsafe { pthread_mutex_unlock(m) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn mtx_destroy(m: *mut mtx_t) {
+    // SAFETY: `m` is an initialised mtx_t (C contract).
     unsafe { pthread_mutex_destroy(m) };
 }
 
+/// The condition object of a cnd_t argument (glibc uses it without a NULL check).
 macro_rules! cnd_ref {
     ($p:expr) => {{
+        // SAFETY: the C caller passes an initialised cnd_t that stays valid for the call; all its fields are atomics.
         unsafe { arg($p as *const cnd_t) }
     }};
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn cnd_init(c: *mut cnd_t) -> c_int {
+    // SAFETY: `c` is writable memory for one cnd_t (C contract).
     map(unsafe { pthread_cond_init(c, core::ptr::null()) })
 }
 
@@ -140,11 +162,13 @@ pub unsafe extern "C" fn cnd_broadcast(c: *mut cnd_t) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn cnd_wait(c: *mut cnd_t, m: *mut mtx_t) -> c_int {
+    // SAFETY: `c` and `m` are initialised and the caller holds `m` (C contract).
     map(unsafe { pthread_cond_wait(c, m) })
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn cnd_timedwait(c: *mut cnd_t, m: *mut mtx_t, ts: *const timespec) -> c_int {
+    // SAFETY: as cnd_wait, and `ts` is a valid timespec (C contract).
     map(unsafe { pthread_cond_timedwait(c, m, ts) })
 }
 
@@ -155,6 +179,7 @@ pub unsafe extern "C" fn cnd_destroy(c: *mut cnd_t) {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn tss_create(key: *mut tss_t, dtor: tss_dtor_t) -> c_int {
+    // SAFETY: `key` is a writable tss_t (C contract).
     map(unsafe { pthread_key_create(key, dtor) })
 }
 
@@ -175,5 +200,6 @@ pub unsafe extern "C" fn tss_set(key: tss_t, val: *mut c_void) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn call_once(flag: *mut once_flag, f: unsafe extern "C" fn()) {
+    // SAFETY: `flag` is a valid once_flag and `f` the program's initialiser (C contract).
     unsafe { pthread_once(flag, f) };
 }

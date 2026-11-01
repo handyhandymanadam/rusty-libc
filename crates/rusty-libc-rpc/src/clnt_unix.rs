@@ -1,3 +1,7 @@
+//! RPC client over a UNIX domain socket (`clntunix_create`), with the peer credentials sent as
+//! `SCM_CREDENTIALS` control messages. Port of Sun's `clnt_unix.c`. The call and the other operations are
+//! clnt_stream.rs's, shared with the TCP client. Also holds the `recvmsg` / `sendmsg` helpers the UNIX server
+//! transport shares.
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 
 use crate::clnt_stream::*;
@@ -23,8 +27,14 @@ static UNIX_OPS: clnt_ops = clnt_ops {
     cl_control: Some(clntunix_control),
 };
 
+/// Free the two blocks of a client that could not be made.
+///
+/// # Safety
+/// Each is NULL or our malloc block, not used afterwards.
 unsafe fn fooy(h: *mut CLIENT, ct: *mut CtData) -> *mut CLIENT {
+    // SAFETY: caller's contract.
     unsafe { mem_free(ct.cast()) };
+    // SAFETY: caller's contract.
     unsafe { mem_free(h.cast()) };
     core::ptr::null_mut()
 }
@@ -36,13 +46,17 @@ pub unsafe extern "C" fn clntunix_create(raddr: *mut sockaddr_un, prog: c_ulong,
     if h.is_null() || ct.is_null() {
         oom("clntunix_create");
         set_createerr(RPC_SYSTEMERROR, ENOMEM);
+        // SAFETY: NULL or our fresh blocks.
         return unsafe { fooy(h, ct) };
     }
+    // SAFETY: the C contract: `raddr` points to the server's address.
     let addr = unsafe { *raddr };
+    // SAFETY: the C contract: `sockp` points to the socket variable.
     let sock = unsafe { &mut *sockp };
     let closeit;
     if *sock < 0 {
         *sock = crate::sock::socket(AF_UNIX, SOCK_STREAM, 0);
+        // the path's length (up to its NUL, at most the array) plus the family and the NUL
         let plen = addr.sun_path.iter().position(|&c| c == 0).unwrap_or(addr.sun_path.len());
         let len = plen + 2 + 1;
         if *sock < 0 || crate::sock::connect(*sock, &addr, len as u32) < 0 {
@@ -50,6 +64,7 @@ pub unsafe extern "C" fn clntunix_create(raddr: *mut sockaddr_un, prog: c_ulong,
             if *sock != -1 {
                 sys_close(*sock);
             }
+            // SAFETY: our fresh blocks.
             return unsafe { fooy(h, ct) };
         }
         closeit = TRUE;
@@ -57,6 +72,8 @@ pub unsafe extern "C" fn clntunix_create(raddr: *mut sockaddr_un, prog: c_ulong,
         closeit = FALSE;
     }
     let sockfd = *sock;
+    // SAFETY: our fresh, suitably aligned block for one CtData, written whole (the timeout's seconds and the error are
+    // set before they are read, as in glibc, which leaves them as malloc did).
     unsafe {
         ct.write(CtData {
             ct_sock: sockfd,
@@ -70,37 +87,48 @@ pub unsafe extern "C" fn clntunix_create(raddr: *mut sockaddr_un, prog: c_ulong,
             ct_xdrs: XDR::zeroed(),
         })
     };
+    // SAFETY: our fresh blocks; `ct` is written; the callbacks are this transport's.
     if !unsafe { stream_finish(h, ct, prog, vers, sendsz, recvsz, Some(readunix), Some(writeunix), &UNIX_OPS) } {
         if closeit != 0 {
             sys_close(sockfd);
         }
+        // SAFETY: our fresh blocks.
         return unsafe { fooy(h, ct) };
     }
     h
 }
 
 unsafe extern "C" fn clntunix_call(h: *mut CLIENT, proc_: c_ulong, xdr_args: xdrproc_t, args_ptr: caddr_t, xdr_results: xdrproc_t, results_ptr: caddr_t, timeout: timeval) -> c_int {
+    // SAFETY: an operation of UNIX_OPS: `h` is a UNIX client; the routines and objects are the caller's.
     unsafe { stream_call::<sockaddr_un>(h, proc_, xdr_args, args_ptr, xdr_results, results_ptr, timeout, true) }
 }
 
 unsafe extern "C" fn clntunix_geterr(h: *mut CLIENT, errp: *mut rpc_err) {
+    // SAFETY: an operation of UNIX_OPS.
     unsafe { stream_geterr::<sockaddr_un>(h, errp) }
 }
 
 unsafe extern "C" fn clntunix_freeres(cl: *mut CLIENT, xdr_res: xdrproc_t, res_ptr: caddr_t) -> bool_t {
+    // SAFETY: an operation of UNIX_OPS.
     unsafe { stream_freeres::<sockaddr_un>(cl, xdr_res, res_ptr) }
 }
 
 unsafe extern "C" fn clntunix_abort() {}
 
 unsafe extern "C" fn clntunix_control(cl: *mut CLIENT, request: c_int, info: *mut c_char) -> bool_t {
+    // SAFETY: an operation of UNIX_OPS.
     unsafe { stream_control::<sockaddr_un>(cl, request, info, false) }
 }
 
 unsafe extern "C" fn clntunix_destroy(h: *mut CLIENT) {
+    // SAFETY: an operation of UNIX_OPS.
     unsafe { stream_destroy::<sockaddr_un>(h) }
 }
 
+// ---- credentials over the socket
+
+/// `recvmsg` into `data`, asking for the peer's credentials into `cm`. 0 on EOF or when the control data was
+/// truncated, -1 on error.
 #[inline]
 pub(crate) fn msg_read(sock: c_int, data: &mut [u8], cm: &mut [u8]) -> c_int {
     if crate::sock::setsockopt_int(sock, SOL_SOCKET, SO_PASSCRED, 1) != 0 {
@@ -121,8 +149,10 @@ pub(crate) fn msg_read(sock: c_int, data: &mut [u8], cm: &mut [u8]) -> c_int {
     }
 }
 
+/// `sendmsg` of `data` with our credentials as an `SCM_CREDENTIALS` message built in the first 32 bytes of `cm`.
 #[inline]
 pub(crate) fn msg_write(sock: c_int, data: &[u8], cm: &mut [u8]) -> c_int {
+    // struct cmsghdr { size_t len; int level; int type; } then struct ucred { pid, uid, gid }
     let (pid, uid, gid) = (getpid() as u32, geteuid(), getegid());
     let Some(h) = cm.first_chunk_mut::<28>() else { return -1 };
     h[0..8].copy_from_slice(&(16usize + 12).to_ne_bytes());
@@ -146,16 +176,21 @@ pub(crate) fn msg_write(sock: c_int, data: &[u8], cm: &mut [u8]) -> c_int {
 
 unsafe extern "C" fn readunix(ctptr: *mut c_char, buf: *mut c_char, len: c_int) -> c_int {
     let rd = |sock: c_int| {
+        // the peer's credentials are not used on the client side (glibc reads them into a static buffer)
         let mut cm = [0u8; 32];
+        // SAFETY: the record stream passes `len` writable bytes of its buffer.
         msg_read(sock, unsafe { bytes_mut(buf.cast(), len as usize) }, &mut cm)
     };
+    // SAFETY: the record stream's handle is our state.
     unsafe { stream_read::<sockaddr_un>(ctptr, len, rd) }
 }
 
 unsafe extern "C" fn writeunix(ctptr: *mut c_char, buf: *mut c_char, len: c_int) -> c_int {
     let mut cm = [0u8; 32];
     let wr = |sock: c_int, off: usize, n: usize| {
+        // SAFETY: the record stream passes `len` readable bytes; `off + n` is at most `len`.
         msg_write(sock, unsafe { bytes(buf.cast::<u8>().wrapping_add(off), n) }, &mut cm) as isize
     };
+    // SAFETY: the record stream's handle is our state.
     unsafe { stream_write::<sockaddr_un>(ctptr, len, wr) }
 }

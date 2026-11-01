@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""Generates tab_yrows.rs: Taylor rows of the entire series E(u) of y0 and y1 on 0 <= x <= 1.25.
+
+    python3 gen_yrows.py > tab_yrows.rs
+
+y0(x) = (2/pi) j0(x) ln x + E0(u),  y1(x) = -2/(pi x) + (x/2) ((2/pi) ln x K(u) + E1(u)),  u = x^2/4,
+with the coefficients E_k of `Y0_E` and `Y1_E` in tab_bessel.rs (read from that file: double-doubles,
+exact rational arithmetic here). Same layout as tab_jrows.rs: row j holds the Taylor coefficients
+g_0..g_6 at u = j/128 (g_0 and g_1 as double-doubles, the rest as doubles), |d| <= 1/256.
+"""
 import os
 import re
 from fractions import Fraction

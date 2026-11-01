@@ -3,8 +3,25 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "math.h",
     items: &[
-        Item::Guard { name: "_RLIBC_MATH_H", value: "1", end: "", items: &[
+        Item::Comment(r#"/* math.h for the Rust libc. Written by hand: feature macros, constants and the type-generic macros
+   (glibc's layout and values). The function declarations come from two generated files,
+   bits/rlibc-mathcalls.h (cbindgen, from crates/rusty-libc-math) and bits/rlibc-mathaliases.h
+   (tools/math_headers.py, for the functions the Rust sources make with macros).
+   The long double (l) functions and the _Float64x names come from bits/rlibc-mathldcalls.h
+   (tools/math_headers.py, longdouble_header); the _Float128 names and the narrowing operations come from
+   bits/rlibc-mathquadcalls.h (quad_header). Not provided: the _Float16 names. */"#),
+        Item::Guard { name: "_RLIBC_MATH_H", value: "1", end: " /* math.h */", items: &[
             Item::Blank,
+            Item::Comment(r#"/* Feature tiers, in the way glibc's features.h would set them (simplified: the tiers are tested
+   from the standard macros only).
+     __RLIBC_MATH_MISC    BSD/SysV extras (isinf, finite, drem, scalb, M_PI, ...): default mode,
+                          off in strict ISO mode unless _DEFAULT_SOURCE/_GNU_SOURCE/_XOPEN_SOURCE
+     __RLIBC_MATH_GNU     _GNU_SOURCE (sincos, M_PIl, ...)
+     __RLIBC_MATH_EXT     C23 and IEC 60559 extension functions (exp10, sinpi, fromfp, nextup,
+                          fmaximum, totalorder, ...): _GNU_SOURCE, __STDC_WANT_IEC_60559_*_EXT__,
+                          or C23 mode
+     __RLIBC_MATH_FLOATN  _Float32/_Float64/_Float32x names: _GNU_SOURCE or
+                          __STDC_WANT_IEC_60559_TYPES_EXT__ */"#),
             Item::Gate(&[
                 Branch { head: r#"if defined _GNU_SOURCE || defined _DEFAULT_SOURCE || defined _BSD_SOURCE || defined _SVID_SOURCE \
     || defined _XOPEN_SOURCE || !defined __STRICT_ANSI__"#, items: &[
@@ -52,11 +69,13 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* The functions come first (isnan, isinf and finite are functions as well as macros). */"),
             Item::Include("<bits/rlibc-mathcalls.h>"),
             Item::Include("<bits/rlibc-mathaliases.h>"),
             Item::Include("<bits/rlibc-mathldcalls.h>"),
             Item::Include("<bits/rlibc-mathquadcalls.h>"),
             Item::Blank,
+            Item::Comment("/* HUGE_VAL, INFINITY, NAN */"),
             Item::Consts(&[
                 ("HUGE_VAL", V::Txt("(__builtin_huge_val ())")),
                 ("HUGE_VALF", V::Txt("(__builtin_huge_valf ())")),
@@ -98,6 +117,7 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* Evaluation types: FLT_EVAL_METHOD is 0 with SSE on x86-64, 2 with -mfpmath=387 (glibc's bits/mathdef.h) */"),
             Item::Gate(&[
                 Branch { head: "if defined __FLT_EVAL_METHOD__ && __FLT_EVAL_METHOD__ == 2", items: &[
                     Item::Typedef("long double", "float_t"),
@@ -143,6 +163,7 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* ilogb and llogb results */"),
             Item::Consts(&[
                 ("FP_ILOGB0", V::Txt("(-2147483647 - 1)")),
                 ("FP_ILOGBNAN", V::Txt("(-2147483647 - 1)")),
@@ -156,6 +177,7 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* fpclassify results */"),
             Item::Consts(&[
                 ("FP_NAN", V::Dec(0)),
                 ("FP_INFINITE", V::Dec(1)),
@@ -164,6 +186,7 @@ pub static HDR: Header = Header {
                 ("FP_NORMAL", V::Dec(4)),
             ]),
             Item::Blank,
+            Item::Comment("/* The compiler's fused multiply-add is hardware only with -mfma; it says so */"),
             Item::Gate(&[
                 Branch { head: "ifdef __FP_FAST_FMA", items: &[
                     Item::Consts(&[
@@ -179,6 +202,7 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* Error handling: errno is set and the exception flags are raised */"),
             Item::Consts(&[
                 ("MATH_ERRNO", V::Dec(1)),
                 ("MATH_ERREXCEPT", V::Dec(2)),
@@ -196,14 +220,20 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* Classification and comparison macros (GCC builtins: inline, no library call) */"),
             Item::Raw(Reason::StdMacro, "#define signbit(x) __builtin_signbit (x)"),
+            Item::Comment("/* With -fsignaling-nans (__SUPPORT_SNAN__) the builtins would raise Invalid on a signalling NaN (GCC bug 66462): use the library functions, chosen by type */"),
             Item::Gate(&[
+                // clang: glibc uses the builtins whatever __SUPPORT_SNAN__ says (its condition: GCC 4.4 without
+                // __SUPPORT_SNAN__, or clang 2.8 / 3.7 for isinf)
                 Branch { head: "if defined __SUPPORT_SNAN__ && !defined __clang__", items: &[
                     Item::Gate(&[
                         Branch { head: "if defined __RLIBC_MATH_FLOATN && __HAVE_FLOATN_NOT_TYPEDEF", items: &[
                             Item::Raw(Reason::Generic, r#"# define __MATH_TG(x, func, args) _Generic ((x), float: func ## f args, _Float32: func ## f args, default: func args, \
                                    long double: func ## l args, _Float64x: func ## l args, _Float128: func ## f128 args)"#),
                         ] },
+                        // clang: _Float32 and _Float64x are typedefs of float and long double (bits/floatn.h), which a _Generic
+                        // may not name twice; _Float128 (__float128) is a type of its own
                         Branch { head: "elif defined __RLIBC_MATH_FLOATN", items: &[
                             Item::Raw(Reason::Generic, r#"# define __MATH_TG(x, func, args) _Generic ((x), float: func ## f args, default: func args, \
                                    long double: func ## l args, _Float128: func ## f128 args)"#),
@@ -226,6 +256,8 @@ pub static HDR: Header = Header {
                     Item::Raw(Reason::StdMacro, "# define isinf(x) __builtin_isinf_sign (x)"),
                 ] },
             ], ""),
+            // as glibc 2.43: the comparison builtins for GCC; for clang (and other compilers) glibc's generic forms, which
+            // evaluate each argument once and compare only ordered values (isunordered checks both operands first)
             Item::Gate(&[
                 Branch { head: "if __GNUC_PREREQ (3, 1) && !defined __clang__", items: &[
                     Item::Raw(Reason::StdMacro, "# define isgreater(x, y) __builtin_isgreater (x, y)"),
@@ -248,9 +280,12 @@ pub static HDR: Header = Header {
                 Branch { head: "ifdef __RLIBC_MATH_EXT", items: &[
                     Item::Raw(Reason::StdMacro, "# define iszero(x) (fpclassify (x) == FP_ZERO)"),
                     Item::Raw(Reason::StdMacro, "# define issubnormal(x) (fpclassify (x) == FP_SUBNORMAL)"),
+                    Item::Comment("/* float, double and _Float128 values are always canonical; a long double has the x87 forms that are not */"),
                     Item::Raw(Reason::Generic, "# define iscanonical(x) _Generic ((x), long double: __iscanonicall (x), default: 1)"),
                     Item::Gate(&[
                         Branch { head: "if defined __RLIBC_MATH_FLOATN && __HAVE_FLOATN_NOT_TYPEDEF", items: &[
+                            Item::Comment(r#"/* the _FloatN types are distinct types for _Generic: _Float32 is float's format, _Float64 and _Float32x are double's, _Float64x
+   is long double's, _Float128 has its own functions */"#),
                             Item::Raw(Reason::Generic, r#"#  define issignaling(x) _Generic ((x), float: __issignalingf, double: __issignaling, long double: __issignalingl, \
                                    _Float32: __issignalingf, _Float64: __issignaling, _Float32x: __issignaling, \
                                    _Float64x: __issignalingl, _Float128: __issignalingf128) (x)"#),
@@ -259,6 +294,7 @@ pub static HDR: Header = Header {
                                   _Float64x: __iseqsigl, _Float128: __iseqsigf128) ((x), (y))"#),
                         ] },
                         Branch { head: "elif defined __RLIBC_MATH_FLOATN", items: &[
+                            Item::Comment("/* clang: only _Float128 is a type of its own (the other _FloatN names are typedefs, bits/floatn.h) */"),
                             Item::Raw(Reason::Generic, r#"#  define issignaling(x) _Generic ((x), float: __issignalingf, double: __issignaling, long double: __issignalingl, \
                                    _Float128: __issignalingf128) (x)"#),
                             Item::Raw(Reason::Generic, r#"#  define iseqsig(x, y) _Generic ((x) + (y), float: __iseqsigf, double: __iseqsig, long double: __iseqsigl, \
@@ -272,22 +308,23 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* Constants (long double and _FloatN forms: GNU) */"),
             Item::Gate(&[
                 Branch { head: "if defined __RLIBC_MATH_MISC || defined _XOPEN_SOURCE", items: &[
                     Item::Consts(&[
-                        ("M_E", V::Txt("2.7182818284590452354")),
-                        ("M_LOG2E", V::Txt("1.4426950408889634074")),
-                        ("M_LOG10E", V::Txt("0.43429448190325182765")),
-                        ("M_LN2", V::Txt("0.69314718055994530942")),
-                        ("M_LN10", V::Txt("2.30258509299404568402")),
-                        ("M_PI", V::Txt("3.14159265358979323846")),
-                        ("M_PI_2", V::Txt("1.57079632679489661923")),
-                        ("M_PI_4", V::Txt("0.78539816339744830962")),
-                        ("M_1_PI", V::Txt("0.31830988618379067154")),
-                        ("M_2_PI", V::Txt("0.63661977236758134308")),
-                        ("M_2_SQRTPI", V::Txt("1.12837916709551257390")),
-                        ("M_SQRT2", V::Txt("1.41421356237309504880")),
-                        ("M_SQRT1_2", V::Txt("0.70710678118654752440")),
+                        ("M_E", V::Txt("2.7182818284590452354 /* e */")),
+                        ("M_LOG2E", V::Txt("1.4426950408889634074 /* log_2 e */")),
+                        ("M_LOG10E", V::Txt("0.43429448190325182765 /* log_10 e */")),
+                        ("M_LN2", V::Txt("0.69314718055994530942 /* log_e 2 */")),
+                        ("M_LN10", V::Txt("2.30258509299404568402 /* log_e 10 */")),
+                        ("M_PI", V::Txt("3.14159265358979323846 /* pi */")),
+                        ("M_PI_2", V::Txt("1.57079632679489661923 /* pi/2 */")),
+                        ("M_PI_4", V::Txt("0.78539816339744830962 /* pi/4 */")),
+                        ("M_1_PI", V::Txt("0.31830988618379067154 /* 1/pi */")),
+                        ("M_2_PI", V::Txt("0.63661977236758134308 /* 2/pi */")),
+                        ("M_2_SQRTPI", V::Txt("1.12837916709551257390 /* 2/sqrt(pi) */")),
+                        ("M_SQRT2", V::Txt("1.41421356237309504880 /* sqrt(2) */")),
+                        ("M_SQRT1_2", V::Txt("0.70710678118654752440 /* 1/sqrt(2) */")),
                         ("MAXFLOAT", V::Txt("3.40282347e+38F")),
                     ]),
                 ] },

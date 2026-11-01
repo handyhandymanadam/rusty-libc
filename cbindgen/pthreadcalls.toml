@@ -4,6 +4,8 @@ include_guard = "_RLIBC_PTHREADCALLS_H"
 usize_is_size_t = true
 no_includes = true
 sys_includes = ["stddef.h"]
+# Included by tools/hdrgen/src/hdr/pthread.h, which has the types, constants and macros by hand; only
+# the function declarations are generated here.
 [export]
 item_types = ["functions"]
 exclude = ["rl_syscall_cancel_arch", "rl_clone", "rl_clone3", "rl_sigreturn", "rl_cancel_start", "rl_cancel_end", "pthread_sigqueue", "__pthread_cleanup_routine"]

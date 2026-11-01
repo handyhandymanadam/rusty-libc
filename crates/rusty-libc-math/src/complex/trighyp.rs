@@ -1,8 +1,16 @@
+//! csin, ccos, ctan, csinh, ccosh, ctanh.
+//!
+//! Derived from glibc 2.43 `math/s_csin_template.c`, `s_ccos_template.c`, `s_ctan_template.c`,
+//! `s_csinh_template.c`, `s_ccosh_template.c`, `s_ctanh_template.c` (LGPL-2.1-or-later): case
+//! structure, special values and overflow scaling (exp(t) with t = (MAX_EXP-1) ln 2, applied up to
+//! three times).
 use super::cfp::*;
 use super::explog::{sincos_small, tmax};
 
 type P<F> = (W<F>, W<F>);
 
+/// Scale `exp(|v|) * (a, b) / 2` for |v| > t without intermediate overflow, as glibc does. Returns
+/// the pair of products, or `MAX * (a, b)` when the true result overflows.
 fn big_exp_mul<F: CF>(v: W<F>, mut a: W<F>, mut b: W<F>, tt: W<F>, halve: bool) -> P<F> {
     let exp_t = tt.exp();
     let mut r = v.abs() - tt;
@@ -211,6 +219,7 @@ pub fn ctan<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
         let (sinrx, cosrx) = sincos_small(xr);
         let (re, im);
         if xi.abs() > tt {
+            // imaginary part +-1, real part 4 sin(x) cos(x) / exp(2y)
             let exp_2t = W::<F>::k(2.0 * t).exp();
             let i = one.copysign(xi);
             let mut r = W::<F>::k(4.0) * sinrx * cosrx;

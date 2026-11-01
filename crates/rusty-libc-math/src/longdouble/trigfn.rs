@@ -1,3 +1,5 @@
+//! sinl, cosl, tanl, sincosl, asinl, acosl, atanl, atan2l, sinhl, coshl, tanhl, asinhl, acoshl,
+//! atanhl and the pi forms sinpil, cospil, tanpil, asinpil, acospil, atanpil, atan2pil.
 use super::common::*;
 use super::consts::*;
 use super::ext::*;
@@ -11,6 +13,7 @@ fn fin(x: &Ext, ex: Exact) -> F80 {
     r
 }
 
+/// Result of an odd function that overflows or underflows: ERANGE only for overflow or a zero.
 pub fn sinl_impl(x: F80) -> F80 {
     if let Some(r) = super::fast::sinl(x) {
         return r;
@@ -53,6 +56,8 @@ pub fn sincosl_impl(x: F80) -> (F80, F80) {
     }
     let e = Ext::from_f80(x);
     let (s, c) = sincos_ext(e);
+    // sin x and cos x of a nonzero x are never exactly representable (a tiny x gives x and 1 with "inexact", as the fast
+    // path and sinl, cosl do); only cos 0 = 1 is exact
     let sr = if s.is_zero_() { x } else { finish(&s, Exact::Less) };
     let cr = finish(&c, if x.is_zero_() { Exact::Yes } else { Exact::Less });
     (sr, cr)
@@ -118,6 +123,7 @@ pub fn acosl_impl(x: F80) -> F80 {
     let e = Ext::from_f80(x);
     if e.is_inf() || e.cmp_abs(&Ext::ONE) == core::cmp::Ordering::Greater {
         if crate::SVID {
+            // the SVID wrapper of glibc's shared libm: invalid only (no overflow of x*x), positive NaN
             return domain_svid();
         }
         edom();
@@ -129,12 +135,15 @@ pub fn acosl_impl(x: F80) -> F80 {
     finish(&acos_ext(e), Exact::Never)
 }
 
+/// atan2 special cases (C Annex F), None for the regular case. `scale` multiplies the angle in
+/// the special cases that give a multiple of pi (the pi form passes 1/pi).
 fn atan2_special(y: F80, x: F80, pi_form: bool) -> Option<F80> {
     if x.is_nan_() || y.is_nan_() {
         return Some(nan2(y, x));
     }
     let (yn, xn) = (is_neg(y), is_neg(x));
     let ang = |num: u64, den: u64| -> F80 {
+        // num/den of pi (or of 1 for the pi form) with the sign of y
         let v = Ext::from_u64(num).div_u64(den);
         let r = if pi_form { v } else { v.mul(PI) };
         finish(&r, Exact::IfClose).with_sign_f(yn)
@@ -229,6 +238,8 @@ pub fn acospil_impl(x: F80) -> F80 {
     }
     fin(&acos_ext(e).mul(INV_PI), Exact::IfClose)
 }
+
+// ---- hyperbolic ----
 
 pub fn sinhl_impl(x: F80) -> F80 {
     if let Some(r) = super::fast::sinhl(x) {
@@ -330,6 +341,8 @@ pub fn atanhl_impl(x: F80) -> F80 {
     finish(&atanh_ext(e), Exact::Never)
 }
 
+// ---- pi forms of sin, cos, tan ----
+
 pub fn sinpil_impl(x: F80) -> F80 {
     if x.is_nan_() {
         return nan1(x);
@@ -351,6 +364,7 @@ pub fn sinpil_impl(x: F80) -> F80 {
 
 pub fn cospil_impl(x: F80) -> F80 {
     if x.is_nan_() {
+        // glibc computes -cos(pi * (1 - |x - 2 round(x/2)|)): a negative quiet NaN with x's payload
         return with_sign(nan1(x), true);
     }
     if is_inf(x) {
@@ -379,12 +393,59 @@ pub fn tanpil_impl(x: F80) -> F80 {
     if let Some(n) = half_integer(e) {
         return match n {
             0 => zero(is_neg(x)),
+            // odd integers: -0 for positive x and +0 for negative x (glibc's convention)
             2 => zero(!is_neg(x)),
             _ => pole(n == 3),
         };
     }
     let (s, c) = sincospi_ext(e);
     finish(&s.div(c), Exact::More)
+}
+
+/// The `Ext` computations without the fast paths (the reference of the fast-path tests).
+#[cfg(test)]
+pub(crate) mod slow {
+    use super::*;
+    pub fn asinhl(x: F80) -> F80 {
+        finish(&asinh_ext(Ext::from_f80(x)), Exact::Less)
+    }
+    pub fn acoshl(x: F80) -> F80 {
+        finish(&acosh_ext(Ext::from_f80(x)), Exact::Never)
+    }
+    pub fn atanhl(x: F80) -> F80 {
+        finish(&atanh_ext(Ext::from_f80(x)), Exact::Never)
+    }
+    pub fn sinhl(x: F80) -> F80 {
+        fin(&sinh_ext(Ext::from_f80(x)), Exact::Never)
+    }
+    pub fn coshl(x: F80) -> F80 {
+        fin(&cosh_ext(Ext::from_f80(x)), Exact::Never)
+    }
+    pub fn tanhl(x: F80) -> F80 {
+        finish(&tanh_ext(Ext::from_f80(x)), Exact::Less)
+    }
+    pub fn sinl(x: F80) -> F80 {
+        finish(&sincos_ext(Ext::from_f80(x)).0, Exact::Less)
+    }
+    pub fn cosl(x: F80) -> F80 {
+        finish(&sincos_ext(Ext::from_f80(x)).1, Exact::Less)
+    }
+    pub fn tanl(x: F80) -> F80 {
+        let (s, c) = sincos_ext(Ext::from_f80(x));
+        finish(&s.div(c), Exact::More)
+    }
+    pub fn atanl(x: F80) -> F80 {
+        finish(&atan_ext(Ext::from_f80(x)), Exact::Less)
+    }
+    pub fn asinl(x: F80) -> F80 {
+        finish(&asin_ext(Ext::from_f80(x)), Exact::Never)
+    }
+    pub fn acosl(x: F80) -> F80 {
+        finish(&acos_ext(Ext::from_f80(x)), Exact::Never)
+    }
+    pub fn atan2l(y: F80, x: F80) -> F80 {
+        fin(&atan2_ext(Ext::from_f80(y), Ext::from_f80(x)), Exact::Less)
+    }
 }
 
 ld_unary_fast!(sinl, super::sinl_impl, crate::longdouble::fast::sinl);

@@ -32,7 +32,9 @@ pub static HDR: Header = Header {
  *   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */"#),
-        Item::Guard { name: "_RPC_SVC_H", value: "1", end: "", items: &[
+        Item::Comment(r#"/* Structure layouts and constants follow Sun's RPC headers (as in glibc's sunrpc/rpc/);
+   the function prototypes are generated from the Rust sources (bits/rlibc-rpc-*.h). */"#),
+        Item::Guard { name: "_RPC_SVC_H", value: "1", end: " /* rpc/svc.h */", items: &[
             Item::Blank,
             Item::Include("<sys/select.h>"),
             Item::Include("<poll.h>"),
@@ -41,7 +43,7 @@ pub static HDR: Header = Header {
             Item::Block { head: "enum xprt_stat ", body: &["", r#"	XPRT_DIED,"#, r#"	XPRT_MOREREQS,"#, r#"	XPRT_IDLE"#, ""], tail: "" },
             Item::Blank,
             Item::Typedef("struct SVCXPRT", "SVCXPRT"),
-            Item::Block { head: "struct SVCXPRT ", body: &["", "  int xp_sock;", r#"  u_short xp_port;"#, "  const struct xp_ops {", r#"    bool_t	(*xp_recv) (SVCXPRT *__xprt, struct rpc_msg *__msg);"#, "    enum xprt_stat (*xp_stat) (SVCXPRT *__xprt);", r#"    bool_t	(*xp_getargs) (SVCXPRT *__xprt, xdrproc_t __xdr_args,"#, r#"			       caddr_t __args_ptr);"#, r#"    bool_t	(*xp_reply) (SVCXPRT *__xprt, struct rpc_msg *__msg);"#, r#"    bool_t	(*xp_freeargs) (SVCXPRT *__xprt, xdrproc_t __xdr_args,"#, r#"				caddr_t __args_ptr);"#, r#"    void	(*xp_destroy) (SVCXPRT *__xprt);"#, "  } *xp_ops;", r#"  int		xp_addrlen;"#, r#"  struct sockaddr_in xp_raddr;"#, r#"  struct opaque_auth xp_verf;"#, r#"  caddr_t		xp_p1;"#, r#"  caddr_t		xp_p2;"#, r#"  char		xp_pad [256];"#, ""], tail: "" },
+            Item::Block { head: "struct SVCXPRT ", body: &["", "  int xp_sock;", r#"  u_short xp_port;		 /* associated port number */"#, "  const struct xp_ops {", r#"    bool_t	(*xp_recv) (SVCXPRT *__xprt, struct rpc_msg *__msg);"#, "    enum xprt_stat (*xp_stat) (SVCXPRT *__xprt);", r#"    bool_t	(*xp_getargs) (SVCXPRT *__xprt, xdrproc_t __xdr_args,"#, r#"			       caddr_t __args_ptr);"#, r#"    bool_t	(*xp_reply) (SVCXPRT *__xprt, struct rpc_msg *__msg);"#, r#"    bool_t	(*xp_freeargs) (SVCXPRT *__xprt, xdrproc_t __xdr_args,"#, r#"				caddr_t __args_ptr);"#, r#"    void	(*xp_destroy) (SVCXPRT *__xprt);"#, "  } *xp_ops;", r#"  int		xp_addrlen;	 /* length of remote address */"#, r#"  struct sockaddr_in xp_raddr;	 /* remote address */"#, r#"  struct opaque_auth xp_verf;	 /* raw response verifier */"#, r#"  caddr_t		xp_p1;		 /* private */"#, r#"  caddr_t		xp_p2;		 /* private */"#, r#"  char		xp_pad [256];	/* padding, internal use */"#, ""], tail: "" },
             Item::Blank,
             Item::Raw(Reason::GlibcMacro, "#define svc_getcaller(x) (&(x)->xp_raddr)"),
             Item::Blank,
@@ -58,7 +60,7 @@ pub static HDR: Header = Header {
             Item::Raw(Reason::GlibcMacro, r#"#define SVC_DESTROY(xprt)	(*(xprt)->xp_ops->xp_destroy)(xprt)"#),
             Item::Raw(Reason::GlibcMacro, r#"#define svc_destroy(xprt)	(*(xprt)->xp_ops->xp_destroy)(xprt)"#),
             Item::Blank,
-            Item::Block { head: "struct svc_req ", body: &["", "  rpcprog_t rq_prog;", "  rpcvers_t rq_vers;", "  rpcproc_t rq_proc;", "  struct opaque_auth rq_cred;", "  caddr_t rq_clntcred;", "  SVCXPRT *rq_xprt;", ""], tail: "" },
+            Item::Block { head: "struct svc_req ", body: &["", "  rpcprog_t rq_prog;            /* service program number */", "  rpcvers_t rq_vers;            /* service protocol version */", "  rpcproc_t rq_proc;            /* the desired procedure */", "  struct opaque_auth rq_cred;   /* raw creds from the wire */", "  caddr_t rq_clntcred;          /* read only cooked cred */", "  SVCXPRT *rq_xprt;             /* associated transport */", ""], tail: "" },
             Item::Blank,
             Item::Gate(&[
                 Branch { head: "ifndef __DISPATCH_FN_T", items: &[
@@ -77,7 +79,7 @@ pub static HDR: Header = Header {
             Item::Decl("extern int svc_max_pollfd;"),
             Item::Decl("extern fd_set svc_fdset;"),
             Item::Consts(&[
-                ("svc_fds", V::Txt(r#"svc_fdset.fds_bits[0]"#)),
+                ("svc_fds", V::Txt(r#"svc_fdset.fds_bits[0]	/* compatibility */"#)),
             ]),
             Item::Blank,
         ]},

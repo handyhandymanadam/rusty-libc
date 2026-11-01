@@ -25,6 +25,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
     Item::Blank,
     Item::Block { head: "struct group ", body: &["", "  char *gr_name;", "  char *gr_passwd;", "  gid_t gr_gid;", "  char **gr_mem;", ""], tail: "" },
     Item::Blank,
+    Item::Comment("/* setgroups lives in rusty-libc-sys; glibc declares it here. */"),
     Item::Decl("int setgroups(size_t __n, const gid_t *__groups);"),
 ];
 pub const AFTER_INCLUDES_CHOMP: bool = false;

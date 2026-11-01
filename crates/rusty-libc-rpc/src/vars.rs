@@ -1,3 +1,11 @@
+//! Per-thread RPC variables (glibc's `struct rpc_thread_variables`), small system-call helpers, the
+//! transaction id generator, text output to stderr and a growable C string.
+//!
+//! glibc keeps the state of the RPC layer per thread: the first thread that touches it uses the
+//! global variables `svc_fdset`, `rpc_createerr`, `svc_pollfd` and `svc_max_pollfd` (the compatibility
+//! data symbols) and a static block for the rest, every other thread gets a calloc'ed block. Done the
+//! same here. (glibc frees a thread's block when the thread exits; this runtime does not, so a
+//! thread that used the RPC layer leaks its block.)
 use crate::types::*;
 use core::cell::Cell;
 use core::ffi::{c_char, c_int, c_long, c_void};
@@ -20,20 +28,32 @@ pub const ENAMETOOLONG: c_int = 36;
 pub const EPROTOTYPE: c_int = 91;
 pub const ENOSYS: c_int = 38;
 
+/// Memory for values the caller frees with `free` (glibc's `mem_alloc`).
+/// `free(p)`.
+///
+/// # Safety
+/// `p` is NULL or a live block from this allocator, not used afterwards.
 #[inline]
 pub unsafe fn mem_free(p: *mut c_void) {
+    // SAFETY: caller's contract.
     unsafe { rusty_libc_malloc::free(p) }
 }
 
+/// `malloc(n)`: safe to call (malloc has no preconditions); the result is NULL or `n` fresh bytes.
 #[inline]
 pub fn alloc(n: usize) -> *mut c_void {
+    // SAFETY: malloc accepts any size.
     unsafe { rusty_libc_malloc::malloc(n) }
 }
 
+/// `calloc(n, size)`: safe to call; the result is NULL or `n * size` zeroed bytes.
 #[inline]
 pub fn alloc_zeroed(n: usize, size: usize) -> *mut c_void {
+    // SAFETY: calloc accepts any sizes (it checks the product for overflow).
     unsafe { rusty_libc_malloc::calloc(n, size) }
 }
+
+// ---- the per-thread block
 
 pub struct RpcVars {
     pub clnt_perr_buf: *mut c_char,
@@ -53,12 +73,17 @@ pub struct RpcVars {
     pub svc_max_pollfd_s: c_int,
 }
 
+/// The static block of the first thread that uses the RPC layer (glibc's `__libc_tsd_RPC_VARS_mem`).
 static MEM: SyncCell<core::mem::MaybeUninit<RpcVars>> = SyncCell::new(core::mem::MaybeUninit::zeroed());
 static MEM_TAKEN: AtomicBool = AtomicBool::new(false);
 
+/// This thread's block (NULL until the thread first uses the RPC layer). Thread-local, so a `Cell` needs no locking.
 #[thread_local]
 static TVP: Cell<*mut RpcVars> = Cell::new(core::ptr::null_mut());
 
+// The compatibility data symbols: the main block's `svc_fdset`, `rpc_createerr`, `svc_pollfd`, `svc_max_pollfd`, and
+// `_null_auth`. C programs read and write them directly (a SyncCell has the layout of its value), so the rule for each is
+// the C one: the first thread's RPC state, touched by that thread only (`_null_auth`: never written by the library).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub static svc_fdset: SyncCell<fd_set> = SyncCell::new(fd_set::ZERO);
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
@@ -70,8 +95,11 @@ pub static svc_max_pollfd: SyncCell<c_int> = SyncCell::new(0);
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub static _null_auth: SyncCell<opaque_auth> = SyncCell::new(opaque_auth::null());
 
+/// `_null_auth`, the empty authentication (a copy).
 #[inline]
 pub fn null_auth() -> opaque_auth {
+    // SAFETY: the library never writes `_null_auth`; a C program that writes it while another thread reads it races in
+    // glibc as well.
     unsafe { _null_auth.read() }
 }
 
@@ -80,6 +108,10 @@ fn mem_ptr() -> *mut RpcVars {
     MEM.as_ptr().cast()
 }
 
+/// `__rpc_thread_variables`: this thread's block, set up on first use. Getting the pointer is safe; the accessors below
+/// read and write its fields by value (no reference to the block is ever made, so callbacks that re-enter the RPC layer
+/// cannot alias one). The block belongs to this thread (the static one to the first thread; if calloc fails a thread
+/// shares the static block, as in glibc).
 pub fn tv() -> *mut RpcVars {
     let mut tvp = TVP.get();
     if tvp.is_null() {
@@ -91,6 +123,7 @@ pub fn tv() -> *mut RpcVars {
         if tvp.is_null() {
             tvp = alloc_zeroed(1, core::mem::size_of::<RpcVars>()) as *mut RpcVars;
             if tvp.is_null() {
+                // out of memory: share the main block rather than crash
                 tvp = mem_ptr();
             } else {
                 TVP.set(tvp);
@@ -107,11 +140,13 @@ macro_rules! tv_field {
             #[inline]
             pub fn $get() -> $t {
                 let p = tv();
+                // SAFETY: `p` is this thread's block (see `tv`); a copy of one field.
                 unsafe { (*p).$f }
             }
             #[inline]
             pub fn $set(v: $t) {
                 let p = tv();
+                // SAFETY: `p` is this thread's block (see `tv`); one field is overwritten, no reference is kept.
                 unsafe { (*p).$f = v }
             }
         )*
@@ -132,10 +167,13 @@ tv_field! {
     key_call_private: *mut c_void => tv_key_call_private, set_tv_key_call_private;
 }
 
+/// What glibc's `__rpc_thread_destroy` does when a thread exits: unregister its services, close its
+/// clients, free its block. (The main thread does not run it at exit, as in glibc.)
 unsafe extern "C" fn thread_exit(_arg: *mut c_void) {
     crate::pmap::thread_destroy();
     let tvp = TVP.get();
     if !tvp.is_null() && tvp != mem_ptr() {
+        // SAFETY: a block of our own from calloc (not the static one).
         unsafe { rusty_libc_malloc::free(tvp.cast()) };
     }
     TVP.set(core::ptr::null_mut());
@@ -150,62 +188,80 @@ fn register_exit_cleanup() {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn __rpc_thread_svc_fdset() -> *mut fd_set {
     let tvp = tv();
+    // SAFETY: `tvp` is a live block (see `tv`); only the field's address is taken.
     if tvp == mem_ptr() { svc_fdset.as_ptr() } else { unsafe { &raw mut (*tvp).svc_fdset_s } }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn __rpc_thread_createerr() -> *mut rpc_createerr {
     let tvp = tv();
+    // SAFETY: `tvp` is a live block (see `tv`); only the field's address is taken.
     if tvp == mem_ptr() { rpc_createerr.as_ptr() } else { unsafe { &raw mut (*tvp).rpc_createerr_s } }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn __rpc_thread_svc_pollfd() -> *mut *mut pollfd {
     let tvp = tv();
+    // SAFETY: `tvp` is a live block (see `tv`); only the field's address is taken.
     if tvp == mem_ptr() { svc_pollfd.as_ptr() } else { unsafe { &raw mut (*tvp).svc_pollfd_s } }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn __rpc_thread_svc_max_pollfd() -> *mut c_int {
     let tvp = tv();
+    // SAFETY: `tvp` is a live block (see `tv`); only the field's address is taken.
     if tvp == mem_ptr() { svc_max_pollfd.as_ptr() } else { unsafe { &raw mut (*tvp).svc_max_pollfd_s } }
 }
 
+/// This thread's `rpc_createerr` (a copy).
 #[inline]
 pub fn get_createerr() -> rpc_createerr {
     let p = __rpc_thread_createerr();
+    // SAFETY: this thread's own structure (see `tv`); a copy.
     unsafe { *p }
 }
 
+/// Set this thread's `rpc_createerr.cf_stat` only (glibc leaves `cf_error` alone in some paths).
 #[inline]
 pub fn set_createerr_stat(stat: c_int) {
     let p = __rpc_thread_createerr();
+    // SAFETY: this thread's own structure (see `tv`); one field is written, no reference kept.
     unsafe { (*p).cf_stat = stat };
 }
 
+/// Set this thread's `rpc_createerr` status and errno.
 #[inline]
 pub fn set_createerr(stat: c_int, errno_val: c_int) {
     let p = __rpc_thread_createerr();
+    // SAFETY: this thread's own structure (see `tv`); a copy is changed and written back.
     let mut ce = unsafe { *p };
     ce.cf_stat = stat;
     ce.cf_error.ru.RE_errno = errno_val;
+    // SAFETY: as above.
     unsafe { *p = ce };
 }
 
+/// Set this thread's whole `rpc_createerr`.
 #[inline]
 pub fn set_createerr_full(stat: c_int, err: rpc_err) {
     let p = __rpc_thread_createerr();
+    // SAFETY: this thread's own structure (see `tv`); written by value.
     unsafe { *p = rpc_createerr { cf_stat: stat, cf_error: err } };
 }
 
+/// Set this thread's `rpc_createerr` error code (`cf_error.re_status`) only.
 #[inline]
 pub fn set_createerr_error_status(status: c_int) {
     let p = __rpc_thread_createerr();
+    // SAFETY: this thread's own structure (see `tv`); one field is written, no reference kept.
     unsafe { (*p).cf_error.re_status = status };
 }
 
+// ---- file descriptor table size
+
 static DTABLE: AtomicI32 = AtomicI32::new(0);
 
+/// `_rpc_dtablesize`: the descriptor table size, read once.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn _rpc_dtablesize() -> c_int {
     let mut s = DTABLE.load(Ordering::Relaxed);
@@ -216,6 +272,9 @@ pub extern "C" fn _rpc_dtablesize() -> c_int {
     s
 }
 
+// ---- transaction ids
+
+/// The transaction id generator: the pid it was seeded for and the drand48 state, under one lock.
 struct XidState {
     pid: i32,
     rand: rusty_libc_stdlib::rand::Drand48Data,
@@ -223,28 +282,35 @@ struct XidState {
 
 static XID: Locked<XidState> = Locked::new(XidState { pid: 0, rand: rusty_libc_stdlib::rand::Drand48Data { x: [0; 3], old_x: [0; 3], c: 0, init: 0, a: 0 } });
 
+/// `_create_xid`: a pseudo random 31-bit number, seeded from the clock and the pid (again after a fork).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn _create_xid() -> c_ulong_t {
     XID.with(|st| {
         let pid = rusty_libc_sys::unistd::getpid();
         if st.pid != pid {
             let (_, now) = gettime(0);
+            // SAFETY: a valid drand48 state of our own.
             unsafe { rusty_libc_stdlib::rand::srand48_r(now.tv_sec ^ now.tv_nsec ^ pid as i64, &mut st.rand) };
             st.pid = pid;
         }
         let mut res: c_long = 0;
+        // SAFETY: a valid drand48 state of our own and a result variable.
         unsafe { rusty_libc_stdlib::rand::lrand48_r(&mut st.rand, &mut res) };
         res as c_ulong_t
     })
 }
 
+/// `clock_gettime(clock, &ts)` (errno set on failure, as the C call does): the result and the time.
 pub fn gettime(clock: c_int) -> (c_int, rusty_libc_time::clock::Timespec) {
     let mut ts = rusty_libc_time::clock::Timespec::default();
+    // SAFETY: a valid out pointer to a local.
     let r = unsafe { rusty_libc_time::clock::clock_gettime(clock, &mut ts) };
     (r, ts)
 }
 
 pub type c_ulong_t = core::ffi::c_ulong;
+
+// ---- clocks and deadlines (glibc's inet/deadline.c)
 
 #[derive(Clone, Copy)]
 pub struct Deadline {
@@ -338,6 +404,8 @@ pub fn deadline_first(a: Deadline, b: Deadline) -> Deadline {
     if a.sec < b.sec || (a.sec == b.sec && a.nsec < b.nsec) { a } else { b }
 }
 
+// ---- system helpers (cancellation points like glibc's)
+
 #[inline]
 pub fn sc_isize(ret: usize) -> isize {
     if ret > usize::MAX - 4095 {
@@ -348,11 +416,15 @@ pub fn sc_isize(ret: usize) -> isize {
     }
 }
 
+/// write(2) as a cancellation point.
 pub fn write_fd(fd: c_int, buf: &[u8]) -> isize {
+    // SAFETY: write reads `buf.len()` bytes at `buf`.
     sc_isize(unsafe { rusty_libc_core::tls::syscall_cp(1, fd as usize, buf.as_ptr() as usize, buf.len(), 0, 0, 0) })
 }
 
+/// read(2) (a cancellation point, through the sys crate).
 pub fn read_fd(fd: c_int, buf: &mut [u8]) -> isize {
+    // SAFETY: read writes at most `buf.len()` bytes at `buf`.
     unsafe { rusty_libc_sys::unistd::read(fd, buf.as_mut_ptr().cast(), buf.len()) }
 }
 
@@ -360,7 +432,9 @@ pub fn sys_close(fd: c_int) -> c_int {
     rusty_libc_sys::unistd::close(fd)
 }
 
+/// poll(2) on the descriptors of `fds`.
 pub fn poll_fds(fds: &mut [pollfd], ms: c_int) -> c_int {
+    // SAFETY: poll reads and writes the `fds.len()` entries at `fds` (`pollfd` has the C layout).
     unsafe { rusty_libc_sys::poll::poll(fds.as_mut_ptr().cast(), fds.len() as core::ffi::c_ulong, ms) }
 }
 
@@ -402,11 +476,17 @@ pub fn ntohl(x: u32) -> u32 {
 
 pub use rusty_libc_core::ffi::cstr_len as strlen;
 
+// ---- text output
+
+/// Write text to standard error through the stdio layer (glibc's `__fxprintf (NULL, ...)`).
 pub fn eprint(text: &[u8]) {
+    // (the stdio layer's own stderr stream, always set up)
     let e = rusty_libc_stdio::file::stderr_ptr();
+    // SAFETY: a live FILE (no lock, as before).
     rusty_libc_stdio::file::write_bytes(unsafe { rusty_libc_stdio::file::stream(e) }, text);
 }
 
+/// "<func>: out of memory\n" on standard error.
 pub fn oom(func: &str) {
     let mut b = StackBuf::<128>::new();
     b.push(func.as_bytes());
@@ -414,11 +494,14 @@ pub fn oom(func: &str) {
     eprint(b.as_bytes());
 }
 
+/// `perror (msg)` with the current errno.
 pub fn perror_msg(msg: &str) {
     let mut b = StackBuf::<256>::new();
     b.push(msg.as_bytes());
     b.push(&[0]);
+    // the NUL may have been cut off by a message longer than the buffer: end it there
     b.buf[255] = 0;
+    // SAFETY: a NUL-terminated string.
     unsafe { rusty_libc_stdio::file_api::perror(b.buf.as_ptr().cast()) };
 }
 
@@ -454,6 +537,7 @@ impl<const N: usize> core::fmt::Write for StackBuf<N> {
     }
 }
 
+/// A growable, NUL-terminated string in `malloc` memory.
 pub struct CBuf {
     ptr: *mut u8,
     len: usize,
@@ -472,6 +556,7 @@ impl CBuf {
         let need = self.len + s.len() + 1;
         if need > self.cap {
             let ncap = need.max(self.cap * 2).max(64);
+            // SAFETY: `ptr` is NULL or our own block from realloc.
             let np = unsafe { rusty_libc_malloc::realloc(self.ptr.cast(), ncap) } as *mut u8;
             if np.is_null() {
                 self.failed = true;
@@ -480,19 +565,24 @@ impl CBuf {
             self.ptr = np;
             self.cap = ncap;
         }
+        // SAFETY: our block of `cap` >= `len + s.len() + 1` bytes.
         let buf = unsafe { rusty_libc_core::ffi::bytes_mut(self.ptr, self.cap) };
         buf[self.len..self.len + s.len()].copy_from_slice(s);
         self.len += s.len();
         buf[self.len] = 0;
     }
+    /// The finished C string, or NULL when memory ran out.
     pub fn finish(self) -> *mut c_char {
         if self.failed {
+            // SAFETY: NULL or our own block.
             unsafe { rusty_libc_malloc::free(self.ptr.cast()) };
             return core::ptr::null_mut();
         }
         if self.ptr.is_null() {
+            // empty string
             let p = alloc(1) as *mut u8;
             if !p.is_null() {
+                // SAFETY: a fresh 1-byte block.
                 unsafe { *p = 0 };
             }
             return p.cast();
@@ -514,7 +604,9 @@ impl core::fmt::Write for CBuf {
     }
 }
 
+/// The text of an errno value (glibc's `__strerror_r`, translated).
 pub fn strerror_into(code: c_int, out: &mut CBuf) {
+    // rusty-libc-core's one copy of the texts (a direct use of the ERRLIST constant would add a private table with load-time relocations)
     if let Some(m) = rusty_libc_core::messages::error_message_tr(code) {
         out.push(m.to_bytes());
         return;
@@ -523,4 +615,5 @@ pub fn strerror_into(code: c_int, out: &mut CBuf) {
     let _ = write!(out, "{}{}", core::str::from_utf8(rusty_libc_core::i18n::tr(c"Unknown error ").to_bytes()).unwrap_or("Unknown error "), code);
 }
 
+/// A NUL-terminated string as a slice, without the NUL.
 pub use rusty_libc_core::ffi::cstr_bytes as cstr;

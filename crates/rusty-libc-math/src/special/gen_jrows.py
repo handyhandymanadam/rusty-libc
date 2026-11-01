@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
+"""Generates tab_jrows.rs: Taylor rows of (2/pi) times the entire functions behind j0 and j1 on
+0 <= x <= 1.25 (for y0 and y1: the factor of their logarithm term), and the power series of j0 and j1 in w = x^2 (JS0_C, JS1_C: m <= 11 and m <= 10, the first term
+left out is below 2^-68 of the value at x = 1.25).
+
+    python3 gen_jrows.py > tab_jrows.rs
+
+With u = x^2/4:  j0(x) = J(u) = sum (-1)^m u^m / (m!)^2   and   j1(x) = (x/2) K(u),
+K(u) = sum (-1)^m u^m / (m! (m+1)!).  Row j holds the Taylor coefficients g_0..g_6 of (2/pi) J (or K) at
+u = j/128 (g_0 and g_1 as double-doubles, the rest as doubles): value(u) = g_0 + g_1 d + g_2 d^2 + ...,
+d = u - j/128, |d| <= 1/256 (the truncation after d^6 is below 2^-79). Exact rational
+arithmetic (2/pi from MPFR at 600 bits, mp.py); nothing is copied from another library.
+"""
 from fractions import Fraction
 
 import mp
 from math import comb, factorial
 
-ROWS = 51
+ROWS = 51  # u up to 1.25^2 / 4 = 0.390625 -> j = 0..=50
 M = 60
 
 
@@ -12,6 +24,7 @@ TWO_OVER_PI = 2 / mp.fn("const_pi")
 
 
 def series(kind):
+    """(2/pi) J(u) (kind 0) or (2/pi) K(u) (kind 1)"""
     if kind == 0:
         return [TWO_OVER_PI * Fraction((-1) ** m, factorial(m) ** 2) for m in range(M)]
     return [TWO_OVER_PI * Fraction((-1) ** m, factorial(m) * factorial(m + 1)) for m in range(M)]
@@ -37,6 +50,7 @@ def row(a, j):
 
 
 def coeffs(kind, n):
+    """(-1)^m / (4^m m! (m + kind)!), m < n, as pairs"""
     out = []
     for m in range(n):
         c = Fraction((-1) ** m, 4 ** m * factorial(m) * factorial(m + kind))

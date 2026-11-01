@@ -1,3 +1,7 @@
+/* Offline helper of gen_charsets.py: for each charset name given, decide whether it is a plain
+ * single-byte charset (every byte is one character or invalid, every character one byte or
+ * unrepresentable, no state) by asking the host's iconv, and dump its tables.
+ * Output per charset: "SIMPLE name" + 256 lines "D value|-1" + lines "E cp byte"; or "OTHER name reason". */
 #include <iconv.h>
 #include <stdio.h>
 #include <stdlib.h>

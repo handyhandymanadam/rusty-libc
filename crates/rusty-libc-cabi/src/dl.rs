@@ -1,5 +1,12 @@
+//! libc.so.6's dl* interface: glibc keeps dlopen, dlsym, dlclose, dlerror, dladdr, dlinfo, dl_iterate_phdr and
+//! `_dl_find_object` in libc.so.6 since 2.34; here each is a trampoline into our dynamic loader (`__libc_ldso_*`,
+//! crates/rusty-libc-ldso/src/dl.rs), which owns the link maps. dlerror is not one: as in glibc, libc composes and translates
+//! its text from the record the loader keeps (rusty-libc-extra dlfcn.rs `dlerror_shared`). Functions that need to know their caller (the search path of
+//! the calling object, RTLD_NEXT) get the return address as an extra argument. The loader symbols are weak: a program that
+//! runs without our loader has no dl functions to call (and crashes if it calls them).
 core::arch::global_asm!(
     ".text",
+    // dlopen(file, mode) -> (file, mode, caller, environ): the constructors it runs get this libc's current environment
     ".globl dlopen",
     ".type dlopen, @function",
     "dlopen:",
@@ -8,6 +15,7 @@ core::arch::global_asm!(
     "mov rcx, [rcx]",
     "jmp [rip + __libc_ldso_dlopen@GOTPCREL]",
     ".size dlopen, .-dlopen",
+    // dlmopen(lmid, file, mode) -> (lmid, file, mode, caller, environ)
     ".globl dlmopen",
     ".type dlmopen, @function",
     "dlmopen:",
@@ -21,12 +29,14 @@ core::arch::global_asm!(
     "dlclose:",
     "jmp [rip + __libc_ldso_dlclose@GOTPCREL]",
     ".size dlclose, .-dlclose",
+    // dlsym(handle, name) -> (handle, name, caller)
     ".globl dlsym",
     ".type dlsym, @function",
     "dlsym:",
     "mov rdx, [rsp]",
     "jmp [rip + __libc_ldso_dlsym@GOTPCREL]",
     ".size dlsym, .-dlsym",
+    // dlvsym(handle, name, version) -> (..., caller)
     ".globl dlvsym",
     ".type dlvsym, @function",
     "dlvsym:",
@@ -43,6 +53,7 @@ core::arch::global_asm!(
     "dladdr1:",
     "jmp [rip + __libc_ldso_dladdr1@GOTPCREL]",
     ".size dladdr1, .-dladdr1",
+    // dlinfo(handle, request, arg) -> (..., caller)
     ".globl dlinfo",
     ".type dlinfo, @function",
     "dlinfo:",

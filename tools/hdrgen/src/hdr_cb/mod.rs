@@ -69,6 +69,7 @@ mod wctype;
 
 use crate::model::Item;
 
+/// C text a cbindgen config used to carry: (items, drop the final newline).
 pub struct Text {
     pub header: Option<(&'static [Item], bool)>,
     pub after_includes: Option<(&'static [Item], bool)>,

@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* Entry types of the kernel's auxiliary vector (glibc takes them from <elf.h>). */"),
     Item::Consts(&[
         ("AT_NULL", V::Dec(0)),
         ("AT_IGNORE", V::Dec(1)),
@@ -50,6 +51,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("AT_L3_CACHEGEOMETRY", V::Dec(47)),
         ("AT_MINSIGSTKSZ", V::Dec(51)),
     ]),
+    Item::Comment("/* bits/hwcap.h: no bits defined for x86-64 */"),
 ];
 pub const AFTER_INCLUDES_CHOMP: bool = false;
 

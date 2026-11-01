@@ -3,7 +3,15 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "obstack.h",
     items: &[
-        Item::Guard { name: "_OBSTACK_H", value: "1", end: "", items: &[
+        Item::Comment(r#"/* obstack.h for the Rust libc (crates/rusty-libc-extra/src/obstack.rs).
+   An obstack is a stack of objects kept in chunks obtained from a function you supply: you define
+   obstack_chunk_alloc and obstack_chunk_free before using the macros that need them (obstack_init and
+   obstack_begin). One object at a time is growing; once finished (obstack_finish) it never moves. The
+   macros below work on the structure directly and call the library only to start an obstack, to open a
+   new chunk (_obstack_newchunk) and to free several chunks (obstack_free). Their arguments are evaluated
+   more than once in the non-GNU-C versions: a statement-expression version is used with GNU C.
+   The layout of struct obstack (88 bytes) and of the chunk header is the one of glibc on x86-64. */"#),
+        Item::Guard { name: "_OBSTACK_H", value: "1", end: " /* obstack.h */", items: &[
             Item::Blank,
             Item::Gate(&[
                 Branch { head: "ifdef __PTRDIFF_TYPE__", items: &[
@@ -19,7 +27,9 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* P rounded up to the next multiple of A + 1 (a power of two), counted from B. */"),
             Item::Raw(Reason::GlibcMacro, "#define __BPTR_ALIGN(B, P, A) ((B) + (((P) - (B) + (A)) & ~(A)))"),
+            Item::Comment("/* The same, computed from address 0 when a pointer fits in PTR_INT_TYPE. */"),
             Item::Raw(Reason::GlibcMacro, "#define __PTR_ALIGN(B, P, A) __BPTR_ALIGN (sizeof (PTR_INT_TYPE) < sizeof (void *) ? (B) : (char *) 0, P, A)"),
             Item::Blank,
             Item::Include("<string.h>"),
@@ -43,15 +53,17 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::ExternBegin,
             Item::Blank,
-            Item::Block { head: "struct _obstack_chunk ", body: &["", "  char *limit;", "  struct _obstack_chunk *prev;", "  char contents[4];", ""], tail: "" },
+            Item::Comment("/* The header of every chunk. */"),
+            Item::Block { head: "struct _obstack_chunk ", body: &["", "  char *limit;                  /* one past the end of this chunk */", "  struct _obstack_chunk *prev;  /* the chunk before it, or NULL */", "  char contents[4];             /* objects start here */", ""], tail: "" },
             Item::Blank,
-            Item::Block { head: "struct obstack ", body: &["", "  long chunk_size;", "  struct _obstack_chunk *chunk;", "  char *object_base;", "  char *next_free;", "  char *chunk_limit;", "  union {", "    PTR_INT_TYPE tempint;", "    void *tempptr;", "  } temp;", "  int alignment_mask;", "  struct _obstack_chunk *(*chunkfun) (void *, long);", "  void (*freefun) (void *, struct _obstack_chunk *);", "  void *extra_arg;", "  unsigned use_extra_arg : 1;", "  unsigned maybe_empty_object : 1;", "  unsigned alloc_failed : 1;", ""], tail: "" },
+            Item::Block { head: "struct obstack ", body: &["", "  long chunk_size;              /* preferred size of new chunks */", "  struct _obstack_chunk *chunk; /* the current chunk */", "  char *object_base;            /* the object being built */", "  char *next_free;              /* where the next byte of it goes */", "  char *chunk_limit;            /* one past the end of the current chunk */", "  union {", "    PTR_INT_TYPE tempint;", "    void *tempptr;", "  } temp;                       /* scratch for the non-GNU-C macros */", "  int alignment_mask;           /* low bits that must be clear in an object's address */", "  struct _obstack_chunk *(*chunkfun) (void *, long);", "  void (*freefun) (void *, struct _obstack_chunk *);", "  void *extra_arg;              /* first argument of chunkfun and freefun */", "  unsigned use_extra_arg : 1;", "  unsigned maybe_empty_object : 1; /* the current chunk may hold an empty object: do not free it early */", "  unsigned alloc_failed : 1;    /* no longer used */", ""], tail: "" },
             Item::Blank,
             Item::Decl("extern void _obstack_newchunk (struct obstack *, int);"),
             Item::Decl("extern int _obstack_begin (struct obstack *, int, int, void *(*) (long), void (*) (void *));"),
             Item::Decl("extern int _obstack_begin_1 (struct obstack *, int, int, void *(*) (void *, long), void (*) (void *, void *), void *);"),
             Item::Decl("extern int _obstack_memory_used (struct obstack *) __attribute_pure__;"),
             Item::Blank,
+            Item::Comment("/* obstack_free is also the name of the function; the macro calls it through (__obstack_free). */"),
             Item::Gate(&[
                 Branch { head: "ifndef __obstack_free", items: &[
                     Item::Consts(&[
@@ -61,7 +73,9 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Decl("extern void __obstack_free (struct obstack *, void *);"),
             Item::Blank,
+            Item::Comment(r#"/* Called when a chunk cannot be had; it must not return. The default prints "memory exhausted". */"#),
             Item::Decl("extern void (*obstack_alloc_failed_handler) (void);"),
+            Item::Comment("/* The exit status of the default handler. */"),
             Item::Decl("extern int obstack_exit_failure;"),
             Item::Blank,
             Item::Raw(Reason::GlibcMacro, "#define obstack_base(h) ((void *) (h)->object_base)"),
@@ -89,6 +103,7 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::Gate(&[
                 Branch { head: "if defined __GNUC__", items: &[
+                    Item::Comment("/* GNU C: statement expressions evaluate every argument once and need no scratch slot. */"),
                     Item::Gate(&[
                         Branch { head: "if ! (2 < __GNUC__ + (8 <= __GNUC_MINOR__))", items: &[
                             Item::Consts(&[
@@ -127,6 +142,7 @@ pub static HDR: Header = Header {
                    if (__ob->next_free + 1 > __ob->chunk_limit) _obstack_newchunk (__ob, 1); \
                    obstack_1grow_fast (__ob, datum); \
                    (void) 0; })"#),
+                    Item::Comment("/* These two assume the alignment of the obstack and of the data so far suits a pointer or an int. */"),
                     Item::Raw(Reason::GlibcMacro, r#"# define obstack_ptr_grow(OBSTACK, datum) \
   __extension__ ({ struct obstack *__ob = (OBSTACK); \
                    if (__ob->next_free + sizeof (void *) > __ob->chunk_limit) _obstack_newchunk (__ob, sizeof (void *)); \
@@ -156,6 +172,7 @@ pub static HDR: Header = Header {
   __extension__ ({ struct obstack *__oh = (OBSTACK); obstack_grow (__oh, (where), (length)); obstack_finish (__oh); })"#),
                     Item::Raw(Reason::GlibcMacro, r#"# define obstack_copy0(OBSTACK, where, length) \
   __extension__ ({ struct obstack *__oh = (OBSTACK); obstack_grow0 (__oh, (where), (length)); obstack_finish (__oh); })"#),
+                    Item::Comment("/* The variable is called __ob1 so that obstack_blank (which uses __ob) cannot clash with it. */"),
                     Item::Raw(Reason::GlibcMacro, r#"# define obstack_finish(OBSTACK) \
   __extension__ ({ struct obstack *__ob1 = (OBSTACK); void *__value = (void *) __ob1->object_base; \
                    if (__ob1->next_free == __value) __ob1->maybe_empty_object = 1; \
@@ -171,13 +188,14 @@ pub static HDR: Header = Header {
                    else (__obstack_free) (__ob, __obj); })"#),
                     Item::Blank,
                 ] },
-                Branch { head: "else", items: &[
+                Branch { head: "else /* not GNU C: the same through the temp slot and comma expressions */", items: &[
                     Item::Blank,
                     Item::Raw(Reason::GlibcMacro, "# define obstack_object_size(h) (unsigned) ((h)->next_free - (h)->object_base)"),
                     Item::Raw(Reason::GlibcMacro, "# define obstack_room(h) (unsigned) ((h)->chunk_limit - (h)->next_free)"),
                     Item::Raw(Reason::GlibcMacro, r#"# define obstack_empty_p(h) \
   ((h)->chunk->prev == 0 \
    && (h)->next_free == __PTR_ALIGN ((char *) (h)->chunk, (h)->chunk->contents, (h)->alignment_mask))"#),
+                    Item::Comment("/* the call of _obstack_newchunk is inside (..., 0) so both arms of ?: have a value */"),
                     Item::Raw(Reason::GlibcMacro, r#"# define obstack_make_room(h, length) \
   ((h)->temp.tempint = (length), \
    (((h)->next_free + (h)->temp.tempint > (h)->chunk_limit) ? (_obstack_newchunk ((h), (h)->temp.tempint), 0) : 0))"#),
@@ -222,8 +240,9 @@ pub static HDR: Header = Header {
     ? (void) ((h)->next_free = (h)->object_base = (h)->temp.tempint + (char *) (h)->chunk) \
     : (__obstack_free) (h, (h)->temp.tempint + (char *) (h)->chunk)))"#),
                 ] },
-            ], ""),
+            ], " /* not GNU C */"),
             Item::Blank,
+            Item::Comment("/* Appends formatted text to the growing object (declared in glibc's <stdio.h>, with the GNU extensions). */"),
             Item::Include("<stdarg.h>"),
             Item::Decl(r#"extern int obstack_printf (struct obstack *__restrict __obstack, const char *__restrict __format, ...)
   __attribute__ ((__format__ (__printf__, 2, 3)));"#),

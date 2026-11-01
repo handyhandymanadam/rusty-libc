@@ -1,17 +1,25 @@
+//! fmax, fmin, fmaxmag, fminmag, fmaximum*, fminimum*, fdim, iseqsig. The NaN rules are those of
+//! glibc 2.43 on x86-64 (its `fmax`/`fmin` are assembly around `maxsd`/`minsd`), including which
+//! NaN's payload comes out, so the cases with two NaNs or a signaling NaN are bit-identical.
 use super::fp::{EDOM, ERANGE, Fp, set_errno};
 
+/// C `fmax`/`fmin`: a quiet NaN loses to a number; a signaling NaN, or two NaNs, give `x + y`.
+/// `pick_first(x, y)` says whether `x` wins for ordered operands, ties going to `y` like the
+/// instruction does.
 fn fmax_fmin<F: Fp>(x: F, y: F, want_max: bool) -> F {
     if !x.is_nan_() && !y.is_nan_() {
         let first = if want_max { x > y } else { x < y };
         return if first { x } else { y };
     }
     if !y.is_nan_() {
+        // x is the NaN
         if !x.is_signaling_() {
             return y;
         }
         return x.add(y);
     }
     if !x.is_nan_() {
+        // y is the NaN
         if !y.is_signaling_() {
             return x;
         }
@@ -20,6 +28,7 @@ fn fmax_fmin<F: Fp>(x: F, y: F, want_max: bool) -> F {
     x.add(y)
 }
 
+/// Magnitude compare: the maximum or minimum by absolute value, ties by value.
 fn magnitude<F: Fp>(x: F, y: F, want_max: bool) -> F {
     let (ax, ay) = (x.abs_(), y.abs_());
     let x_wins = if want_max { ax > ay } else { ax < ay };
@@ -40,6 +49,7 @@ fn magnitude<F: Fp>(x: F, y: F, want_max: bool) -> F {
     }
 }
 
+/// C23 fmaximum/fminimum: NaN propagates (`x + y`); +0 is above -0.
 fn maximum<F: Fp>(x: F, y: F, want_max: bool, mag: bool, num: bool) -> F {
     let (kx, ky) = if mag { (x.abs_(), y.abs_()) } else { (x, y) };
     let x_wins = if want_max { kx > ky } else { kx < ky };
@@ -51,12 +61,14 @@ fn maximum<F: Fp>(x: F, y: F, want_max: bool, mag: bool, num: bool) -> F {
         return y;
     }
     if kx == ky {
+        // equal values (or equal magnitudes): the sign decides, +0 above -0
         let x_pos = !x.sign_bit();
         let y_pos = !y.sign_bit();
         let first = if want_max { x_pos >= y_pos } else { !x_pos >= !y_pos };
         return if first { x } else { y };
     }
     if num {
+        // a number beats a NaN; two NaNs give x + y
         if y.is_nan_() {
             return if x.is_nan_() { x.add(y) } else { x };
         }
@@ -64,6 +76,8 @@ fn maximum<F: Fp>(x: F, y: F, want_max: bool, mag: bool, num: bool) -> F {
     }
     x.add(y)
 }
+
+// ---- C functions
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn fmax(x: f64, y: f64) -> f64 {
@@ -173,6 +187,7 @@ fn fdim_impl<F: Fp>(x: F, y: F) -> F {
     r
 }
 
+/// Positive difference: `x - y` when `x > y`, else 0 (a NaN gives the NaN); ERANGE on overflow.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn fdim(x: f64, y: f64) -> f64 {
     fdim_impl(x, y)
@@ -195,6 +210,7 @@ fn iseqsig_impl<F: Fp>(x: F, y: F) -> i32 {
     }
 }
 
+/// C23 `iseqsig`: equality that raises "invalid" for NaN operands; EDOM when unordered.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn __iseqsig(x: f64, y: f64) -> i32 {
     iseqsig_impl(x, y)
@@ -204,6 +220,9 @@ pub extern "C" fn __iseqsigf(x: f32, y: f32) -> i32 {
     iseqsig_impl(x, y)
 }
 
+// The type aliases (`fmaxf64`, `fmaxf32x`, `fmaxf32` ...) run the Rust body themselves. They must not call the C-named
+// function (`fmax` ...): the compiler takes a call to that name for the library function and replaces it with its own maxnum,
+// which gives the wrong result for a signaling NaN (FIXLIST #66).
 macro_rules! alias_body {
     (@go $t:ty; $body:ident($($arg:expr),*);) => {};
     (@go $t:ty; $body:ident($($arg:expr),*); $alias:ident $(, $rest:ident)*) => {

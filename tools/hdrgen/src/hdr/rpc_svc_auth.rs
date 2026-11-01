@@ -32,7 +32,9 @@ pub static HDR: Header = Header {
  *   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */"#),
-        Item::Guard { name: "_RPC_SVC_AUTH_H", value: "1", end: "", items: &[
+        Item::Comment(r#"/* Structure layouts and constants follow Sun's RPC headers (as in glibc's sunrpc/rpc/);
+   the function prototypes are generated from the Rust sources (bits/rlibc-rpc-*.h). */"#),
+        Item::Guard { name: "_RPC_SVC_AUTH_H", value: "1", end: " /* rpc/svc_auth.h */", items: &[
             Item::Blank,
             Item::Include("<rpc/svc.h>"),
             Item::Blank,

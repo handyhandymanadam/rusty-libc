@@ -1,8 +1,22 @@
+//! TSCII (Tamil, 8 bit): ASCII plus Tamil letters, with vowel signs that come before their consonant
+//! in the byte stream and a few ligature bytes, so both directions keep a little state.
+//!
+//! Written from the observable behaviour of glibc's module and checked against it call by call.
+//! The state words are glibc's `count`: decoding keeps the character (and a queue of the following
+//! ones, as an index into [`NEXT`]) still to be output, shifted left by 8 bits; encoding keeps the
+//! consonant byte (or two bytes) that may still combine with the next character, shifted left by 3.
+//! Quirks kept on purpose: when the output fills up in the middle of a queued sequence glibc
+//! writes the first queued character again for each following one; a consonant with a following
+//! U+0BC1/U+0BC2 for 0x85/0x86 is written as the "with virama" byte and the vowel sign is then
+//! converted on its own.
 use crate::engine::*;
 use crate::tsciidata::*;
 
+/// The queue that follows a pending character: 0 nothing, 1 U+0BB7, 2 U+0BC0, 3 U+0BCD,
+/// 4 U+0BB0 U+0BC0, 5 U+0BB7 U+0BCD (character in bits 8 up, next index in bits 4-7).
 const NEXT: [u32; 6] = [0, 0x0BB7 << 8, 0x0BC0 << 8, 0x0BCD << 8, (0x0BB0 << 8) + (2 << 4), (0x0BB7 << 8) + (3 << 4)];
 
+/// Decoding: the characters a flush must still write.
 pub fn pending(st: u32) -> ([u32; 4], usize) {
     let mut out = [0u32; 4];
     let (mut n, mut st) = (0, st);
@@ -52,6 +66,7 @@ pub fn dec(st: &mut u32, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u32]
                     continue;
                 }
             }
+            // output the queued character, and what follows it while there is room
             loop {
                 out[o] = last;
                 o += 1;
@@ -102,6 +117,7 @@ pub fn dec(st: &mut u32, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u32]
                 i += 1;
             }
             0x82 | 0x87 | 0x8c => {
+                // a ligature byte: a fixed run of characters; what does not fit is queued
                 let (run, states): (&[u32], &[u32]) = match ch {
                     0x82 => (&[0x0BB8, 0x0BCD, 0x0BB0, 0x0BC0], &[0, (0x0BCD << 8) + (4 << 4), (0x0BB0 << 8) + (2 << 4), 0x0BC0 << 8]),
                     0x87 => (&[0x0B95, 0x0BCD, 0x0BB7], &[0, (0x0BCD << 8) + (1 << 4), 0x0BB7 << 8]),
@@ -198,6 +214,7 @@ pub fn enc(st: &mut u32, flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u8]
                 }
             } else if (0x83..=0x86).contains(&last) {
                 if last >= 0x85 && (ch == 0x0BC1 || ch == 0x0BC2) {
+                    // the vowel sign stays in the input and is converted on its own next
                     o[0] = (last + 5) as u8;
                     *st = 0;
                     return EBody::Ok(0, 1);
@@ -228,10 +245,12 @@ pub fn enc(st: &mut u32, flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u8]
                     return EBody::Ok(1, 1);
                 }
             } else if ch == 0x0BC0 {
+                // two consonants joined through a virama (last == 0xc38a)
                 o[0] = 0x82;
                 *st = 0;
                 return EBody::Ok(1, 1);
             }
+            // not combining: write the held-back character, then convert this one again
             let n = if (last >> 8) != 0 {
                 if o.len() < 2 {
                     return EBody::Full;
@@ -280,6 +299,7 @@ pub fn enc(st: &mut u32, flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u8]
     })
 }
 
+/// The held-back byte(s) of the encoder.
 pub fn emit_reset(st: &mut u32, out: &mut [u8], op: &mut usize) -> St {
     if *st != 0 {
         let last = *st >> 3;

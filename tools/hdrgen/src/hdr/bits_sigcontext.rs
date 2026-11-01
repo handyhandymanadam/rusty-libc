@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "bits/sigcontext.h",
     items: &[
+        Item::Comment("/* struct sigcontext and the FP/XSAVE structures, x86-64 (glibc's layout). */"),
         Item::Guard { name: "_RLIBC_BITS_SIGCONTEXT_H", value: "1", end: "", items: &[
             Item::Consts(&[
                 ("FP_XSTATE_MAGIC1", V::Txt("0x46505853U")),

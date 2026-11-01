@@ -1,3 +1,6 @@
+//! Old libio entry points (`_IO_getc`, `_IO_fopen`, `_IO_printf`, ...) that programs built against glibc before 2.28 import: each is the
+//! public function of the same meaning (glibc defines them as aliases). The vtable-level internals (`_IO_file_jumps`, `_IO_default_*`,
+//! `_IO_str_*`, `_IO_wfile_*`, markers) belong to glibc's `struct _IO_FILE` layout, which our FILE does not have: not provided.
 #![allow(missing_docs)]
 
 core::arch::global_asm!(

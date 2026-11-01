@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""Generates fast_tables.rs for trig/fast.rs: the tables of the fast paths (sin/cos at k/64,
+atan at k/64, exp-based tables for the hyperbolics, ...). Everything is computed here from first
+principles with exact big-integer arithmetic (fixed point, 400 bits); nothing is copied from
+another library.  Usage: python3 gen_fast.py > fast_tables.rs"""
 from fractions import Fraction
 import math
 
@@ -11,10 +15,12 @@ def mul(a, b):
 
 
 def sincos_fp(num, den):
+    """(sin, cos) of num/den in fixed point (Taylor series; argument below 1)."""
     x = (num * ONE) // den
     x2 = mul(x, x)
     s = 0
     c = 0
+    # sin: x - x^3/3! + ..., cos: 1 - x^2/2! + ...
     t = x
     k = 1
     while t:
@@ -48,6 +54,7 @@ PI = 4 * (4 * atan_inv(5) - atan_inv(239))
 
 
 def atan_fp(num, den):
+    """atan(num/den) for 0 <= num/den <= 1 by argument halving and the series."""
     x = (num * ONE) // den
     h = 0
     for _ in range(6):
@@ -115,9 +122,12 @@ def top_bits(fr, nbits):
 
 
 def sincos_angle(j):
+    """(sin, cos) of j*pi/128 in fixed point, exact zeros where the value is exactly zero."""
+    # reduce j mod 256 to the first octant by symmetry is not needed: Taylor on the fixed-point angle
     ang = (j * PI) // 128
+    # Taylor needs a small argument: reduce by quarter turns using exact symmetry
     q, r = divmod(j % 256, 64)
-    rr = (r * PI) // 128
+    rr = (r * PI) // 128  # angle in [0, pi/2)
     x = rr
     x2 = mul(x, x)
     s = 0
@@ -134,9 +144,11 @@ def sincos_angle(j):
         c += t if (k // 2) % 2 == 0 else -t
         t = mul(t, x2) // ((k + 1) * (k + 2))
         k += 2
+    # rotate by q quarter turns: (s, c) -> after one quarter turn (c, -s)
     for _ in range(q):
         s, c = c, -s
     if r == 0:
+        # exact values: sin(q*pi/2) in {0,1,0,-1}, cos in {1,0,-1,0}
         s = [0, ONE, 0, -ONE][q]
         c = [ONE, 0, -ONE, 0][q]
     return s, c
@@ -170,6 +182,7 @@ for e in range(-32, 32):
 out("];")
 out("/// 128/pi.")
 out("pub const INV_PI128: f64 = %s;" % lit(float(128 / frac(PI))))
+# three full doubles for the FMA-based reduction of large arguments (direct.rs, reduce_big)
 b1 = float(step)
 b2 = float(step - Fraction(b1))
 b3 = float(step - Fraction(b1) - Fraction(b2))
@@ -179,12 +192,17 @@ out("pub const PI128_B2: f64 = %s;" % lit(b2))
 out("pub const PI128_B3: f64 = %s;" % lit(b3))
 
 
+# ---------------------------------------------------------------------------------------------
+# Taylor rows: f(c + d) = g0 + g1 d + g2 d^2 + ... + g8 d^8, rows as [g0 hi, g0 lo, g1 hi, g1 lo,
+# g2, g3, g4, g5, g6, g7, g8]
+# ---------------------------------------------------------------------------------------------
 from math import comb
 
 DEG = 8
 
 
 def row_out(g):
+    """g: list of fixed-point Taylor coefficients g0..g8 -> Rust row literal"""
     h0, l0 = dd(frac(g[0]))
     h1, l1 = dd(frac(g[1]))
     rest = [float(frac(v)) for v in g[2:DEG + 1]]
@@ -192,6 +210,7 @@ def row_out(g):
 
 
 def taylor_from_series(coef_fp, c_fp, mmax):
+    """Taylor coefficients g_k (k = 0..DEG) at c of f(u) = sum coef[m] u^m (c within the radius)."""
     pw = [ONE]
     for _ in range(mmax):
         pw.append(mul(pw[-1], c_fp))
@@ -204,8 +223,10 @@ def taylor_from_series(coef_fp, c_fp, mmax):
     return g
 
 
+# asin(x) = x R(x^2), R(u) = sum C(2m,m) / (4^m (2m+1)) u^m, radius 1
 MM = 260
 R_COEF = [(comb(2 * m, m) << P) // (4 ** m * (2 * m + 1)) for m in range(MM + 1)]
+# acos(1 - w) = sqrt(2 w) Q(w), Q(w) = sum C(2m,m) / (8^m (2m+1)) w^m, radius 2
 Q_COEF = [(comb(2 * m, m) << P) // (8 ** m * (2 * m + 1)) for m in range(MM + 1)]
 
 out()
@@ -223,6 +244,7 @@ out("];")
 
 
 def atan_taylor(c_num, c_den):
+    """atan(c + d) = atan c + sum G_n d^(n+1) / (n+1), G = 1 / (1 + (c+d)^2) = 1 / (q0 + q1 d + d^2)."""
     c = (c_num << P) // c_den
     q0 = ONE + mul(c, c)
     q1 = 2 * c
@@ -243,6 +265,11 @@ for j in range(129):
 out("];")
 
 
+# ---------------------------------------------------------------------------------------------
+# exp tables for the hyperbolics: 2^(j/128) and 2^(-j/128) as double-doubles, ln2/128 in three
+# pieces, 128/ln2, tanh Taylor coefficients
+# ---------------------------------------------------------------------------------------------
+
 
 def ln2_fixed():
     s = 0
@@ -259,6 +286,7 @@ LN2F = ln2_fixed()
 
 
 def exp_fp(x):
+    """e^x for 0 <= x < 1 in fixed point."""
     s = ONE
     t = ONE
     n = 1
@@ -291,6 +319,7 @@ out("pub const LN2_128_2: f64 = %s;" % lit(float(l2)))
 out("pub const LN2_128_3: f64 = %s;" % lit(float(l3)))
 out("pub const INV_LN2_128: f64 = %s;" % lit(float(128 / frac(LN2F))))
 
+# tanh x = sum_{n>=1} 2^(2n) (2^(2n) - 1) B_{2n} x^(2n-1) / (2n)!
 def bernoulli(nmax):
     B = [Fraction(0)] * (nmax + 1)
     B[0] = Fraction(1)
@@ -309,6 +338,10 @@ out("/// tanh x = x + x^3 * (TANH_C[0] + TANH_C[1] x^2 + ...): coefficients of x
 out("pub const TANH_C: [f64; 10] = [" + ", ".join(lit(float(c)) for c in tc[1:]) + "];")
 
 
+# ---------------------------------------------------------------------------------------------
+# exp10 reduction constants: x = m log10(2)/128 + r', ln10 as a double-double
+# ---------------------------------------------------------------------------------------------
+
 
 def atanh_fp(num, den):
     x = (num * ONE) // den
@@ -323,15 +356,16 @@ def atanh_fp(num, den):
     return s
 
 
+# ln 10 = 3 ln 2 + 2 atanh(1/9)   (10 = 8 * 1.25, 1.25 = (1 + 1/9) / (1 - 1/9))
 LN10F = 3 * LN2F + 2 * atanh_fp(1, 9)
-LOG2_10 = (LN10F << P) // LN2F
+LOG2_10 = (LN10F << P) // LN2F  # log2(10)
 out()
 l10 = frac(LN10F)
 h, l = dd(l10)
 out("pub const LN10_DD: (f64, f64) = (%s, %s);" % (lit(h), lit(l)))
 out("/// 128 log2(10).")
 out("pub const INV_LOG10_2_128: f64 = %s;" % lit(float(128 * frac(LOG2_10))))
-step = frac(LN2F) / frac(LN10F) / 128
+step = frac(LN2F) / frac(LN10F) / 128  # log10(2)/128
 a1 = top_bits(step, 35)
 a2 = top_bits(step - a1, 35)
 a3 = step - a1 - a2
@@ -340,12 +374,16 @@ out("pub const LOG10_2_128_1: f64 = %s;" % lit(float(a1)))
 out("pub const LOG10_2_128_2: f64 = %s;" % lit(float(a2)))
 
 
+# ---------------------------------------------------------------------------------------------
+# log table: c_j = 1 + j/128 for j = -37..=53 (c from 0.711 to 1.414): [1/c, ln c hi, ln c lo]
+# ---------------------------------------------------------------------------------------------
 out()
 out("/// [1/c_j, ln c_j hi, ln c_j lo] for c_j = 1 + j/128, j = -37..=53 (index j + 37).")
 out("pub const LOG128: [[f64; 3]; 91] = [")
 for j in range(-37, 54):
     cinv = (ONE << P) // (((128 + j) * ONE) // 128)
     ih = float(frac(cinv))
+    # ln c for c = 1 / ih exactly (ih is a rounded double): ln c = 2 atanh((1 - ih) / (1 + ih))
     fr = Fraction(ih)
     num, den = fr.denominator - fr.numerator, fr.denominator + fr.numerator
     if num == 0:
@@ -359,8 +397,14 @@ for j in range(-37, 54):
 out("];")
 
 
+# ---------------------------------------------------------------------------------------------
+# rows for asinh, atanh and acosh
+# ---------------------------------------------------------------------------------------------
+# asinh(x) = x R(-x^2) with R the asin series (alternating signs)
 RH_COEF = [(-1) ** m * R_COEF[m] for m in range(MM + 1)]
+# atanh(x) = x S(x^2), S(u) = sum u^m / (2m + 1)
 S_COEF = [(ONE // (2 * m + 1)) for m in range(MM + 1)]
+# acosh(1 + t) = sqrt(2 t) Q2(t), Q2(t) = sum (-1)^m C(2m,m) / (8^m (2m+1)) t^m
 Q2_COEF = [(-1) ** m * Q_COEF[m] for m in range(MM + 1)]
 out()
 out("/// asinh(x) = x R(-x^2) near u = x^2 = j/128: rows for j = 0..=32.")
@@ -380,6 +424,7 @@ out("pub const ATANH_ROWS_W: [[f64; 11]; 186] = [")
 for j in range(186):
     out("    " + row_out(taylor_from_series(S_COEF, (j << P) // 256, MM)) + ",")
 out("];")
+# tanh(x) = x T(x^2), T(u) = sum_{n>=1} 2^(2n) (2^(2n) - 1) B_{2n} / (2n)! u^(n-1), radius pi^2/4
 BN2 = bernoulli(2 * (MM + 1))
 T_COEF = []
 for n in range(1, MM + 2):
@@ -399,6 +444,10 @@ for j in range(129):
 out("];")
 
 
+# ---------------------------------------------------------------------------------------------
+# tan rows: tan(c + d) = g0 + g1 d + ... with c = j/256, j = 0..=200 (|x| < 25/32).
+# g0 = tan c, g1 = 1 + g0^2, (n+1) g(n+1) = sum_{i=0..n} g(i) g(n-i)  (from tan' = 1 + tan^2)
+# ---------------------------------------------------------------------------------------------
 def tan_taylor(j, den):
     s, c = sincos_fp(j, den)
     g = [(s * ONE) // c if c else 0]
@@ -419,6 +468,9 @@ for j in range(201):
 out("];")
 
 
+# ---------------------------------------------------------------------------------------------
+# asin(x)/pi and acos(1 - w)/pi rows (the pi functions need no double-double product with 1/pi)
+# ---------------------------------------------------------------------------------------------
 INV_PI_FP = (ONE * ONE) // PI
 R_PI_COEF = [mul(c, INV_PI_FP) for c in R_COEF]
 Q_PI_COEF = [mul(c, INV_PI_FP) for c in Q_COEF]

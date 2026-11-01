@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""Generates fast_tables.rs for the double-double fast paths of the long double functions
+(fast.rs): tables and constants as pairs of doubles (hi, lo), with hi + lo accurate to about 2^-106.
+Everything is computed here with exact big-integer / Fraction arithmetic (nothing is copied from
+another library). Usage: python3 gen_fast.py > fast_tables.rs"""
 from fractions import Fraction
 import math
 
@@ -6,7 +10,7 @@ P = 500
 ONE = 1 << P
 
 
-def atanh_inv(n):
+def atanh_inv(n):  # atanh(1/n), fixed point
     x = ONE // n
     n2 = n * n
     s = 0
@@ -25,7 +29,7 @@ def fp_mul(a, b):
     return (a * b) >> P
 
 
-def ln_ratio(num, den):
+def ln_ratio(num, den):  # ln(num/den) for num/den near 1, fixed point
     a, b = num - den, num + den
     sign = 1
     if a < 0:
@@ -40,18 +44,21 @@ def ln_ratio(num, den):
     return sign * 2 * s
 
 
-def ln_int(n):
+def ln_int(n):  # ln(n) for a positive integer, via powers of 2 and ln(n / 2^k)
     k = max(0, n.bit_length() - 1)
+    # n / 2^k in [1, 2): ln = ln2 * k + ln_ratio(n, 2^k) is slow to converge near 2; use ln(3/2) split
     m = Fraction(n, 1 << k)
     return fp_ln_frac(m) + k * LN2
 
 
-def fp_ln_frac(m):
+def fp_ln_frac(m):  # ln of a Fraction in [1, 2]
+    # ln(m) = ln(m / c) + ln(c) with c = 1 or 3/2 or 5/4 ... use 2 atanh((m-1)/(m+1)) with halving
+    # of the argument by square roots would be inexact; the direct series converges for (m-1)/(m+1) <= 1/3
     num, den = m.numerator, m.denominator
     return ln_ratio(num, den)
 
 
-def ln_frac(m):
+def ln_frac(m):  # any positive Fraction
     k = 0
     while m >= 2:
         m /= 2
@@ -62,7 +69,7 @@ def ln_frac(m):
     return fp_ln_frac(m) + k * LN2
 
 
-def exp_fp(x):
+def exp_fp(x):  # exp of a fixed-point |x| < 1
     s = ONE
     t = ONE
     k = 1
@@ -75,21 +82,23 @@ def exp_fp(x):
     return s
 
 
-def exp2_frac(num, den):
+def exp2_frac(num, den):  # 2^(num/den), fixed point, 0 <= num/den < 1
     return exp_fp(num * LN2 // den)
 
 
-def frac(v):
+def frac(v):  # fixed point to Fraction
     return Fraction(v, ONE)
 
 
 def dd(v):
+    """v: Fraction -> (hi, lo) doubles with hi = round(v), lo = round(v - hi)."""
     hi = float(v)
     lo = float(v - Fraction(hi))
     return hi, lo
 
 
 def trunc_bits(v, nbits):
+    """v (Fraction > 0) truncated to its leading nbits significant bits (as a Fraction)."""
     e = 0
     t = v
     while t >= 2:
@@ -142,6 +151,7 @@ print("#![allow(clippy::approx_constant, clippy::excessive_precision, clippy::un
 print()
 
 ln2 = frac(LN2)
+# ---- exp: 2^(j/256) as double-double, ln2/256 in four 30-bit pieces ----
 emit_pair_table("EXP2_256", [dd(frac(exp2_frac(j, 256))) for j in range(256)], "2^(j/256), j = 0..255, as (hi, lo).")
 emit_const("INV_LN2_256", float(Fraction(256) / ln2), "256 / ln 2.")
 for i, c in enumerate(pieces(ln2 / 256, 4)):
@@ -153,11 +163,12 @@ emit_dd("LOG2_E_DD", 1 / ln2, "1 / ln 2.")
 emit_dd("LOG10_E_DD", 1 / frac(LN10), "1 / ln 10.")
 
 
+# ---- log: c_j = 1/m_center (a double), -ln(c_j) as a double-double, for the 512 bins of the fraction ----
 def log_table():
     rows = []
     for j in range(512):
         m = Fraction(1) + Fraction(2 * j + 1, 1024)
-        if j >= 212:
+        if j >= 212:  # m' = m / 2 in [0.707, 1)
             m = m / 2
         c = float(1 / m)
         lc = -frac(ln_frac(Fraction(c)))
@@ -179,7 +190,8 @@ for i, c in enumerate(pieces(ln2, 2, 38)):
 emit_dd("ONE_THIRD_DD", Fraction(1, 3), "1/3.")
 
 
-def atan_inv(n):
+# ---- atan: atan(j/256), pi and pi/2 ----
+def atan_inv(n):  # atan(1/n), fixed point
     x = ONE // n
     n2 = n * n
     s = x
@@ -196,7 +208,7 @@ def atan_inv(n):
 PI = 4 * (4 * atan_inv(5) - atan_inv(239))
 
 
-def atan_fp(num, den):
+def atan_fp(num, den):  # atan(num/den), 0 < num/den <= 1, fixed point, by argument halving
     x = (num * ONE) // den
     h = 0
     for _ in range(6):
@@ -222,7 +234,8 @@ emit_dd("PIO2_DD", frac(PI) / 2, "pi/2.")
 emit_dd("ONE_SIXTH_DD", Fraction(1, 6), "1/6.")
 
 
-def sincos_fp(num, den):
+# ---- sin, cos: sin and cos of j/128 (j = 0..=101), pi/2 in four pieces, 2/pi ----
+def sincos_fp(num, den):  # sin and cos of num/den (fixed point), small argument, Taylor series
     x = (num * ONE) // den
     x2 = fp_mul(x, x)
     s = x
@@ -255,4 +268,5 @@ for i, c in enumerate(pieces(frac(PI) / 2, 4, 30)):
 emit_const("TWO_OVER_PI", float(2 / frac(PI)), "2 / pi.")
 emit_dd("TWO_OVER_PI_DD", 2 / frac(PI), "2 / pi.")
 emit_dd("INV_PI_DD", 1 / frac(PI), "1 / pi.")
+# ln(pi) = ln(pi / 4) + 2 ln 2 (pi/4 is in (1/2, 1): ln_frac handles any positive Fraction)
 emit_dd("LN_PI_DD", frac(ln_frac(frac(PI))), "ln(pi).")

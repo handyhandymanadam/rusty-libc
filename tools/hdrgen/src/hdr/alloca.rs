@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "alloca.h",
     items: &[
+        Item::Comment("/* alloca.h for the Rust libc: alloca is the compiler builtin (stack allocation cannot be a function). */"),
         Item::Guard { name: "_ALLOCA_H", value: "1", end: "", items: &[
             Item::Include("<stddef.h>"),
             Item::ExternBegin,

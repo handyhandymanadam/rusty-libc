@@ -1,3 +1,6 @@
+//! The old-version table of `hdrgen compat-symver`: (symbol, version) -> the function that implements it
+//! (a plain alias, or a shim of crates/rusty-libc-cabi/src/compat_shims.rs / compat_old.rs).
+
 pub static OVERRIDES: &[(&str, &str, &str)] = &[
     ("regexec", "GLIBC_2.2.5", "__rl_compat_regexec"),
     ("realpath", "GLIBC_2.2.5", "__rl_compat_realpath"),

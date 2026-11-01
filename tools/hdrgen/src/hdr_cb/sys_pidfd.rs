@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("PIDFD_NONBLOCK", V::Dec(2048)),
         ("PIDFD_THREAD", V::Dec(128)),

@@ -3,6 +3,10 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "sys/ipc.h",
     items: &[
+        Item::Comment(r#"/* sys/ipc.h for the Rust libc (crates/rusty-libc-ipc): System V IPC key, flags and permission structure in
+   glibc's x86-64 layout (struct ipc_perm is 48 bytes; checked against the system header by
+   tests/c/ipc_layout.c). Only ftok is declared here; its prototype is generated
+   (bits/rlibc-ipc-ipc.h). */"#),
         Item::Guard { name: "_SYS_IPC_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),

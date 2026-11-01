@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Gamma rows for the binary32 tgammaf fast path:
+
+    python3 gen_gamma16.py   -> tab_gamma16.rs (GAMMA16[k] = degree-8 coefficients in h of Gamma(1 + k/16 + h), |h| <= 1/32, k = 0..32)
+
+Each row is the Chebyshev interpolant (cheb.py, exact arithmetic, MPFR gamma at 600 bits) of degree 8 on
+[x0 - 1/32, x0 + 1/32], x0 = 1 + k/16, k = 0..32; the coefficients rounded to double. The relative error of
+the rounded rows (checked here at 65 points per row, exact arithmetic) is printed and asserted below 2^-52."""
 import math
 import os
 import sys
@@ -6,8 +13,8 @@ from fractions import Fraction as Fr
 
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, here)
-import mp
-import cheb
+import mp  # noqa: E402
+import cheb  # noqa: E402
 
 DEG = 8
 W = Fr(1, 32)

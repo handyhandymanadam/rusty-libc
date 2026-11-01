@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "nl_types.h",
     items: &[
+        Item::Comment("/* nl_types.h for the Rust libc (catgets, crates/rusty-libc-locale/src/catgets.rs). */"),
         Item::Guard { name: "_RLIBC_NL_TYPES_H", value: "1", end: "", items: &[
             Item::ExternBegin,
             Item::Consts(&[

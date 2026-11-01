@@ -1,3 +1,16 @@
+//! The login records (utmp: who is logged in now; wtmp: the history), read through the running C library's utmpx
+//! functions (rusty-libc-rs-core's `utmpx` module: getutent_r under a process-wide lock). For `who`, `users`, `pinky`,
+//! `uptime` (the boot record and the user count) and `last`.
+//!
+//! Thread safety: the C library's utmp functions are not thread-safe (one file position per process). This crate's
+//! readers never interleave with each other, and each record is read into this crate's own buffer, but C code (or
+//! another library) using setutxent/getutxent at the same moment shares the file position and could make either side
+//! see a partial list. glibc also swaps the SIGALRM handler and the alarm(2)/ITIMER_REAL timer for a moment during
+//! each read (its 10-second file-lock timeout).
+//!
+//! Note: on systems where login records live in systemd-logind (coreutils 9.x `who` can read logind instead of
+//! utmp), these functions still read the utmp file, as the C library does.
+
 use rustix::io;
 use rusty_libc_rs_core::utmpx as raw;
 use std::ffi::{CString, OsString};
@@ -8,18 +21,30 @@ use std::time::{Duration, SystemTime};
 
 pub use raw::Utmpx as RawUtmpx;
 
+/// ut_type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UtmpKind {
+    /// EMPTY (0): an unused record.
     Empty,
+    /// RUN_LVL (1): a run-level change (`pid` holds the run level and the previous one).
     RunLevel,
+    /// BOOT_TIME (2): the system booted.
     BootTime,
+    /// NEW_TIME (3): the clock was changed; the record has the time after the change.
     NewTime,
+    /// OLD_TIME (4): the clock was changed; the record has the time before the change.
     OldTime,
+    /// INIT_PROCESS (5): a process started by init.
     InitProcess,
+    /// LOGIN_PROCESS (6): a getty waiting for a login.
     LoginProcess,
+    /// USER_PROCESS (7): a user's login session.
     UserProcess,
+    /// DEAD_PROCESS (8): a session that ended.
     DeadProcess,
+    /// ACCOUNTING (9).
     Accounting,
+    /// Any other value.
     Other(i16),
 }
 
@@ -41,19 +66,33 @@ impl UtmpKind {
     }
 }
 
+/// One login record, owned. The text fields are bytes up to the first NUL (the C fields are fixed-size and not always
+/// NUL-terminated).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UtmpEntry {
+    /// ut_type.
     pub kind: UtmpKind,
+    /// ut_pid (for RunLevel: the run level characters).
     pub pid: i32,
+    /// ut_line: the terminal without "/dev/" ("pts/0", "tty2", "~" for boot and run-level records).
     pub line: OsString,
+    /// ut_id: the terminal suffix or inittab id (up to 4 bytes).
     pub id: OsString,
+    /// ut_user: the user name ("reboot", "runlevel", "shutdown" in the special records).
     pub user: OsString,
+    /// ut_host: the remote host, a display, or the kernel version for boot records.
     pub host: OsString,
+    /// ut_exit: (e_termination, e_exit) of a DEAD_PROCESS.
     pub exit: (i16, i16),
+    /// ut_session.
     pub session: i32,
+    /// ut_tv: the time of the record.
     pub time: SystemTime,
+    /// ut_tv as (seconds, microseconds) since the epoch, as stored.
     pub tv: (i32, i32),
+    /// ut_addr_v6: the remote address (None when all zero). An address with only the first word set is IPv4.
     pub addr: Option<IpAddr>,
+    /// The record as the C library returned it.
     pub raw: RawUtmpx,
 }
 
@@ -92,14 +131,21 @@ fn decode(r: &RawUtmpx) -> UtmpEntry {
     }
 }
 
+/// The records of the C library's current utmp file (normally /var/run/utmp: who is logged in now), in file order.
+/// A missing file gives an empty list.
 pub fn utmp_entries() -> io::Result<Vec<UtmpEntry>> {
     raw::read(None).map(|v| v.iter().map(decode).collect()).map_err(crate::errno)
 }
 
+/// The records of the utmp-format file `path` (e.g. [`PATH_WTMP`] for `last`), through utmpxname(path); afterwards
+/// the C library's file name is set back to its default /var/run/utmp. A missing file gives an empty list. EINVAL for
+/// a path with a NUL byte.
 pub fn utmp_entries_from(path: impl AsRef<Path>) -> io::Result<Vec<UtmpEntry>> {
     let c = CString::new(path.as_ref().as_os_str().as_bytes()).map_err(|_| io::Errno::INVAL)?;
     raw::read(Some(&c)).map(|v| v.iter().map(decode).collect()).map_err(crate::errno)
 }
 
+/// glibc's _PATH_UTMP, "/var/run/utmp".
 pub const PATH_UTMP: &str = "/var/run/utmp";
+/// glibc's _PATH_WTMP, "/var/log/wtmp".
 pub const PATH_WTMP: &str = "/var/log/wtmp";

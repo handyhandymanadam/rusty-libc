@@ -1,3 +1,5 @@
+# glibc 2.43 libm.so.6 of this machine: symbols exported only with a non-default version (compat), from `readelf --dyn-syms`: name version kind size
+# Used by hdrgen compat-symver (writes crates/rusty-libc-cabi/src/compat_symver_math.rs). Our libm is part of libc.so.6, which exports these names.
 _LIB_VERSION GLIBC_2.2.5 data 4
 __acos_finite GLIBC_2.15 func 62
 __acosf128_finite GLIBC_2.26 func 2651

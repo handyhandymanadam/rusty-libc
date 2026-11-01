@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "utmp.h",
     items: &[
+        Item::Comment(r#"/* utmp.h for the Rust libc (crates/rusty-libc-extra/src/utmp.rs): the record (glibc's x86-64 layout, 384
+   bytes), the constants, and the prototypes (generated: bits/rlibc-utmpcalls.h and -misc). */"#),
         Item::Guard { name: "_RLIBC_UTMP_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<bits/rlibc-features.h>"),
@@ -15,10 +17,13 @@ pub static HDR: Header = Header {
                 ("UT_HOSTSIZE", V::Dec(256)),
             ]),
             Item::Blank,
+            Item::Comment("/* The structure describing an entry in the database of previous logins. */"),
             Item::Block { head: "struct lastlog ", body: &["", "  unsigned int ll_time;", "  char ll_line[UT_LINESIZE];", "  char ll_host[UT_HOSTSIZE];", ""], tail: "" },
             Item::Blank,
+            Item::Comment("/* The structure describing the status of a terminated process. */"),
             Item::Block { head: "struct exit_status ", body: &["", "  short int e_termination;", "  short int e_exit;", ""], tail: "" },
             Item::Blank,
+            Item::Comment("/* The structure describing an entry in the user accounting database. */"),
             Item::Block { head: "struct utmp ", body: &["", "  short int ut_type;", "  pid_t ut_pid;", "  char ut_line[UT_LINESIZE];", "  char ut_id[4];", "  char ut_user[UT_NAMESIZE];", "  char ut_host[UT_HOSTSIZE];", "  struct exit_status ut_exit;", "  int ut_session;", "  struct {", "    unsigned int tv_sec;", "    int tv_usec;", "  } ut_tv;", "  int ut_addr_v6[4];", "  char __glibc_reserved[20];", ""], tail: "" },
             Item::Blank,
             Item::Consts(&[
@@ -69,6 +74,7 @@ pub static HDR: Header = Header {
             ]),
             Item::Blank,
             Item::ExternBegin,
+            Item::Comment("/* Make FD be the controlling terminal, stdin, stdout, and stderr; then close FD. */"),
             Item::Decl("extern int login_tty (int __fd);"),
             Item::Include("<bits/rlibc-utmpcalls.h>"),
             Item::Gate(&[

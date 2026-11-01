@@ -1,3 +1,24 @@
+//! The resolver's debugging printers and small helpers that glibc's libresolv exports and old programs (and the BIND
+//! tools) import: `__p_type`, `__p_class`, `__p_rcode`, `__p_option`, `__p_time`, `__p_secstodate`, `__sym_ntos`,
+//! `__sym_ntop`, `__sym_ston`, `__p_query`, `__fp_query`, `__fp_nquery`, `__fp_resstat`, `__p_cdname`, `__p_cdnname`,
+//! `__p_fqname`, `__p_fqnname`, `__dn_count_labels`, `__loc_aton`, `__putlong`, `__putshort`, `_getlong`, `_getshort`,
+//! `__res_nameinquery`, `__res_queriesmatch`, `__res_isourserver`, `__res_hostalias`, `__hostalias`, `__res_close`,
+//! `_res_opcodes`, `inet_neta`, `inet_net_ntop`, `inet_net_pton`, `res_send_setqhook`, `res_send_setrhook`.
+//!
+//! Written from reading glibc 2.43's resolv/res_debug.c, res_data.c, res_hostalias.c, res_context_hostalias.c,
+//! res_isourserver.c, res_nameinquery.c, res_queriesmatch.c, res-putget.c, compat-hooks.c, inet_neta.c,
+//! inet_net_ntop.c and inet_net_pton.c (BIND code under the ISC / BSD licences; derived, not copied: the control flow
+//! and the quirks, such as the static result buffers, the `?0x..?` option name and the `%.2d` fields of `loc_aton`,
+//! are kept because programs print them). Behaviour oracle: the installed libresolv.so.2 (tests/dyn/c/resolvdbg.c runs
+//! under both loaders).
+//!
+//! Two faces: the C functions, and a Rust API ([`Sink`] based renderers: [`render_fp_nquery`], [`type_str`], ...) that
+//! never touches a `FILE`.
+//!
+//! U2 (BRIEF-UNSAFE.md): the C functions convert their pointers once and call the renderers and parsers on slices. What
+//! stays unsafe: `fwrite`/`strerror`/`stdout` of the stdio crate, the C symbol tables a program passes to `__sym_*`, the
+//! header bytes `__res_nameinquery` / `__res_queriesmatch` read before any bound (as glibc), and `__res_isourserver`'s
+//! reads of socket addresses whose size depends on their family.
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::nsparse::{
     __p_class_syms, __p_type_syms, ns_f_aa, ns_f_ad, ns_f_cd, ns_f_opcode, ns_f_qr, ns_f_ra, ns_f_rcode, ns_f_rd, ns_f_tc, ns_f_z, ns_msg, ns_rr, ns_s_an,
@@ -30,15 +51,21 @@ const RES_PRF_HEADX: c_ulong = 0x800;
 
 unsafe extern "C" {
     fn fwrite(ptr: *const c_void, size: usize, n: usize, f: *mut c_void) -> usize;
+    /// The C program's `stdout` (a `FILE *` the program may reassign: interior mutability, read with a raw access).
     static stdout: SyncCell<*mut c_void>;
     fn strerror(e: c_int) -> *const c_char;
 }
 
+/// `strerror(e)` as bytes (the stdio crate's text, translated like glibc's).
 fn strerror_text(e: c_int) -> &'static [u8] {
+    // SAFETY: strerror takes any error number and returns a C string that stays valid (a static text or the thread's buffer,
+    // not reused until the next strerror call of this thread, after the caller has printed it).
     let p = unsafe { strerror(e) };
+    // SAFETY: `p` is the C string just returned.
     unsafe { ffi::cstr_bytes(p) }
 }
 
+/// Where the printers write: a `FILE` in the C functions, a `Vec` in tests.
 pub trait Sink {
     fn put(&mut self, bytes: &[u8]);
 }
@@ -47,10 +74,14 @@ struct FileSink(*mut c_void);
 impl Sink for FileSink {
     fn put(&mut self, bytes: &[u8]) {
         if !bytes.is_empty() {
+            // SAFETY: `self.0` is the `FILE *` the C caller passed (the contract of the printing functions); fwrite reads
+            // `bytes.len()` bytes of `bytes`.
             unsafe { fwrite(bytes.as_ptr() as *const c_void, 1, bytes.len(), self.0) };
         }
     }
 }
+
+// ---------------------------------------------------------------- name tables
 
 const fn sym(number: c_int, name: &'static CStr, human: &'static CStr) -> res_sym {
     res_sym { number, name: name.as_ptr(), humanname: human.as_ptr() }
@@ -91,20 +122,25 @@ static P_RCODE_SYMS: [res_sym; 16] = [
     SYM_END,
 ];
 
+/// `_res_opcodes` (a compatibility variable of glibc: an array of 16 `const char *`).
 const OPCODE_NAMES: [&CStr; 16] = [
     c"QUERY", c"IQUERY", c"CQUERYM", c"CQUERYU", c"NOTIFY", c"UPDATE", c"6", c"7", c"8", c"9", c"10", c"11", c"12", c"13", c"ZONEINIT", c"ZONEREF",
 ];
 
+/// The names of the opcodes (`_res_opcodes` is the same table as an exported C array, see `rusty-libc-cabi`).
 pub fn opcode_name(opcode: usize) -> &'static str {
     OPCODE_NAMES[opcode & 15].to_str().unwrap_or("")
 }
 
+// glibc's static result buffers (`unname`, `nbuf`): the C functions return pointers into them. Each is behind a spin lock
+// while it is filled; the pointer handed back is read after the lock is released, as glibc's unlocked buffers are.
 static UNNAME_NTOS: Spin<[u8; 20]> = Spin::new([0; 20]);
 static UNNAME_NTOP: Spin<[u8; 20]> = Spin::new([0; 20]);
 static NBUF_OPTION: Spin<[u8; 40]> = Spin::new([0; 40]);
 static NBUF_TIME: Spin<[u8; 40]> = Spin::new([0; 40]);
 static OUTPUT_DATE: Spin<[u8; 15]> = Spin::new([0; 15]);
 
+/// Copy `s` (cut to the buffer) and a NUL into `dst`; a pointer to it.
 fn fill(dst: &mut [u8], s: &[u8]) -> *const c_char {
     let n = s.len().min(dst.len() - 1);
     dst[..n].copy_from_slice(&s[..n]);
@@ -153,29 +189,44 @@ fn hex(mut v: u64) -> Buf<24> {
     b
 }
 
+/// Name for `number` in a symbol table (the entries before its terminator): the table's name (or `humanname`).
 fn sym_lookup(syms: &[res_sym], number: c_int, human: bool) -> Option<*const c_char> {
     syms.iter().take_while(|s| !s.name.is_null()).find(|s| s.number == number).map(|s| if human { s.humanname } else { s.name })
 }
 
+/// A C symbol table up to and including its terminating entry (the first with a NULL name), and the `success`
+/// out-parameter of the `__sym_*` functions.
+///
+/// # Safety
+/// `syms` points to a table ended by an entry with a NULL name, valid for `'a`; `success` is NULL or writable.
 unsafe fn sym_args<'a>(syms: *const res_sym, success: *mut c_int) -> (&'a [res_sym], Option<&'a mut c_int>) {
     let mut n = 0usize;
+    // SAFETY: the entries up to the terminator are readable (the caller's contract); the loop stops at it.
     while !unsafe { (*syms.wrapping_add(n)).name }.is_null() {
         n += 1;
     }
+    // SAFETY: the `n + 1` entries were just read.
     let table = unsafe { ffi::slice(syms, n + 1) };
+    // SAFETY: the caller's contract.
     (table, unsafe { ffi::out(success) })
 }
 
+/// The text of a name of this crate's own tables (`__p_type_syms`, `__p_class_syms`, `P_*_SYMS`).
 fn own_name(p: *const c_char) -> &'static [u8] {
     crate::nsparse::sym_text(p)
 }
 
+/// # Safety
+/// `syms` is a table ended by an entry with a NULL name; `name` a C string; `success` NULL or writable.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __sym_ston(syms: *const res_sym, name: *const c_char, success: *mut c_int) -> c_int {
+    // SAFETY: the caller's contract: `name` is a C string.
     let want = unsafe { ffi::cstr_bytes(name) };
+    // SAFETY: the caller's contract: a terminated table, `success` NULL or writable.
     let (table, success) = unsafe { sym_args(syms, success) };
     let (entries, end) = table.split_at(table.len() - 1);
     for s in entries {
+        // SAFETY: the names of the caller's table entries are C strings.
         if unsafe { ffi::cstr_bytes(s.name) }.eq_ignore_ascii_case(want) {
             if let Some(ok) = success {
                 *ok = 1;
@@ -189,6 +240,7 @@ pub unsafe extern "C" fn __sym_ston(syms: *const res_sym, name: *const c_char, s
     end[0].number
 }
 
+/// `__sym_ntos` (`human` false) and `__sym_ntop` (true) on a table: the entry's name, or the number in `unname`.
 fn sym_name_or_number(table: &[res_sym], number: c_int, human: bool, success: Option<&mut c_int>, unname: &Spin<[u8; 20]>) -> *const c_char {
     if let Some(p) = sym_lookup(table, number, human) {
         if let Some(ok) = success {
@@ -202,14 +254,20 @@ fn sym_name_or_number(table: &[res_sym], number: c_int, human: bool, success: Op
     fill(&mut unname.lock()[..], dec(number as i64).as_bytes())
 }
 
+/// # Safety
+/// As `__sym_ston`. The result may point to a static buffer (not thread safe, as in glibc).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __sym_ntos(syms: *const res_sym, number: c_int, success: *mut c_int) -> *const c_char {
+    // SAFETY: the caller's contract: a terminated table, `success` NULL or writable.
     let (table, success) = unsafe { sym_args(syms, success) };
     sym_name_or_number(table, number, false, success, &UNNAME_NTOS)
 }
 
+/// # Safety
+/// As `__sym_ntos`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __sym_ntop(syms: *const res_sym, number: c_int, success: *mut c_int) -> *const c_char {
+    // SAFETY: the caller's contract: a terminated table, `success` NULL or writable.
     let (table, success) = unsafe { sym_args(syms, success) };
     sym_name_or_number(table, number, true, success, &UNNAME_NTOP)
 }
@@ -221,14 +279,17 @@ fn sym_ntos_rust(syms: &'static [res_sym], number: c_int) -> Buf<24> {
     }
 }
 
+/// The mnemonic of an RR type (`A`, `MX`, ..., or the decimal number): glibc's `p_type`.
 pub fn type_str(ty: c_int) -> Buf<24> {
     sym_ntos_rust(&__p_type_syms, ty)
 }
 
+/// The mnemonic of an RR class (`IN`, ...): glibc's `p_class`.
 pub fn class_str(class: c_int) -> Buf<24> {
     sym_ntos_rust(&__p_class_syms, class)
 }
 
+/// The mnemonic of a response code (`NOERROR`, ...): glibc's `p_rcode`.
 pub fn rcode_str(rcode: c_int) -> Buf<24> {
     sym_ntos_rust(&P_RCODE_SYMS, rcode)
 }
@@ -238,6 +299,7 @@ fn section_str(section: c_int, opcode: c_int) -> Buf<24> {
     sym_ntos_rust(t, section)
 }
 
+/// The name of one resolver option bit (`init`, `use-vc`, ...; `?0x..?` for anything else): glibc's `p_option`.
 pub fn option_str(option: c_ulong) -> Buf<40> {
     let name: &[u8] = match option {
         0x1 => b"init",
@@ -269,27 +331,36 @@ pub fn option_str(option: c_ulong) -> Buf<40> {
     Buf::from(name).unwrap()
 }
 
+/// # Safety
+/// The result points to a static buffer.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_type(ty: c_int) -> *const c_char {
     sym_name_or_number(&__p_type_syms, ty, false, None, &UNNAME_NTOS)
 }
 
+/// # Safety
+/// The result points to a static buffer.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_class(class: c_int) -> *const c_char {
     sym_name_or_number(&__p_class_syms, class, false, None, &UNNAME_NTOS)
 }
 
+/// # Safety
+/// The result points to a static buffer.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_rcode(rcode: c_int) -> *const c_char {
     sym_name_or_number(&P_RCODE_SYMS, rcode, false, None, &UNNAME_NTOS)
 }
 
+/// # Safety
+/// The result points to a static buffer.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_option(option: c_ulong) -> *const c_char {
     let s = option_str(option);
     fill(&mut NBUF_OPTION.lock()[..], s.as_bytes())
 }
 
+/// A TTL as `1w2d`, or the plain decimal number when it cannot be formatted: glibc's `p_time`.
 pub fn time_str(value: u32) -> Buf<40> {
     let mut tmp = [0u8; 40];
     match crate::nsparse::format_ttl(value as u64, &mut tmp) {
@@ -302,11 +373,14 @@ pub fn time_str(value: u32) -> Buf<40> {
     }
 }
 
+/// # Safety
+/// The result points to a static buffer.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_time(value: u32) -> *const c_char {
     fill(&mut NBUF_TIME.lock()[..], time_str(value).as_bytes())
 }
 
+/// Days since 1970-01-01 to (year, month, day) in the proleptic Gregorian calendar.
 fn civil(days: i64) -> (i64, u32, u32) {
     let z = days + 719468;
     let era = z.div_euclid(146097);
@@ -320,6 +394,8 @@ fn civil(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// `YYYYMMDDHHMMSS` of a time in seconds since the epoch, or `<overflow>` above 0x7fffffff (EOVERFLOW): glibc's
+/// obsolescent `p_secstodate`.
 pub fn secstodate(secs: c_ulong) -> Result<[u8; 14], ()> {
     if secs > 0x7fffffff {
         return Err(());
@@ -343,6 +419,8 @@ pub fn secstodate(secs: c_ulong) -> Result<[u8; 14], ()> {
     Ok(out)
 }
 
+/// # Safety
+/// The result points to a static buffer.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_secstodate(secs: c_ulong) -> *mut c_char {
     let mut out = OUTPUT_DATE.lock();
@@ -359,6 +437,7 @@ pub unsafe extern "C" fn __p_secstodate(secs: c_ulong) -> *mut c_char {
     out.as_mut_ptr().cast::<c_char>()
 }
 
+/// The number of DNS hierarchy levels in a name: glibc's `dn_count_labels`.
 pub fn count_labels(name: &[u8]) -> c_int {
     let mut count = name.iter().filter(|&&c| c == b'.').count() as c_int;
     if !name.is_empty() && name[0] == b'*' && count != 0 {
@@ -370,32 +449,51 @@ pub fn count_labels(name: &[u8]) -> c_int {
     count
 }
 
+/// # Safety
+/// `name` is a C string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __dn_count_labels(name: *const c_char) -> c_int {
+    // SAFETY: the caller's contract: `name` is a C string.
     count_labels(unsafe { ffi::cstr_bytes(name) })
 }
 
+// ---------------------------------------------------------------- put/get
+
+/// # Safety
+/// `dst` has 4 writable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __putlong(src: u32, dst: *mut c_uchar) {
+    // SAFETY: the caller's contract: `dst` has 4 writable bytes.
     unsafe { ffi::bytes_mut(dst, 4) }.copy_from_slice(&src.to_be_bytes());
 }
 
+/// # Safety
+/// `dst` has 2 writable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __putshort(src: u16, dst: *mut c_uchar) {
+    // SAFETY: the caller's contract: `dst` has 2 writable bytes.
     unsafe { ffi::bytes_mut(dst, 2) }.copy_from_slice(&src.to_be_bytes());
 }
 
+/// # Safety
+/// `src` has 4 readable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn _getlong(src: *const c_uchar) -> u32 {
+    // SAFETY: the caller's contract: `src` has 4 readable bytes.
     let b = unsafe { ffi::bytes(src, 4) };
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
 }
 
+/// # Safety
+/// `src` has 2 readable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn _getshort(src: *const c_uchar) -> u16 {
+    // SAFETY: the caller's contract: `src` has 2 readable bytes.
     let b = unsafe { ffi::bytes(src, 2) };
     u16::from_be_bytes([b[0], b[1]])
 }
+
+// ---------------------------------------------------------------- LOC text
 
 const POWEROFTEN: [u32; 10] = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000];
 
@@ -407,6 +505,7 @@ fn is_space(c: u8) -> bool {
     crate::util::is_space(c)
 }
 
+/// ASCII size/precision `X * 10**Y` cm to the `0xXY` byte; moves `pos`.
 fn precsize_aton(s: &[u8], pos: &mut usize) -> u8 {
     let at = |i: usize| -> u8 { *s.get(i).unwrap_or(&0) };
     let mut cp = *pos;
@@ -443,6 +542,7 @@ fn precsize_aton(s: &[u8], pos: &mut usize) -> u8 {
     ((mantissa << 4) | exponent as u32) as u8
 }
 
+/// ASCII latitude/longitude to the unsigned encoded 32-bit number; moves `pos`; `which` 1 latitude, 2 longitude, 0 error.
 fn latlon2ul(s: &[u8], pos: &mut usize, which: &mut c_int) -> u32 {
     let at = |i: usize| -> u8 { *s.get(i).unwrap_or(&0) };
     let mut cp = *pos;
@@ -516,6 +616,7 @@ fn latlon2ul(s: &[u8], pos: &mut usize, which: &mut c_int) -> u32 {
     retval
 }
 
+/// A zone-file LOC text to its 16-byte wire form; 0 if the text is not a LOC (glibc's `loc_aton`).
 pub fn loc_aton(ascii: &[u8]) -> Option<[u8; 16]> {
     let maxcp = ascii.len();
     let at = |i: usize| -> u8 { *ascii.get(i).unwrap_or(&0) };
@@ -593,16 +694,22 @@ pub fn loc_aton(ascii: &[u8]) -> Option<[u8; 16]> {
     Some(out)
 }
 
+/// # Safety
+/// `ascii` is a C string; `binary` has 16 writable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __loc_aton(ascii: *const c_char, binary: *mut c_uchar) -> c_int {
+    // SAFETY: the caller's contract: `ascii` is a C string.
     match loc_aton(unsafe { ffi::cstr_bytes(ascii) }) {
         Some(b) => {
+            // SAFETY: the caller's contract: `binary` has 16 writable bytes.
             unsafe { ffi::bytes_mut(binary, 16) }.copy_from_slice(&b);
             16
         }
         None => 0,
     }
 }
+
+// ---------------------------------------------------------------- message printers
 
 fn getflag(h: &ns_msg, flag: c_int) -> c_int {
     crate::nsparse::ns_msg_getflag(*h, flag)
@@ -616,6 +723,7 @@ fn do_section(pfcode: c_ulong, handle: &mut ns_msg, m: &[u8], section: c_int, pf
     let opcode = getflag(handle, ns_f_opcode);
     let mut rrnum: c_int = 0;
     let mut rr = ns_rr::zero();
+    // glibc starts with a 2048 byte buffer, grows it by 1024 on ENOSPC up to 131072, and gives up beyond
     let mut buf = [0u8; 2048];
     let mut big: Option<Buf<{ 131072 + 1024 }>> = None;
     loop {
@@ -645,6 +753,7 @@ fn do_section(pfcode: c_ulong, handle: &mut ns_msg, m: &[u8], section: c_int, pf
             let mut n = crate::nsparse::sprintrr_c(handle, m, &rr, &mut buf);
             let mut text: &[u8] = &buf;
             if n < 0 && errno::get() == ENOSPC {
+                // the larger buffer: any record that fits glibc's growing buffer fits this one
                 let b = big.get_or_insert_with(Buf::new);
                 n = crate::nsparse::sprintrr_c(handle, m, &rr, &mut b.b[..131072]);
                 if n < 0 && errno::get() == ENOSPC {
@@ -671,12 +780,19 @@ fn msg(out: &mut dyn Sink, prefix: &[u8], err: &[u8]) {
     out.put(b"\n");
 }
 
+/// Print the contents of a DNS message the way glibc's `fp_nquery` does; `pfcode` is `_res.pfcode`. The length is taken
+/// as the C `int` the C function gets.
 pub fn render_fp_nquery(message: &[u8], pfcode: c_ulong, out: &mut dyn Sink) {
     let len = message.len() as c_int;
     render(&message[..len.max(0) as usize], pfcode, out)
 }
 
+/// [`render_fp_nquery`] on a pointer and a (possibly bogus) length, as the C function receives them.
+///
+/// # Safety
+/// `msg` has `len` readable bytes (when `len` is positive).
 pub unsafe fn render_fp_nquery_raw(m: *const c_uchar, len: c_int, pfcode: c_ulong, out: &mut dyn Sink) {
+    // SAFETY: the caller's contract (nothing is read for a length of 0 or less).
     render(unsafe { ffi::bytes(m, len.max(0) as usize) }, pfcode, out)
 }
 
@@ -732,6 +848,7 @@ fn render(m: &[u8], pfcode: c_ulong, out: &mut dyn Sink) {
     }
 }
 
+/// Print the current resolver options: `;; res options: init recurs ...` (glibc's `fp_resstat`).
 pub fn render_resstat(options: c_ulong, out: &mut dyn Sink) {
     out.put(b";; res options:");
     let mut mask: c_ulong = 1;
@@ -745,8 +862,11 @@ pub fn render_resstat(options: c_ulong, out: &mut dyn Sink) {
     out.put(b"\n");
 }
 
+/// # Safety
+/// `statp` is a resolver state, `file` a `FILE *`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __fp_resstat(statp: *const ResState, file: *mut c_void) {
+    // SAFETY: the caller's contract: `statp` is a readable state.
     let options = unsafe { (*statp).options };
     render_resstat(options, &mut FileSink(file))
 }
@@ -755,29 +875,45 @@ fn cur_pfcode() -> c_ulong {
     with_this_state(|st| st.pfcode)
 }
 
+/// # Safety
+/// `msg` has `len` readable bytes, `file` is a `FILE *`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __fp_nquery(msg: *const c_uchar, len: c_int, file: *mut c_void) {
+    // SAFETY: the caller's contract.
     unsafe { render_fp_nquery_raw(msg, len, cur_pfcode(), &mut FileSink(file)) }
 }
 
+/// # Safety
+/// `msg` has at least `PACKETSZ` (512) readable bytes, `file` is a `FILE *`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __fp_query(msg: *const c_uchar, file: *mut c_void) {
+    // SAFETY: the caller's contract.
     unsafe { render_fp_nquery_raw(msg, PACKETSZ, cur_pfcode(), &mut FileSink(file)) }
 }
 
+/// # Safety
+/// `msg` has at least 512 readable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_query(msg: *const c_uchar) {
+    // SAFETY: `stdout` is the stdio crate's variable; a plain read of the pointer it holds.
     let out = unsafe { *stdout.as_ptr() };
+    // SAFETY: the caller's contract; `out` is the program's stdout `FILE *`.
     unsafe { render_fp_nquery_raw(msg, PACKETSZ, cur_pfcode(), &mut FileSink(out)) }
 }
 
+// ---------------------------------------------------------------- names
+
+/// The text of a NUL-terminated name in `b` (all of `b` without a NUL).
 fn text(b: &[u8]) -> &[u8] {
     &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
 }
 
+/// # Safety
+/// As `dn_expand`; `file` is a `FILE *`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_cdnname(cp: *const c_uchar, msg: *const c_uchar, len: c_int, file: *mut c_void) -> *const c_uchar {
     let mut name = [0u8; MAXDNAME];
+    // SAFETY: the caller's contract: `msg..msg + len` is the message.
     let m = unsafe { msg_slice(msg, msg.wrapping_offset(len as isize)) };
     let n = crate::resolv::expand(m, offset_in(msg, cp), &mut name);
     if n < 0 {
@@ -792,11 +928,16 @@ pub unsafe extern "C" fn __p_cdnname(cp: *const c_uchar, msg: *const c_uchar, le
     cp.wrapping_add(n as usize)
 }
 
+/// # Safety
+/// As `__p_cdnname`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_cdname(cp: *const c_uchar, msg: *const c_uchar, file: *mut c_void) -> *const c_uchar {
+    // SAFETY: the same contract.
     unsafe { __p_cdnname(cp, msg, PACKETSZ, file) }
 }
 
+/// `p_fqnname` on slices: the name at `off` of `m` into `name` (`namelen` its C length) with a trailing dot added; the bytes
+/// the name occupies, or None.
 fn fqnname(m: &[u8], off: Option<usize>, name: &mut [u8], namelen: c_int) -> Option<usize> {
     let n = crate::resolv::expand(m, off, name);
     if n < 0 {
@@ -813,8 +954,12 @@ fn fqnname(m: &[u8], off: Option<usize>, name: &mut [u8], namelen: c_int) -> Opt
     Some(n as usize)
 }
 
+/// # Safety
+/// As `dn_expand`; `name` has `namelen` writable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_fqnname(cp: *const c_uchar, msg: *const c_uchar, msglen: c_int, name: *mut c_char, namelen: c_int) -> *const c_uchar {
+    // glibc's end of the message is `cp + msglen`
+    // SAFETY: the caller's contract: `msg..cp + msglen` is readable, `name` has `namelen` writable bytes.
     let (m, nm) = unsafe { msg_dst(msg, cp.wrapping_offset(msglen as isize), name.cast::<u8>(), namelen.max(0) as usize) };
     match fqnname(m, offset_in(msg, cp), nm, namelen) {
         Some(n) => cp.wrapping_add(n),
@@ -822,9 +967,12 @@ pub unsafe extern "C" fn __p_fqnname(cp: *const c_uchar, msg: *const c_uchar, ms
     }
 }
 
+/// # Safety
+/// As `__p_cdnname`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __p_fqname(cp: *const c_uchar, msg: *const c_uchar, file: *mut c_void) -> *const c_uchar {
     let mut name = [0u8; MAXDNAME];
+    // SAFETY: the caller's contract: `msg..cp + MAXCDNAME` is readable (as for glibc's p_fqnname call).
     let m = unsafe { msg_slice(msg, cp.wrapping_offset(MAXCDNAME as isize)) };
     match fqnname(m, offset_in(msg, cp), &mut name, MAXDNAME as c_int) {
         Some(n) => {
@@ -835,11 +983,19 @@ pub unsafe extern "C" fn __p_fqname(cp: *const c_uchar, msg: *const c_uchar, fil
     }
 }
 
+/// The six header bytes up to QDCOUNT that `__res_nameinquery` / `__res_queriesmatch` read without a bound (as glibc),
+/// and the message `buf..eom`.
+///
+/// # Safety
+/// `buf` has 6 readable bytes and `buf..eom` is readable.
 unsafe fn header_msg<'a>(buf: *const c_uchar, eom: *const c_uchar) -> ([u8; 6], &'a [u8]) {
+    // SAFETY: the caller's contract.
     let b = unsafe { ffi::bytes(buf, 6) };
+    // SAFETY: the caller's contract.
     ([b[0], b[1], b[2], b[3], b[4], b[5]], unsafe { msg_slice(buf, eom) })
 }
 
+/// `__res_nameinquery` on the message `m` whose question count is `qdcount`.
 fn nameinquery(name: &[u8], ty: c_int, class: c_int, m: &[u8], qdcount: c_int) -> c_int {
     let mut cp = HFIXEDSZ;
     let mut qdcount = qdcount;
@@ -864,24 +1020,37 @@ fn nameinquery(name: &[u8], ty: c_int, class: c_int, m: &[u8], qdcount: c_int) -
     0
 }
 
+/// Does `name` appear among the questions of the message `buf..eom`? 1 yes, 0 no, -1 malformed.
+///
+/// # Safety
+/// `buf..eom` is readable memory.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __res_nameinquery(name: *const c_char, ty: c_int, class: c_int, buf: *const c_uchar, eom: *const c_uchar) -> c_int {
+    // SAFETY: the caller's contract: `buf..eom` is readable (glibc reads QDCOUNT before any bound check).
     let (h, m) = unsafe { header_msg(buf, eom) };
+    // SAFETY: the caller's contract: `name` is a C string.
     let name = unsafe { ffi::cstr_bytes(name) };
     nameinquery(name, ty, class, m, u16::from_be_bytes([h[4], h[5]]) as c_int)
 }
 
+/// Do two messages ask the same questions? 1 yes, 0 no, -1 malformed.
+///
+/// # Safety
+/// Both ranges are readable memory.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __res_queriesmatch(buf1: *const c_uchar, eom1: *const c_uchar, buf2: *const c_uchar, eom2: *const c_uchar) -> c_int {
     if (eom1 as usize).wrapping_sub(buf1 as usize) < HFIXEDSZ || (eom2 as usize).wrapping_sub(buf2 as usize) < HFIXEDSZ {
         return -1;
     }
+    // SAFETY: the caller's contract: the first message is readable (its header: checked above, or read as glibc does).
     let (h1, m1) = unsafe { header_msg(buf1, eom1) };
+    // SAFETY: as above, the second message.
     let (h2, m2) = unsafe { header_msg(buf2, eom2) };
     queriesmatch(m1, h1, m2, h2)
 }
 
 fn queriesmatch(m1: &[u8], h1: [u8; 6], m2: &[u8], h2: [u8; 6]) -> c_int {
+    // the opcode is bits 3..6 of the third header byte
     let op1 = (h1[2] >> 3) & 0xf;
     let op2 = (h2[2] >> 3) & 0xf;
     if op1 == 5 && op2 == 5 {
@@ -915,6 +1084,9 @@ fn queriesmatch(m1: &[u8], h1: [u8; 6], m2: &[u8], h2: [u8; 6]) -> c_int {
     1
 }
 
+// ---------------------------------------------------------------- state helpers
+
+/// The address of name server `n` of `st` (the IPv6 extension entry when the IPv4 slot is empty).
 fn nsaddr(st: &ResState, n: usize) -> *const u8 {
     if st.nsaddr_list[n].sin_family == 0 && !st.u.nsaddrs[n].is_null() {
         st.u.nsaddrs[n] as *const u8
@@ -923,11 +1095,19 @@ fn nsaddr(st: &ResState, n: usize) -> *const u8 {
     }
 }
 
+/// `__res_get_nsaddr`: the address of name server `n` (the IPv6 extension entry when the IPv4 slot is empty).
+///
+/// # Safety
+/// `st` is a resolver state and `n < st.nscount`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __res_get_nsaddr(st: *const ResState, n: c_uint) -> *const u8 {
+    // SAFETY: the caller's contract: a readable state.
     nsaddr(unsafe { &*st }, n as usize)
 }
 
+/// The bytes of name server `n` as `__res_get_nsaddr` gives it: the IPv6 extension entry (28 bytes) when the IPv4 slot is
+/// empty, else the `sockaddr_in` slot (16 bytes, then zeros: glibc would read the bytes after the slot there, which only a
+/// program that writes AF_INET6 into an IPv4 slot reaches).
 fn server_bytes(st: &ResState, n: usize) -> [u8; 28] {
     let mut b = [0u8; 28];
     if let Some(a) = (st.nsaddr_list[n].sin_family == 0).then(|| crate::resolv::ext_addr(st, n)).flatten() {
@@ -946,7 +1126,13 @@ fn server_bytes(st: &ResState, n: usize) -> [u8; 28] {
     b
 }
 
+/// Is the socket address (a `sockaddr_in` or `sockaddr_in6`, read as raw bytes) one of the state's name servers?
+///
+/// # Safety
+/// `inp` points to a socket address of the family it says; `st` is a resolver state.
 pub unsafe fn isourserver(st: &ResState, inp: *const u8) -> bool {
+    // the family and port of `inp`, then the address bytes its family has
+    // SAFETY: the caller's contract: every socket address starts with its family and port.
     let head = unsafe { ffi::bytes(inp, 4) };
     let family = u16::from_ne_bytes([head[0], head[1]]) as c_int;
     let port = [head[2], head[3]];
@@ -955,6 +1141,7 @@ pub unsafe fn isourserver(st: &ResState, inp: *const u8) -> bool {
         10 => (8, 16),
         _ => return false,
     };
+    // SAFETY: the caller's contract: a socket address of its family (sockaddr_in: 16 bytes, sockaddr_in6: 28).
     let addr = unsafe { ffi::bytes(inp.wrapping_add(aoff), alen) };
     for ns in 0..st.nscount.max(0) as usize {
         let srv = server_bytes(st, ns);
@@ -968,11 +1155,15 @@ pub unsafe fn isourserver(st: &ResState, inp: *const u8) -> bool {
     false
 }
 
+/// # Safety
+/// `inp` points to a `sockaddr_in` or `sockaddr_in6`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __res_isourserver(inp: *const sockaddr_in) -> c_int {
+    // SAFETY: the caller's contract for `inp`.
     with_this_state(|st| unsafe { isourserver(st, inp as *const u8) } as c_int)
 }
 
+/// The host alias for `name` from the file named by `$HOSTALIASES` (`alias   real.name` lines), or None.
 pub fn host_alias(options: c_ulong, name: &[u8]) -> Option<Buf<MAXDNAME>> {
     if options & crate::dns::RES_NOALIASES as c_ulong != 0 {
         return None;
@@ -980,7 +1171,9 @@ pub fn host_alias(options: c_ulong, name: &[u8]) -> Option<Buf<MAXDNAME>> {
     let file = crate::util::getenv(b"HOSTALIASES")?;
     let mut path = Buf::<4097>::from(file)?;
     path.push(0);
+    // SAFETY: `path` is NUL-terminated (pushed above).
     let fd = unsafe { rusty_libc_core::unistd::open(path.b.as_ptr().cast::<c_char>(), 0o2000000, 0) }.ok()?;
+    // glibc reads the file with fgets (BUFSIZ = 8192 byte lines); read it whole here
     let mut data = Buf::<65536>::new();
     loop {
         let n = match rusty_libc_core::unistd::read_nocancel(fd, &mut data.b[data.len..]) {
@@ -998,6 +1191,7 @@ pub fn host_alias(options: c_ulong, name: &[u8]) -> Option<Buf<MAXDNAME>> {
         let end = rest.iter().position(|&c| c == b'\n').map(|i| i + 1).unwrap_or(rest.len());
         let line = &rest[..end.min(8191)];
         let next = &rest[end..];
+        // the line as a C string: the first token, then the target
         let mut i = 0;
         while i < line.len() && line[i] != 0 && !is_space(line[i]) {
             i += 1;
@@ -1006,6 +1200,7 @@ pub fn host_alias(options: c_ulong, name: &[u8]) -> Option<Buf<MAXDNAME>> {
             break;
         }
         let alias = &line[..i];
+        // glibc compares the C strings: each is cut at its first NUL, and at MAXDNAME - 1 bytes by the copies made here
         let mut name_c = Buf::<MAXDNAME>::new();
         name_c.push_all(name);
         name_c.push(0);
@@ -1035,6 +1230,7 @@ pub fn host_alias(options: c_ulong, name: &[u8]) -> Option<Buf<MAXDNAME>> {
 
 static ABUF: Spin<[u8; MAXDNAME]> = Spin::new([0; MAXDNAME]);
 
+/// `res_hostalias` into `dst` (cut to it, NUL-terminated); false when there is no alias.
 fn hostalias_into(options: c_ulong, name: &[u8], dst: &mut [u8]) -> bool {
     match host_alias(options, name) {
         Some(a) => {
@@ -1047,14 +1243,21 @@ fn hostalias_into(options: c_ulong, name: &[u8], dst: &mut [u8]) -> bool {
     }
 }
 
+/// # Safety
+/// `name` is a C string; `dst` has `siz` writable bytes (`siz` > 0).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __res_hostalias(statp: *const ResState, name: *const c_char, dst: *mut c_char, siz: usize) -> *const c_char {
+    // SAFETY: the caller's contract: a readable state.
     let options = unsafe { (*statp).options };
+    // SAFETY: the caller's contract: `name` is a C string.
     let name = unsafe { ffi::cstr_bytes(name) };
+    // SAFETY: the caller's contract: `dst` has `siz` writable bytes.
     let d = unsafe { ffi::bytes_mut(dst.cast::<u8>(), siz) };
     if hostalias_into(options, name, d) { dst } else { core::ptr::null() }
 }
 
+/// # Safety
+/// `name` is a C string. The result points to a static buffer.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __hostalias(name: *const c_char) -> *const c_char {
     let options = with_this_state(|st| {
@@ -1063,11 +1266,17 @@ pub unsafe extern "C" fn __hostalias(name: *const c_char) -> *const c_char {
         }
         st.options
     });
+    // SAFETY: the caller's contract: `name` is a C string.
     let name = unsafe { ffi::cstr_bytes(name) };
     let mut buf = ABUF.lock();
     if hostalias_into(options, name, &mut buf[..]) { buf.as_ptr().cast::<c_char>() } else { core::ptr::null() }
 }
 
+/// `res_close`, as glibc 2.43 (res_data.c): on a state set up (RES_INIT) `__res_iclose(&_res, false)`, which closes the
+/// sockets RES_STAYOPEN kept and keeps the server copies.
+///
+/// # Safety
+/// Closes the descriptors of the calling thread's resolver state.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __res_close() {
     with_this_state(|st| {
@@ -1077,16 +1286,23 @@ pub unsafe extern "C" fn __res_close() {
     })
 }
 
+/// # Safety
+/// `hook` is stored, never called.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __rl_res_send_setqhook(hook: *mut c_void) {
     with_this_state(|st| st.qhook = hook)
 }
 
+/// # Safety
+/// `hook` is stored, never called.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __rl_res_send_setrhook(hook: *mut c_void) {
     with_this_state(|st| st.rhook = hook)
 }
 
+// ---------------------------------------------------------------- inet_net_*
+
+/// `inet_neta`: a network number as dotted text without the trailing zero bytes (`10.1`); None = EMSGSIZE.
 pub fn neta(mut src: u32, size: usize) -> Option<Buf<20>> {
     let mut out = Buf::<20>::new();
     let mut size = size;
@@ -1114,10 +1330,14 @@ pub fn neta(mut src: u32, size: usize) -> Option<Buf<20>> {
     Some(out)
 }
 
+/// # Safety
+/// `dst` has `size` writable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_neta(src: u32, dst: *mut c_char, size: usize) -> *mut c_char {
     match neta(src, size) {
         Some(b) => {
+            // SAFETY: the caller's contract: `dst` has `size` writable bytes, and `neta` only succeeds when the text and
+            // its NUL fit in them.
             let d = unsafe { ffi::bytes_mut(dst.cast::<u8>(), b.len + 1) };
             d[..b.len].copy_from_slice(b.as_bytes());
             d[b.len] = 0;
@@ -1130,6 +1350,7 @@ pub unsafe extern "C" fn inet_neta(src: u32, dst: *mut c_char, size: usize) -> *
     }
 }
 
+/// `inet_net_ntop` for AF_INET: `10.1.2/24`; Err(errno).
 pub fn net_ntop_ipv4(src: &[u8], bits: c_int, size: usize) -> Result<Buf<24>, c_int> {
     if !(0..=32).contains(&bits) {
         return Err(EINVAL);
@@ -1179,16 +1400,22 @@ pub fn net_ntop_ipv4(src: &[u8], bits: c_int, size: usize) -> Result<Buf<24>, c_
     Ok(out)
 }
 
+/// # Safety
+/// `src` has the address bytes, `dst` has `size` writable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_net_ntop(af: c_int, src: *const c_void, bits: c_int, dst: *mut c_char, size: usize) -> *mut c_char {
     if af != AF_INET {
         errno::set(EAFNOSUPPORT);
         return core::ptr::null_mut();
     }
+    // the bytes the prefix covers (none for a bad prefix length, which is refused before anything is read)
     let n = if (0..=32).contains(&bits) { (bits as usize).div_ceil(8) } else { 0 };
+    // SAFETY: the caller's contract: `src` holds the address bytes the prefix covers.
     let s = unsafe { ffi::bytes(src.cast::<u8>(), n) };
     match net_ntop_ipv4(s, bits, size) {
         Ok(b) => {
+            // SAFETY: the caller's contract: `dst` has `size` writable bytes, and the text and its NUL fit in them
+            // (`net_ntop_ipv4` checked).
             let d = unsafe { ffi::bytes_mut(dst.cast::<u8>(), b.len + 1) };
             d[..b.len].copy_from_slice(b.as_bytes());
             d[b.len] = 0;
@@ -1201,6 +1428,7 @@ pub unsafe extern "C" fn inet_net_ntop(af: c_int, src: *const c_void, bits: c_in
     }
 }
 
+/// `inet_net_pton` for AF_INET: the address bytes written into `dst` and the prefix length; Err(errno).
 pub fn net_pton_ipv4(src: &[u8], dst: &mut [u8]) -> Result<c_int, c_int> {
     let at = |i: usize| -> u8 { *src.get(i).unwrap_or(&0) };
     let mut i = 0usize;
@@ -1324,13 +1552,17 @@ pub fn net_pton_ipv4(src: &[u8], dst: &mut [u8]) -> Result<c_int, c_int> {
     Ok(bits)
 }
 
+/// # Safety
+/// `src` is a C string; `dst` has `size` writable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn inet_net_pton(af: c_int, src: *const c_char, dst: *mut c_void, size: usize) -> c_int {
     if af != AF_INET {
         errno::set(EAFNOSUPPORT);
         return -1;
     }
+    // SAFETY: the caller's contract: `dst` has `size` writable bytes.
     let d = unsafe { ffi::bytes_mut(dst.cast::<u8>(), size) };
+    // SAFETY: the caller's contract: `src` is a C string.
     match net_pton_ipv4(unsafe { ffi::cstr_bytes(src) }, d) {
         Ok(b) => b,
         Err(e) => {

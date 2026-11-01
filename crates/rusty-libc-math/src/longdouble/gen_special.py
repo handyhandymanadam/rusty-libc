@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
+"""Generates fast_special_tables.rs: the polynomial tables of the double-double fast paths of erfl,
+erfcl, lgammal, tgammal, j0l, j1l, y0l, y1l (fast_special.rs). Each function is fitted on short
+intervals by Chebyshev interpolation computed in exact fixed-point arithmetic (fpmath.py), the
+monomial coefficients in t = x - c are rounded to double-doubles for the first K terms (their
+rounding would otherwise show at 2^-85) and to doubles after that, and every interval is checked
+against the function at many points with the rounded coefficients evaluated exactly. Everything is
+computed here from the mathematics (nothing is copied from another library).
+Usage: python3 gen_special.py > fast_special_tables.rs"""
 import sys
 from fractions import Fraction
 from fpmath import *
 import fpmath
 
-TOL_BITS = 100
-CHECK_BITS = 86
-DD_THRESH = Fraction(1, 1 << 36)
+TOL_BITS = 100       # truncation of the Chebyshev series: below 2^-100 of the function's size
+CHECK_BITS = 86      # the verified error of the rounded polynomial: below 2^-86 (relative to |f| >= 2^-4)
+DD_THRESH = Fraction(1, 1 << 36)  # coefficients above this (in magnitude of the term at |s| = 1) are double-doubles
 
 
 def err(msg):
@@ -14,30 +22,38 @@ def err(msg):
 
 
 class Table:
+    """Polynomials on a list of intervals (c_i, h_i) for a function f(x) -> fixed point."""
 
     def __init__(self, name, f, intervals, deg_min=10, deg_max=40, scale=lambda x: 1):
         self.name, self.f, self.intervals = name, f, intervals
         self.rows = []
+        # choose the degree: the largest D needed over the intervals
         need = 0
         fits = []
         for (c, h) in intervals:
             n = deg_max
             mono, a = cheb_fit(f, c, h, n)
+            # smallest d such that all |a_k| (k > d) are below tolerance relative to the function size
             fsize = max(abs(to_frac(a[0])), Fraction(1, 1 << 10))
             tol = fsize / (1 << TOL_BITS)
             d = n - 1
             while d > deg_min and abs(to_frac(a[d])) < tol:
                 d -= 1
+            # the coefficients above d are dropped: refit exactly with d+2 nodes to keep a good interpolant
             need = max(need, d)
             fits.append((c, h))
-        self.deg = need
+        self.deg = need  # polynomial of degree `need` (need + 1 coefficients)
         n = need + 1
         self.K = 0
         monos = []
         for (c, h) in intervals:
             mono, a = cheb_fit(f, c, h, n)
+            # truncate to degree `need` by dropping the last coefficient(s) of the Chebyshev series
+            # (re-fit with exactly need + 1 nodes instead: interpolation at n nodes of a function whose
+            # Chebyshev tail is below the tolerance)
             assert len(mono) == self.deg + 1
             monos.append((c, h, mono, a))
+        # dd count
         for (c, h, mono, a) in monos:
             for k, m in enumerate(mono):
                 if abs(to_frac(m)) > DD_THRESH:
@@ -49,7 +65,7 @@ class Table:
         for (c, h, mono, a) in self.monos:
             hi, lo = [], []
             for k, m in enumerate(mono):
-                q = to_frac(m) / (Fraction(h) ** k)
+                q = to_frac(m) / (Fraction(h) ** k)  # coefficient of (x - c)^k
                 if k < self.K:
                     qh, ql = dd(q)
                     hi.append(qh)
@@ -81,7 +97,7 @@ class Table:
         rows = self.rows_dd()
         n = len(rows)
         print(f"/// {self.name}: polynomial coefficients (hi parts) of (x - c)^k, k = 0..={self.deg}, per interval.")
-        kw = "static" if n * (self.deg + 1) * 8 > 16000 else "const"
+        kw = "static" if n * (self.deg + 1) * 8 > 16000 else "const"  # clippy::large_const_arrays
         print(f"pub {kw} {self.name}_HI: [[f64; {self.deg + 1}]; {n}] = [")
         for hi, lo in rows:
             print("    [" + ", ".join(fmt(v) for v in hi) + "],")
@@ -96,7 +112,9 @@ class Table:
         print()
 
 
-def asin_fp(x):
+# ---- the functions at high precision --------------------------------------------------------------
+
+def asin_fp(x):  # x Fraction in (-0.76, 0.76): Newton on sin y = x in fixed point, from the double estimate
     xf = from_frac(x)
     y = from_frac(Fraction(math.asin(float(x))))
     for _ in range(7):
@@ -105,7 +123,7 @@ def asin_fp(x):
     return y
 
 
-def atan_fp(x):
+def atan_fp(x):  # x Fraction in [0, 1.01): Newton on sin y = x cos y from the double estimate
     xf = from_frac(x)
     y = from_frac(Fraction(math.atan(float(x))))
     for _ in range(7):
@@ -114,7 +132,7 @@ def atan_fp(x):
     return y
 
 
-def erf_fp(x):
+def erf_fp(x):  # x Fraction in (0, 7.2)
     xf = from_frac(x)
     x2 = fmul(xf, xf)
     two_x2 = x2 * 2
@@ -129,6 +147,7 @@ def erf_fp(x):
 
 
 def gs_fp(x, N=3000):
+    """erfc(x) e^(x^2) = 1/(sqrt(pi) (x + (1/2)/(x + 1/(x + (3/2)/(x + ...)))))."""
     xf = from_frac(x)
     f = xf
     for k in range(N, 0, -1):
@@ -137,8 +156,9 @@ def gs_fp(x, N=3000):
 
 
 def fln(x):
+    """ln of a positive fixed-point number of any magnitude."""
     e = x.bit_length() - 1 - P
-    m = x >> e if e >= 0 else x << -e
+    m = x >> e if e >= 0 else x << -e  # in [ONE, 2 ONE)
     z = fdiv(m - ONE, m + ONE)
     z2 = fmul(z, z)
     s, t, k = 0, z, 1
@@ -150,6 +170,7 @@ def fln(x):
 
 
 def bernoulli(n):
+    """B_0..B_n as Fractions."""
     B = [Fraction(0)] * (n + 1)
     B[0] = Fraction(1)
     for m in range(1, n + 1):
@@ -162,6 +183,7 @@ LN_2PI_HALF = fln(2 * PI) // 2
 
 
 def stirling_tail(yf):
+    """sum_{k>=1} B_2k / (2k (2k - 1) y^(2k-1)) for a fixed-point y >= 100, as fixed point."""
     w = fdiv(ONE, yf)
     w2 = fmul(w, w)
     s = 0
@@ -174,6 +196,7 @@ def stirling_tail(yf):
 
 
 def lgamma_fp(x):
+    """ln Gamma(x) for a Fraction x in [0.4, 30], fixed point, by the recurrence up to y >= 300 and Stirling."""
     xf = from_frac(x)
     n = int(300 - x) + 1
     prod = ONE
@@ -185,6 +208,7 @@ def lgamma_fp(x):
 
 
 def lgamma_over_zeros(x):
+    """lgamma(x) / ((x - 1)(x - 2))."""
     xf = from_frac(x)
     return fdiv(lgamma_fp(x), fmul(xf - ONE, xf - 2 * ONE))
 
@@ -205,14 +229,16 @@ INV_PI = fdiv(ONE, PI)
 
 
 def bessel_series(x):
+    """(J0, J1, Y0, Y1, R0, R1) at a Fraction x in (0, 45], fixed point."""
     xf = from_frac(x)
-    q = fmul(xf, xf) >> 2
+    q = fmul(xf, xf) >> 2  # x^2/4
+    # sums over k: A_k = (-q)^k/(k!)^2 and B_k = (-q)^k/(k! (k+1)!)
     a = ONE
     b = ONE
     sj0, sj1 = 0, 0
-    sy0 = 0
-    sy1 = 0
-    hk = 0
+    sy0 = 0      # sum_{k>=1} (-1)^(k+1) H_k q^k/(k!)^2 = - sum H_k A_k
+    sy1 = 0      # sum_k [psi(k+1) + psi(k+2)] B_k with psi(n+1) = -gamma + H_n
+    hk = 0       # H_k
     k = 0
     while True:
         sj0 += a
@@ -236,6 +262,7 @@ def bessel_series(x):
 
 
 def asym_coeffs(nu, count):
+    """a_k(nu) = prod_{j<=k} (4 nu^2 - (2j-1)^2) / (k! 8^k), k = 0..count."""
     mu = 4 * nu * nu
     a = [Fraction(1)]
     for k in range(1, count + 1):
@@ -250,6 +277,11 @@ def main():
     print()
     which = sys.argv[1:] or ["erf", "erfc", "lgamma", "bessel"]
     if "asin" in which:
+        # asin on [0, 0.75) in rows of width 1/256 centred on j/256 (asinl: |x| < 0.75 directly, above that
+        # through asin(x) = pi/2 - 2 asin(sqrt((1 - x)/2)), whose argument is below 0.354)
+        # the rounding test accepts an answer only when the value is more than 2^-10 ulp (2^-74) from a rounding
+        # boundary, so 2^-84 (checked against max(|f|, 2^-4)) leaves a margin of 2^-7 ulp... and terms below 2^-26
+        # of the value are plain doubles (their rounding is below 2^-79)
         global TOL_BITS, CHECK_BITS, DD_THRESH
         TOL_BITS, CHECK_BITS, DD_THRESH = 88, 84, Fraction(1, 1 << 26)
         ivs = [(Fraction(j, 256), Fraction(1, 512)) for j in range(0, 193)]
@@ -258,6 +290,8 @@ def main():
         tab.emit()
 
     if "atan" in which:
+        # atan on [0, 1 + 2^-52] in rows of width 1/256 centred on j/256 (atanl and atan2l: the ratio n/d <= 1 as a
+        # double-double goes straight into the rows; the last row, j = 256, also holds 1 + 2^-52); same tolerances as asin
         TOL_BITS, CHECK_BITS, DD_THRESH = 88, 84, Fraction(1, 1 << 32)
         ivs = [(Fraction(j, 256), Fraction(1, 512)) for j in range(0, 257)]
         tab = Table("ATAN_TAB", atan_fp, ivs, deg_min=6)
@@ -265,6 +299,7 @@ def main():
         tab.emit()
 
     if "erf" in which:
+        # Taylor coefficients of erf(x) / x in z = x^2: (-1)^k 2 / (sqrt(pi) k! (2k + 1)), k = 0..13
         co = []
         fact = 1
         for k in range(14):
@@ -276,12 +311,14 @@ def main():
         print("pub const ERF_TAYLOR_HI: [f64; 14] = [" + ", ".join(fmt(float(v)) for v in co) + "];")
         print("pub const ERF_TAYLOR_LO: [f64; 5] = [" + ", ".join(fmt(dd(v)[1]) for v in co[:5]) + "];")
         print()
+        # erf on [1/4, 7): intervals of width 1/8
         ivs = [(Fraction(2 * k + 1, 16), Fraction(1, 16)) for k in range(2, 56)]
         tab = Table("ERF_TAB", erf_fp, ivs)
         tab.verify()
         tab.emit()
 
     if "lgamma" in which:
+        # Stirling coefficients s_k = B_2k / (2k (2k - 1)), k = 1..20 (s_1 as a double-double)
         co = [BERN[2 * k] / (2 * k * (2 * k - 1)) for k in range(1, 21)]
         print("/// Stirling series of ln Gamma(x) = (x - 1/2) ln x - x + ln(2 pi)/2 + sum s_k x^(1 - 2k): s_1 .. s_20.")
         print("pub const STIRLING_HI: [f64; 20] = [" + ", ".join(fmt(float(v)) for v in co) + "];")
@@ -290,6 +327,7 @@ def main():
         hl = to_frac(LN_2PI_HALF)
         print(f"pub const HALF_LN_2PI_DD: (f64, f64) = ({fmt(dd(hl)[0])}, {fmt(dd(hl)[1])});")
         print()
+        # rows of relative width 1/32: C = lgamma on [4, 256) (e = 2..7), D = lgamma / ((x-1)(x-2)) on [1/2, 4) (e = -1, 0, 1)
         R = 32
         ivs = []
         for e in range(2, 8):
@@ -336,6 +374,7 @@ def main():
         t = Table("BY1", lambda x: bs(x)[3], ivs)
         t.verify()
         t.emit()
+        # J1(x)/x = sum c_k z^k, z = x^2: c_k = (-1)^k / (2^(2k+1) k! (k+1)!), k = 0..15
         co = []
         for k in range(16):
             co.append(Fraction((-1) ** k, 2 ** (2 * k + 1) * math.factorial(k) * math.factorial(k + 1)))
@@ -343,6 +382,7 @@ def main():
         print("pub const J1_TAYLOR_HI: [f64; 16] = [" + ", ".join(fmt(float(v)) for v in co) + "];")
         print("pub const J1_TAYLOR_LO: [f64; 6] = [" + ", ".join(fmt(dd(v)[1]) for v in co[:6]) + "];")
         print()
+        # Hankel asymptotic series in z = 1/x^2: P = sum (-1)^m a_2m z^m, Q x = sum (-1)^m a_(2m+1) z^m
         zmax = Fraction(1, 1600)
         for nu in (0, 1):
             a = asym_coeffs(nu, 80)
@@ -351,17 +391,19 @@ def main():
                 for m in range(0, 36):
                     c = (-1) ** m * a[2 * m + off]
                     coefs.append(c)
+                # truncate where the term is below 2^-100 (relative to the leading 1 or 1/8 or 3/8)
                 M = 0
                 for m, c in enumerate(coefs):
                     if abs(c) * zmax ** m > Fraction(1, 1 << 100):
                         M = m
-                M += 2
+                M += 2  # keep two more terms (the series is asymptotic: check the terms keep decreasing)
                 assert all(abs(coefs[m + 1]) * zmax ** (m + 1) < abs(coefs[m]) * zmax ** m for m in range(M)), (nu, name)
                 print(f"/// Hankel series of the {name} function of order {nu}: coefficients of z^m, z = 1/x^2, m = 0..={M} (the first three are exact doubles).")
                 print(f"pub const {name}{nu}_HI: [f64; {M + 1}] = [" + ", ".join(fmt(float(c)) for c in coefs[: M + 1]) + "];")
         print()
 
     if "erfc" in which:
+        # erfc(x) e^(x^2) on 2^e (1 + j/8) .. 2^e (1 + (j+1)/8), from 13/16 up to 128
         ivs = []
         for e in range(-1, 7):
             for j in range(8):

@@ -9,7 +9,12 @@ rusty-libc-mem = { path = "../rusty-libc-mem" }
 rusty-libc-rs-core = { path = "../rusty-libc-rs-core" }
 
 [features]
+# Program entry (_start) and panic handler, for the real runtime builds only.
 start = []
+# Export the C memory symbols from rusty-libc-mem.
 export-mem = ["rusty-libc-mem/export"]
+# Export the thread-local symbol `errno` (glibc's GLIBC_PRIVATE one).
 export-errno = []
+# Built into the shared libc.so.6: no `_start`; initialisation is done by an init_array entry
+# and `__libc_start_main` (src/shared.rs) because the dynamic loader starts the program.
 shared = ["start"]

@@ -1,3 +1,5 @@
+//! The Rust face: compile a pattern, search a byte string. No allocation behind the caller's back
+//! except inside the compiler and the matcher (which use this library's `malloc`).
 use crate::charset;
 use crate::consts::*;
 use crate::exec::{self, Env, Reg};
@@ -7,17 +9,24 @@ use crate::vec::V;
 
 pub const MAGIC: u64 = 0x5265_4772_6578_0001;
 
+/// A compiled pattern: the NFA plus what the matcher derives from it once.
 pub struct Compiled {
     pub magic: u64,
     pub nfa: Nfa,
+    /// glibc's fastmap (bytes a match can start with) and its can_be_null flag.
     pub fastmap: [u8; 256],
     pub can_be_null: bool,
+    /// The translation table when no user table is set: identity, or upper case for REG_ICASE.
     pub xlat: [u8; 256],
+    /// The whole pattern when it is a plain ASCII literal (no operators, no case folding, a
+    /// byte-clean charset): matching is then a substring search. `lit_len` 0: not a literal.
     pub lit: [u8; 32],
     pub lit_len: u8,
+    /// The literal is anchored: bit 0 `^` in front, bit 1 `$` at the end.
     pub lit_anchor: u8,
 }
 
+/// The pattern as a plain literal, if it is one (see `Compiled::lit`).
 fn plain_literal(pattern: &[u8], syntax: u64, mb: charset::Mb) -> Option<([u8; 32], u8, u8)> {
     let flags = RE_ICASE | RE_DOT_NEWLINE | RE_HAT_LISTS_NOT_NEWLINE | RE_NO_SUB;
     let base = syntax & !flags;
@@ -68,11 +77,13 @@ pub fn compile(pattern: &[u8], syntax: u64, trans: Option<&[u8; 256]>) -> Result
     let mut fm = [0u8; 256];
     let mut cbn = false;
     nfa.fastmap(syntax & RE_ICASE != 0, &mut fm, &mut cbn);
+    // (in a multibyte locale the text is not case-converted: the case variants are nodes of the pattern)
     let xlat = make_xlat(syntax & RE_ICASE != 0 && nfa.mb == charset::Mb::None, trans);
     let (lit, lit_len, lit_anchor) = plain_literal(pattern, syntax, nfa.mb).unwrap_or(([0; 32], 0, 0));
     Ok(Compiled { magic: MAGIC, nfa, fastmap: fm, can_be_null: cbn, xlat, lit, lit_len, lit_anchor })
 }
 
+/// One search, glibc's re_search_internal with its environment filled in.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     c: &Compiled,
@@ -95,8 +106,10 @@ pub fn run(
         && start >= 0
         && start as usize <= stop
         && stop <= text.len()
+        // an anchor needs a search from the very start, and no newline anchoring or flags that move it
         && (c.lit_anchor == 0 || (start == 0 && !newline_anchor && eflags & (REG_NOTBOL | REG_NOTEOL) == 0))
     {
+        // plain literal: a substring search over the part of the text being searched
         let hay = &text[start as usize..stop];
         let lit = &c.lit[..c.lit_len as usize];
         let at: usize = match c.lit_anchor {
@@ -117,26 +130,16 @@ pub fn run(
         }
         return REG_NOERROR;
     }
-    let env = Env {
-        nfa: &c.nfa,
-        text,
-        xlat,
-        xlat_fixed: core::ptr::eq(xlat, &c.xlat),
-        fastmap,
-        fm_trans,
-        stop,
-        not_bol: eflags & REG_NOTBOL != 0,
-        not_eol: eflags & REG_NOTEOL != 0,
-        newline_anchor,
-        starts: Env::char_starts(&c.nfa, text),
-    };
+    let env = Env::new(&c.nfa, text, xlat, core::ptr::eq(xlat, &c.xlat), fastmap, fm_trans, stop, eflags & REG_NOTBOL != 0, eflags & REG_NOTEOL != 0, newline_anchor);
     exec::search_internal(&env, start, last_start, nmatch, pmatch)
 }
 
+/// A regex error: one of the REG_E* codes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Error(pub i32);
 
 impl Error {
+    /// glibc's text for the error (what `regerror` returns).
     pub fn message(&self) -> &'static str {
         match error_message(self.0) {
             Some(m) => core::str::from_utf8(m).unwrap_or("?"),
@@ -151,12 +154,15 @@ impl core::fmt::Display for Error {
     }
 }
 
+/// Offsets of one match or group.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
 }
 
+/// A compiled regular expression with POSIX (glibc) semantics: leftmost match, longest
+/// alternative, glibc's choice of submatches.
 pub struct Regex {
     c: Compiled,
     xlat: [u8; 256],
@@ -165,6 +171,7 @@ pub struct Regex {
 }
 
 impl Regex {
+    /// Compile with regcomp's flags (REG_EXTENDED, REG_ICASE, REG_NEWLINE, REG_NOSUB).
     pub fn new(pattern: &[u8], cflags: i32) -> Result<Regex, Error> {
         let mut syntax = if cflags & REG_EXTENDED != 0 { RE_SYNTAX_POSIX_EXTENDED } else { RE_SYNTAX_POSIX_BASIC };
         if cflags & REG_ICASE != 0 {
@@ -181,16 +188,21 @@ impl Regex {
         Ok(r)
     }
 
+    /// Compile with GNU syntax bits (`RE_SYNTAX_*`); `newline_anchor` makes `^` and `$` match at
+    /// newlines.
     pub fn with_syntax(pattern: &[u8], syntax: u64, newline_anchor: bool) -> Result<Regex, Error> {
         let c = compile(pattern, syntax, None).map_err(Error)?;
         let xlat = c.xlat;
         Ok(Regex { c, xlat, newline_anchor, no_sub: syntax & RE_NO_SUB != 0 })
     }
 
+    /// Number of parenthesized groups.
     pub fn group_count(&self) -> usize {
         self.c.nfa.nsub as usize
     }
 
+    /// regexec on a byte string: search from `start`, eflags REG_NOTBOL / REG_NOTEOL, fill `out`
+    /// (offsets, -1 for groups that did not take part). True when there is a match.
     pub fn exec(&self, text: &[u8], start: usize, eflags: i32, out: &mut [Reg]) -> Result<bool, Error> {
         let nmatch = if self.no_sub { 0 } else { out.len() };
         let fm = if !self.c.can_be_null && start != text.len() { Some(&self.c.fastmap) } else { None };
@@ -205,10 +217,13 @@ impl Regex {
         self.exec(text, 0, 0, &mut []).unwrap_or(false)
     }
 
+    /// Leftmost-longest match.
     pub fn find(&self, text: &[u8]) -> Option<Span> {
         self.find_at(text, 0)
     }
 
+    /// Like `find`, starting the search at `start` (the text before it still counts as context for
+    /// `^`, `\<` and so on).
     pub fn find_at(&self, text: &[u8], start: usize) -> Option<Span> {
         let mut m = [exec::UNSET];
         match self.exec(text, start, 0, &mut m) {
@@ -217,6 +232,8 @@ impl Regex {
         }
     }
 
+    /// Match with groups: `caps[0]` is the whole match, `caps[i]` group i (None when it did not take
+    /// part). Entries beyond the pattern's groups are set to None. Returns whether it matched.
     pub fn captures(&self, text: &[u8], caps: &mut [Option<Span>]) -> bool {
         let mut regs: V<Reg> = V::from_elem(exec::UNSET, caps.len());
         if regs.oom {

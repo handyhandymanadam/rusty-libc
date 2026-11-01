@@ -3,6 +3,11 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "bits/pthreadtypes.h",
     items: &[
+        Item::Comment(r#"/* Types of the thread library (pthread.h, semaphore.h, threads.h), with glibc's x86-64 layout and
+   sizes: pthread_mutex_t 40 bytes, pthread_cond_t 48, pthread_rwlock_t 56, pthread_barrier_t 32,
+   pthread_attr_t 56, pthread_mutexattr_t 4, pthread_condattr_t 4, sem_t 32. The static initializers
+   in pthread.h produce the same bytes as glibc's. Checked against the system headers by
+   tests/c/pthread_diff.c. */"#),
         Item::Guard { name: "_RLIBC_BITS_PTHREADTYPES_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Consts(&[

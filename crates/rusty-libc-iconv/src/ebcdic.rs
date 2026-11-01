@@ -1,5 +1,9 @@
+//! The stateful EBCDIC charsets with a double-byte set (IBM930, IBM933, IBM935, IBM937, IBM939):
+//! single bytes by default, SO (0x0e) switches to two-byte codes, SI (0x0f) back. The encoder
+//! writes SO or SI before a character from the other set; if the character then does not fit, the
+//! shift stays written.
 use crate::engine::*;
-use crate::mb::Mb;
+use crate::mb::{Mb, ool};
 use crate::mbdata::{ibm930, ibm933, ibm935, ibm937, ibm939, ibm1364, ibm1371, ibm1388, ibm1390, ibm1399};
 
 const SO: u8 = 0x0e;
@@ -22,29 +26,33 @@ pub enum Kind {
 pub const KINDS: [Kind; 10] = [Kind::Ibm930, Kind::Ibm933, Kind::Ibm935, Kind::Ibm937, Kind::Ibm939, Kind::Ibm1364, Kind::Ibm1371, Kind::Ibm1388, Kind::Ibm1390, Kind::Ibm1399];
 pub const EBCDIC_BASE: u8 = 48;
 
+/// 0 = single-byte set, 64 = double-byte set (glibc's values).
 pub type State = u32;
 const SB: u32 = 0;
 const DB: u32 = 64;
 
-fn mb(k: Kind) -> &'static Mb {
+fn mb(k: Kind) -> Mb {
     match k {
-        Kind::Ibm930 => &ibm930::MB,
-        Kind::Ibm933 => &ibm933::MB,
-        Kind::Ibm935 => &ibm935::MB,
-        Kind::Ibm937 => &ibm937::MB,
-        Kind::Ibm939 => &ibm939::MB,
-        Kind::Ibm1364 => &ibm1364::MB,
-        Kind::Ibm1371 => &ibm1371::MB,
-        Kind::Ibm1388 => &ibm1388::MB,
-        Kind::Ibm1390 => &ibm1390::MB,
-        Kind::Ibm1399 => &ibm1399::MB,
+        Kind::Ibm930 => ool(ibm930::mb),
+        Kind::Ibm933 => ool(ibm933::mb),
+        Kind::Ibm935 => ool(ibm935::mb),
+        Kind::Ibm937 => ool(ibm937::mb),
+        Kind::Ibm939 => ool(ibm939::mb),
+        Kind::Ibm1364 => ool(ibm1364::mb),
+        Kind::Ibm1371 => ool(ibm1371::mb),
+        Kind::Ibm1388 => ool(ibm1388::mb),
+        Kind::Ibm1390 => ool(ibm1390::mb),
+        Kind::Ibm1399 => ool(ibm1399::mb),
     }
 }
 
+/// The IBM13xx modules ignore errors without leaving an "illegal input" status behind and have no
+/// transliteration; their character limit is U+FFFF except for IBM1390 and IBM1399.
 fn is13(k: Kind) -> bool {
     !matches!(k, Kind::Ibm930 | Kind::Ibm933 | Kind::Ibm935 | Kind::Ibm937 | Kind::Ibm939)
 }
 
+/// Codes that stand for two characters (IBM1390, IBM1399): (code with the SO prefix, first, second).
 fn combos(k: Kind) -> &'static [(u32, u32, u32)] {
     match k {
         Kind::Ibm1390 => &ibm1390::COMBOS,
@@ -61,7 +69,7 @@ fn limit(k: Kind) -> u32 {
 }
 
 pub fn dec(k: Kind, st: &mut State, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u32], op: &mut usize, irr: &mut usize) -> St {
-    let m = mb(k);
+    let m = &mb(k);
     let (quiet, cb) = (is13(k), combos(k));
     dec_loop(flags, inp, ip, out, op, irr, 1, no_fast_dec, |s| {
         let bad = |n: usize| if quiet { Body::IllegalQuiet(n) } else { Body::Illegal(n) };
@@ -95,10 +103,11 @@ pub fn dec(k: Kind, st: &mut State, flags: u32, inp: &[u8], ip: &mut usize, out:
 }
 
 pub fn enc(k: Kind, st: &mut State, flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u8], op: &mut usize, irr: Option<&mut usize>) -> St {
-    let m = mb(k);
+    let m = &mb(k);
     let (quiet, cb, lim) = (is13(k), combos(k), limit(k));
     enc_loop(flags, inp, ip, out, op, irr, 1, true, &mut no_prep, no_fast_enc, &mut |s: &[u32], o: &mut [u8]| {
         let ch = s[0];
+        // the unrepresentable: with translit and "illegal" status in the IBM9xx modules, without in IBM13xx
         let bad = || if quiet { EBody::IllegalPlainQuiet } else { EBody::Illegal };
         if ch >= lim {
             if quiet && is_tag(ch) {
@@ -106,6 +115,7 @@ pub fn enc(k: Kind, st: &mut State, flags: u32, inp: &[u32], ip: &mut usize, out
             }
             return bad();
         }
+        // a pair that has a code of its own (look ahead one character)
         if s.len() > 1 {
             if let Some(&(code, _, _)) = cb.iter().find(|x| x.1 == ch && x.2 == s[1]) {
                 let mut n = 0;
@@ -164,6 +174,7 @@ pub fn enc(k: Kind, st: &mut State, flags: u32, inp: &[u32], ip: &mut usize, out
     })
 }
 
+/// Flush: back to single-byte mode with SI. (Decoders just reset.)
 pub fn emit_reset(st: &mut State, out: &mut [u8], op: &mut usize) -> St {
     if *st != SB {
         if *op >= out.len() {

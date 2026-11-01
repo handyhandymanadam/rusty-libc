@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""Generate crates/rusty-libc-iconv/src/jpextra.rs: for the four 94x94 sets of ISO-2022-JP-2 (JIS X 0208,
+JIS X 0212, GB 2312, KS C 5601) what the host's converter writes for the characters U+0000..U+00FF
+and U+203E while that set is the current one (glibc's per-set encoders know a few more of these
+than the EUC encoders that the other direction of the tables comes from). Run:
+python3 gen_jp_extra.py > ../src/jpextra.rs   (needs gcc and the glibc gconv modules)"""
 import os, subprocess, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETS = [("J0208", "3042"), ("J0212", "02d8"), ("GB2312", "2236"), ("KSC5601", "ac00")]

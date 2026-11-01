@@ -1,8 +1,10 @@
+//! malloc.h: glibc extensions to the allocator interface.
 use crate::heap;
 use core::ffi::{c_int, c_void};
 use core::sync::atomic::Ordering::Relaxed;
 use rusty_libc_core::errno;
 
+/// Old `mallinfo` result (32-bit fields, which wrap for big heaps; prefer `mallinfo2`).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct mallinfo {
@@ -18,6 +20,7 @@ pub struct mallinfo {
     pub keepcost: c_int,
 }
 
+/// `mallinfo2` result: the same fields as `size_t`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct mallinfo2 {
@@ -33,14 +36,19 @@ pub struct mallinfo2 {
     pub keepcost: usize,
 }
 
+/// memalign's rule (Rust API): an alignment up to 16 means 16, any other is rounded up to a power of two; EINVAL when
+/// there is none.
 pub fn memalign_rs(alignment: usize, size: usize) -> *mut u8 {
     memalign_rule(alignment, size)
 }
 
+/// pvalloc's rule (Rust API): whole pages, page-aligned; ENOMEM when the size cannot be rounded up.
 pub fn pvalloc_rs(size: usize) -> *mut u8 {
     pvalloc_rule(size)
 }
 
+// (The C names inline these private forms. A `pub` #[inline] function would make everything it inlines reachable from
+// other crates, and the allocator's statics would then be reached through the GOT on its fast paths.)
 #[inline(always)]
 fn memalign_rule(alignment: usize, size: usize) -> *mut u8 {
     let a = if alignment <= 16 { 16 } else { alignment.checked_next_power_of_two().unwrap_or(0) };
@@ -62,29 +70,39 @@ fn pvalloc_rule(size: usize) -> *mut u8 {
     }
 }
 
+/// # Safety
+/// As `malloc`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[inline(never)]
 pub unsafe extern "C" fn memalign(alignment: usize, size: usize) -> *mut c_void {
     memalign_rule(alignment, size).cast()
 }
 
+/// # Safety
+/// As `malloc`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[inline(never)]
 pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
     heap::memalign(4096, size).cast()
 }
 
+/// # Safety
+/// As `malloc`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 #[inline(never)]
 pub unsafe extern "C" fn pvalloc(size: usize) -> *mut c_void {
     pvalloc_rule(size).cast()
 }
 
+/// # Safety
+/// `ptr` must be NULL or a live block from this allocator.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> usize {
+    // SAFETY: `ptr` is NULL or a live block (contract).
     unsafe { heap::usable_size(ptr.cast()) }
 }
 
+/// The `mallinfo2` figures (Rust API).
 pub fn fill_info() -> mallinfo2 {
     let st = heap::stats();
     let avail = st.top + st.free_bytes + st.small_bytes;
@@ -139,6 +157,7 @@ pub const M_PERTURB: c_int = -6;
 pub const M_ARENA_TEST: c_int = -7;
 pub const M_ARENA_MAX: c_int = -8;
 
+/// Adjust allocator parameters. Always returns 1, like glibc 2.43.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn mallopt(param: c_int, value: c_int) -> c_int {
     heap::ensure_init();
@@ -147,6 +166,8 @@ pub extern "C" fn mallopt(param: c_int, value: c_int) -> c_int {
     let p = &heap::P;
     let r = match param {
         M_MXFAST => {
+            // glibc 2.43 accepts any value here (the fast bins it once controlled are gone); a value
+            // of 0 is kept to mean "do not keep small blocks on quick lists".
             p.small_enabled.store(value != 0, Relaxed);
             1
         }
@@ -161,6 +182,8 @@ pub extern "C" fn mallopt(param: c_int, value: c_int) -> c_int {
             1
         }
         M_MMAP_THRESHOLD => {
+            // Out-of-range values are ignored; glibc 2.43 still reports success (checked against it
+            // for 16 parameters and 14 values: every call returned 1).
             if (0..=32 * 1024 * 1024).contains(&value) {
                 p.mmap_threshold.store(value as usize, Relaxed);
                 p.dynamic_thresholds.store(false, Relaxed);
@@ -222,6 +245,7 @@ fn put_num(buf: &mut [u8], at: &mut usize, label: &[u8], v: usize) {
     *at += 1;
 }
 
+/// Print allocator statistics to stderr in glibc's format.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn malloc_stats() {
     let mut buf = [0u8; 160];
@@ -231,10 +255,12 @@ pub extern "C" fn malloc_stats() {
             *at += 1;
         }
     };
+    // not a cancellation point: arena locks are taken in here (and glibc disables cancellation)
     let out = |buf: &[u8]| {
         let _ = rusty_libc_core::unistd::write_nocancel(2, buf);
     };
     let (mut system, mut in_use) = (0usize, 0usize);
+    // one block per arena, in the ring's order (glibc's numbering)
     let mut i = 0;
     heap::arenas(|a| {
         let st = heap::arena_stats(a);
@@ -273,26 +299,42 @@ pub extern "C" fn malloc_stats() {
     out(&buf[..at]);
 }
 
+// ---- glibc's own names (see stdlib_api.rs: `__libc_malloc` and its kin do not go through the interposable public names) ----
+
+/// glibc's own `memalign`.
+///
+/// # Safety
+/// As `malloc`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __libc_memalign(alignment: usize, size: usize) -> *mut c_void {
     memalign_rule(alignment, size).cast()
 }
 
+/// glibc's own `valloc`.
+///
+/// # Safety
+/// As `malloc`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __libc_valloc(size: usize) -> *mut c_void {
     heap::memalign(4096, size).cast()
 }
 
+/// glibc's own `pvalloc`.
+///
+/// # Safety
+/// As `malloc`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __libc_pvalloc(size: usize) -> *mut c_void {
     pvalloc_rule(size).cast()
 }
 
+/// glibc's own `mallinfo`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn __libc_mallinfo() -> mallinfo {
     mallinfo()
 }
 
+/// glibc's own `mallopt`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn __libc_mallopt(param: c_int, value: c_int) -> c_int {
     mallopt(param, value)

@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "setjmp.h",
     items: &[
+        Item::Comment(r#"/* setjmp.h for the Rust libc (crates/rusty-libc-signal/src/jmp.rs). jmp_buf is glibc's x86-64 layout:
+   eight saved registers, the "mask saved" flag and the saved signal mask (200 bytes). */"#),
         Item::Guard { name: "_RLIBC_SETJMP_H", value: "1", end: "", items: &[
             Item::Include("<bits/types/__sigset_t.h>"),
             Item::Blank,

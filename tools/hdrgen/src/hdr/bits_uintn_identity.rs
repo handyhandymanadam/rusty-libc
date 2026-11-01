@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "bits/uintn-identity.h",
     items: &[
+        Item::Comment("/* bits/uintn-identity.h for the Rust libc */"),
         Item::Guard { name: "_BITS_UINTN_IDENTITY_H", value: "1", end: "", items: &[
             Item::Include("<stdint.h>"),
             Item::Raw(Reason::StaticInline, "static __inline uint16_t __uint16_identity (uint16_t __x) { return __x; }"),

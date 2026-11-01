@@ -7,6 +7,12 @@ license.workspace = true
 [dependencies]
 rusty-libc-core = { path = "../rusty-libc-core" }
 
+[dev-dependencies]
+libc = "0.2"
+
 [features]
+# Export the C symbols. Off for host tests so they never replace the host libc.
 export = ["start"]
+# Take the vDSO address from rusty-libc-core's startup code (programs started by its `_start`) instead of
+# reading /proc/self/auxv.
 start = ["rusty-libc-core/start"]

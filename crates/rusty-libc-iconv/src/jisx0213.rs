@@ -1,3 +1,7 @@
+//! EUC-JISX0213 and SHIFT_JISX0213 (JIS X 0213:2004). Some codes stand for two characters (a kana
+//! with a handakuten, an IPA letter with a tone mark): the decoder writes the first and queues the
+//! second when the output has no room; the encoder holds back the 21 characters that can start
+//! such a pair until it has seen the next one.
 use crate::engine::*;
 use crate::mb::Mb;
 use crate::mbdata::{euc_jisx0213 as e, shift_jisx0213 as s};
@@ -8,20 +12,24 @@ pub enum Kind {
     Sjis,
 }
 
+/// Decoder state: the queued second character shifted left by 3 bits.
 pub type DecState = u32;
+/// Encoder state: the two bytes held back, shifted left by 3 bits.
 pub type EncState = u32;
 
-type Tables = (&'static Mb, &'static [(u32, u32, u32)], &'static [u32]);
+/// The tables of one charset: the code tables, the two-character codes, the characters held back.
+type Tables = (Mb, &'static [(u32, u32, u32)], &'static [u32]);
 
 fn tables(k: Kind) -> Tables {
     match k {
-        Kind::Euc => (&e::MB, &e::COMBOS, &e::BUFFERED),
-        Kind::Sjis => (&s::MB, &s::COMBOS, &s::BUFFERED),
+        Kind::Euc => (e::mb(), &e::COMBOS, &e::BUFFERED),
+        Kind::Sjis => (s::mb(), &s::COMBOS, &s::BUFFERED),
     }
 }
 
 pub fn dec(k: Kind, st: &mut DecState, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u32], op: &mut usize, irr: &mut usize) -> St {
     let (mb, combos, _) = tables(k);
+    let mb = &mb;
     let mut result = St::Empty;
     let (mut i, mut o) = (*ip, *op);
     let (end, cap) = (inp.len(), out.len());
@@ -45,6 +53,7 @@ pub fn dec(k: Kind, st: &mut DecState, flags: u32, inp: &[u8], ip: &mut usize, o
         let mut ch = *st >> 3;
         if ch == 0 {
             let b = inp[i];
+            // the first character, or the two of a combination (code, then characters)
             let mut two: Option<(u32, u32)> = None;
             match k {
                 Kind::Euc => {
@@ -145,6 +154,7 @@ const MARKS: [u32; 5] = [0x02e5, 0x02e9, 0x0300, 0x0301, 0x309a];
 
 pub fn enc(k: Kind, st: &mut EncState, flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u8], op: &mut usize, irr: Option<&mut usize>) -> St {
     let (mb, combos, buffered) = tables(k);
+    let mb = &mb;
     enc_loop(flags, inp, ip, out, op, irr, 1, true, &mut no_prep, no_fast_enc, &mut |s: &[u32], o: &mut [u8]| {
         let ch = s[0];
         if (*st >> 3) != 0 {

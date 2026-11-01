@@ -32,7 +32,9 @@ pub static HDR: Header = Header {
  *   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */"#),
-        Item::Guard { name: "_RPC_AUTH_DES_H", value: "1", end: "", items: &[
+        Item::Comment(r#"/* Structure layouts and constants follow Sun's RPC headers (as in glibc's sunrpc/rpc/);
+   the function prototypes are generated from the Rust sources (bits/rlibc-rpc-*.h). */"#),
+        Item::Guard { name: "_RPC_AUTH_DES_H", value: "1", end: " /* rpc/auth_des.h */", items: &[
             Item::Blank,
             Item::Include("<rpc/auth.h>"),
             Item::Blank,
@@ -40,16 +42,16 @@ pub static HDR: Header = Header {
   "#, body: &["", "    ADN_FULLNAME,", "    ADN_NICKNAME", "  "], tail: "" },
             Item::Blank,
             Item::Block { head: r#"struct authdes_fullname
-  "#, body: &["", r#"    char *name;"#, r#"    des_block key;"#, r#"    uint32_t window;"#, "  "], tail: "" },
+  "#, body: &["", r#"    char *name;		/* network name of client, null terminated */"#, r#"    des_block key;	/* conversation key */"#, r#"    uint32_t window;	/* associated window */"#, "  "], tail: "" },
             Item::Blank,
             Item::Block { head: r#"struct authdes_cred
   "#, body: &["", "    enum authdes_namekind adc_namekind;", "    struct authdes_fullname adc_fullname;", "    uint32_t adc_nickname;", "  "], tail: "" },
             Item::Blank,
             Item::Block { head: r#"struct rpc_timeval
-  "#, body: &["", "    uint32_t tv_sec;", "    uint32_t tv_usec;", "  "], tail: "" },
+  "#, body: &["", "    uint32_t tv_sec;            /* Seconds.  */", "    uint32_t tv_usec;           /* Microseconds.  */", "  "], tail: "" },
             Item::Blank,
             Item::Block { head: r#"struct authdes_verf
-  "#, body: &["", "    union", "      {", r#"	struct rpc_timeval adv_ctime;"#, r#"	des_block adv_xtime;"#, "      }", "    adv_time_u;", "    uint32_t adv_int_u;", "  "], tail: "" },
+  "#, body: &["", "    union", "      {", r#"	struct rpc_timeval adv_ctime;	/* clear time */"#, r#"	des_block adv_xtime;		/* crypt time */"#, "      }", "    adv_time_u;", "    uint32_t adv_int_u;", "  "], tail: "" },
             Item::Blank,
             Item::Consts(&[
                 ("adv_timestamp", V::Sp("  adv_time_u.adv_ctime")),

@@ -1,11 +1,13 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("FD_SETSIZE", V::Dec(1024)),
         ("NFDBITS", V::Dec(64)),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Typedef("long int", "__fd_mask"),
     Item::Consts(&[
         ("__NFDBITS", V::Txt("(8 * (int)sizeof(__fd_mask))")),
@@ -25,6 +27,7 @@ pub const AFTER_INCLUDES_CHOMP: bool = false;
 pub static TRAILER: &[Item] = &[
     Item::Gate(&[
         Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __GNUC__", items: &[
+            Item::Comment("/* the checked __FD_ELT of bits/select2.h only helps if FD_SET, FD_CLR and FD_ISSET go through it (as glibc's do) */"),
             Item::Gate(&[
                 Branch { head: "ifndef __FD_SETSIZE", items: &[
                     Item::Raw(Reason::GlibcMacro, "# define __FD_SETSIZE 1024"),

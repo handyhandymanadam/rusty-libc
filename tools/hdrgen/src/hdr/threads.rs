@@ -3,10 +3,14 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "threads.h",
     items: &[
+        Item::Comment(r#"/* threads.h (C11) for the Rust libc: types and constants by hand, declarations generated
+   (bits/rlibc-threadscalls.h, from crates/rusty-libc-pthread/src/c11.rs). thrd_t is the pthread_t, mtx_t
+   the pthread_mutex_t, cnd_t the pthread_cond_t, tss_t the pthread_key_t, once_flag the
+   pthread_once_t, as in glibc. */"#),
         Item::Guard { name: "_RLIBC_THREADS_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),
-            Item::Include("<time.h>"),
+            Item::Include("<time.h>   /* glibc: struct timespec and the clock names come with <threads.h> */"),
             Item::Include("<bits/pthreadtypes.h>"),
             Item::Include("<bits/types/struct_timespec.h>"),
             Item::Blank,

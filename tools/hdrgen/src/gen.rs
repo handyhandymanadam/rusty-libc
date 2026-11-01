@@ -1,3 +1,10 @@
+//! The cbindgen-driven headers (port of tools/gen_headers.py): slice the Rust sources per header, run cbindgen as a
+//! library, then post-process (glibc attributes, un-typedef, <features.h>).
+//!
+//! The sources use #[cfg_attr(feature = "export", unsafe(no_mangle))] to keep host tests from replacing the host
+//! libc; cbindgen only sees a plain #[unsafe(no_mangle)], so the attribute is rewritten in the temporary copy it
+//! reads (the Rust sources themselves are not changed).
+
 use crate::math::{self, Math};
 use crate::specs::{build_specs, item_src, Spec, Subst};
 use crate::sys::{self, Sys};
@@ -46,11 +53,13 @@ fn pick_items(root: &Path, path: &str, names: &[String]) -> Vec<String> {
     names.iter().map(|n| found[n].clone()).collect()
 }
 
+/// Keep (only/skip) the `#[unsafe(no_mangle)]` of the listed functions; a dropped function is ignored by cbindgen.
 fn filter_exports(src: &str, spec: &Spec) -> String {
     let lines: Vec<&str> = src.split_inclusive('\n').collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let fn_re = Regex::new(r#"^pub (?:unsafe )?extern "C" fn (\w+)"#).unwrap();
     let nm = "#[unsafe(no_mangle)]\n";
+    // only: statics lose their no_mangle line first (nm, then any #[ lines, then `pub static`)
     let mut lines2: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
     if spec.only.is_some() {
         let mut i = 0;
@@ -87,7 +96,7 @@ fn filter_exports(src: &str, spec: &Spec) -> String {
                         _ => true,
                     };
                     if !ok {
-                        i += 1;
+                        i += 1; // drop the no_mangle line
                         continue;
                     }
                 }
@@ -100,6 +109,7 @@ fn filter_exports(src: &str, spec: &Spec) -> String {
 }
 
 fn strip_inner(src: &str) -> String {
+    // inner doc comments and inner attributes are only valid at the top of a file; the sources are concatenated
     let inner_attr = Regex::new(r"^#!\[.*\]$").unwrap();
     let mut out = String::with_capacity(src.len());
     for l in src.split_inclusive('\n') {
@@ -123,10 +133,12 @@ impl Gen {
         Gen { root: root.to_path_buf(), tmp: tmp.to_path_buf() }
     }
 
+    /// Every header made from the Rust sources: path (with ".h") -> text, before the post passes.
     pub fn cbindgen_headers(&self) -> BTreeMap<String, String> {
         let mut specs = build_specs();
         let sys = Sys::new(&self.root);
         let math = Math::new(&self.root);
+        // every header of SYS_FNS (plus the constants-only ones) is generated from stub signatures
         let mut sys_names: Vec<String> = sys::sys_fns().iter().map(|(h, _)| h.to_string()).collect();
         sys_names.extend(sys::CONST_ONLY.iter().map(|s| s.to_string()));
         sys_names.push("sys/types".into());
@@ -173,6 +185,7 @@ impl Gen {
             fs::write(&tmp, &src).unwrap();
             let cfg_path = self.root.join("cbindgen").join(format!("{}.toml", spec.config));
             let mut cfg = cbindgen::Config::from_file(&cfg_path).unwrap_or_else(|e| panic!("{}: {e}", cfg_path.display()));
+            // the C text of the header (macros, constants, conditionals) is data of hdr_cb, not part of the TOML
             if let Some(t) = crate::hdr_cb::lookup(&spec.config) {
                 let render = |x: (&'static [crate::model::Item], bool)| {
                     let mut s = String::new();
@@ -203,6 +216,8 @@ impl Gen {
     }
 }
 
+// ---------------------------------------------------------------- post passes
+
 fn attr_table() -> BTreeMap<&'static str, Vec<(String, String)>> {
     let p = |a: &str| format!("__THROW __attribute_pure__ __nonnull (({a}))");
     let t = |a: &str| format!("__THROW __nonnull (({a}))");
@@ -225,6 +240,8 @@ fn attr_table() -> BTreeMap<&'static str, Vec<(String, String)>> {
     s.push(("strdup".into(), "__THROW __attribute_malloc__ __nonnull ((1))".into()));
     s.push(("strndup".into(), "__THROW __attribute_malloc__ __nonnull ((1))".into()));
     s.push(("strerror".into(), "__THROW".into()));
+    // glibc's access attributes on the functions _FORTIFY_SOURCE wraps: with gcc they give the same -Wstringop-overflow
+    // warnings for a constant overflow as glibc's prototypes (tests/c/fortify_diag.c)
     s.push(("explicit_bzero".into(), "__THROW __nonnull ((1)) __fortified_attr_access (__write_only__, 1, 2)".into()));
     s.push(("strlcpy".into(), "__THROW __nonnull ((1, 2)) __attr_access ((__write_only__, 1, 3))".into()));
     s.push(("strlcat".into(), "__THROW __nonnull ((1, 2)) __attr_access ((__read_write__, 1, 3))".into()));
@@ -270,6 +287,8 @@ fn attr_table() -> BTreeMap<&'static str, Vec<(String, String)>> {
     m
 }
 
+/// Append the glibc attributes to the first matching prototype of each name (regex
+/// `^(?![ \t]*[*/])([^\n;{}()]*[ *]NAME[ \t]*\([^;{}]*\))[ \t]*;` with count=1).
 fn add_attrs_to(text: &str, name: &str, attr: &str) -> String {
     let b = text.as_bytes();
     let mut ls = 0usize;
@@ -280,9 +299,10 @@ fn add_attrs_to(text: &str, name: &str, attr: &str) -> String {
         let trimmed = line.trim_start_matches([' ', '\t']);
         let skip = trimmed.starts_with('*') || trimmed.starts_with('/');
         if !skip {
+            // find NAME preceded by ' ' or '*' with a clean prefix and followed by [ \t]*(
             let lb = line.as_bytes();
             let mut idx = 0;
-            let mut hit: Option<usize> = None;
+            let mut hit: Option<usize> = None; // index of '(' in text
             while idx < lb.len() {
                 let c = lb[idx];
                 if (c == b' ' || c == b'*') && lb[idx + 1..].starts_with(name_pat) {
@@ -296,11 +316,12 @@ fn add_attrs_to(text: &str, name: &str, attr: &str) -> String {
                     }
                 }
                 if matches!(c, b';' | b'{' | b'}' | b'(' | b')') {
-                    break;
+                    break; // prefix must stay clean past this char
                 }
                 idx += 1;
             }
             if let Some(par) = hit {
+                // [^;{}]*\) then [ \t]*;
                 let mut t = par + 1;
                 while t < b.len() && !matches!(b[t], b';' | b'{' | b'}') {
                     t += 1;
@@ -336,6 +357,10 @@ pub fn add_attributes(files: &mut BTreeMap<String, String>) {
     }
 }
 
+/// glibc's `const` and `pure` function attributes (const_pure.txt): the first prototype of each listed name in every header gets
+/// the same attribute unless it has one already. A `const` function's result depends only on its arguments (and for
+/// `__errno_location`, `pthread_self`, `getpagesize`: on the thread or process, fixed while it runs); a `pure` one also reads
+/// memory. Either lets the compiler fold repeated calls, as it does with glibc's headers.
 fn add_const_pure(files: &mut BTreeMap<String, String>) {
     for line in include_str!("const_pure.txt").lines() {
         if line.starts_with('#') || line.trim().is_empty() {
@@ -344,15 +369,17 @@ fn add_const_pure(files: &mut BTreeMap<String, String>) {
         let mut f = line.split_whitespace();
         let (Some(name), Some(kind)) = (f.next(), f.next()) else { continue };
         let attr = if kind == "const" { "__attribute__ ((__const__))" } else { "__attribute__ ((__pure__))" };
+        // a declaration line (not a comment or directive) naming the function, its parameter list, then whatever follows up to `;`
         let re = Regex::new(&format!(r"(?m)^([^\n#/*;{{}}()][^\n;{{}}()]*[ *]{}[ \t]*\([^;{{}}]*\))([^;{{}}]*);", regex_lite::escape(name))).unwrap();
         for text in files.values_mut() {
             let Some(c) = re.captures(text) else { continue };
             let tail = c.get(2).unwrap();
+            // (the whole declaration: the parameter match may run on over attributes written as `__attr ((...))`)
             if ["__const__", "__pure__", "__attribute_const__", "__attribute_pure__"].iter().any(|a| c.get(0).unwrap().as_str().contains(a)) {
                 continue;
             }
             let at = tail.end();
-            *text = format!("{} {}{}", &text[..at].trim_end(), attr, &text[at..]);
+            *text = format!("{} {}{}", text[..at].trim_end(), attr, &text[at..]);
         }
     }
 }
@@ -377,6 +404,7 @@ pub fn untypedef(files: &mut BTreeMap<String, String>) {
 }
 
 fn has_define(text: &str, name: &str) -> bool {
+    // `#\s*define\s+NAME\b` anywhere
     let b = text.as_bytes();
     let isw = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
     for (i, _) in text.match_indices('#') {
@@ -405,6 +433,7 @@ fn has_define(text: &str, name: &str) -> bool {
     false
 }
 
+/// First `#ifndef X` / `#define X` guard pair at line starts; returns the end offset of the define line.
 fn find_guard(text: &str) -> Option<usize> {
     let mut ls = 0;
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
@@ -438,13 +467,14 @@ fn find_guard(text: &str) -> Option<usize> {
             continue;
         }
         let r2 = r2.trim_start();
-        if r2.starts_with(id) && r2.as_bytes().get(id.len()).map_or(true, |c| !isw(*c)) {
+        if r2.starts_with(id) && r2.as_bytes().get(id.len()).is_none_or(|c| !isw(*c)) {
             return Some(offs[i + 1] + n.len());
         }
     }
     None
 }
 
+/// glibc's headers all include <features.h>; insert it after each public header's include guard.
 pub fn add_features_include(files: &mut BTreeMap<String, String>) {
     let skip = ["features.h", "limits.h", "gnu-versions.h"];
     for (path, text) in files.iter_mut() {
@@ -471,6 +501,7 @@ pub fn add_features_include(files: &mut BTreeMap<String, String>) {
     }
 }
 
+/// `#include <bits/rlibc-xxx.h>` of a generated declaration fragment (the cbindgen output that math.h, fenv.h, netdb.h ... pull in).
 fn frag_include(line: &str, frags: &BTreeMap<String, bool>) -> bool {
     let Some(r) = line.strip_prefix('#') else { return false };
     let Some(r) = r.trim_start().strip_prefix("include") else { return false };
@@ -479,6 +510,10 @@ fn frag_include(line: &str, frags: &BTreeMap<String, bool>) -> bool {
     frags.get(name).copied().unwrap_or(false)
 }
 
+/// Where glibc puts `__BEGIN_DECLS`: after the header's includes and `#define`s, before the first declaration.
+/// Scans the text after the include guard up to the guard's closing `#endif`; returns the offset just after the last
+/// complete top-level directive that precedes the first line of C, whether any line of C holds a `(` (a prototype or a
+/// function-like declarator) or includes a declaration fragment, and the offset of the guard's closing `#endif` line.
 fn extern_c_start(text: &str, from: usize, frags: &BTreeMap<String, bool>) -> (usize, bool, usize) {
     let mut depth = 0i32;
     let mut after = from;
@@ -507,6 +542,7 @@ fn extern_c_start(text: &str, from: usize, frags: &BTreeMap<String, bool>) -> (u
                 in_comment = true;
             }
         } else if frag_include(body, frags) {
+            // an include of a generated fragment that holds declarations counts as a line of C
             if first_c.is_none() {
                 first_c = Some(after);
             }
@@ -539,16 +575,22 @@ fn extern_c_start(text: &str, from: usize, frags: &BTreeMap<String, bool>) -> (u
     (first_c.unwrap_or(after), has_paren, guard_end)
 }
 
+/// The text already has C++ linkage of its own (an `extern "C"` block or glibc's macros).
 fn guarded(text: &str) -> bool {
     text.contains("extern \"C\"") || text.contains("__BEGIN_DECLS")
 }
 
+/// glibc wraps the declarations of its headers in `__BEGIN_DECLS` / `__END_DECLS` (`extern "C"` under C++). Do the same
+/// for every public header that declares a function and has no C++ guard of its own: BEGIN where glibc has it (see
+/// `extern_c_start`), END before the include guard's closing `#endif`. A header with only types and macros stays as it is.
 pub fn add_extern_c(files: &mut BTreeMap<String, String>) {
+    // the bits/ fragments that declare functions and carry no C++ guard of their own
     let mut frags: BTreeMap<String, bool> = files
         .iter()
         .filter(|(p, t)| p.starts_with("bits/") && !guarded(t))
         .map(|(p, t)| (p.clone(), extern_c_start(t, 0, &BTreeMap::new()).1))
         .collect();
+    // a fragment that only includes fragments with declarations has declarations too (bits/getopt_posix.h -> bits/getopt_core.h)
     loop {
         let more: Vec<String> = files
             .iter()
@@ -572,6 +614,7 @@ pub fn add_extern_c(files: &mut BTreeMap<String, String>) {
         if !has_decl || end < at || end >= text.len() {
             continue;
         }
+        // what follows the guard's closing #endif (the trailer of a cbindgen header: the fortify includes) is wrapped on its own
         let (head, tail) = text.split_at(end);
         let close = tail.find('\n').map_or(tail.len(), |i| i + 1);
         let (endif, trailer) = tail.split_at(close);
@@ -599,9 +642,33 @@ pub fn post_passes(files: &mut BTreeMap<String, String>) {
     untypedef(files);
     add_features_include(files);
     add_floatn_include(files);
+    add_libc_header_start(files);
     add_extern_c(files);
 }
 
+/// The headers glibc 2.43 starts with bits/libc-header-start.h (`#define __GLIBC_INTERNAL_STARTING_HEADER_IMPLEMENTATION`,
+/// then the include), inside their include guard: it sets the __GLIBC_USE values of the ISO C extension feature-test
+/// macros (__STDC_WANT_IEC_60559_*__, __STDC_WANT_LIB_EXT2__) as they stand when each of them is first included. Inserted
+/// right after <features.h>, before <bits/floatn.h>, as in glibc.
+pub fn add_libc_header_start(files: &mut BTreeMap<String, String>) {
+    const STARTERS: [&str; 10] = ["complex.h", "fenv.h", "limits.h", "math.h", "stdint.h", "stdio.h", "stdlib.h", "string.h", "tgmath.h", "wchar.h"];
+    for name in STARTERS {
+        let Some(text) = files.get_mut(name) else {
+            eprintln!("hdrgen: {name} missing, bits/libc-header-start.h not added");
+            continue;
+        };
+        let Some(at) = text.find("#include <features.h>\n") else {
+            eprintln!("hdrgen: {name} has no <features.h>, bits/libc-header-start.h not added");
+            continue;
+        };
+        let at = at + "#include <features.h>\n".len();
+        text.insert_str(at, "#define __GLIBC_INTERNAL_STARTING_HEADER_IMPLEMENTATION\n#include <bits/libc-header-start.h>\n");
+    }
+}
+
+/// A public header that names _Float32, _Float64, _Float32x, _Float64x or _Float128 (itself or through the math declaration
+/// fragments it includes) includes <bits/floatn.h> right after <features.h>, as glibc's stdlib.h, wchar.h, math.h and complex.h
+/// do: with gcc these are keywords, but clang (C) has none of them and bits/floatn.h makes them typedefs there.
 pub fn add_floatn_include(files: &mut BTreeMap<String, String>) {
     let uses = |t: &str| ["_Float32", "_Float64", "_Float128"].iter().any(|w| t.contains(w));
     let frags: Vec<String> = files.iter().filter(|(p, t)| p.starts_with("bits/rlibc-") && uses(t)).map(|(p, _)| format!("<{p}>")).collect();
@@ -618,6 +685,7 @@ pub fn add_floatn_include(files: &mut BTreeMap<String, String>) {
     }
 }
 
+/// The whole include tree: hand-described headers, cbindgen headers, post passes.
 pub fn full_tree(root: &Path, tmp: &Path) -> BTreeMap<String, String> {
     let g = Gen::new(root, tmp);
     let mut files: BTreeMap<String, String> = crate::hdr::ALL.iter().map(|h| (h.path.to_string(), h.render())).collect();
@@ -628,3 +696,18 @@ pub fn full_tree(root: &Path, tmp: &Path) -> BTreeMap<String, String> {
     files
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A header must have exactly one source: a hand-described one that a cbindgen header overwrites would be dead data.
+    #[test]
+    fn no_header_has_two_sources() {
+        let root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let g = Gen::new(&root, &root.join("target/hdrgen-test/overlap"));
+        let generated = g.cbindgen_headers();
+        let mut both: Vec<&str> = crate::hdr::ALL.iter().map(|h| h.path).filter(|p| generated.contains_key(*p)).collect();
+        both.sort();
+        assert!(both.is_empty(), "headers with two sources: {both:?}");
+    }
+}

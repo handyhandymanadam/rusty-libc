@@ -1,3 +1,16 @@
+/* Offline helper of gen_mb.py: asks the host's iconv how a multibyte charset converts.
+ *   mbprobe enc CHARSET        : every character U+0000..U+10FFFF (and the surrogate range, skipped)
+ *                                converted to the charset; prints "cp hexbytes" for each success
+ *   mbprobe dec CHARSET < seqs : for every line (hex bytes) the conversion to UCS-4LE of exactly those
+ *                                bytes; prints "hex ok cp[,cp]" (all bytes used), "hex inc" (EINVAL),
+ *                                "hex ill n" (EILSEQ with n bytes consumed first... always 0) or "hex part n cp" (stopped
+ *                                after n bytes with a character: a shorter match)
+ *   mbprobe conv TO FROM < seqs : the conversion FROM -> TO (directly, whatever route glibc takes) of
+ *                                every line (hex bytes); prints "hex ok outhex", "hex ill" or "hex inc"
+ *   mbprobe decf CHARSET < seqs: like dec, but the converter is flushed after the sequence and the
+ *                                characters it releases are listed too (charsets that hold back a
+ *                                character in case a combining mark follows)
+ * Each probe converts one unit with a fresh state (iconv reset). Stateful charsets are not probed. */
 #include <iconv.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +47,7 @@ int main(int argc, char **argv) {
             iconv(e, NULL, NULL, NULL, NULL);
             size_t r = iconv(e, &ip, &il, &op, &ol);
             if (r == (size_t)-1 || il) continue;
+            /* flush: stateful charsets would emit more here */
             size_t fl = ol; r = iconv(e, NULL, NULL, &op, &ol);
             printf("%x ", c);
             for (size_t i = 0; i < sizeof out - ol; i++) printf("%02x", out[i]);

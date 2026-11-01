@@ -1,3 +1,15 @@
+//! getaddrinfo, freeaddrinfo and getnameinfo.
+//!
+//! `getaddrinfo` follows glibc 2.43's flow: numeric addresses first (BSD forms for IPv4, `%scope` for
+//! IPv6), then the `hosts` sources in `nsswitch.conf` order, then the socket-type table
+//! (tcp, udp, sctp, udplite, dccp, mptcp, raw) and service lookup, and finally the RFC 3484/6724 sorting
+//! of the addresses. Differences from glibc: `/etc/gai.conf` is not read (the built-in tables are used),
+//! rule 7 ("prefer native transport") is not applied. Internationalised names (`AI_IDN`, `AI_CANONIDN`, `NI_IDN`) go
+//! through libidn2, loaded at run time as glibc does (see [`crate::idna`]).
+//!
+//! The C functions are shells over safe ones ([`addrinfo_list`], [`nameinfo`]). Unsafe that stays: the malloc'd addrinfo
+//! nodes (their layout is the C structure, freed by freeaddrinfo), the names the hosts and services lookups leave in their
+//! buffers (C strings), if_indextoname, and the shells' pointer conversions.
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::dns::{Addr, HostData};
 use crate::inet;
@@ -43,7 +55,7 @@ const TP: &[TypeProto] = &[
 struct ServTuple {
     socktype: c_int,
     protocol: c_int,
-    port: u16,
+    port: u16, // network order value
     set: bool,
 }
 
@@ -63,6 +75,7 @@ fn serv_by_name(name: &[u8], proto: &[u8]) -> Option<u16> {
     let p = CStr::from_bytes_until_nul(p.as_bytes()).ok()?;
     let mut res = SERVENT_ZERO;
     let mut buf = [0u8; 1024];
+    // s_port holds the port in network order already
     with_growing(&mut buf, |b| match netdb::servbyname_r(n, Some(p), &mut res, b) {
         (ERANGE, _) => None,
         (0, true) => Some(Some(res.s_port as u16)),
@@ -71,6 +84,8 @@ fn serv_by_name(name: &[u8], proto: &[u8]) -> Option<u16> {
     .flatten()
 }
 
+/// Call `f` with `first`, then with heap buffers of twice the size before each retry, while it answers None (the buffer
+/// was too small). None when memory runs out.
 fn with_growing<R>(first: &mut [u8], mut f: impl FnMut(&mut [u8]) -> Option<R>) -> Option<R> {
     if let Some(r) = f(first) {
         return Some(r);
@@ -170,8 +185,10 @@ struct At {
     scope: u32,
 }
 
+/// The addresses found for a name, in heap memory (no limit on their number, as glibc's lists in the NSS buffer).
 struct Found {
     at: HeapVec<At>,
+    /// An address could not be kept (out of memory): getaddrinfo fails with EAI_MEMORY.
     oom: bool,
     canon: Option<Buf<256>>,
     got_ipv6: bool,
@@ -196,6 +213,7 @@ fn map_v4(a: &[u8; 16]) -> [u8; 16] {
     o
 }
 
+/// Numeric host names into `found`. Ok(true) if one matched, Ok(false) to go on to a lookup.
 fn text_to_binary(name: &[u8], fam: c_int, flags: c_int, found: &mut Found) -> Result<bool, c_int> {
     if let Some((v, end)) = inet::parse_aton(name) {
         if end == name.len() {
@@ -257,12 +275,113 @@ fn convert(found: &mut Found, fam: c_int, req_family: c_int, d: &HostData) {
     found.got_ipv6 = fam == AF_INET6;
 }
 
+/// Does the plug-in source `e` have a function glibc's `get_nss_addresses` would call for this request?
 fn module_has_lookup(e: &nss::Entry, req_family: c_int, flags: c_int) -> bool {
     use rusty_libc_core::nssmod::function;
     let m = e.module_name();
     (req_family == AF_UNSPEC && function(m, b"gethostbyname4_r") != 0) || (flags & AI_CANONNAME != 0 && function(m, b"gethostbyname3_r") != 0) || function(m, b"gethostbyname2_r") != 0
 }
 
+/// The name service cache daemon's answer through glibc's `try_simple_gethostbyname`: `gethostbyname2_r (name, AF_INET)`
+/// with a buffer that grows on `ERANGE`. Ok(true): the addresses are in `found`; Ok(false): the daemon did not answer;
+/// Err: a final "no such host" (`EAI_NODATA` when the daemon's `h_errno` was NO_DATA, else `EAI_NONAME`).
+fn simple_nscd_addresses(name: &[u8], found: &mut Found) -> Result<bool, c_int> {
+    use rusty_libc_core::nscd::{self, Res};
+    let mut first = [0u8; 1024];
+    let answer = with_growing(&mut first, |buf| match nscd::host_by_name(name, false, buf) {
+        Res::Erange => None,
+        Res::Found(l) => {
+            // the addresses: `h_addr_list` holds addresses of 4-byte entries inside the buffer
+            let mut at = l.addr_list;
+            while let Some(off) = pointer_word(buf, at).filter(|&p| p != 0) {
+                let mut a = [0u8; 16];
+                a[..4].copy_from_slice(&buf[off..off + 4]);
+                found.push(At { family: AF_INET, addr: a, scope: 0 });
+                at += 8;
+            }
+            Some(Some(Ok(())))
+        }
+        Res::NotFound(h) => {
+            set_h_errno(h);
+            Some(Some(Err(if h == NO_DATA { EAI_NODATA } else { EAI_NONAME })))
+        }
+        _ => Some(None),
+    });
+    match answer {
+        None => Err(EAI_MEMORY),
+        Some(None) => Ok(false),
+        Some(Some(Err(e))) => Err(e),
+        Some(Some(Ok(()))) => Ok(true),
+    }
+}
+
+/// The word stored at `off` of `buf` as a buffer offset: the pointers the daemon's reply parser stored are addresses inside
+/// `buf`. None when `off` is out of range or the address is outside the buffer.
+fn pointer_word(buf: &[u8], off: usize) -> Option<usize> {
+    let word = usize::from_ne_bytes(buf.get(off..off + 8)?.try_into().ok()?);
+    if word == 0 {
+        return Some(0);
+    }
+    word.checked_sub(buf.as_ptr() as usize).filter(|&o| o < buf.len())
+}
+
+/// glibc's `get_nscd_addresses`: the daemon's GETAI answer for `name`. Ok(true): the addresses are in `found`; Ok(false): the
+/// daemon did not answer, go on to the sources; Err: a final answer (no such name, no memory, a broken reply).
+fn nscd_addresses(name: &[u8], req_family: c_int, flags: c_int, found: &mut Found) -> Result<bool, c_int> {
+    use rusty_libc_core::nscd::{self, AddrInfo, reply::AddrInfoData};
+    let mut sink = nss::ZBuf::new();
+    let (naddrs, addrslen, canonlen) = match nscd::addr_info(name, &mut sink) {
+        AddrInfo::Fallback => return Ok(false),
+        AddrInfo::NotFound(h) => {
+            set_h_errno(h);
+            return Err(EAI_NONAME);
+        }
+        AddrInfo::NoMemory => {
+            set_h_errno(NETDB_INTERNAL);
+            return Err(EAI_MEMORY);
+        }
+        AddrInfo::Failed => {
+            set_h_errno(NETDB_INTERNAL);
+            return Err(EAI_SYSTEM);
+        }
+        AddrInfo::Found { naddrs, addrslen, canonlen } => (naddrs, addrslen, canonlen),
+    };
+    let data = &sink.as_slice()[..naddrs + addrslen + canonlen];
+    let Some(info) = AddrInfoData::split(data, naddrs, addrslen, canonlen) else { return Err(EAI_SYSTEM) };
+    let mut count = 0;
+    for (family, addr) in info.addresses() {
+        let family = c_int::from(family);
+        let mapped = family == AF_INET && req_family == AF_INET6 && flags & AI_V4MAPPED != 0;
+        if !(mapped || req_family == AF_UNSPEC || family == req_family) {
+            continue;
+        }
+        let mut bytes = [0u8; 16];
+        if mapped {
+            bytes[10] = 0xff;
+            bytes[11] = 0xff;
+            bytes[12..].copy_from_slice(addr);
+            found.push(At { family: AF_INET6, addr: bytes, scope: 0 });
+        } else {
+            bytes[..addr.len()].copy_from_slice(addr);
+            if family == AF_INET6 {
+                found.got_ipv6 = true;
+            }
+            found.push(At { family, addr: bytes, scope: 0 });
+        }
+        count += 1;
+    }
+    if flags & AI_CANONNAME != 0 {
+        if let Some(canon) = info.canon {
+            found.canon = Buf::from(&canon[..canon.len().min(256)]);
+        }
+    }
+    if count == 0 {
+        return Err(EAI_NONAME);
+    }
+    Ok(true)
+}
+
+/// glibc's `get_nss_addresses`: walk the sources, ask each for the families the request wants.
 fn get_nss_addresses(name: &[u8], req_family: c_int, flags: c_int, found: &mut Found) -> Result<(), c_int> {
     nss::hconf_init();
     let order = nss::hosts_order();
@@ -279,18 +398,23 @@ fn get_nss_addresses(name: &[u8], req_family: c_int, flags: c_int, found: &mut F
         }
     };
     let mut do_merge = false;
+    // h_errno is NETDB_INTERNAL as the sources asked last left it
     let mut h_internal = false;
     for e in &order.e[..order.n] {
         found.at.clear();
         found.canon = None;
         found.got_ipv6 = false;
         if do_merge {
+            // the hosts database does not support merge: a SUCCESS with `merge` followed by another source throws the
+            // answer away (glibc sets h_errno NETDB_INTERNAL and errno EBUSY and stops, the result stays empty)
             errno::set(EBUSY);
             break;
         }
         no_data = 0;
         let mut hd = HostData::new();
         if e.src == Source::Module && !module_has_lookup(e, req_family, flags) {
+            // none of the lookup functions can be located (glibc: "the NSS lookup code does not consistently set errno"):
+            // UNAVAIL, h_errno NETDB_INTERNAL, errno EBUSY; the other states stay as the earlier sources left them
             status = Status::Unavail;
             h_internal = true;
             errno::set(EBUSY);
@@ -366,6 +490,7 @@ fn get_nss_addresses(name: &[u8], req_family: c_int, flags: c_int, found: &mut F
             do_merge = true;
         }
     }
+    // a failure that sets errno is reported as EAI_SYSTEM
     if matches!(status, Status::TryAgain | Status::Unavail) && h_internal {
         return Err(EAI_SYSTEM);
     }
@@ -380,6 +505,8 @@ fn get_nss_addresses(name: &[u8], req_family: c_int, flags: c_int, found: &mut F
     }
     Err(EAI_NONAME)
 }
+
+// ---------------------------------------------------------------- sorting (RFC 3484 with glibc's table)
 
 struct Prefix {
     prefix: [u8; 16],
@@ -400,7 +527,7 @@ const fn pfx(head: &[u8], bits: u32, val: i32) -> Prefix {
 const LOOP: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
 static LABELS: [Prefix; 8] = [
-    Prefix { prefix: LOOP, bits: 128, val: 0 },
+    Prefix { prefix: LOOP, bits: 128, val: 0 }, // ::1
     pfx(&[0x20, 0x02], 16, 2),
     pfx(&[], 96, 3),
     pfx(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff], 96, 4),
@@ -507,6 +634,7 @@ fn source_for(at: &At, locals: &[crate::ifaddrs::LocalAddr]) -> SortInfo {
     }
     si.got_source = true;
     si.src_family = at.family;
+    // the address in the returned sockaddr_in (offset 4) or sockaddr_in6 (offset 8); `__ss_padding` starts at offset 2
     if at.family == AF_INET {
         si.src[..4].copy_from_slice(&out.__ss_padding[2..6]);
     } else {
@@ -533,6 +661,7 @@ fn lead_zeros32(x: u32) -> i32 {
 
 fn cmp_addr(a1: &At, s1: &SortInfo, a2: &At, s2: &SortInfo) -> core::cmp::Ordering {
     use core::cmp::Ordering::*;
+    // rule 1
     if s1.got_source && !s2.got_source {
         return Less;
     }
@@ -550,6 +679,7 @@ fn cmp_addr(a1: &At, s1: &SortInfo, a2: &At, s2: &SortInfo) -> core::cmp::Orderi
         if d1 != sc1 && d2 == sc2 {
             return Greater;
         }
+        // rule 3: avoid deprecated
         let dep = |s: &SortInfo| s.flags & crate::ifaddrs::IFA_F_DEPRECATED != 0;
         if !dep(s1) && dep(s2) {
             return Less;
@@ -557,6 +687,7 @@ fn cmp_addr(a1: &At, s1: &SortInfo, a2: &At, s2: &SortInfo) -> core::cmp::Orderi
         if dep(s1) && !dep(s2) {
             return Greater;
         }
+        // rule 4: prefer home addresses
         let home = |s: &SortInfo| s.flags & 0x10 != 0;
         if !home(s1) && home(s2) {
             return Greater;
@@ -564,6 +695,7 @@ fn cmp_addr(a1: &At, s1: &SortInfo, a2: &At, s2: &SortInfo) -> core::cmp::Orderi
         if home(s1) && !home(s2) {
             return Less;
         }
+        // rule 5: matching label
         let l1d = get_label(a1.family, &a1.addr);
         let l1s = get_label(s1.src_family, &s1.src);
         let l2d = get_label(a2.family, &a2.addr);
@@ -575,6 +707,7 @@ fn cmp_addr(a1: &At, s1: &SortInfo, a2: &At, s2: &SortInfo) -> core::cmp::Orderi
             return Greater;
         }
     }
+    // rule 6
     let p1 = get_precedence(a1.family, &a1.addr);
     let p2 = get_precedence(a2.family, &a2.addr);
     if p1 > p2 {
@@ -583,12 +716,14 @@ fn cmp_addr(a1: &At, s1: &SortInfo, a2: &At, s2: &SortInfo) -> core::cmp::Orderi
     if p1 < p2 {
         return Greater;
     }
+    // rule 8
     if d1 < d2 {
         return Less;
     }
     if d1 > d2 {
         return Greater;
     }
+    // rule 9
     if s1.got_source && a1.family == a2.family {
         let (mut b1, mut b2) = (0, 0);
         if a1.family == AF_INET {
@@ -627,12 +762,14 @@ fn cmp_addr(a1: &At, s1: &SortInfo, a2: &At, s2: &SortInfo) -> core::cmp::Orderi
     Equal
 }
 
+/// RFC 3484/6724 order (glibc's rfc3484_sort), stable: equal addresses keep their order. False when out of memory.
 fn sort_addresses(at: &mut [At]) -> bool {
     let mut locals = [crate::ifaddrs::LocalAddr { family: 0, addr: [0; 16], prefixlen: 0, index: 0, flags: 0, scope: 0 }; 64];
     let nl = crate::ifaddrs::local_addrs(&mut locals).unwrap_or(0);
     let n = at.len();
     let (mut info, mut idx, mut tmp, mut copy) = (HeapVec::<SortInfo>::new(), HeapVec::<usize>::new(), HeapVec::<usize>::new(), HeapVec::<At>::new());
     for (i, a) in at.iter().enumerate() {
+        // a destination equal to an earlier one has the same source: no second socket, connect and getsockname
         let si = match at[..i].iter().position(|b| b.family == a.family && b.addr == a.addr && b.scope == a.scope) {
             Some(j) => info[j],
             None => source_for(a, &locals[..nl]),
@@ -644,6 +781,7 @@ fn sort_addresses(at: &mut [At]) -> bool {
     if !copy.extend_from(at) {
         return false;
     }
+    // bottom-up merge sort of the indices: on a tie the earlier run wins, so the order is stable
     let greater = |a: usize, b: usize| cmp_addr(&copy[a], &info[a], &copy[b], &info[b]) == core::cmp::Ordering::Greater;
     let (mut src, mut dst) = (idx.as_mut_slice(), tmp.as_mut_slice());
     let mut width = 1;
@@ -673,13 +811,19 @@ fn sort_addresses(at: &mut [At]) -> bool {
     true
 }
 
+// ---------------------------------------------------------------- getaddrinfo
+
+/// One malloc'd addrinfo node with its sockaddr right after it (freed by freeaddrinfo), or NULL.
 fn alloc_ai(flags: c_int, at: &At, st: &ServTuple) -> *mut addrinfo {
     let socklen = if at.family == AF_INET6 { 28 } else { 16 };
+    // SAFETY: malloc has no precondition.
     let p = unsafe { rusty_libc_malloc::malloc(core::mem::size_of::<addrinfo>() + socklen) } as *mut addrinfo;
     if p.is_null() {
         return p;
     }
     let sa = p.wrapping_add(1) as *mut u8;
+    // sockaddr_in: family 0, port 2, address 4; sockaddr_in6: family 0, port 2, address 8, scope 24 (port already in
+    // network order); built on the stack, then copied in whole
     let mut b = [0u8; 28];
     b[0..2].copy_from_slice(&(at.family as u16).to_ne_bytes());
     b[2..4].copy_from_slice(&st.port.to_ne_bytes());
@@ -689,25 +833,50 @@ fn alloc_ai(flags: c_int, at: &At, st: &ServTuple) -> *mut addrinfo {
     } else {
         b[4..8].copy_from_slice(&at.addr[..4]);
     }
+    // SAFETY: the `socklen` bytes after the addrinfo are part of the fresh block, ours alone; `b` has at least that many.
     unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), sa, socklen) };
     let node = addrinfo { ai_flags: flags, ai_family: at.family, ai_socktype: st.socktype, ai_protocol: st.protocol, ai_addrlen: socklen as u32, ai_addr: sa as *mut sockaddr, ai_canonname: core::ptr::null_mut(), ai_next: core::ptr::null_mut() };
+    // SAFETY: `p` is a fresh malloc block (16-aligned) of at least the size of an addrinfo.
     unsafe { p.write(node) };
     p
 }
 
+/// # Safety
+/// glibc's contract for `getaddrinfo`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getaddrinfo(name: *const c_char, service: *const c_char, hints: *const addrinfo, pai: *mut *mut addrinfo) -> c_int {
+    // SAFETY: `name` and `service` NULL or C strings, `hints` NULL or a valid addrinfo, `pai` a valid result slot (contract).
     let ((name, service), (hints, pai)) = unsafe { ((OptStr(name), OptStr(service)), (OptRef(hints), Out(pai))).conv() };
-    match addrinfo_list(name.map(CStr::to_bytes), service.map(CStr::to_bytes), hints) {
-        Ok(head) => {
+    match addrinfo_pair(name.map(CStr::to_bytes), service.map(CStr::to_bytes), hints) {
+        (0, head) => {
             *pai = head;
             0
         }
-        Err(e) => e,
+        (e, _) => e,
     }
 }
 
+/// getaddrinfo on safe types: the head of a list of malloc'd nodes (give it back with [`freeaddrinfo`]), or an EAI_* code.
 pub fn addrinfo_list(name: Option<&[u8]>, service: Option<&[u8]>, hints: Option<&addrinfo>) -> Result<*mut addrinfo, c_int> {
+    match addrinfo_pair(name, service, hints) {
+        (0, head) => Ok(head),
+        (e, _) => Err(e),
+    }
+}
+
+/// [`addrinfo_list`] as (0, head) or (EAI_* code, null): a pair comes back in two registers, the `Result` came back
+/// through memory (the C entry point's share of a numeric lookup).
+#[inline(never)]
+fn addrinfo_pair(name: Option<&[u8]>, service: Option<&[u8]>, hints: Option<&addrinfo>) -> (c_int, *mut addrinfo) {
+    match lookup(name, service, hints) {
+        Ok(head) => (0, head),
+        Err(e) => (e, core::ptr::null_mut()),
+    }
+}
+
+/// The work of [`addrinfo_list`]; the EAI_* codes are negative, never 0.
+#[inline(always)]
+fn lookup(name: Option<&[u8]>, service: Option<&[u8]>, hints: Option<&addrinfo>) -> Result<*mut addrinfo, c_int> {
     {
         let mut name = name;
         let mut service = service;
@@ -720,8 +889,17 @@ pub fn addrinfo_list(name: Option<&[u8]>, service: Option<&[u8]>, hints: Option<
         if name.is_none() && service.is_none() {
             return Err(EAI_NONAME);
         }
-        let default_hints = addrinfo { ai_flags: AI_DEFAULT, ..addrinfo::default() };
-        let mut h = hints.copied().unwrap_or(default_hints);
+        // only the four fields getaddrinfo reads (a copy of the whole addrinfo was a memcpy call per lookup)
+        struct Hints {
+            ai_flags: c_int,
+            ai_family: c_int,
+            ai_socktype: c_int,
+            ai_protocol: c_int,
+        }
+        let mut h = match hints {
+            Some(x) => Hints { ai_flags: x.ai_flags, ai_family: x.ai_family, ai_socktype: x.ai_socktype, ai_protocol: x.ai_protocol },
+            None => Hints { ai_flags: AI_DEFAULT, ai_family: 0, ai_socktype: 0, ai_protocol: 0 },
+        };
         if h.ai_flags & !(AI_PASSIVE | AI_CANONNAME | AI_NUMERICHOST | AI_ADDRCONFIG | AI_V4MAPPED | AI_IDN | AI_CANONIDN | DEPRECATED_AI_IDN | AI_NUMERICSERV | AI_ALL) != 0 {
             return Err(EAI_BADFLAGS);
         }
@@ -773,6 +951,7 @@ pub fn addrinfo_list(name: Option<&[u8]>, service: Option<&[u8]>, hints: Option<
         };
         let mut st = [ServTuple::default(); MAX_ST];
         get_servtuples(&svc, h.ai_socktype, h.ai_protocol, &mut st)?;
+        // AI_IDN: the name in the DNS form (libidn2); `orig` stays the caller's name for the canonical-name fallback
         let orig = name;
         let idn_name;
         if h.ai_flags & AI_IDN != 0 {
@@ -805,13 +984,20 @@ pub fn addrinfo_list(name: Option<&[u8]>, service: Option<&[u8]>, hints: Option<
                 Err(e) => return Err(e),
                 Ok(true) => {}
                 Ok(false) => {
-                    get_nss_addresses(nm, h.ai_family, h.ai_flags, &mut found)?;
+                    // glibc: try_simple_gethostbyname (IPv4 only, no canonical name: gethostbyname2_r), else the daemon's
+                    // GETAI answer, then the sources of nsswitch.conf
+                    let answered = if h.ai_family == AF_INET && h.ai_flags & AI_CANONNAME == 0 { simple_nscd_addresses(nm, &mut found)? } else { nscd_addresses(nm, h.ai_family, h.ai_flags, &mut found)? };
+                    if !answered {
+                        get_nss_addresses(nm, h.ai_family, h.ai_flags, &mut found)?;
+                    }
                 }
             },
         }
+        // canonical name
         let mut canon: Option<Buf<256>> = None;
         if h.ai_flags & AI_CANONNAME != 0 {
             canon = found.canon.or_else(|| orig.and_then(|n| Buf::from(&n[..n.len().min(256)])));
+            // AI_CANONIDN: back to the locale's form; a name libidn2 rejects stays in the DNS form (glibc's process_canonname)
             if h.ai_flags & AI_CANONIDN != 0 {
                 if let Some(c) = &canon {
                     match crate::idna::from_dns(c.as_bytes()) {
@@ -822,6 +1008,7 @@ pub fn addrinfo_list(name: Option<&[u8]>, service: Option<&[u8]>, hints: Option<
                 }
             }
         }
+        // the addresses to emit
         if found.oom {
             return Err(EAI_MEMORY);
         }
@@ -837,6 +1024,7 @@ pub fn addrinfo_list(name: Option<&[u8]>, service: Option<&[u8]>, hints: Option<
         if list.len() > 1 && !sort_addresses(&mut list) {
             return Err(EAI_MEMORY);
         }
+        // build the nodes
         let mut nodes = AiList { head: core::ptr::null_mut(), tail: core::ptr::null_mut() };
         for a in list.iter() {
             for s in st.iter().take_while(|s| s.set) {
@@ -861,21 +1049,27 @@ pub fn addrinfo_list(name: Option<&[u8]>, service: Option<&[u8]>, hints: Option<
     }
 }
 
+/// The nodes of a getaddrinfo answer being built: each made by alloc_ai and owned here until `finish` (freed with
+/// freeaddrinfo when the build fails).
 struct AiList {
     head: *mut addrinfo,
     tail: *mut addrinfo,
 }
 
 impl AiList {
+    /// Append a node fresh from alloc_ai.
     fn push(&mut self, ai: *mut addrinfo) {
         if self.tail.is_null() {
             self.head = ai;
         } else {
+            // SAFETY: `tail` is the last node made by alloc_ai, owned by this list.
             unsafe { (*self.tail).ai_next = ai };
         }
         self.tail = ai;
     }
+    /// The first node's canonical name (a malloc'd C string the list then owns).
     fn set_canon(&mut self, p: *mut c_char) {
+        // SAFETY: `head` is a node of this list (the caller checked it is not NULL).
         unsafe { (*self.head).ai_canonname = p };
     }
     fn finish(mut self) -> *mut addrinfo {
@@ -889,24 +1083,33 @@ impl Drop for AiList {
         if self.head.is_null() {
             return;
         }
+        // SAFETY: the nodes (NULL: none) came from alloc_ai and are linked from `head`, owned by this list.
         unsafe { freeaddrinfo(self.head) };
     }
 }
 
+/// # Safety
+/// `ai` came from `getaddrinfo` (or is null).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn freeaddrinfo(mut ai: *mut addrinfo) {
     while !ai.is_null() {
+        // SAFETY: `ai` is a node of a getaddrinfo list (contract), not freed yet.
         let node = unsafe { &*ai };
         let next = node.ai_next;
         if !node.ai_canonname.is_null() {
+            // SAFETY: the canonical name was malloc'd by getaddrinfo and is freed once, with its node.
             unsafe { rusty_libc_malloc::free(node.ai_canonname as *mut c_void) };
         }
+        // SAFETY: the node (with its sockaddr) is one malloc'd block; nothing refers to it after this.
         unsafe { rusty_libc_malloc::free(ai as *mut c_void) };
         ai = next;
     }
 }
 
+// ---------------------------------------------------------------- getnameinfo
+
 fn domain_name() -> Option<Buf<256>> {
+    // the domain part of what `localhost` resolves to, else of the host name, else of its lookup
     let mut hd = HostData::new();
     if netdb::lookup_name(b"localhost", AF_INET, false, &mut hd).is_ok() {
         if let Some(d) = hd.canon.as_bytes().iter().position(|&c| c == b'.') {
@@ -929,6 +1132,7 @@ fn domain_name() -> Option<Buf<256>> {
     None
 }
 
+/// `s` and a NUL into `dst`, or EAI_OVERFLOW when it does not fit.
 fn copy_out(dst: &mut [u8], s: &[u8]) -> c_int {
     if s.len() + 1 > dst.len() {
         return EAI_OVERFLOW;
@@ -938,6 +1142,8 @@ fn copy_out(dst: &mut [u8], s: &[u8]) -> c_int {
     0
 }
 
+/// # Safety
+/// glibc's contract for `getnameinfo`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getnameinfo(sa: *const sockaddr, addrlen: socklen_t, host: *mut c_char, hostlen: socklen_t, serv: *mut c_char, servlen: socklen_t, flags: c_int) -> c_int {
     if flags & !(NI_NUMERICHOST | NI_NUMERICSERV | NI_NOFQDN | NI_NAMEREQD | NI_DGRAM | NI_IDN | 0xc0) != 0 {
@@ -949,8 +1155,10 @@ pub unsafe extern "C" fn getnameinfo(sa: *const sockaddr, addrlen: socklen_t, ho
     if flags & NI_NAMEREQD != 0 && host.is_null() && serv.is_null() {
         return EAI_NONAME;
     }
+    // SAFETY: `sa` points to at least `addrlen` >= 2 bytes (contract): the family.
     let fam = unsafe { Bytes(sa as *const u8, 2).conv() };
     let fam = c_int::from(u16::from_ne_bytes([fam[0], fam[1]]));
+    // the bytes looked at: the whole sockaddr_in / sockaddr_in6 (checked against addrlen), a sockaddr_un's 108-byte path
     let need = match fam {
         AF_UNIX => 110,
         AF_INET if (addrlen as usize) < 16 => return EAI_FAMILY,
@@ -959,10 +1167,14 @@ pub unsafe extern "C" fn getnameinfo(sa: *const sockaddr, addrlen: socklen_t, ho
         AF_INET6 => 28,
         _ => return EAI_FAMILY,
     };
+    // SAFETY: the caller's sockaddr of that family (for AF_UNIX the path is read up to its NUL, as before), `host` and
+    // `serv` NULL or writable for their lengths, apart from each other (contract).
     let (sab, (host, serv)) = unsafe { (Bytes(sa as *const u8, need), (OptBytesMut(host as *mut u8, hostlen as usize), OptBytesMut(serv as *mut u8, servlen as usize))).conv() };
     nameinfo(sab, host, serv, flags)
 }
 
+/// getnameinfo on safe types, after the flag and length checks: `sa` holds the sockaddr's bytes (family first), `host` and
+/// `serv` the caller's buffers (None: not wanted).
 pub fn nameinfo(sa: &[u8], host: Option<&mut [u8]>, serv: Option<&mut [u8]>, flags: c_int) -> c_int {
     if let Some(h) = host {
         let r = gni_host(sa, h, flags);
@@ -995,6 +1207,7 @@ fn gni_host(sa: &[u8], host: &mut [u8], flags: c_int) -> c_int {
         }
         return copy_out(host, b"localhost");
     }
+    // sockaddr_in6: address at 8, scope at 24; sockaddr_in: address at 4
     let (addr, alen): ([u8; 16], usize) = if fam == AF_INET6 {
         let mut a = [0u8; 16];
         a.copy_from_slice(&sa[8..24]);
@@ -1008,6 +1221,7 @@ fn gni_host(sa: &[u8], host: &mut [u8], flags: c_int) -> c_int {
         let mut res = HOSTENT0;
         let mut buf = [0u8; 2048];
         let mut herr = 0;
+        // Some(Some(r)): a name was found (r: the copy's result); Some(None): not found
         let found = with_growing(&mut buf, |b| {
             let (rc, ok) = netdb::hostbyaddr_r(&addr[..alen], alen as u32, fam, &mut res, b, &mut herr);
             if rc == ERANGE && herr == NETDB_INTERNAL {
@@ -1016,6 +1230,7 @@ fn gni_host(sa: &[u8], host: &mut [u8], flags: c_int) -> c_int {
             if !ok {
                 return Some(None);
             }
+            // SAFETY: on success h_name is the C string hostbyaddr_r put in `b`, which lives until this closure returns.
             let mut nm = unsafe { cbytes(res.h_name) };
             let dom;
             if flags & NI_NOFQDN != 0 {
@@ -1031,6 +1246,7 @@ fn gni_host(sa: &[u8], host: &mut [u8], flags: c_int) -> c_int {
                     }
                 }
             }
+            // NI_IDN: the name in the locale's form; a name libidn2 rejects is given as it is (glibc's gni_host_inet_name)
             let idn = if flags & NI_IDN != 0 { crate::idna::from_dns(nm) } else { Ok(None) };
             Some(Some(match &idn {
                 Ok(Some(u)) => copy_out(host, u.as_bytes()),
@@ -1052,10 +1268,12 @@ fn gni_host(sa: &[u8], host: &mut [u8], flags: c_int) -> c_int {
                 }
             }
         }
+        // not found: fall through to the numeric form unless a name was required
     }
     if flags & NI_NAMEREQD != 0 {
         return EAI_NONAME;
     }
+    // numeric
     let mut t = if fam == AF_INET6 { inet::format_ipv6(&addr) } else { inet::format_ipv4(&[addr[0], addr[1], addr[2], addr[3]]) };
     if fam == AF_INET6 {
         let scope = u32::from_ne_bytes([sa[24], sa[25], sa[26], sa[27]]);
@@ -1066,6 +1284,7 @@ fn gni_host(sa: &[u8], host: &mut [u8], flags: c_int) -> c_int {
             let mut named = false;
             if ll || mc_ll {
                 let mut nb = [0u8; 16];
+                // SAFETY: `nb` holds IF_NAMESIZE (16) bytes, what if_indextoname writes at most.
                 if !unsafe { crate::ifaddrs::if_indextoname(scope, nb.as_mut_ptr() as *mut c_char) }.is_null() {
                     let l = nb.iter().position(|&c| c == 0).unwrap_or(16);
                     t.push_all(&nb[..l]);
@@ -1096,6 +1315,7 @@ fn gni_serv(sa: &[u8], serv: &mut [u8], flags: c_int) -> c_int {
         let proto = if flags & NI_DGRAM != 0 { c"udp" } else { c"tcp" };
         let r = with_growing(&mut buf, |b| match netdb::servbyport_r(port as c_int, Some(proto), &mut res, b) {
             (ERANGE, _) => None,
+            // SAFETY: on success s_name is the C string servbyport_r put in `b`, alive in this closure.
             (_, true) => Some(Some(copy_out(serv, unsafe { cbytes(res.s_name) }))),
             _ => Some(None),
         });

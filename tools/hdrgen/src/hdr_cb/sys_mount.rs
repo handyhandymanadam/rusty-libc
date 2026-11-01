@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("MS_RDONLY", V::Txt("1U")),
         ("MS_NOSUID", V::Txt("2U")),
@@ -112,6 +113,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("O_CLOEXEC", V::Hex(0x80000)),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Block { head: "struct mount_attr ", body: &["", "  uint64_t attr_set;", "  uint64_t attr_clr;", "  uint64_t propagation;", "  uint64_t userns_fd;", ""], tail: "" },
 ];
 pub const AFTER_INCLUDES_CHOMP: bool = false;

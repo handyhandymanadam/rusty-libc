@@ -3,7 +3,9 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "sys/gmon.h",
     items: &[
-        Item::Guard { name: "_SYS_GMON_H", value: "1", end: "", items: &[
+        Item::Comment(r#"/* sys/gmon.h for the Rust libc: the profiling data of gprof (gmonparam), the states of the profiler and
+   the start-up and clean-up calls. */"#),
+        Item::Guard { name: "_SYS_GMON_H", value: "1", end: " /* sys/gmon.h */", items: &[
             Item::Blank,
             Item::Include("<features.h>"),
             Item::Include("<sys/types.h>"),
@@ -17,6 +19,8 @@ pub static HDR: Header = Header {
                 ("GMON_PROF_REDIRECT", V::Sp(r#"	4"#)),
             ]),
             Item::Blank,
+            Item::Comment(r#"/* Sampling rate of the program histogram: one counter per HISTFRACTION counter sizes of text; one
+   hash slot per HASHFRACTION slot sizes of text; arc table size is ARCDENSITY percent of the text size. */"#),
             Item::Consts(&[
                 ("HISTFRACTION", V::Sp(r#"	2"#)),
                 ("HASHFRACTION", V::Sp(r#"	2"#)),
@@ -28,9 +32,11 @@ pub static HDR: Header = Header {
             Item::Block { head: r#"struct tostruct
 "#, body: &["", "  unsigned long selfpc;", "  long count;", "  unsigned short link;", "  unsigned short pad;", ""], tail: "" },
             Item::Blank,
+            Item::Comment("/* A raw call arc as gprof reads it from the old format. */"),
             Item::Block { head: r#"struct rawarc
 "#, body: &["", "  unsigned long raw_frompc;", "  unsigned long raw_selfpc;", "  long raw_count;", ""], tail: "" },
             Item::Blank,
+            Item::Comment("/* General rounding functions. */"),
             Item::Raw(Reason::GlibcMacro, r#"#define ROUNDDOWN(x,y)	(((x)/(y))*(y))"#),
             Item::Raw(Reason::GlibcMacro, r#"#define ROUNDUP(x,y)	((((x)+(y)-1)/(y))*(y))"#),
             Item::Blank,
@@ -40,9 +46,11 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::Decl("__BEGIN_DECLS"),
             Item::Blank,
+            Item::Comment("/* Set up data structures and start profiling. */"),
             Item::Decl("extern void __monstartup (unsigned long __lowpc, unsigned long __highpc) __THROW;"),
             Item::Decl("extern void monstartup (unsigned long __lowpc, unsigned long __highpc) __THROW;"),
             Item::Blank,
+            Item::Comment("/* Clean up profiling and write out gmon.out. */"),
             Item::Decl("extern void _mcleanup (void) __THROW;"),
             Item::Blank,
             Item::Decl("__END_DECLS"),

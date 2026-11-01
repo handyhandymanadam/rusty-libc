@@ -1,3 +1,6 @@
+//! The C types of the RPC headers (`rpc/types.h`, `rpc/xdr.h`, `rpc/auth.h`, `rpc/clnt.h`,
+//! `rpc/svc.h`, `rpc/rpc_msg.h`, `rpc/pmap_*.h`, `rpc/auth_des.h`, `rpc/key_prot.h`), with glibc's
+//! layouts (checked by `tests/c/rpc_layout.c` against the system's copy of Sun's headers).
 use core::ffi::{c_char, c_int, c_long, c_short, c_uchar, c_uint, c_ulong, c_ushort, c_void};
 pub use rusty_libc_net::types::{sockaddr_in, sockaddr_un};
 
@@ -18,6 +21,7 @@ pub type rpcport_t = c_ulong;
 
 pub const TRUE: bool_t = 1;
 pub const FALSE: bool_t = 0;
+/// `__dontcare__` of rpc/types.h
 pub const DONTCARE: c_int = -1;
 pub const LASTUNSIGNED: u_int = u_int::MAX;
 
@@ -156,6 +160,9 @@ pub const KEY_NET_GET: c_ulong = 9;
 pub const KEY_GET_CONV: c_ulong = 10;
 pub const MAXGIDS: u_int = 16;
 
+// ---- XDR
+
+/// `struct xdr_ops`: the operations vector of a stream.
 #[repr(C)]
 pub struct xdr_ops {
     pub x_getlong: Option<unsafe extern "C" fn(*mut XDR, *mut c_long) -> bool_t>,
@@ -170,6 +177,7 @@ pub struct xdr_ops {
     pub x_putint32: Option<unsafe extern "C" fn(*mut XDR, *const i32) -> bool_t>,
 }
 
+/// The XDR handle.
 #[repr(C)]
 pub struct XDR {
     pub x_op: c_int,
@@ -186,15 +194,20 @@ impl XDR {
     }
 }
 
+/// `xdrproc_t`. (glibc's header declares it with a trailing `...`; the calling convention is the same.)
 pub type xdrproc_t = Option<unsafe extern "C" fn(*mut XDR, *mut c_void) -> bool_t>;
+/// The same pointer without the `Option`.
 pub type XdrFn = unsafe extern "C" fn(*mut XDR, *mut c_void) -> bool_t;
 
+/// Turn the address of an XDR routine of any argument type into an `xdrproc_t`.
 #[macro_export]
 macro_rules! xproc {
     ($f:expr) => {
         {
             #[allow(unused_unsafe)]
             let p = $f as *const ();
+            // SAFETY: an XDR routine's address; `xdrproc_t` calls it with (XDR *, object *), which every routine
+            // of any object type accepts under the C calling convention.
             #[allow(unused_unsafe)]
             let f = unsafe { core::mem::transmute::<*const (), $crate::types::XdrFn>(p) };
             Some(f)
@@ -213,6 +226,8 @@ pub struct netobj {
     pub n_len: u_int,
     pub n_bytes: *mut c_char,
 }
+
+// ---- authentication
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -304,6 +319,8 @@ pub struct authdes_verf {
     pub adv_int_u: u32,
 }
 
+// ---- client
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct timeval {
@@ -372,6 +389,8 @@ pub struct CLIENT {
     pub cl_ops: *const clnt_ops,
     pub cl_private: caddr_t,
 }
+
+// ---- messages
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -451,9 +470,12 @@ pub struct rpc_msg {
 
 impl rpc_msg {
     pub fn zeroed() -> rpc_msg {
+        // SAFETY: every field is an integer, a raw pointer or an `Option` of a function pointer: all zero is valid.
         unsafe { core::mem::zeroed() }
     }
 }
+
+// ---- server
 
 #[repr(C)]
 pub struct xp_ops {
@@ -490,6 +512,8 @@ pub struct svc_req {
 
 pub type dispatch_fn_t = Option<unsafe extern "C" fn(*mut svc_req, *mut SVCXPRT)>;
 
+// ---- portmapper
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct pmap {
@@ -524,6 +548,8 @@ pub struct rmtcallres {
 }
 
 pub type resultproc_t = Option<unsafe extern "C" fn(caddr_t, *mut sockaddr_in) -> bool_t>;
+
+// ---- key server protocol
 
 pub type keystatus = c_int;
 pub type netnamestr = *mut c_char;
@@ -599,6 +625,8 @@ pub struct key_netstres {
     pub key_netstres_u: key_netstres_u,
 }
 
+// ---- system structures
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct pollfd {
@@ -626,20 +654,31 @@ impl fd_set {
     pub const ZERO: fd_set = fd_set { fds_bits: [0; 16] };
 }
 
+/// Convert a Rust function item with the right signature to an `Option` of it (for vtables).
 pub const fn some<T>(f: T) -> Option<T> {
     Some(f)
 }
 
+// ---- safe access to the unions of the RPC headers
+//
+// Every field of these unions is plain data: integers, raw pointers, `Option`s of function pointers, and arrays and
+// structs of those. Any initialised bit pattern is a valid value of each field (a function pointer only has to be
+// non-NULL, and NULL is `None`), so reading any field is sound; the union's bytes come from C memory or from this crate's
+// own zero-initialised values. The accessors below are that argument made once (Scylla, "Translating an Applicative
+// Subset of C to Safe Rust", p.7: a tagged union is a variant selected by its tag; the tag check stays with the caller,
+// as in the C code).
 macro_rules! pod_union {
     ($u:ident { $( $f:ident : $t:ty => $get:ident, $get_mut:ident );* $(;)? }) => {
         impl $u {
             $(
                 #[inline(always)]
                 pub fn $get(&self) -> &$t {
+                    // SAFETY: plain data, see above.
                     unsafe { &self.$f }
                 }
                 #[inline(always)]
                 pub fn $get_mut(&mut self) -> &mut $t {
+                    // SAFETY: plain data, see above.
                     unsafe { &mut self.$f }
                 }
             )*
@@ -658,15 +697,19 @@ pod_union!(cryptkeyres_u { deskey: des_block => deskey, deskey_mut });
 pod_union!(key_netstres_u { knet: key_netstarg => knet, knet_mut });
 
 impl des_block {
+    /// The eight bytes of the block.
     #[inline(always)]
     pub fn bytes_mut(&mut self) -> &mut [u8; 8] {
         let c: &mut [c_char; 8] = self.chars_mut();
+        // SAFETY: `c_char` and `u8` have the same size, alignment and valid values.
         unsafe { &mut *(c as *mut [c_char; 8]).cast::<[u8; 8]>() }
     }
 
+    /// The eight bytes of the block.
     #[inline(always)]
     pub fn bytes(&self) -> &[u8; 8] {
         let c: &[c_char; 8] = self.chars();
+        // SAFETY: `c_char` and `u8` have the same size, alignment and valid values.
         unsafe { &*(c as *const [c_char; 8]).cast::<[u8; 8]>() }
     }
 }
@@ -674,6 +717,7 @@ impl des_block {
 impl getcredres_u {
     #[inline(always)]
     pub fn cred_mut(&mut self) -> &mut unixcred {
+        // SAFETY: plain data (`unixcred` is integers and a raw pointer), see above.
         unsafe { &mut self.cred }
     }
 }
@@ -685,13 +729,17 @@ impl call_body {
 }
 
 
+/// A C character array as bytes.
 #[inline(always)]
 pub fn chars_as_bytes_mut<const N: usize>(a: &mut [c_char; N]) -> &mut [u8; N] {
+    // SAFETY: `c_char` and `u8` have the same size, alignment and valid values.
     unsafe { &mut *(a as *mut [c_char; N]).cast::<[u8; N]>() }
 }
 
+/// A C character array as bytes.
 #[inline(always)]
 pub fn chars_as_bytes<const N: usize>(a: &[c_char; N]) -> &[u8; N] {
+    // SAFETY: `c_char` and `u8` have the same size, alignment and valid values.
     unsafe { &*(a as *const [c_char; N]).cast::<[u8; N]>() }
 }
 

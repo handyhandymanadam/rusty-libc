@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "gnu/lib-names-64.h",
     items: &[
+        Item::Comment("/* gnu/lib-names-64.h: the sonames of glibc's shared libraries on x86-64 (same names glibc uses; libc.so.6 here is rusty-libc's) */"),
         Item::Consts(&[
             ("LD_LINUX_X86_64_SO", V::Sp(r#"             "ld-linux-x86-64.so.2""#)),
             ("LD_SO", V::Sp(r#"                          "ld-linux-x86-64.so.2""#)),

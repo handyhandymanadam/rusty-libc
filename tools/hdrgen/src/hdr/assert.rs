@@ -3,10 +3,14 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "assert.h",
     items: &[
+        Item::Comment(r#"/* assert.h: no include guard on purpose, like glibc: it may be included again after defining or
+   undefining NDEBUG, and each inclusion redefines assert (C99 7.2). */"#),
         Item::Include("<features.h>"),
         Item::Undef("assert"),
         Item::Undef("assert_perror"),
         Item::Blank,
+        Item::Comment(r#"/* In C (not C++) assert takes any number of arguments, so that an expression with a comma outside parentheses (a compound
+   literal, a macro call) can be asserted; the message shows the arguments as written. */"#),
         Item::Undef("__ASSERT_VARIADIC"),
         Item::Gate(&[
             Branch { head: "if !defined __cplusplus && (defined __GNUC__ || (defined __STDC_VERSION__ && __STDC_VERSION__ >= 199901L))", items: &[

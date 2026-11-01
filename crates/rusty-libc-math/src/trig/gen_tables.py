@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+"""Generates tables.rs for trig.rs. Everything is computed here from first principles with
+exact big-integer arithmetic (2400-bit fixed point); nothing is copied from another library.
+Usage: python3 gen_tables.py > tables.rs"""
 from fractions import Fraction
 import math
 
@@ -6,7 +9,7 @@ P = 2400
 ONE = 1 << P
 
 
-def atan_inv(n):
+def atan_inv(n):  # atan(1/n), fixed point
     x = ONE // n
     n2 = n * n
     s = x
@@ -23,7 +26,7 @@ def atan_inv(n):
 PI = 4 * (4 * atan_inv(5) - atan_inv(239))
 
 
-def atan_fp(num, den):
+def atan_fp(num, den):  # atan(num/den), 0 < num/den <= 1, fixed point, by argument halving
     x = (num * ONE) // den
     h = 0
     for _ in range(5):
@@ -43,7 +46,7 @@ def atan_fp(num, den):
     return s << h
 
 
-def ln2_fp():
+def ln2_fp():  # ln2 = sum 1/(k 2^k)
     s = 0
     t = ONE
     k = 1

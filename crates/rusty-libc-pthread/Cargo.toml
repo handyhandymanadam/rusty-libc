@@ -9,9 +9,20 @@ rusty-libc-core = { path = "../rusty-libc-core" }
 rusty-libc-mem = { path = "../rusty-libc-mem" }
 rusty-libc-malloc = { path = "../rusty-libc-malloc" }
 
+[dev-dependencies]
+libc = "0.2"
+rusty-libc-malloc = { path = "../rusty-libc-malloc", features = ["no-brk"] }
+
 [features]
+# Export the C symbols. Off for host tests so they never replace the host libc.
 export = ["start"]
+# Take the vDSO address from rusty-libc-core's startup code (programs started by its `_start`) instead of
+# reading /proc/self/auxv.
 start = ["rusty-libc-core/start"]
+# The closure-spawning part of the Rust API (Thread::spawn boxes the closure): needs `alloc`, so the
+# program must have a global allocator. Off for the C runtime build.
 alloc = []
+# Cancellation and pthread_exit unwind the thread's stack with `_Unwind_ForcedUnwind` when the program has one (a weak
+# reference: see unwind.rs); `unwind-dl` also looks for it in the process and loads libgcc_s.so.1 (the shared library).
 unwind = []
 unwind-dl = ["unwind"]

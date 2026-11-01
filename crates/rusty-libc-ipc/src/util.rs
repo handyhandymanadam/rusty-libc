@@ -1,7 +1,9 @@
+//! Small helpers shared by the modules: errno handling and error numbers.
 #![allow(dead_code)]
 use core::ffi::{c_int, c_void};
 use rusty_libc_core::errno;
 
+/// Raw system call result to the C convention: -1 and errno on failure.
 #[inline]
 pub(crate) fn sc(ret: usize) -> isize {
     if ret > usize::MAX - 4095 {
@@ -17,32 +19,50 @@ pub(crate) fn sci(ret: usize) -> c_int {
     sc(ret) as c_int
 }
 
+/// Raw system call result to `Ok(value)` or `Err(errno)`.
 #[inline]
 pub(crate) fn res(ret: usize) -> Result<usize, rusty_libc_core::Errno> {
     rusty_libc_core::syscall::check(ret)
 }
 
+/// The library's malloc: a block of `size` bytes aligned to 16, or null. Safe: getting memory has no preconditions (using
+/// it does, at each use).
 #[inline(always)]
 pub(crate) fn malloc(size: usize) -> *mut c_void {
+    // SAFETY: malloc has no preconditions.
     unsafe { rusty_libc_malloc::malloc(size) }
 }
 
+/// `v` moved into a block from the library's malloc (glibc's helpers hand such blocks to the threads they start), or null
+/// when malloc fails (`v` is dropped then). Free it with [`heap_take`] or [`heap_free`].
 pub(crate) fn heap_box<T>(v: T) -> *mut T {
     const { assert!(core::mem::align_of::<T>() <= 16) };
     let p = malloc(core::mem::size_of::<T>()).cast::<T>();
     if !p.is_null() {
+        // SAFETY: `p` is a fresh, 16-byte aligned (enough for `T`, checked above) block of `size_of::<T>()` bytes.
         unsafe { p.write(v) };
     }
     p
 }
 
+/// Move the value out of a block made by [`heap_box`] and free the block.
+///
+/// # Safety
+/// `p` came from `heap_box` (not null) and is not used again.
 pub(crate) unsafe fn heap_take<T>(p: *mut T) -> T {
+    // SAFETY: `p` holds a `T` written by `heap_box` (caller's contract).
     let v = unsafe { p.read() };
+    // SAFETY: the block came from malloc and its value has been moved out.
     unsafe { rusty_libc_malloc::free(p.cast()) };
     v
 }
 
+/// Free a block made by [`heap_box`] without reading it (for plain-data values that need no drop).
+///
+/// # Safety
+/// `p` came from `heap_box` (or is null) and is not used again.
 pub(crate) unsafe fn heap_free<T>(p: *mut T) {
+    // SAFETY: the caller's contract; free(NULL) does nothing.
     unsafe { rusty_libc_malloc::free(p.cast()) };
 }
 
@@ -69,6 +89,7 @@ pub const ETIMEDOUT: c_int = 110;
 pub const EINPROGRESS: c_int = 115;
 pub const ECANCELED: c_int = 125;
 
+/// "*** <msg> ***: terminated" on standard error, then abort (glibc's `__fortify_fail`).
 #[cold]
 pub fn fortify_fail(msg: &[u8]) -> ! {
     let mut buf = [0u8; 160];

@@ -1,3 +1,23 @@
+//! printf.h: user-defined conversions for the printf family: `register_printf_specifier`,
+//! `register_printf_function`, `register_printf_modifier`, `register_printf_type`,
+//! `parse_printf_format`, `printf_size` and `printf_size_info`.
+//!
+//! The registry is three tables like glibc's: handler and arginfo function per conversion character
+//! (0..=255), user argument types (numbers from `PA_LAST` up, each with a function that takes the
+//! argument from the `va_list`) and user modifiers (strings that set a bit in `printf_info.user`).
+//! While nothing is registered the printf engine is untouched: it looks at one flag per call. Once something is
+//! registered every narrow printf call takes the path in [`format_ext`], which follows glibc's
+//! `printf_positional`: the whole format is parsed first (calling the arginfo functions), all arguments are
+//! read from the argument list by type, then each conversion is handled in order: by the registered function
+//! (output written to a temporary stream, whose bytes are inserted; a return of -2 means "not mine" and the
+//! built-in conversion runs), or by the built-in code. The built-ins are run by the ordinary engine on a
+//! rebuilt one-conversion format with the arguments already read, so their output is the engine's.
+//!
+//! The wide printf functions (`swprintf`, `fwprintf`, `wprintf` and the `v` forms) call the handlers too: the
+//! format is parsed as wide characters, the handler gets a wide-oriented stream (glibc: it has to write with
+//! `fwprintf`, `fputwc`), `printf_info.wide` is 1. Structure follows glibc 2.43 stdio-common/printf-parsemb.c, reg-printf.c, reg-modifier.c,
+//! reg-type.c, printf-prs.c, printf_size.c and the positional part of vfprintf-internal.c (read as
+//! reference; code written in Rust).
 #![allow(clippy::deref_addrof, clippy::manual_range_contains, clippy::needless_late_init)]
 use crate::file::File;
 use crate::fmt::{self, Args, FmtChar, Kind, Sink, Val};
@@ -23,12 +43,15 @@ pub const PA_FLAG_LONG: c_int = 1 << 9;
 pub const PA_FLAG_SHORT: c_int = 1 << 10;
 pub const PA_FLAG_PTR: c_int = 1 << 11;
 
+/// `struct printf_info` (20 bytes): what a handler is told about the conversion.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PrintfInfo {
     pub prec: c_int,
     pub width: c_int,
     pub spec: i32,
+    /// is_long_double:1 is_short:1 is_long:1 alt:1 space:1 left:1 showsign:1 group:1 extra:1 is_char:1 wide:1
+    /// i18n:1 is_binary128:1 (bit 0 first), then 3 unused bits.
     pub flags: u16,
     pub user: u16,
     pub pad: i32,
@@ -66,9 +89,15 @@ pub type ArginfoSizeFunction = unsafe extern "C" fn(*const PrintfInfo, usize, *m
 pub type ArginfoFunction = unsafe extern "C" fn(*const PrintfInfo, usize, *mut c_int) -> c_int;
 pub type VaArgFunction = unsafe extern "C" fn(*mut c_void, *mut c_void);
 
+// ---------------------------------------------------------------------------------------- registry
+
+/// Non-zero once anything is registered: the only thing the fast path looks at.
 static ACTIVE: AtomicU8 = AtomicU8::new(0);
 static LOCK: AtomicU32 = AtomicU32::new(0);
 
+// The registry tables (heap arrays, allocated on first registration) and counters. Written only with `LOCK` held; the printf
+// calls read them without the lock once `ACTIVE` is set (its Release store follows the writes), as glibc reads its tables:
+// programs register their conversions before other threads print.
 static FUNC_TABLE: SyncCell<*mut Option<PrintfFunction>> = SyncCell::new(null_mut());
 static ARGINFO_TABLE: SyncCell<*mut Option<ArginfoSizeFunction>> = SyncCell::new(null_mut());
 static VAARG_TABLE: SyncCell<*mut Option<VaArgFunction>> = SyncCell::new(null_mut());
@@ -76,21 +105,33 @@ static MOD_TABLE: SyncCell<*mut *mut ModRecord> = SyncCell::new(null_mut());
 static NEXT_BIT: SyncCell<c_int> = SyncCell::new(0);
 static NEXT_TYPE: SyncCell<c_int> = SyncCell::new(PA_LAST);
 
+/// A registry value, read under the rule above (a registering thread holds `LOCK`; printf calls read after `ACTIVE`).
 #[inline(always)]
 fn get<T: Copy>(c: &SyncCell<T>) -> T {
+    // SAFETY: the registry rule (see the tables): writes happen under `LOCK` before `ACTIVE` publishes them.
     unsafe { c.read() }
 }
 
+/// A registry write.
+///
+/// # Safety
+/// The caller holds `LOCK`.
 #[inline(always)]
 unsafe fn put<T: Copy>(c: &SyncCell<T>, v: T) {
+    // SAFETY: the caller's promise.
     unsafe { c.write(v) }
 }
 
+/// Entry `i` of a registry table (null table: `None`).
+///
+/// # Safety
+/// `t` is null or a table of at least `i + 1` entries.
 #[inline(always)]
 unsafe fn entry<T: Copy>(t: *mut Option<T>, i: usize) -> Option<T> {
     if t.is_null() {
         return None;
     }
+    // SAFETY: the caller's promise.
     unsafe { *t.wrapping_add(i) }
 }
 
@@ -101,6 +142,7 @@ struct ModRecord {
     text: *mut u8,
 }
 
+/// Has anything been registered? (Cheap: one relaxed load.)
 #[inline(always)]
 pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed) != 0
@@ -116,6 +158,8 @@ fn unlock() {
     LOCK.store(0, Ordering::Release);
 }
 
+/// `register_printf_specifier (spec, func, arginfo)`: use `func` for conversion `spec` and `arginfo` to
+/// find what arguments it takes. 0, or -1 with EINVAL (spec not in 0..=255) or ENOMEM.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn register_printf_specifier(spec: c_int, converter: Option<PrintfFunction>, arginfo: Option<ArginfoSizeFunction>) -> c_int {
     if !(0..=255).contains(&spec) {
@@ -125,19 +169,27 @@ pub extern "C" fn register_printf_specifier(spec: c_int, converter: Option<Print
     lock();
     let mut result = 0;
     if get(&FUNC_TABLE).is_null() {
+        // SAFETY: calloc has no precondition.
         let f = unsafe { rusty_libc_malloc::calloc(256, size_of::<Option<PrintfFunction>>()) } as *mut Option<PrintfFunction>;
+        // SAFETY: as above.
         let a = unsafe { rusty_libc_malloc::calloc(256, size_of::<Option<ArginfoSizeFunction>>()) } as *mut Option<ArginfoSizeFunction>;
         if f.is_null() || a.is_null() {
+            // SAFETY: each is null or the block just allocated, unused.
             unsafe { crate::file::free(f.cast()) };
+            // SAFETY: as above.
             unsafe { crate::file::free(a.cast()) };
             result = -1;
         } else {
+            // SAFETY: `LOCK` is held (this and the next write).
             unsafe { put(&ARGINFO_TABLE, a) };
+            // SAFETY: as above.
             unsafe { put(&FUNC_TABLE, f) };
         }
     }
     if result == 0 {
+        // SAFETY: `LOCK` is held; the tables have 256 entries (zeroed by calloc: `None`) and `spec` is below 256.
         unsafe { *get(&FUNC_TABLE).wrapping_add(spec as usize) = converter };
+        // SAFETY: as above.
         unsafe { *get(&ARGINFO_TABLE).wrapping_add(spec as usize) = arginfo };
         ACTIVE.store(1, Ordering::Release);
     }
@@ -145,19 +197,32 @@ pub extern "C" fn register_printf_specifier(spec: c_int, converter: Option<Print
     result
 }
 
+/// `register_printf_function (spec, func, arginfo)`: the old form of `register_printf_specifier` (the arginfo
+/// function has no size argument).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn register_printf_function(spec: c_int, converter: Option<PrintfFunction>, arginfo: Option<ArginfoFunction>) -> c_int {
+    // the two function types differ in the trailing argument only, which the caller's function never reads
+    // SAFETY: same size and representation (nullable function pointers); called with one extra integer argument, which
+    // the C calling convention lets the callee ignore.
     let a = unsafe { core::mem::transmute::<Option<ArginfoFunction>, Option<ArginfoSizeFunction>>(arginfo) };
     register_printf_specifier(spec, converter, a)
 }
 
+/// `register_printf_modifier (str)`: a new modifier (a wide string of characters in 0..=255) that sets a bit of
+/// `printf_info.user`; returns that bit, or -1 (EINVAL for an empty or wide string, ENOSPC after 16, ENOMEM).
+///
+/// # Safety
+/// `s` is a wide string ending in 0.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn register_printf_modifier(s: *const i32) -> c_int {
+    // SAFETY: the caller's contract.
     let n = unsafe { rusty_libc_wchar::wstring::wcslen(s as *const rusty_libc_wchar::wchar_t) };
+    // SAFETY: the caller's contract: `n` characters before the terminating 0.
     let text = unsafe { core::slice::from_raw_parts(s, n) };
     register_modifier(text)
 }
 
+/// The safe core of `register_printf_modifier`: the modifier's characters.
 fn register_modifier(s: &[i32]) -> c_int {
     let n = s.len();
     if n == 0 {
@@ -176,7 +241,9 @@ fn register_modifier(s: &[i32]) -> c_int {
     let mut result = -1;
     'out: {
         if get(&MOD_TABLE).is_null() {
+            // SAFETY: calloc has no precondition.
             let t = unsafe { rusty_libc_malloc::calloc(256, size_of::<*mut ModRecord>()) } as *mut *mut ModRecord;
+            // SAFETY: `LOCK` is held.
             unsafe { put(&MOD_TABLE, t) };
             if t.is_null() {
                 break 'out;
@@ -188,19 +255,26 @@ fn register_modifier(s: &[i32]) -> c_int {
         }
         let text = crate::file::alloc(n);
         if text.is_null() {
+            // SAFETY: the block just allocated, unused.
             unsafe { crate::file::free(rec.cast()) };
             break 'out;
         }
         for (i, &c) in s.iter().enumerate().skip(1) {
+            // SAFETY: `i - 1 < n - 1`: inside the fresh block of `n` bytes.
             unsafe { *text.wrapping_add(i - 1) = c as u8 };
         }
         let first = s[0] as u8 as usize;
         let t = get(&MOD_TABLE);
         let bit = 1 << get(&NEXT_BIT);
+        // (`LOCK` is held; the table has 256 entries and `first` is below 256)
         let head = t.wrapping_add(first);
+        // SAFETY: as above (an entry of the zeroed table: null or a record).
         let old = unsafe { *head };
+        // SAFETY: a fresh block of `ModRecord`'s size from malloc, aligned for it.
         unsafe { rec.write(ModRecord { next: old, bit, len: n - 1, text }) };
+        // SAFETY: `LOCK` is held.
         unsafe { put(&NEXT_BIT, get(&NEXT_BIT) + 1) };
+        // SAFETY: as for the read of the entry.
         unsafe { *head = rec };
         result = bit;
         ACTIVE.store(1, Ordering::Release);
@@ -209,12 +283,16 @@ fn register_modifier(s: &[i32]) -> c_int {
     result
 }
 
+/// `register_printf_type (fct)`: a new argument type (a number from `PA_LAST` up) whose values are taken from the
+/// argument list by `fct (memory, &va_list)`. -1 with ENOSPC when the numbers are used up.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn register_printf_type(fct: Option<VaArgFunction>) -> c_int {
     lock();
     let mut result = -1;
     if get(&VAARG_TABLE).is_null() {
+        // SAFETY: calloc has no precondition.
         let t = unsafe { rusty_libc_malloc::calloc((0x100 - PA_LAST) as usize, size_of::<Option<VaArgFunction>>()) } as *mut Option<VaArgFunction>;
+        // SAFETY: `LOCK` is held.
         unsafe { put(&VAARG_TABLE, t) };
     }
     if !get(&VAARG_TABLE).is_null() {
@@ -222,7 +300,9 @@ pub extern "C" fn register_printf_type(fct: Option<VaArgFunction>) -> c_int {
             errno::set(28);
         } else {
             result = get(&NEXT_TYPE);
+            // SAFETY: `LOCK` is held.
             unsafe { put(&NEXT_TYPE, result + 1) };
+            // SAFETY: `LOCK` is held; the table has `0x100 - PA_LAST` entries and `result` is in `PA_LAST..0x100`.
             unsafe { *get(&VAARG_TABLE).wrapping_add((result - PA_LAST) as usize) = fct };
             ACTIVE.store(1, Ordering::Release);
         }
@@ -235,6 +315,7 @@ fn func_for(spec: i32) -> Option<PrintfFunction> {
     if !(0..=255).contains(&spec) {
         return None;
     }
+    // SAFETY: the table is null or has 256 entries; `spec` is below 256.
     unsafe { entry(get(&FUNC_TABLE), spec as usize) }
 }
 
@@ -242,6 +323,7 @@ fn arginfo_for(spec: i32) -> Option<ArginfoSizeFunction> {
     if !(0..=255).contains(&spec) {
         return None;
     }
+    // SAFETY: the table is null or has 256 entries; `spec` is below 256.
     unsafe { entry(get(&ARGINFO_TABLE), spec as usize) }
 }
 
@@ -249,9 +331,13 @@ fn vaarg_for(ty: c_int) -> Option<VaArgFunction> {
     if !(PA_LAST..0x100).contains(&ty) {
         return None;
     }
+    // SAFETY: the table is null or has `0x100 - PA_LAST` entries; `ty` is in `PA_LAST..0x100`.
     unsafe { entry(get(&VAARG_TABLE), (ty - PA_LAST) as usize) }
 }
 
+// ---------------------------------------------------------------------------------------- parsing
+
+/// One parsed conversion (glibc's `struct printf_spec`); format positions are offsets into the format string.
 #[derive(Clone, Copy)]
 struct SpecRec {
     info: PrintfInfo,
@@ -275,6 +361,10 @@ fn is_digit(c: u8) -> bool {
     c.is_ascii_digit()
 }
 
+/// `read_int`: the first character is a digit; -1 on overflow. Leaves `*i` after the digits.
+///
+/// # Safety
+/// `p` is a NUL-terminated format and `*i` is not past its NUL.
 unsafe fn read_int<F: FmtChar>(p: *const F, i: &mut usize) -> i32 {
     let mut retval = i32::from(fmt_at!(p, *i)) - i32::from(b'0');
     loop {
@@ -300,6 +390,10 @@ unsafe fn read_int<F: FmtChar>(p: *const F, i: &mut usize) -> i32 {
     retval
 }
 
+/// A registered modifier at `*i` (the longest match wins); sets its bit and moves `*i` past it. false = none.
+///
+/// # Safety
+/// `p` is a NUL-terminated format and `*i` is not past its NUL.
 unsafe fn handle_registered_modifier<F: FmtChar>(p: *const F, i: &mut usize, info: &mut PrintfInfo) -> bool {
     let t = get(&MOD_TABLE);
     if t.is_null() {
@@ -309,11 +403,14 @@ unsafe fn handle_registered_modifier<F: FmtChar>(p: *const F, i: &mut usize, inf
     if first > 255 {
         return false;
     }
+    // SAFETY: the table has 256 entries (null or a record list) and `first` is below 256.
     let mut runp = unsafe { *t.wrapping_add(first as usize) };
     let mut best_bit = 0;
     let mut best_len = 0usize;
     while !runp.is_null() {
+        // SAFETY: a record of the list: allocated by `register_modifier`, never freed.
         let r = unsafe { &*runp };
+        // SAFETY: the record's text: `len` bytes of its own block.
         let text = unsafe { core::slice::from_raw_parts(r.text, r.len) };
         let mut k = 0;
         while fmt_raw!(p, *i + 1 + k) != 0 && k < r.len && fmt_raw!(p, *i + 1 + k) == u32::from(text[k]) {
@@ -333,6 +430,11 @@ unsafe fn handle_registered_modifier<F: FmtChar>(p: *const F, i: &mut usize, inf
     false
 }
 
+/// Parse the conversion starting at the `%` at offset `start` (glibc's `__parse_one_specmb`). Returns the number of
+/// arguments it takes sequentially, or Err when the format is invalid (errno set).
+///
+/// # Safety
+/// `p` is a NUL-terminated format with a `%` at `start`.
 unsafe fn parse_one<F: FmtChar>(p: *const F, start: usize, posn: usize, max_ref_arg: &mut usize, spec: &mut SpecRec) -> (usize, bool) {
     let mut posn = posn;
     let mut nargs = 0usize;
@@ -343,8 +445,10 @@ unsafe fn parse_one<F: FmtChar>(p: *const F, start: usize, posn: usize, max_ref_
     if F::WIDE {
         spec.info.set(INFO_WIDE);
     }
+    // positional argument
     if is_digit(fmt_at!(p, i)) {
         let begin = i;
+        // SAFETY: the function's contract: the format is NUL-terminated and `i` is not past its NUL.
         let n = unsafe { read_int::<F>(p, &mut i) };
         if n != 0 && fmt_at!(p, i) == b'$' {
             i += 1;
@@ -356,6 +460,7 @@ unsafe fn parse_one<F: FmtChar>(p: *const F, start: usize, posn: usize, max_ref_
             i = begin;
         }
     }
+    // flags
     loop {
         match fmt_at!(p, i) {
             b' ' => spec.info.set(INFO_SPACE),
@@ -375,12 +480,14 @@ unsafe fn parse_one<F: FmtChar>(p: *const F, start: usize, posn: usize, max_ref_
     if spec.info.has(INFO_LEFT) {
         spec.info.pad = i32::from(b' ');
     }
+    // width
     spec.width_arg = -1;
     spec.info.width = 0;
     if fmt_at!(p, i) == b'*' {
         i += 1;
         let begin = i;
         if is_digit(fmt_at!(p, i)) {
+            // SAFETY: the function's contract: the format is NUL-terminated and `i` is not past its NUL.
             let n = unsafe { read_int::<F>(p, &mut i) };
             if n != 0 && fmt_at!(p, i) == b'$' {
                 if n != -1 {
@@ -397,11 +504,13 @@ unsafe fn parse_one<F: FmtChar>(p: *const F, start: usize, posn: usize, max_ref_
             i = begin;
         }
     } else if is_digit(fmt_at!(p, i)) {
+        // SAFETY: the function's contract: the format is NUL-terminated and `i` is not past its NUL.
         let n = unsafe { read_int::<F>(p, &mut i) };
         if n != -1 {
             spec.info.width = n;
         }
     }
+    // precision
     spec.prec_arg = -1;
     spec.info.prec = -1;
     if fmt_at!(p, i) == b'.' {
@@ -410,6 +519,7 @@ unsafe fn parse_one<F: FmtChar>(p: *const F, start: usize, posn: usize, max_ref_
             i += 1;
             let begin = i;
             if is_digit(fmt_at!(p, i)) {
+                // SAFETY: the function's contract: the format is NUL-terminated and `i` is not past its NUL.
                 let n = unsafe { read_int::<F>(p, &mut i) };
                 if n != 0 && fmt_at!(p, i) == b'$' {
                     if n != -1 {
@@ -426,6 +536,7 @@ unsafe fn parse_one<F: FmtChar>(p: *const F, start: usize, posn: usize, max_ref_
                 i = begin;
             }
         } else if is_digit(fmt_at!(p, i)) {
+            // SAFETY: the function's contract: the format is NUL-terminated and `i` is not past its NUL.
             let n = unsafe { read_int::<F>(p, &mut i) };
             if n != -1 {
                 spec.info.prec = n;
@@ -434,7 +545,9 @@ unsafe fn parse_one<F: FmtChar>(p: *const F, start: usize, posn: usize, max_ref_
             spec.info.prec = 0;
         }
     }
+    // type modifiers
     spec.info.user = 0;
+    // SAFETY: the function's contract: the format is NUL-terminated and `i` is not past its NUL.
     if !unsafe { handle_registered_modifier(p, &mut i, &mut spec.info) } {
         let c = fmt_at!(p, i);
         i += 1;
@@ -464,6 +577,7 @@ unsafe fn parse_one<F: FmtChar>(p: *const F, start: usize, posn: usize, max_ref_
                 }
                 let mut bitwidth = 0;
                 if is_digit(fmt_at!(p, i)) {
+                    // SAFETY: the function's contract: the format is NUL-terminated and `i` is not past its NUL.
                     bitwidth = unsafe { read_int::<F>(p, &mut i) };
                 }
                 if is_fast {
@@ -492,6 +606,7 @@ unsafe fn parse_one<F: FmtChar>(p: *const F, start: usize, posn: usize, max_ref_
             _ => i -= 1,
         }
     }
+    // the conversion
     let craw = fmt_raw!(p, i);
     let c = fmt_at!(p, i);
     i += 1;
@@ -501,6 +616,7 @@ unsafe fn parse_one<F: FmtChar>(p: *const F, start: usize, posn: usize, max_ref_
     if let Some(ai) = arginfo_for(spec.info.spec) {
         let mut ty = 0;
         let mut size = -1;
+        // SAFETY: the program's arginfo function, called as glibc calls it: the info and room for one type and one size.
         let r = unsafe { ai(&spec.info, 1, &mut ty, &mut size) } as c_int;
         if r >= 0 {
             spec.data_arg_type = ty;
@@ -524,6 +640,8 @@ unsafe fn parse_one<F: FmtChar>(p: *const F, start: usize, posn: usize, max_ref_
                     } else {
                         PA_INT
                     };
+                    // (as in glibc on x86-64, where long and long long are alike: a `q` or `L` alone, which sets
+                    // only the long-long bit, is read as a plain int)
                 }
                 b'e' | b'E' | b'f' | b'F' | b'g' | b'G' | b'a' | b'A' => {
                     spec.data_arg_type = if i_.has(INFO_LONG_DOUBLE) { PA_DOUBLE | PA_FLAG_LONG_DOUBLE } else { PA_DOUBLE };
@@ -556,19 +674,25 @@ unsafe fn parse_one<F: FmtChar>(p: *const F, start: usize, posn: usize, max_ref_
     (nargs, failed)
 }
 
+// ---------------------------------------------------------------------------------------- small growable arrays
+
 struct Arr<T: Copy> {
     p: *mut T,
     len: usize,
     cap: usize,
 }
 
+// Invariant: `p` is null (`len` = `cap` = 0) or the array's own malloc'd block of `cap` elements, the first `len` of them
+// initialised.
 impl<T: Copy> Arr<T> {
     const fn new() -> Arr<T> {
         Arr { p: null_mut(), len: 0, cap: 0 }
     }
+    /// Append; false when out of memory.
     fn push(&mut self, v: T) -> bool {
         if self.len == self.cap {
             let ncap = if self.cap == 0 { 8 } else { self.cap * 2 };
+            // SAFETY: `p` is null or our own malloc'd block (the invariant).
             let np = unsafe { rusty_libc_malloc::realloc(self.p.cast(), ncap * size_of::<T>()) } as *mut T;
             if np.is_null() {
                 return false;
@@ -576,6 +700,8 @@ impl<T: Copy> Arr<T> {
             self.p = np;
             self.cap = ncap;
         }
+        // SAFETY: `len < cap`: room in the block (malloc's alignment suits the element types used here, all of 16 bytes or
+        // less).
         unsafe { self.p.wrapping_add(self.len).write(v) };
         self.len += 1;
         true
@@ -584,15 +710,18 @@ impl<T: Copy> Arr<T> {
         if self.p.is_null() {
             return &[];
         }
+        // SAFETY: the invariant: `len` initialised elements.
         unsafe { core::slice::from_raw_parts(self.p, self.len) }
     }
     fn as_mut_slice(&mut self) -> &mut [T] {
         if self.p.is_null() {
             return &mut [];
         }
+        // SAFETY: the invariant: `len` initialised elements, borrowed mutably through `self`.
         unsafe { core::slice::from_raw_parts_mut(self.p, self.len) }
     }
     fn free(&mut self) {
+        // SAFETY: null or our own block, forgotten right below.
         unsafe { crate::file::free(self.p.cast()) };
         self.p = null_mut();
         self.len = 0;
@@ -600,10 +729,12 @@ impl<T: Copy> Arr<T> {
     }
 }
 
+/// One argument slot: glibc's `union printf_arg` (16 bytes, 16 aligned).
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 struct Slot([u8; 16]);
 
+/// Feeds one pre-read value to the engine.
 struct OneArg(Val);
 
 impl Args for OneArg {
@@ -612,6 +743,10 @@ impl Args for OneArg {
     }
 }
 
+/// Read the value of type `ty` from the argument list into a slot (`va` is the C va_list for user types).
+///
+/// # Safety
+/// The argument at `pos` has the type `ty` (for a user type: what its registered function takes from a `va_list`).
 unsafe fn read_slot<A: Args>(args: &mut A, ty: c_int, pos: usize, user: &mut Arr<*mut c_void>, size: c_int) -> Option<Slot> {
     let mut s = Slot([0; 16]);
     let put64 = |s: &mut Slot, v: u64| s.0[..8].copy_from_slice(&v.to_le_bytes());
@@ -636,23 +771,29 @@ unsafe fn read_slot<A: Args>(args: &mut A, ty: c_int, pos: usize, user: &mut Arr
             put64(&mut s, v);
         }
     } else if let Some(f) = vaarg_for(ty) {
+        // SAFETY: calloc has no precondition.
         let mem = unsafe { rusty_libc_malloc::calloc(1, (size.max(1)) as usize) };
         if mem.is_null() {
             return None;
         }
         if !user.push(mem) {
+            // SAFETY: the block just allocated, unused.
             unsafe { crate::file::free(mem.cast()) };
             return None;
         }
         put64(&mut s, mem as usize as u64);
+        // (a caller without a C va_list, the Rust API, leaves user types zeroed)
         let va = args.raw_va();
         if !va.is_null() {
+            // SAFETY: the program's va_arg function for its type: a block of the size its arginfo gave and the C va_list,
+            // whose next argument is of that type (the function's contract).
             unsafe { f(mem, va) };
         }
     }
     Some(s)
 }
 
+/// The value of an already read slot, for the engine.
 fn slot_val(ty: c_int, s: &Slot) -> Val {
     let u32v = u32::from_le_bytes([s.0[0], s.0[1], s.0[2], s.0[3]]);
     let u64v = u64::from_le_bytes([s.0[0], s.0[1], s.0[2], s.0[3], s.0[4], s.0[5], s.0[6], s.0[7]]);
@@ -665,6 +806,8 @@ fn slot_val(ty: c_int, s: &Slot) -> Val {
         _ => Val::I(u64::from(u32v)),
     }
 }
+
+// ---------------------------------------------------------------------------------------- the engine
 
 struct Mini {
     buf: [u8; 80],
@@ -695,6 +838,7 @@ impl Mini {
     }
 }
 
+/// A one-conversion format equal to what `info` describes, with width and precision as numbers.
 fn build_mini(info: &PrintfInfo, conv: u8) -> Mini {
     let mut m = Mini { buf: [0; 80], len: 0 };
     m.push(b'%');
@@ -745,6 +889,7 @@ fn build_mini(info: &PrintfInfo, conv: u8) -> Mini {
     m
 }
 
+/// `printf_unknown`: print the conversion as it was written, canonicalized.
 fn print_unknown<S: Sink>(sink: &mut S, info: &PrintfInfo) -> Option<usize> {
     let mut m = Mini { buf: [0; 80], len: 0 };
     m.push(b'%');
@@ -781,24 +926,33 @@ fn print_unknown<S: Sink>(sink: &mut S, info: &PrintfInfo) -> Option<usize> {
     if sink.put(&m.buf[..m.len]) { Some(m.len) } else { None }
 }
 
+/// The printf engine with registered conversions (narrow and wide formats). See the module notes.
+///
+/// # Safety
+/// `fmt` is a NUL-terminated format; the arguments are what it asks for.
 pub(crate) unsafe fn format_ext<S: Sink, A: Args, F: FmtChar>(sink: &mut S, fmt: *const F, args: &mut A) -> i32 {
     if sink.partial_output_on_error() {
+        // SAFETY: the function's contract.
         return unsafe { format_ext_to::<S, A, F>(sink, fmt, args) };
     }
+    // a stream gets nothing when the formatting fails: collect the text and hand it over at the end
     if F::WIDE {
         let mut hold = HoldSinkW { buf: Arr::new() };
+        // SAFETY: the function's contract.
         let r = unsafe { format_ext_to::<HoldSinkW, A, F>(&mut hold, fmt, args) };
         let ok = r >= 0 && (hold.buf.len == 0 || sink.put_wide(hold.buf.as_slice()));
         hold.buf.free();
         return if ok { r } else { -1 };
     }
     let mut hold = HoldSink { buf: Arr::new() };
+    // SAFETY: the function's contract.
     let r = unsafe { format_ext_to::<HoldSink, A, F>(&mut hold, fmt, args) };
     let ok = r >= 0 && (hold.buf.len == 0 || sink.put(hold.buf.as_slice()));
     hold.buf.free();
     if ok { r } else { -1 }
 }
 
+/// Collects output in memory.
 struct HoldSink {
     buf: Arr<u8>,
 }
@@ -815,6 +969,7 @@ impl Sink for HoldSink {
     }
 }
 
+/// Collects wide output in memory.
 struct HoldSinkW {
     buf: Arr<u32>,
 }
@@ -841,8 +996,13 @@ impl Sink for HoldSinkW {
     }
 }
 
+/// Write the literal text `fmt[start..start + len]` of the format.
+///
+/// # Safety
+/// `fmt[start..start + len]` lies inside the format.
 unsafe fn emit_lit<S: Sink, F: FmtChar>(sink: &mut S, fmt: *const F, start: usize, len: usize) -> bool {
     if !F::WIDE {
+        // SAFETY: the caller's contract (a narrow format: one byte per character).
         return sink.put(unsafe { core::slice::from_raw_parts(fmt.wrapping_add(start) as *const u8, len) });
     }
     let mut chunk = [0u32; 64];
@@ -860,6 +1020,8 @@ unsafe fn emit_lit<S: Sink, F: FmtChar>(sink: &mut S, fmt: *const F, start: usiz
     true
 }
 
+/// # Safety
+/// As `format_ext`.
 unsafe fn format_ext_to<S: Sink, A: Args, F: FmtChar>(sink: &mut S, fmt: *const F, args: &mut A) -> i32 {
     let saved_errno = errno::get();
     let mut total: usize = 0;
@@ -868,6 +1030,7 @@ unsafe fn format_ext_to<S: Sink, A: Args, F: FmtChar>(sink: &mut S, fmt: *const 
         f += 1;
     }
     if f > 0 {
+        // SAFETY: `fmt[..f]` was just scanned (no NUL in it).
         if !unsafe { emit_lit::<S, F>(sink, fmt, 0, f) } {
             return -1;
         }
@@ -881,8 +1044,10 @@ unsafe fn format_ext_to<S: Sink, A: Args, F: FmtChar>(sink: &mut S, fmt: *const 
     let mut sizes: Arr<c_int> = Arr::new();
     let mut slots: Arr<Slot> = Arr::new();
     let mut user_mem: Arr<*mut c_void> = Arr::new();
+    // SAFETY: the function's contract.
     let r = unsafe { format_ext_inner::<S, A, F>(sink, fmt, f, args, saved_errno, &mut total, &mut specs, &mut types, &mut sizes, &mut slots, &mut user_mem) };
     for &m in user_mem.as_slice() {
+        // SAFETY: each is a block `read_slot` allocated for a user type, freed once here.
         unsafe { crate::file::free(m.cast()) };
     }
     specs.free();
@@ -900,6 +1065,8 @@ unsafe fn format_ext_to<S: Sink, A: Args, F: FmtChar>(sink: &mut S, fmt: *const 
     total as i32
 }
 
+/// # Safety
+/// As `format_ext`; `first` is not past the format's NUL.
 #[allow(clippy::too_many_arguments)]
 unsafe fn format_ext_inner<S: Sink, A: Args, F: FmtChar>(
     sink: &mut S,
@@ -914,11 +1081,13 @@ unsafe fn format_ext_inner<S: Sink, A: Args, F: FmtChar>(
     slots: &mut Arr<Slot>,
     user_mem: &mut Arr<*mut c_void>,
 ) -> bool {
+    // parse every conversion
     let mut nargs = 0usize;
     let mut max_ref_arg = 0usize;
     let mut f = first;
     while fmt_raw!(fmt, f) != 0 {
         let mut spec = SpecRec::zero();
+        // SAFETY: the function's contract: a NUL-terminated format; `f` is at a `%` (the literal scan stops there).
         let (n, failed) = unsafe { parse_one::<F>(fmt, f, nargs, &mut max_ref_arg, &mut spec) };
         if failed {
             return false;
@@ -937,6 +1106,7 @@ unsafe fn format_ext_inner<S: Sink, A: Args, F: FmtChar>(
             return false;
         }
     }
+    // the types of all arguments
     for k in 0..specs.len {
         let s = specs.as_slice()[k];
         if s.width_arg != -1 && (s.width_arg as usize) < nargs {
@@ -961,13 +1131,17 @@ unsafe fn format_ext_inner<S: Sink, A: Args, F: FmtChar>(
                     let room = nargs - s.data_arg as usize;
                     let tp = types.as_mut_slice()[s.data_arg as usize..].as_mut_ptr();
                     let sp = sizes.as_mut_slice()[s.data_arg as usize..].as_mut_ptr();
+                    // SAFETY: the program's arginfo function, called as glibc calls it: the spec's info and two arrays
+                    // with room for `n.min(room)` entries each.
                     unsafe { ai(&s.info, n.min(room), tp, sp) };
                 }
             }
         }
     }
+    // the values
     for cnt in 0..nargs {
         let (ty, size) = (types.as_slice()[cnt], sizes.as_slice()[cnt]);
+        // SAFETY: the function's contract: the arguments are what the format (and the arginfo functions) say.
         match unsafe { read_slot(args, ty, cnt + 1, user_mem, size) } {
             Some(s) => slots.as_mut_slice()[cnt] = s,
             None => {
@@ -976,6 +1150,7 @@ unsafe fn format_ext_inner<S: Sink, A: Args, F: FmtChar>(
             }
         }
     }
+    // the conversions
     for k in 0..specs.len {
         let mut s = specs.as_slice()[k];
         if s.width_arg != -1 && (s.width_arg as usize) < nargs {
@@ -1017,25 +1192,35 @@ unsafe fn format_ext_inner<S: Sink, A: Args, F: FmtChar>(
                     let p = u64::from_le_bytes([slot.0[0], slot.0[1], slot.0[2], slot.0[3], slot.0[4], slot.0[5], slot.0[6], slot.0[7]]) as *mut u8;
                     if !p.is_null() {
                         let n = *total;
+                        // The function's contract: a `%n` argument points to an integer of the size its length
+                        // modifier names; each branch stores that one.
                         if s.info.has(INFO_CHAR) {
+                            // SAFETY: see above.
                             unsafe { *(p as *mut i8) = n as i8 };
                         } else if s.info.has(INFO_SHORT) {
+                            // SAFETY: see above.
                             unsafe { *(p as *mut i16) = n as i16 };
                         } else if s.info.has(INFO_LONG) || s.info.has(INFO_LONG_DOUBLE) {
+                            // SAFETY: see above.
                             unsafe { *(p as *mut i64) = n as i64 };
                         } else {
+                            // SAFETY: see above.
                             unsafe { *(p as *mut i32) = n as i32 };
                         }
                     }
                 }
                 b'm' | b'i' | b'd' | b'u' | b'o' | b'X' | b'x' | b'B' | b'b' | b'e' | b'E' | b'f' | b'F' | b'g' | b'G' | b'a' | b'A' | b'c' | b'C' | b's' | b'S' | b'p' if spec < 256 => {
                     let mini = build_mini(&s.info, spec as u8);
+                    // (the one-conversion format has the type of the caller's format: `%s` of a wide format
+                    // converts a multibyte string, `%c` is btowc ...)
                     let mut mf = [F::from_ascii(0); 80];
                     for (k, b) in mini.buf.iter().enumerate().take(mini.len) {
                         mf[k] = F::from_ascii(*b);
                     }
                     let mut v = OneArg(slot_val(ty, &slot));
                     errno::set(saved_errno);
+                    // SAFETY: `mf` is a NUL-terminated one-conversion format (`mini` is shorter than it) and `v` holds the
+                    // value read for it with the type the format names.
                     let n = unsafe { fmt::format_builtin::<S, OneArg, F>(sink, mf.as_ptr(), &mut v) };
                     if n < 0 {
                         return false;
@@ -1048,8 +1233,10 @@ unsafe fn format_ext_inner<S: Sink, A: Args, F: FmtChar>(
                 },
             }
         }
+        // the text after this conversion
         let (a, b) = (s.end_of_fmt, s.next_fmt);
         if b > a {
+            // SAFETY: `fmt[a..b]` is literal text the parser stepped over: inside the format.
             if !unsafe { emit_lit::<S, F>(sink, fmt, a, b - a) } {
                 return false;
             }
@@ -1059,17 +1246,24 @@ unsafe fn format_ext_inner<S: Sink, A: Args, F: FmtChar>(
     true
 }
 
+/// Run a registered handler on a temporary stream and insert what it wrote. Ok(true): done; Ok(false): the
+/// handler declined (-2), run the built-in; Err: it failed (errno set by it) or the sink did.
+/// The stream a handler gets is byte oriented for a narrow format and wide oriented for a wide one (as in
+/// glibc: it must then write with `fwprintf`, `fputwc` ...; the byte functions fail on it).
 fn call_handler<S: Sink, F: FmtChar>(sink: &mut S, func: PrintfFunction, s: &SpecRec, slots: &Arr<Slot>, total: &mut usize) -> Result<bool, ()> {
+    // the handler gets an array of pointers to its argument slots (null past the arguments read)
     let mut ptrs: [*const c_void; 4] = [core::ptr::null(); 4];
     let mut heap: *mut *const c_void = null_mut();
     let n = s.ndata_args;
     let arr: &mut [*const c_void] = if n <= ptrs.len() {
         &mut ptrs[..n]
     } else {
+        // SAFETY: calloc has no precondition.
         heap = unsafe { rusty_libc_malloc::calloc(n, size_of::<*const c_void>()) } as *mut *const c_void;
         if heap.is_null() {
             return Err(());
         }
+        // SAFETY: a fresh zeroed block of `n` pointers (all null: valid values).
         unsafe { core::slice::from_raw_parts_mut(heap, n) }
     };
     let all = slots.as_slice();
@@ -1080,23 +1274,33 @@ fn call_handler<S: Sink, F: FmtChar>(sink: &mut S, func: PrintfFunction, s: &Spe
     let pp = arr.as_ptr();
     let mut buf: *mut c_char = null_mut();
     let mut size: usize = 0;
+    // SAFETY: both locations are locals that outlive the stream (it is closed below).
     let fp = unsafe { crate::file_extra::open_memstream_unit(&mut buf, &mut size, if F::WIDE { 4 } else { 1 }) };
     if fp.is_null() {
+        // SAFETY: null or the block allocated above, unused.
         unsafe { crate::file::free(heap.cast()) };
         return Err(());
     }
+    // SAFETY: the program's handler, called as glibc calls it: an open stream, the spec's info and the array of `n` slot
+    // pointers.
     let done = unsafe { func(fp, &s.info, pp) };
+    // SAFETY: our memory stream, still open.
     unsafe { crate::file_api::fflush(fp) };
+    // SAFETY: as above; closed once.
     unsafe { crate::file_api::fclose(fp) };
+    // SAFETY: null or the block allocated above, no longer used.
     unsafe { crate::file::free(heap.cast()) };
     let ok = if buf.is_null() || size == 0 {
         true
     } else if F::WIDE {
+        // SAFETY: the closed wide memory stream published `size` characters at `buf` (its own malloc'd block).
         sink.put_wide(unsafe { core::slice::from_raw_parts(buf as *const u32, size) })
     } else {
+        // SAFETY: the closed memory stream published `size` bytes at `buf` (its own malloc'd block).
         sink.put(unsafe { core::slice::from_raw_parts(buf as *const u8, size) })
     };
     let written = size;
+    // SAFETY: the stream's buffer, handed over at its close; freed once.
     unsafe { crate::file::free(buf.cast()) };
     if !ok {
         return Err(());
@@ -1111,18 +1315,26 @@ fn call_handler<S: Sink, F: FmtChar>(sink: &mut S, func: PrintfFunction, s: &Spe
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------------------- parse_printf_format
+
+/// `parse_printf_format (fmt, n, argtypes)`: the argument types `fmt` needs (`PA_*` codes), up to `n` of them
+/// stored; the number of arguments the format takes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn parse_printf_format(fmt: *const c_char, n: usize, argtypes: *mut c_int) -> usize {
     let p = fmt as *const u8;
     let mut nargs = 0usize;
     let mut max_ref_arg = 0usize;
     let mut f = 0usize;
+    // (the caller's contract: `fmt` is NUL-terminated; `fmt_at!` reads it)
     while fmt_at!(p, f) != 0 && fmt_at!(p, f) != b'%' {
         f += 1;
     }
+    // SAFETY: the caller's contract: room for `n` types (`n` 0: nothing is stored).
     let types = unsafe { rusty_libc_core::ffi::slice_mut(argtypes, n) };
     while fmt_at!(p, f) != 0 {
         let mut spec = SpecRec::zero();
+        // (a format that fails to parse is not an error here: the spec is used as far as it was parsed)
+        // SAFETY: a NUL-terminated format with a `%` at `f`.
         let (k, _failed) = unsafe { parse_one(p, f, nargs, &mut max_ref_arg, &mut spec) };
         nargs += k;
         if spec.width_arg != -1 && (spec.width_arg as usize) < n {
@@ -1137,9 +1349,15 @@ pub unsafe extern "C" fn parse_printf_format(fmt: *const c_char, n: usize, argty
                 1 => types[spec.data_arg as usize] = spec.data_arg_type,
                 k => {
                     if let Some(ai) = arginfo_for(spec.info.spec) {
+                        // the function may store a size for each of its arguments: give it room
+                        // (glibc hands it the one `size` field of the spec)
+                        // SAFETY: calloc has no precondition.
                         let room = unsafe { rusty_libc_malloc::calloc(k.max(n), size_of::<c_int>()) } as *mut c_int;
                         let tp = types[spec.data_arg as usize..].as_mut_ptr();
+                        // SAFETY: the program's arginfo function: room for `n - data_arg` types at `tp` and as many sizes in
+                        // `room` (glibc's call; a failed calloc gives it null, as before).
                         unsafe { ai(&spec.info, n - spec.data_arg as usize, tp, room) };
+                        // SAFETY: null or the block allocated above, freed once.
                         unsafe { crate::file::free(room.cast()) };
                     }
                 }
@@ -1150,11 +1368,17 @@ pub unsafe extern "C" fn parse_printf_format(fmt: *const c_char, n: usize, argty
     nargs.max(max_ref_arg)
 }
 
+// ---------------------------------------------------------------------------------------- printf_size
+
+/// x87 helpers for `printf_size` on a long double (the scaling must be done in extended precision).
 mod x87 {
     use core::arch::asm;
 
+    /// `v >= d`?
     pub fn ge(v: &[u8; 16], d: i32) -> bool {
         let r: u8;
+        // SAFETY: reads the 10-byte x87 value in `v` and the int `d` (both live references); the x87 stack is restored (one
+        // load each, one pop each) and declared clobbered.
         unsafe {
             asm!(
                 "fild dword ptr [{d}]",
@@ -1172,7 +1396,10 @@ mod x87 {
         r != 0
     }
 
+    /// `v /= d`
     pub fn div(v: &mut [u8; 16], d: i32) {
+        // SAFETY: reads and writes back the 10-byte x87 value in `v` (a live mutable reference) and reads the int `d`; the
+        // x87 stack is restored (one load, one pop) and declared clobbered.
         unsafe {
             asm!(
                 "fld tbyte ptr [{v}]",
@@ -1187,23 +1414,34 @@ mod x87 {
     }
 }
 
+/// Write `s` to the stream; false when it failed.
+///
+/// # Safety
+/// `fp` is an open stream (the one a handler was given) the calling thread may use.
 unsafe fn fput(fp: *mut File, s: &[u8]) -> bool {
+    // SAFETY: the caller's contract (a short borrow for the orientation test).
     if unsafe { crate::file::stream(fp) }.flags & crate::file::F_WIDE != 0 {
+        // a wide stream (the handler of a wide format gets one): the text is ASCII, written as wide characters
         for &b in s {
+            // SAFETY: as above.
             if crate::wfile::putwc_raw(unsafe { crate::file::stream(fp) }, u32::from(b)) == rusty_libc_wchar::WEOF {
                 return false;
             }
         }
         return true;
     }
+    // SAFETY: the caller's contract; `s` is readable for its length.
     unsafe { crate::file_api::fwrite(s.as_ptr().cast(), 1, s.len(), fp) == s.len() }
 }
 
+/// # Safety
+/// As `fput`.
 unsafe fn fpad(fp: *mut File, n: usize) -> bool {
     let chunk = [b' '; 64];
     let mut left = n;
     while left > 0 {
         let k = left.min(64);
+        // SAFETY: the caller's contract.
         if !unsafe { fput(fp, &chunk[..k]) } {
             return false;
         }
@@ -1232,34 +1470,60 @@ impl Sink for VecSink<'_> {
     }
 }
 
+/// Print `val` with the `%f` conversion the way `info` says (flags, width, precision); returns the characters
+/// written, or -1.
+///
+/// # Safety
+/// As `fput`.
 unsafe fn printf_fp_f(fp: *mut File, info: &PrintfInfo, val: Val) -> c_int {
+    // SAFETY: the caller's contract.
     unsafe { printf_fp_conv(fp, info, val, b'f') }
 }
 
+/// Print `val` with the floating-point conversion `conv` the way `info` says; returns the characters written, or -1.
+///
+/// # Safety
+/// As `fput`.
 unsafe fn printf_fp_conv(fp: *mut File, info: &PrintfInfo, val: Val, conv: u8) -> c_int {
     let mini = build_mini(info, conv);
     let mut more: Arr<u8> = Arr::new();
     let mut sink = VecSink { buf: [0; 512], len: 0, more: &mut more };
     let mut a = OneArg(val);
+    // a nested format must not be taken over by user conversions registered for 'f'
+    // SAFETY: `mini.buf` is a NUL-terminated one-conversion format; `a` holds a value of the type it names.
     let n = unsafe { fmt::format_builtin::<VecSink, OneArg, u8>(&mut sink, mini.buf.as_ptr(), &mut a) };
     let len = sink.len;
+    // SAFETY: the caller's contract.
     let mut ok = n >= 0 && unsafe { fput(fp, &sink.buf[..len]) };
     if ok && more.len > 0 {
+        // SAFETY: the caller's contract.
         ok = unsafe { fput(fp, more.as_slice()) };
     }
     more.free();
     if ok { n } else { -1 }
 }
 
+/// glibc's `__printf_fp (fp, info, args)` (exported, GLIBC_2.2.5): print the floating-point number `*args[0]` (a double, a long
+/// double with `is_long_double`, a binary128 with `is_binary128`) as `%e`, `%f` or `%g` (by `info->spec`, case kept; any other
+/// letter is taken as `g`) with the flags, width and precision in `info`, the way printf would. Returns the characters written,
+/// or -1. User conversion handlers call it.
+///
+/// # Safety
+/// `fp` is an open stream, `info` a valid `struct printf_info`, `args[0]` points to a value of the type `info` names.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __printf_fp(fp: *mut File, info: *const PrintfInfo, args: *const *const c_void) -> c_int {
+    // SAFETY: the caller's contract (this and the reads below).
     let info = unsafe { &*info };
+    // SAFETY: as above.
     let a0 = unsafe { *args };
     let val = if info.has(INFO_BINARY128) {
+        // SAFETY: as above: a binary128 at `a0` (not necessarily aligned).
         Val::Q(unsafe { (a0 as *const u128).read_unaligned() })
     } else if info.has(INFO_LONG_DOUBLE) {
+        // SAFETY: as above: a long double (16 bytes) at `a0`.
         Val::LD(unsafe { *(a0 as *const [u8; 16]) })
     } else {
+        // SAFETY: as above: a double at `a0`.
         Val::D(unsafe { *(a0 as *const f64) })
     };
     let sp = if (0..256).contains(&info.spec) { info.spec as u8 } else { b'g' };
@@ -1270,13 +1534,22 @@ pub unsafe extern "C" fn __printf_fp(fp: *mut File, info: *const PrintfInfo, arg
     };
     let mut fi = *info;
     if fi.has(INFO_BINARY128) {
+        // the value says its own type; the mini format has no binary128 length modifier
         fi.flags &= !INFO_LONG_DOUBLE;
     }
+    // SAFETY: the caller's contract.
     unsafe { printf_fp_conv(fp, &fi, val, conv) }
 }
 
+/// `printf_size (fp, info, args)`: print a floating-point number scaled to units of 1024 (conversion in lower
+/// case: 'k', 'm', 'g' ...) or 1000 (upper case: 'K', 'M', 'G' ...), as `%f` followed by the unit letter (a space
+/// for none). Register it with `register_printf_function ('b', printf_size, printf_size_info)`.
+///
+/// # Safety
+/// As `__printf_fp`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn printf_size(fp: *mut File, info: *const PrintfInfo, args: *const *const c_void) -> c_int {
+    // SAFETY: the caller's contract (this and the reads of the argument below).
     let info = unsafe { &*info };
     let upper = (info.spec as u8).is_ascii_uppercase() && info.spec < 256;
     let tag: &[u8] = if upper { b" KMGTPEZY" } else { b" kmgtpezy" };
@@ -1284,9 +1557,11 @@ pub unsafe extern "C" fn printf_size(fp: *mut File, info: *const PrintfInfo, arg
     let mut ti = 0usize;
     let mut is_neg = false;
     let mut special: Option<&[u8; 3]> = None;
+    // SAFETY: as above.
     let a0 = unsafe { *args };
     let val: Val;
     if info.has(INFO_LONG_DOUBLE) {
+        // SAFETY: as above: a long double (16 bytes) at `a0`.
         let mut b = unsafe { *(a0 as *const [u8; 16]) };
         let exp = u16::from_le_bytes([b[8], b[9]]) & 0x7fff;
         let mant = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
@@ -1305,6 +1580,7 @@ pub unsafe extern "C" fn printf_size(fp: *mut File, info: *const PrintfInfo, arg
         }
         val = Val::LD(b);
     } else {
+        // SAFETY: as above: a double at `a0`.
         let mut d = unsafe { *(a0 as *const f64) };
         if d.is_nan() {
             special = Some(b"nan");
@@ -1327,6 +1603,7 @@ pub unsafe extern "C" fn printf_size(fp: *mut File, info: *const PrintfInfo, arg
         }
         width -= 3;
         if !info.has(INFO_LEFT) && width > 0 {
+            // SAFETY: the caller's contract: `fp` is the handler's open stream.
             if !unsafe { fpad(fp, width as usize) } {
                 return -1;
             }
@@ -1341,11 +1618,13 @@ pub unsafe extern "C" fn printf_size(fp: *mut File, info: *const PrintfInfo, arg
         } else {
             b""
         };
+        // SAFETY: the caller's contract: `fp` is the handler's open stream (both writes).
         if !unsafe { fput(fp, sign) } || !unsafe { fput(fp, sp) } {
             return -1;
         }
         done += sign.len() as c_int + 3;
         if info.has(INFO_LEFT) && width > 0 {
+            // SAFETY: the caller's contract: `fp` is the handler's open stream.
             if !unsafe { fpad(fp, width as usize) } {
                 return -1;
             }
@@ -1357,14 +1636,18 @@ pub unsafe extern "C" fn printf_size(fp: *mut File, info: *const PrintfInfo, arg
     fp_info.spec = i32::from(b'f');
     fp_info.prec = if info.prec < 0 { 3 } else { info.prec };
     if fp_info.has(INFO_LEFT) && fp_info.pad == i32::from(b' ') {
+        // the unit goes before the padding spaces
         fp_info.width = 0;
+        // SAFETY: the caller's contract.
         done = unsafe { printf_fp_f(fp, &fp_info, val) };
         if done > 0 {
+            // SAFETY: the caller's contract.
             if !unsafe { fput(fp, &tag[ti..ti + 1]) } {
                 return -1;
             }
             done += 1;
             if info.width > done {
+                // SAFETY: the caller's contract: `fp` is the handler's open stream.
                 if !unsafe { fpad(fp, (info.width - done) as usize) } {
                     return -1;
                 }
@@ -1373,8 +1656,10 @@ pub unsafe extern "C" fn printf_size(fp: *mut File, info: *const PrintfInfo, arg
         }
     } else {
         fp_info.width = info.width - 1;
+        // SAFETY: the caller's contract.
         done = unsafe { printf_fp_f(fp, &fp_info, val) };
         if done > 0 {
+            // SAFETY: the caller's contract.
             if !unsafe { fput(fp, &tag[ti..ti + 1]) } {
                 return -1;
             }
@@ -1384,10 +1669,16 @@ pub unsafe extern "C" fn printf_size(fp: *mut File, info: *const PrintfInfo, arg
     done
 }
 
+/// `printf_size_info (info, n, argtypes)`: the arginfo function for `printf_size`: one double (or long double).
+///
+/// # Safety
+/// `info` is a valid `struct printf_info`; `argtypes` has room for `n` types.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn printf_size_info(info: *const PrintfInfo, n: usize, argtypes: *mut c_int) -> c_int {
     if n >= 1 {
+        // SAFETY: the caller's contract.
         let long = unsafe { (*info).has(INFO_LONG_DOUBLE) };
+        // SAFETY: the caller's contract: room for at least one type.
         unsafe { *argtypes = PA_DOUBLE | if long { PA_FLAG_LONG_DOUBLE } else { 0 } };
     }
     1

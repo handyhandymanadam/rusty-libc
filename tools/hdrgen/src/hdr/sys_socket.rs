@@ -4,6 +4,9 @@ pub static HDR: Header = Header {
     path: "sys/socket.h",
     items: &[
         Item::Guard { name: "_SYS_SOCKET_H", value: "1", end: "", items: &[
+            Item::Comment(r#"/* Sockets. Types, constants and macros are written by hand (values checked against glibc by
+   tests/c/net_consts.c and tests/c/net_layout.c); the prototypes come from bits/rlibc-net-sock.h,
+   generated from the Rust functions. */"#),
             Item::Include("<stddef.h>"),
             Item::Include("<stdint.h>"),
             Item::Include("<bits/types/struct_timespec.h>"),
@@ -345,6 +348,7 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::Block { head: "struct sockaddr ", body: &["", "  sa_family_t sa_family;", "  char sa_data[14];", ""], tail: "" },
             Item::Blank,
+            Item::Comment("/* Large enough for any address and aligned for all of them (the size and padding are glibc's) */"),
             Item::Consts(&[
                 ("_SS_SIZE", V::Dec(128)),
             ]),
@@ -378,6 +382,7 @@ pub static HDR: Header = Header {
             Item::Include("<bits/rlibc-net-sock.h>"),
             Item::Gate(&[
                 Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function", items: &[
+                    Item::Comment("/* the declarations here take the plain pointer types (glibc's transparent union only widens what a caller may pass) */"),
                     Item::Raw(Reason::GlibcMacro, "# define __SOCKADDR_ARG struct sockaddr *__restrict"),
                     Item::Raw(Reason::GlibcMacro, "# define __CONST_SOCKADDR_ARG const struct sockaddr *"),
                     Item::Include("<bits/socket2.h>"),

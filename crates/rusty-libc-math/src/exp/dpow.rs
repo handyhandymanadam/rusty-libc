@@ -1,3 +1,10 @@
+//! Double precision pow.
+//!
+//! The algorithm of ARM optimized-routines math/pow.c (MIT OR Apache-2.0 WITH LLVM-exception,
+//! Copyright Arm Limited): `pow(x, y) = exp(y * log(x))` where log(x) is computed to about 68 bits
+//! as a rounded value plus a tail (table of 128 intervals, polynomial of order 8) and the product
+//! `y * log(x)` is formed as a double-double that is fed to an exp with an extra tail argument.
+//! Worst case error about 0.52 ulp.
 use super::common::*;
 use super::data::*;
 
@@ -11,29 +18,37 @@ const SHIFT: f64 = 6755399441055744.0;
 const SIGN_BIAS: u32 = 0x800 << 7;
 const N: u64 = 128;
 
+/// y + tail = log(x) where y is the rounded result and tail has about 15 more bits. `ix` is the bit
+/// pattern of x, normalized in the subnormal range (the exponent then uses the sign bit).
 #[inline(always)]
 fn log_inline<const F: bool>(ix: u64) -> (f64, f64) {
+    // x = 2^k z, z in [OFF, 2 OFF), exact; the range is split into 128 subintervals
     let tmp = ix.wrapping_sub(OFF);
     let i = ((tmp >> (52 - 7)) % N) as usize;
     let k = (tmp as i64) >> 52;
     let iz = ix.wrapping_sub(tmp & (0xfffu64 << 52));
     let z = asf64(iz);
     let kd = k as f64;
+    // log(x) = k*Ln2 + log(c) + log1p(z/c - 1)
     let invc = POW_LOG_TAB[4 * i];
     let logc = POW_LOG_TAB[4 * i + 2];
     let logctail = POW_LOG_TAB[4 * i + 3];
     let a = &POW_LOG_POLY;
+    // 1/c is j/N or j/N/2 with an integer j in [N, 2N) and |z/c - 1| < 1/N: r is exact
     let r = fma::<F>(z, invc, -1.0);
+    // k*Ln2 + log(c) + r
     let t1 = fma::<F>(kd, LN2HI, logc);
     let t2 = t1 + r;
     let lo1 = fma::<F>(kd, LN2LO, logctail);
     let lo2 = t1 - t2 + r;
-    let ar = a[0] * r;
+    let ar = a[0] * r; // A0 = -0.5
     let ar2 = r * ar;
     let ar3 = r * ar2;
+    // k*Ln2 + log(c) + r + A0*r*r
     let hi = t2 + ar2;
     let lo3 = fma::<F>(ar, r, -ar2);
     let lo4 = t2 - hi + ar2;
+    // p = log1p(r) - r - A0*r*r
     let pa = fma::<F>(r, a[2], a[1]);
     let pb = fma::<F>(r, a[4], a[3]);
     let pc = fma::<F>(r, a[6], a[5]);
@@ -45,50 +60,65 @@ fn log_inline<const F: bool>(ix: u64) -> (f64, f64) {
     (y, hi - y + lo)
 }
 
+/// Overflow/underflow cases of exp_inline, with the sign of the result in `sbits`.
 #[inline(always)]
 fn specialcase<const F: bool>(tmp: f64, mut sbits: u64, ki: u64) -> f64 {
     if ki & 0x8000_0000 == 0 {
+        // k > 0, the exponent of scale might have overflowed by <= 460
         sbits = sbits.wrapping_sub(1009u64 << 52);
         let scale = asf64(sbits);
         let y = fma::<F>(scale, tmp, scale);
         if !F {
+            // pow(0x1.fffffffffffffp+1023, 1.0) when rounding up
             if y == pow2(15) && (core::hint::black_box(1.0f64) + pow2(-60)) != 1.0 {
                 return f64::MAX;
             }
         }
         return check_oflow(y * pow2(1009));
     }
+    // k < 0, special care in the subnormal range
     sbits = sbits.wrapping_add(1022u64 << 52);
+    // sbits is the signed scale
     let scale = asf64(sbits);
     let mut y = fma::<F>(scale, tmp, scale);
     if y.abs() < 1.0 {
+        // round y to the right precision before scaling it into the subnormal range to avoid
+        // double rounding
         let one = if y < 0.0 { -1.0 } else { 1.0 };
         let mut lo = fma::<F>(scale, tmp, scale - y);
         let hi = one + y;
         lo = one - hi + y + lo;
         y = (hi + lo) - one;
+        // fix the sign of 0
         if y == 0.0 {
             y = asf64(sbits & 0x8000_0000_0000_0000);
         }
+        // the underflow exception needs to be signaled explicitly
         core::hint::black_box(pow2(-1022) * core::hint::black_box(pow2(-1022)));
     }
     y *= pow2(-1022);
     check_uflow(y)
 }
 
+/// sign * exp(x + xtail) where |xtail| < 2^-8/N and |xtail| <= |x|. `sign_bias` is SIGN_BIAS or 0
+/// and selects the sign of the result.
 #[inline(always)]
 fn exp_inline<const F: bool>(x: f64, xtail: f64, sign_bias: u32) -> f64 {
     let mut abstop = ((asu64(x) >> 52) & 0x7ff) as u32;
     if abstop.wrapping_sub(0x3c9) >= 0x408 - 0x3c9 {
         if abstop.wrapping_sub(0x3c9) >= 0x8000_0000 {
+            // tiny x (0 is common): avoid spurious underflow
             let one = 1.0 + x;
             return if sign_bias != 0 { -one } else { one };
         }
         if abstop >= 0x409 {
+            // inf and nan are already handled
             return if asu64(x) >> 63 != 0 { uflow(sign_bias != 0) } else { oflow(sign_bias != 0) };
         }
+        // large x is special cased below
         abstop = 0;
     }
+    // exp(x) = 2^(k/N) * exp(r), with exp(r) in [2^(-1/2N), 2^(1/2N)]
     let z = INVLN2N * x;
     let mut kd = z + SHIFT;
     let ki = asu64(kd);
@@ -110,6 +140,8 @@ fn exp_inline<const F: bool>(x: f64, xtail: f64, sign_bias: u32) -> f64 {
     fma::<F>(scale, tmp, scale)
 }
 
+/// 0 if not an integer, 1 if odd integer, 2 if even integer. `iy` is the bit pattern of a
+/// non-zero finite value.
 #[inline(always)]
 fn checkint(iy: u64) -> u32 {
     let e = ((iy >> 52) & 0x7ff) as i32;
@@ -128,6 +160,7 @@ fn checkint(iy: u64) -> u32 {
     2
 }
 
+/// Is the bit pattern that of 0, infinity or NaN (either sign)?
 #[inline(always)]
 fn zeroinfnan(i: u64) -> bool {
     i.wrapping_mul(2).wrapping_sub(1) >= (2 * 0x7ff0_0000_0000_0000u64) - 1
@@ -139,6 +172,7 @@ fn issignaling(x: f64) -> bool {
     (ix ^ 0x0008_0000_0000_0000).wrapping_mul(2) > 2 * 0x7ff8_0000_0000_0000u64
 }
 
+/// pow(x, y), double.
 #[inline(always)]
 pub(crate) fn pow_impl<const F: bool>(x: f64, y: f64) -> f64 {
     let mut sign_bias = 0u32;
@@ -147,6 +181,7 @@ pub(crate) fn pow_impl<const F: bool>(x: f64, y: f64) -> f64 {
     let mut topx = (ix >> 52) as u32;
     let topy = (iy >> 52) as u32;
     if topx.wrapping_sub(0x001) >= 0x7ff - 0x001 || (topy & 0x7ff).wrapping_sub(0x3be) >= 0x43e - 0x3be {
+        // Special cases: (x < 0x1p-1022 or inf or nan) or (|y| < 0x1p-65 or |y| >= 0x1p63 or nan)
         if zeroinfnan(iy) {
             if iy.wrapping_mul(2) == 0 {
                 return if issignaling(x) { x + y } else { 1.0 };
@@ -162,7 +197,7 @@ pub(crate) fn pow_impl<const F: bool>(x: f64, y: f64) -> f64 {
                 return 1.0;
             }
             if (ix.wrapping_mul(2) < 2 * asu64(1.0)) == (iy >> 63 == 0) {
-                return 0.0;
+                return 0.0; // |x| < 1 and y == inf, or |x| > 1 and y == -inf
             }
             return y * y;
         }
@@ -177,7 +212,9 @@ pub(crate) fn pow_impl<const F: bool>(x: f64, y: f64) -> f64 {
             }
             return if iy >> 63 != 0 { core::hint::black_box(1.0 / x2) } else { x2 };
         }
+        // here x and y are non-zero finite
         if ix >> 63 != 0 {
+            // finite x < 0
             let yint = checkint(iy);
             if yint == 0 {
                 return invalid(x);
@@ -189,15 +226,18 @@ pub(crate) fn pow_impl<const F: bool>(x: f64, y: f64) -> f64 {
             topx &= 0x7ff;
         }
         if (topy & 0x7ff).wrapping_sub(0x3be) >= 0x43e - 0x3be {
+            // note: sign_bias == 0 here because y is not odd
             if ix == asu64(1.0) {
                 return 1.0;
             }
             if (topy & 0x7ff) < 0x3be {
+                // |y| < 2^-65, x^y ~= 1 + y*log(x)
                 return if ix > asu64(1.0) { 1.0 + y } else { 1.0 - y };
             }
             return if (ix > asu64(1.0)) == (topy < 0x800) { oflow(false) } else { uflow(false) };
         }
         if topx == 0 {
+            // normalize subnormal x so the exponent becomes negative
             ix = asu64(core::hint::black_box(x) * pow2(52));
             ix &= 0x7fff_ffff_ffff_ffff;
             ix = ix.wrapping_sub(52u64 << 52);

@@ -1,0 +1,24 @@
+#!/bin/bash
+# Run one heavy job (build, test, bench) in a memory-capped scope: MemoryMax 2G by default (HEAVY_MEM=4G only for the rusty-libc-math
+# tests, 3G for a big link), no swap (MemorySwapMax=0), nice 10. At most TWO heavy jobs run at once on this machine
+# (Adam, 2026-10-04: full laptop resources are fine, just no OOM crash; 2026-10-07: two laptop-wide OOM kills at 01:06 and 07:06 when
+# several runners and helpers worked at once: back to two slots, and a job also waits while swap is more than 90% used: it was 80% full by other programs when this was written).
+# A job takes slot 1 or 2 and waits while both are taken, while less than 3 GB of memory is available, or while swap is more than 90% used (our jobs never add swap: MemorySwapMax=0).
+# Slot 1 is also the lock older scripts use directly (`flock /tmp/rusty-libc-heavy.lock`).
+# Usage: tools/heavy cargo +nightly test ...
+exec 9>/tmp/rusty-libc-heavy.lock
+exec 8>/tmp/rusty-libc-heavy2.lock
+while :; do
+    avail=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+    swap_pct=$(awk '/^SwapTotal/ {t=$2} /^SwapFree/ {f=$2} END {if (t > 0) print int(100*(t-f)/t); else print 0}' /proc/meminfo)
+    if [ "$avail" -ge 3072 ] && [ "$swap_pct" -le 90 ]; then
+        flock -n 9 && break
+        flock -n 8 && break
+    fi
+    read -r -t 3 <> <(:) || true
+done
+# no core dumps: tests that abort on purpose must not wake systemd-coredump (it once kept a CPU at 100%)
+ulimit -c 0
+export TMPDIR="${TMPDIR:-$HOME/Claude/tmp}"
+mkdir -p "$TMPDIR"
+exec systemd-run --user --scope -q -p MemoryMax="${HEAVY_MEM:-2G}" -p MemorySwapMax=0 nice -n 10 "$@"

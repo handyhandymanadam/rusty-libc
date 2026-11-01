@@ -1,3 +1,14 @@
+//! The old ABI of the fromfp family and of totalorder/totalordermag (glibc libm GLIBC_2.25 .. 2.27): `fromfp`, `ufromfp`,
+//! `fromfpx`, `ufromfpx` (every type) RETURN `intmax_t`/`uintmax_t` and take `(x, round, width)`; the C23 versions this library
+//! exports under the current names return the rounded floating-point value. `totalorder` and `totalordermag` of that time took
+//! their two arguments by value, the current ones take pointers. glibc 2.43 keeps the old ones as `compat_symbol`s (math/
+//! compat_fromfp.h, sysdeps/ieee754/*/s_compat_*fromfp*.c, s_totalorder*.c), read as reference; the code is Rust.
+//!
+//! The by-value floating-point arguments sit in xmm0/xmm1 (float, double, binary128) or on the stack (long double), so every
+//! entry is a small assembly thunk that puts the arguments into memory and calls the Rust core with pointers
+//! (`__rl_ofp_core(ptr, round, width, variant, type)`); hdrgen compat-symver --math binds the old version names to them.
+//! Labels: `__rl_ofp_<T><V>` (T = d f l q, V = 0 fromfp, 1 ufromfp, 2 fromfpx, 3 ufromfpx), `__rl_oto_<T>` (totalorder),
+//! `__rl_otm_<T>` (totalordermag).
 use core::ffi::c_int;
 
 const FP_INT_UPWARD: i32 = 0;
@@ -61,10 +72,12 @@ fn round_value(neg: bool, x: u64, half: bool, more: bool, round: i32) -> u64 {
         FP_INT_DOWNWARD => x.wrapping_add((neg && (half || more)) as u64),
         FP_INT_TONEARESTFROMZERO => x.wrapping_add(half as u64),
         FP_INT_TONEAREST => x.wrapping_add((half && ((x & 1) != 0 || more)) as u64),
-        _ => x,
+        _ => x, // FP_INT_TOWARDZERO and unknown directions: truncation
     }
 }
 
+/// The value as the pieces glibc's per-type code extracts: sign, unbiased exponent, mantissa with its integer bit, `zero`
+/// (glibc returns 0 before looking at the exponent), and the mantissa width.
 struct Parts {
     neg: bool,
     zero: bool,
@@ -73,6 +86,8 @@ struct Parts {
     mant_dig: i32,
 }
 
+/// # Safety
+/// `p` points to a value of type `ty` (`d`, `f`, `l` = x87 80-bit in 10 bytes, `q` = binary128).
 unsafe fn decode(p: *const u8, ty: u32) -> Parts {
     let n = match ty {
         0 => 8,
@@ -80,9 +95,11 @@ unsafe fn decode(p: *const u8, ty: u32) -> Parts {
         2 => 10,
         _ => 16,
     };
+    // SAFETY: `p` points to a value of type `ty`, which is `n` bytes (the contract).
     decode_bytes(unsafe { rusty_libc_core::ffi::bytes(p, n) }, ty)
 }
 
+/// [`decode`] on the value's bytes (`b` has the length of type `ty`).
 fn decode_bytes(b: &[u8], ty: u32) -> Parts {
     let word = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
     match ty {
@@ -107,11 +124,16 @@ fn decode_bytes(b: &[u8], ty: u32) -> Parts {
     }
 }
 
+/// The common body of the 32 old entry points: `variant` 0 fromfp, 1 ufromfp, 2 fromfpx, 3 ufromfpx.
+///
+/// # Safety
+/// As `decode`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rl_ofp_core(p: *const u8, round: c_int, width: u32, variant: u32, ty: u32) -> u64 {
     let unsigned = variant & 1 != 0;
     let inexact = variant & 2 != 0;
     let width = width.min(INTMAX_WIDTH);
+    // SAFETY: forwarded contract.
     let v = unsafe { decode(p, ty) };
     if width == 0 {
         return domain_error(v.neg, 0, unsigned);

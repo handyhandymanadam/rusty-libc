@@ -1,3 +1,10 @@
+//! net/if.h (`if_nametoindex`, `if_indextoname`, `if_nameindex`, `if_freenameindex`) and ifaddrs.h
+//! (`getifaddrs`, `freeifaddrs`) over rtnetlink, plus the local address list used by `AI_ADDRCONFIG` and
+//! the destination sorting of `getaddrinfo`.
+//!
+//! Unsafe (U2): the netlink and ioctl system calls on our own buffers, the heap blocks handed to C (viewed as typed slices
+//! once allocated; the pointers stored in them are computed from the block's own address so they stay valid for C), and the
+//! shells' conversions of the caller's arguments.
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::types::*;
 use core::ffi::{c_char, c_int, c_uint, c_void};
@@ -27,7 +34,7 @@ pub const IFA_F_DEPRECATED: u32 = 0x20;
 const SIOCGIFINDEX: usize = 0x8933;
 const SIOCGIFNAME: usize = 0x8910;
 const IFNAMSIZ: usize = 16;
-const STATS_SIZE: usize = 92;
+const STATS_SIZE: usize = 92; // struct rtnl_link_stats
 
 fn rd16(b: &[u8], o: usize) -> u16 {
     u16::from_ne_bytes([b[o], b[o + 1]])
@@ -36,6 +43,7 @@ fn rd32(b: &[u8], o: usize) -> u32 {
     u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 
+/// A growing heap buffer.
 struct Heap {
     p: *mut u8,
     len: usize,
@@ -51,6 +59,7 @@ impl Heap {
             return true;
         }
         let ncap = (self.len + extra).max(self.cap * 2).max(16384);
+        // SAFETY: `p` is NULL or a block from this allocator that this Heap owns.
         let np = unsafe { rusty_libc_malloc::realloc(self.p as *mut c_void, ncap) } as *mut u8;
         if np.is_null() {
             return false;
@@ -60,10 +69,13 @@ impl Heap {
         true
     }
     fn bytes(&self) -> &[u8] {
+        // SAFETY: the first `len` bytes of the owned block were written by `extend` (with `len` 0 any pointer will do).
         unsafe { ffi::bytes(self.p, self.len) }
     }
+    /// Append `b` (room reserved before).
     fn extend(&mut self, b: &[u8]) {
         assert!(self.len + b.len() <= self.cap);
+        // SAFETY: the `cap - len` bytes after the first `len` belong to the owned block (checked above); `b` is elsewhere.
         unsafe { ffi::bytes_mut(self.p.wrapping_add(self.len), b.len()) }.copy_from_slice(b);
         self.len += b.len();
     }
@@ -72,11 +84,13 @@ impl Heap {
 impl Drop for Heap {
     fn drop(&mut self) {
         if !self.p.is_null() {
+            // SAFETY: the block came from this allocator and is owned by this Heap alone.
             unsafe { rusty_libc_malloc::free(self.p as *mut c_void) };
         }
     }
 }
 
+/// Send a netlink dump request of `typ` and collect all the reply messages (up to NLMSG_DONE).
 fn netlink_dump(typ: u16) -> Result<Heap, i32> {
     let fd = crate::sock::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
     if fd < 0 {
@@ -84,23 +98,28 @@ fn netlink_dump(typ: u16) -> Result<Heap, i32> {
     }
     let r = (|| {
         let sa = sockaddr_nl { nl_family: AF_NETLINK as u16, nl_pad: 0, nl_pid: 0, nl_groups: 0 };
+        // SAFETY: `sa` is a local 12-byte sockaddr_nl.
         if unsafe { crate::sock::bind(fd, &sa as *const _ as *const sockaddr, 12) } < 0 {
             return Err(errno::get());
         }
         let mut req = [0u8; 32];
-        req[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        req[0..4].copy_from_slice(&32u32.to_ne_bytes()); // nlmsg_len incl. 16 byte rtgenmsg slot
         req[4..6].copy_from_slice(&typ.to_ne_bytes());
         req[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
         req[8..12].copy_from_slice(&1u32.to_ne_bytes());
-        req[16] = AF_UNSPEC as u8;
+        req[16] = AF_UNSPEC as u8; // rtgenmsg.rtgen_family
+        // rtgenmsg is one byte; the length is 17 rounded to 20 by NLMSG_ALIGN, the kernel accepts 20
         req[0..4].copy_from_slice(&17u32.to_ne_bytes());
         let mut dst = sockaddr_nl { nl_family: AF_NETLINK as u16, nl_pad: 0, nl_pid: 0, nl_groups: 0 };
+        // SAFETY: `req` holds 32 bytes (20 are sent) and `dst` is a local 12-byte sockaddr_nl.
         if unsafe { crate::sock::sendto(fd, req.as_ptr() as *const c_void, 20, 0, &mut dst as *mut _ as *const sockaddr, 12) } < 0 {
             return Err(errno::get());
         }
         let mut heap = Heap::new();
         let mut buf = [0u8; 16384];
         loop {
+            // recvmsg as glibc's __netlink_request receives (a seccomp allowlist made from glibc's calls has recvmsg, maybe
+            // no recvfrom)
             let mut nladdr = sockaddr_nl { nl_family: 0, nl_pad: 0, nl_pid: 0, nl_groups: 0 };
             let mut iov = iovec { iov_base: buf.as_mut_ptr() as *mut c_void, iov_len: buf.len() };
             let mut msg = msghdr {
@@ -112,6 +131,7 @@ fn netlink_dump(typ: u16) -> Result<Heap, i32> {
                 msg_controllen: 0,
                 msg_flags: 0,
             };
+            // SAFETY: `msg` describes the local `nladdr` (12 bytes) and the local `buf` through `iov`, all live for the call.
             let n = unsafe { crate::sock::recvmsg(fd, &mut msg, 0) };
             if n < 0 {
                 let e = errno::get();
@@ -154,6 +174,7 @@ fn netlink_dump(typ: u16) -> Result<Heap, i32> {
     r
 }
 
+/// The netlink messages of a dump: (type, payload after the 16 byte header).
 fn messages(d: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
     let mut off = 0;
     core::iter::from_fn(move || {
@@ -168,6 +189,7 @@ fn messages(d: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
     })
 }
 
+/// Attributes (type, data) after a fixed header of `skip` bytes.
 fn attrs(m: &[u8], skip: usize) -> impl Iterator<Item = (u16, &[u8])> {
     let mut off = skip;
     core::iter::from_fn(move || {
@@ -185,6 +207,9 @@ fn attrs(m: &[u8], skip: usize) -> impl Iterator<Item = (u16, &[u8])> {
     })
 }
 
+// ---------------------------------------------------------------- local addresses
+
+/// One address configured on a local interface.
 #[derive(Clone, Copy, Debug)]
 pub struct LocalAddr {
     pub family: c_int,
@@ -195,6 +220,8 @@ pub struct LocalAddr {
     pub scope: u8,
 }
 
+/// The addresses of all interfaces (`RTM_GETADDR`); returns how many were stored in `out` (more are
+/// counted but dropped when `out` is full). Err(errno) if netlink is not available.
 pub fn local_addrs(out: &mut [LocalAddr]) -> Result<usize, i32> {
     let d = netlink_dump(RTM_GETADDR)?;
     let mut n = 0;
@@ -231,6 +258,7 @@ pub fn local_addrs(out: &mut [LocalAddr]) -> Result<usize, i32> {
     Ok(n.min(out.len()))
 }
 
+/// What `AI_ADDRCONFIG` looks at: (an IPv4 address other than 127.0.0.1, an IPv6 address other than ::1).
 pub fn check_pf() -> (bool, bool) {
     let mut v = [LocalAddr { family: 0, addr: [0; 16], prefixlen: 0, index: 0, flags: 0, scope: 0 }; 64];
     let Ok(n) = local_addrs(&mut v) else { return (true, true) };
@@ -247,12 +275,15 @@ pub fn check_pf() -> (bool, bool) {
     (s4, s6)
 }
 
+// ---------------------------------------------------------------- names and indexes
+
 fn ifreq_call(req: usize, ifr: &mut [u8; 40]) -> c_int {
     let fd = crate::sock::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     let fd = if fd < 0 { crate::sock::socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0) } else { fd };
     if fd < 0 {
         return -1;
     }
+    // SAFETY: SIOCGIFINDEX and SIOCGIFNAME read and write one struct ifreq (40 bytes), the local `ifr`.
     let r = unsafe { syscall3(rusty_libc_core::syscall::SYS_IOCTL, fd as usize, req, ifr.as_mut_ptr() as usize) };
     let ok = check(r);
     let saved = match ok {
@@ -268,6 +299,7 @@ fn ifreq_call(req: usize, ifr: &mut [u8; 40]) -> c_int {
     }
 }
 
+/// Index of the interface called `name` (without NUL), or None with errno.
 pub fn name_to_index(name: &[u8]) -> Option<u32> {
     if name.len() >= IFNAMSIZ {
         errno::set(ENODEV);
@@ -281,6 +313,7 @@ pub fn name_to_index(name: &[u8]) -> Option<u32> {
     Some(rd32(&ifr, 16))
 }
 
+/// Scope id text: an interface name or a decimal number.
 pub fn scope_id_from_text(s: &[u8]) -> Option<u32> {
     if let Some(i) = name_to_index(s) {
         return Some(i);
@@ -301,6 +334,7 @@ pub fn scope_id_from_text(s: &[u8]) -> Option<u32> {
     Some(v as u32)
 }
 
+/// `__inet6_scopeid_pton` rules: an interface name only counts for link-local addresses.
 pub fn scopeid_pton(addr: &[u8; 16], s: &[u8]) -> Option<u32> {
     let ll = addr[0] == 0xfe && addr[1] & 0xc0 == 0x80;
     let mc_nodelocal = addr[0] == 0xff && addr[1] & 0xf == 1;
@@ -326,12 +360,21 @@ pub fn scopeid_pton(addr: &[u8; 16], s: &[u8]) -> Option<u32> {
     Some(v as u32)
 }
 
+/// GLIBC_PRIVATE `int __inet6_scopeid_pton(const struct in6_addr *address, const char *scope, uint32_t *result)`: parse the scope
+/// of `address%scope` as an interface name (link-local, node-local multicast or link-local multicast addresses only) or as a
+/// decimal number that fits 32 bits. Returns 0 and stores the id in `*result`, or -1 with errno EINVAL and `*result` untouched.
+///
+/// # Safety
+/// `address` points at 16 bytes, `scope` is a C string, `result` is writable.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __inet6_scopeid_pton(address: *const in6_addr, scope: *const c_char, result: *mut u32) -> c_int {
+    // SAFETY: `address` points at 16 readable bytes (the caller's contract).
     let a = unsafe { (*address).s6_addr };
+    // SAFETY: `scope` is a C string (the caller's contract).
     let s = unsafe { ffi::cstr_bytes(scope) };
     match scopeid_pton(&a, s) {
         Some(id) => {
+            // SAFETY: `result` is writable (the caller's contract).
             unsafe { result.write(id) };
             0
         }
@@ -342,12 +385,17 @@ pub unsafe extern "C" fn __inet6_scopeid_pton(address: *const in6_addr, scope: *
     }
 }
 
+/// # Safety
+/// `name` is a C string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn if_nametoindex(name: *const c_char) -> c_uint {
+    // SAFETY: `name` is a C string (the caller's contract).
     let s = unsafe { ffi::cstr_bytes(name) };
     name_to_index(s).unwrap_or(0)
 }
 
+/// # Safety
+/// `buf` has room for `IF_NAMESIZE` bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn if_indextoname(index: c_uint, buf: *mut c_char) -> *mut c_char {
     let mut ifr = [0u8; 40];
@@ -358,12 +406,15 @@ pub unsafe extern "C" fn if_indextoname(index: c_uint, buf: *mut c_char) -> *mut
         }
         return core::ptr::null_mut();
     }
+    // SAFETY: `buf` has room for IF_NAMESIZE (16) bytes (the caller's contract).
     let b = unsafe { ffi::bytes_mut(buf.cast::<u8>(), IFNAMSIZ) };
     b.copy_from_slice(&ifr[..IFNAMSIZ]);
     b[IFNAMSIZ - 1] = 0;
     buf
 }
 
+/// # Safety
+/// Returns a malloc'ed array ended by an entry with index 0; free with `if_freenameindex`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn if_nameindex() -> *mut if_nameindex {
     let d = match netlink_dump(RTM_GETLINK) {
@@ -381,14 +432,18 @@ pub unsafe extern "C" fn if_nameindex() -> *mut if_nameindex {
     }
     let esz = core::mem::size_of::<if_nameindex>();
     let total = (n + 1) * esz + n * IFNAMSIZ;
+    // SAFETY: malloc has no preconditions.
     let blk = unsafe { rusty_libc_malloc::malloc(total) } as *mut u8;
     if blk.is_null() {
         errno::set(ENOMEM);
         return core::ptr::null_mut();
     }
     let arr = blk as *mut if_nameindex;
+    // The names follow the array; the pointers stored for C are computed from `blk`.
     let names_at = blk.wrapping_add((n + 1) * esz);
+    // SAFETY: the block holds `n * IFNAMSIZ` bytes at `names_at` (the size computed above), ours until returned.
     unsafe { names_at.write_bytes(0, n * IFNAMSIZ) };
+    // SAFETY: those bytes are initialised now and nothing else refers to them while the view is used.
     let names = unsafe { ffi::bytes_mut(names_at, n * IFNAMSIZ) };
     let mut i = 0usize;
     for (ty, m) in messages(d.bytes()) {
@@ -396,6 +451,7 @@ pub unsafe extern "C" fn if_nameindex() -> *mut if_nameindex {
             continue;
         }
         let entry = if_nameindex { if_index: rd32(m, 4), if_name: names_at.wrapping_add(i * IFNAMSIZ).cast::<c_char>() };
+        // SAFETY: entry `i` (i < n) of the array at the start of the block, which malloc aligned for it.
         unsafe { arr.wrapping_add(i).write(entry) };
         for (t, v) in attrs(m, 16) {
             if t == IFLA_IFNAME {
@@ -405,19 +461,27 @@ pub unsafe extern "C" fn if_nameindex() -> *mut if_nameindex {
         }
         i += 1;
     }
+    // SAFETY: entry `n` of the array, the terminator, is in the block.
     unsafe { arr.wrapping_add(i).write(if_nameindex { if_index: 0, if_name: core::ptr::null_mut() }) };
     arr
 }
 
+/// # Safety
+/// `p` came from `if_nameindex` (or is null).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn if_freenameindex(p: *mut if_nameindex) {
     if !p.is_null() {
+        // SAFETY: `p` came from if_nameindex's malloc (the caller's contract).
         unsafe { rusty_libc_malloc::free(p as *mut c_void) };
     }
 }
 
+// ---------------------------------------------------------------- getifaddrs
+
 const SLOT: usize = 256;
 
+/// Room for one socket address of a getifaddrs entry (AF_INET, AF_INET6 or AF_PACKET). Writing a field is safe; nothing here
+/// reads one.
 #[repr(C)]
 #[derive(Clone, Copy)]
 union SockSlot {
@@ -427,6 +491,7 @@ union SockSlot {
     raw: [u8; 28],
 }
 
+/// One entry of the getifaddrs block: the list node and the data its pointers point at.
 #[repr(C)]
 struct Slot {
     ia: ifaddrs,
@@ -438,6 +503,7 @@ struct Slot {
     pad: [u8; 8],
 }
 
+// The layout the C side has always seen: ifaddrs (56) | name 16 | addr 28 | netmask 28 | broadcast 28 | data 92 | pad.
 const _: () = assert!(
     core::mem::size_of::<Slot>() == SLOT
         && core::mem::offset_of!(Slot, name) == 56
@@ -447,10 +513,12 @@ const _: () = assert!(
         && core::mem::offset_of!(Slot, data) == 156
 );
 
+/// The first `IFNAMSIZ - 1` bytes of `v` up to a NUL (an interface name attribute).
 fn name_part(v: &[u8]) -> &[u8] {
     &v[..v.iter().position(|&c| c == 0).unwrap_or(v.len()).min(IFNAMSIZ - 1)]
 }
 
+/// An AF_PACKET address with the first (at most 8) bytes of `v`.
 fn packet_addr(index: u32, hatype: u16, v: &[u8]) -> sockaddr_ll {
     let l = v.len().min(8);
     let mut a = [0u8; 8];
@@ -458,6 +526,8 @@ fn packet_addr(index: u32, hatype: u16, v: &[u8]) -> sockaddr_ll {
     sockaddr_ll { sll_family: AF_PACKET as u16, sll_protocol: 0, sll_ifindex: index as c_int, sll_hatype: hatype, sll_pkttype: 0, sll_halen: l as u8, sll_addr: a }
 }
 
+/// # Safety
+/// `ifap` is writable; the list is freed with `freeifaddrs`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getifaddrs(ifap: *mut *mut ifaddrs) -> c_int {
     let links = match netlink_dump(RTM_GETLINK) {
@@ -486,15 +556,20 @@ pub unsafe extern "C" fn getifaddrs(ifap: *mut *mut ifaddrs) -> c_int {
         }
     }
     if count == 0 {
+        // SAFETY: `ifap` is writable (the caller's contract).
         unsafe { ifap.write(core::ptr::null_mut()) };
         return 0;
     }
+    // SAFETY: calloc has no preconditions.
     let blk = unsafe { rusty_libc_malloc::calloc(count, SLOT) } as *mut Slot;
     if blk.is_null() {
         errno::set(ENOMEM);
         return -1;
     }
+    // SAFETY: `count * SLOT` zeroed bytes, aligned for Slot (malloc's 16-byte alignment); all zeros is a valid Slot (NULL
+    // pointers, zero numbers); the block is ours until it is handed to the caller below.
     let slots = unsafe { ffi::slice_mut(blk, count) };
+    // The address of field `off` of slot `i`, computed from the block itself: these are the pointers C gets.
     let at = |i: usize, off: usize| blk.cast::<u8>().wrapping_add(i * SLOT + off);
     const NAME: usize = core::mem::offset_of!(Slot, name);
     const ADDR: usize = core::mem::offset_of!(Slot, addr);
@@ -573,6 +648,9 @@ pub unsafe extern "C" fn getifaddrs(ifap: *mut *mut ifaddrs) -> c_int {
         s.ia.ifa_name = at(i, NAME).cast::<c_char>();
         s.ia.ifa_flags = lflags;
         let want = if fam == AF_INET { 4 } else { 16 };
+        // glibc's rules, in the order the kernel sends the attributes: IFA_ADDRESS fills the address
+        // (or the destination when an address is already there); IFA_LOCAL becomes the address and moves
+        // an earlier one to the destination; IFA_BROADCAST sets the destination.
         let mut addr: Option<[u8; 16]> = None;
         let mut dst: Option<[u8; 16]> = None;
         let pad = |v: &[u8]| -> [u8; 16] {
@@ -635,18 +713,71 @@ pub unsafe extern "C" fn getifaddrs(ifap: *mut *mut ifaddrs) -> c_int {
             s.ia.ifa_ifu.ifu_broadaddr = at(i, BC).cast::<sockaddr>();
         }
     }
+    // the list in slot order
     for i in 1..used {
         slots[i - 1].ia.ifa_next = at(i, 0).cast::<ifaddrs>();
     }
     let first = if used > 0 { blk.cast::<ifaddrs>() } else { core::ptr::null_mut() };
+    // SAFETY: `ifap` is writable (the caller's contract).
     unsafe { ifap.write(first) };
     0
 }
 
+/// # Safety
+/// `ifa` came from `getifaddrs` (or is null).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn freeifaddrs(ifa: *mut ifaddrs) {
     if !ifa.is_null() {
+        // SAFETY: `ifa` came from getifaddrs's calloc (the caller's contract).
         unsafe { rusty_libc_malloc::free(ifa as *mut c_void) };
     }
 }
 
+#[cfg(test)]
+mod scopeid_tests {
+    #![allow(clippy::undocumented_unsafe_blocks)]
+    use super::*;
+
+    fn pton(addr: [u8; 16], scope: &str) -> (c_int, u32, i32) {
+        let c = std::ffi::CString::new(scope).unwrap();
+        let mut r = 1234u32;
+        errno::set(0);
+        let rc = unsafe { __inet6_scopeid_pton(&in6_addr { s6_addr: addr }, c.as_ptr(), &mut r) };
+        (rc, r, errno::get())
+    }
+
+    #[test]
+    fn numbers_for_any_address() {
+        let mut a = [0u8; 16];
+        a[15] = 1;
+        assert_eq!(pton(a, "0"), (0, 0, 0));
+        assert_eq!(pton(a, "5555"), (0, 5555, 0));
+        assert_eq!(pton(a, "4294967295").0, 0);
+        for bad in ["", "-1", "-99", "037777777777", "0x", "0x1", "4294967296", "5a"] {
+            let r = pton(a, bad);
+            assert_eq!((r.0, r.1, r.2), (-1, 1234, EINVAL), "{bad}");
+        }
+    }
+
+    #[test]
+    fn interface_names_only_for_link_local_scopes() {
+        let mut ll = [0u8; 16];
+        ll[0] = 0xfe;
+        ll[1] = 0x80;
+        ll[15] = 1;
+        let mut nodelocal = [0u8; 16];
+        nodelocal[0] = 0xff;
+        nodelocal[1] = 0x01;
+        nodelocal[15] = 1;
+        let mut mc_ll = nodelocal;
+        mc_ll[1] = 0x02;
+        let mut global = [0u8; 16];
+        global[0] = 0x20;
+        global[1] = 0x01;
+        // "lo" always exists on Linux; its index is 1
+        for a in [ll, nodelocal, mc_ll] {
+            assert_eq!(pton(a, "lo"), (0, 1, 0));
+        }
+        assert_eq!(pton(global, "lo"), (-1, 1234, EINVAL));
+    }
+}

@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("UTIME_NOW", V::Txt("0x3fffffffL")),
         ("UTIME_OMIT", V::Txt("0x3ffffffeL")),
@@ -67,6 +68,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("STATX_ATTR_WRITE_ATOMIC", V::Txt("0x00400000")),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Block { head: "struct stat64 ", body: &["", "  unsigned long st_dev;", "  unsigned long st_ino;", "  unsigned long st_nlink;", "  unsigned int st_mode;", "  unsigned int st_uid;", "  unsigned int st_gid;", "  int __pad0;", "  unsigned long st_rdev;", "  long st_size;", "  long st_blksize;", "  long st_blocks;", "  struct timespec st_atim;", "  struct timespec st_mtim;", "  struct timespec st_ctim;", "  long __glibc_reserved[3];", ""], tail: "" },
     Item::Consts(&[
         ("st_atime", V::Txt("st_atim.tv_sec")),

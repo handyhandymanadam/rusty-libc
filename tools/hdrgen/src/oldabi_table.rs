@@ -1,3 +1,5 @@
+//! The old public names of `hdrgen oldabi`: alias -> the function it jumps to.
+
 pub static ALIASES: &[(&str, &str)] = &[
     ("__open", "open"),
     ("__open64", "open64"),
@@ -71,4 +73,6 @@ pub static ALIASES: &[(&str, &str)] = &[
     ("__wcstoul_internal", "wcstoul"),
     ("__wcstoll_internal", "wcstoll"),
     ("__wcstoull_internal", "wcstoull"),
+    // __strtod_internal, __strtof_internal, __strtold_internal, __strtof128_internal and their __wcsto*_internal forms take
+    // a `group` argument and are functions of their own (rusty-libc-stdlib num.rs, rusty-libc-wchar wconv.rs)
 ];

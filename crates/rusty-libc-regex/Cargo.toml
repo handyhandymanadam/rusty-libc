@@ -13,6 +13,13 @@ rusty-libc-stdlib = { path = "../rusty-libc-stdlib" }
 rusty-libc-wchar = { path = "../rusty-libc-wchar" }
 rusty-libc-locale = { path = "../rusty-libc-locale" }
 
+[dev-dependencies]
+libc = "0.2"
+rusty-libc-malloc = { path = "../rusty-libc-malloc", features = ["no-brk"] }
+
 [features]
+# Export the C symbols. Off for host tests so they never replace the host libc.
 export = []
+# The shared libc.so.6: loc1, loc2, locs are exported as the default version GLIBC_2.2.5 by the version script instead of
+# through `.symver` aliases (so that a program's copy relocation and the library's own accesses are one object).
 shared = []

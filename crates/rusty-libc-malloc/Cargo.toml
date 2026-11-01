@@ -7,8 +7,14 @@ license.workspace = true
 [dependencies]
 rusty-libc-core = { path = "../rusty-libc-core" }
 rusty-libc-mem = { path = "../rusty-libc-mem" }
+# the processor count of the arena limit (cpus::online, shared with get_nprocs and the Rust face)
 rusty-libc-rs-core = { path = "../rusty-libc-rs-core" }
 
+[dev-dependencies]
+libc = "0.2"
+
 [features]
+# Export the C symbols (malloc, free, ...). Off for host tests so they never replace the host allocator.
 export = []
+# Use mmap instead of brk for the heap (for host tests that run next to glibc, which also uses brk).
 no-brk = []

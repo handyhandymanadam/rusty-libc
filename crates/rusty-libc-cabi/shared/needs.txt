@@ -1,3 +1,8 @@
+# Version needs of our libraries: which version of which library each of them asks for, as `ldd -v` lists them for glibc 2.43's own
+# libraries (copied from `readelf -V` of Fedora 44's glibc-2.43-9: the lines of each library's "Version needs" section, in glibc's order).
+# tools/build-shared.sh adds the same entries to libc.so.6 and to the stubs (libm.so.6 ...) by referencing one symbol of that version
+# (--undefined=SYM) and, for the two GLIBC_ABI_DT_* markers, by linking with -z pack-relative-relocs / -z mark-plt.
+# Format: LIBRARY NEEDED-LIBRARY VERSION
 libc.so.6 ld-linux-x86-64.so.2 GLIBC_2.2.5
 libc.so.6 ld-linux-x86-64.so.2 GLIBC_2.3
 libc.so.6 ld-linux-x86-64.so.2 GLIBC_2.35

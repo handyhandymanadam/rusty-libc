@@ -1,3 +1,15 @@
+//! The old resolver host lookups of glibc's libresolv (compat symbols up to GLIBC_2.25): `res_gethostbyname`,
+//! `res_gethostbyname2`, `res_gethostbyaddr` (a DNS lookup, answer parsed into a static `struct hostent`) and the
+//! `/etc/hosts` readers `_sethtent`, `_gethtent`, `_gethtbyname`, `_gethtbyname2`, `_gethtbyaddr` they fall back to when the
+//! name server refuses connections. Written from reading glibc 2.43's resolv/compat-gethnamaddr.c (BSD / ISC licences;
+//! derived, not copied: the answer parser keeps its bounds checks and its quirks, because its results are what old
+//! programs got). Everything returns pointers into static storage, as in glibc (not thread safe).
+//!
+//! U2 (BRIEF-UNSAFE.md): the static storage is one `SyncCell<Compat>` taken once per exported function under glibc's
+//! MT-Unsafe contract, and the parser works on slices and offsets into it; the pointers the C caller gets are made from
+//! those offsets. A name or address the caller passes that lies in that storage (from an earlier result, as old programs
+//! pass) is copied before the storage is written: such a lookup sees it as it was at the call (glibc reads the overwritten
+//! bytes). The unused IPv4-mapped (`RES_USE_INET6`) paths are gone: `use_inet6` is always false, as in glibc 2.43.
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::resolv::{ResState, dname_ok, hostname_ok, nquery, with_this_state};
 use crate::strerr::set_h_errno;
@@ -23,6 +35,9 @@ const HFIXEDSZ: usize = 12;
 const QFIXEDSZ: usize = 4;
 const ECONNREFUSED: c_int = 111;
 
+/// The static storage the functions return pointers into (glibc's `host`, `host_aliases`, `h_addr_ptrs`, `hostbuf`,
+/// `host_addr`), the `/etc/hosts` reader's buffer, and where `_gethtent` left the names of its entry. All zero at start, so
+/// it costs nothing in the file (.bss).
 struct Compat {
     host: hostent,
     aliases: [*mut c_char; MAXALIASES],
@@ -33,6 +48,7 @@ struct Compat {
     file_pos: usize,
     file_len: usize,
     stayopen: c_int,
+    /// Offset in `hostbuf` of the last `_gethtent` entry's name, and of its aliases.
     ent_name: usize,
     ent_aliases: [usize; MAXALIASES],
     ent_naliases: usize,
@@ -40,6 +56,9 @@ struct Compat {
 
 const STATE_SIZE: usize = core::mem::size_of::<Compat>();
 
+/// Rule: glibc's contract for these functions (MT-Unsafe race:hostbyname/hostbyaddr/hostent): the program does not run two
+/// of them at once nor one from a signal handler. Each exported function takes the state once (`with_state`); the functions
+/// it calls work on that `&mut Compat` and never take it again.
 static STATE: SyncCell<Compat> = SyncCell::new(Compat {
     host: hostent { h_name: core::ptr::null_mut(), h_aliases: core::ptr::null_mut(), h_addrtype: 0, h_length: 0, h_addr_list: core::ptr::null_mut() },
     aliases: [core::ptr::null_mut(); MAXALIASES],
@@ -55,13 +74,20 @@ static STATE: SyncCell<Compat> = SyncCell::new(Compat {
     ent_naliases: 0,
 });
 
+/// The descriptor of `/etc/hosts` (-1: closed); apart from `STATE` so that stays all zero.
 static HOSTF: AtomicI32 = AtomicI32::new(-1);
 
+/// Run `f` on the static storage.
+///
+/// # Safety
+/// `STATE`'s rule: no other of these functions runs at the same time, and `f` does not take the state again.
 unsafe fn with_state<R>(f: impl FnOnce(&mut Compat) -> R) -> R {
+    // SAFETY: the caller's contract is the cell's rule.
     unsafe { STATE.with_unsync(f) }
 }
 
 impl Compat {
+    /// The C pointer to byte `off` of `hostbuf`.
     fn buf_ptr(&mut self, off: usize) -> *mut c_char {
         self.hostbuf.as_mut_ptr().wrapping_add(off).cast::<c_char>()
     }
@@ -70,6 +96,7 @@ impl Compat {
         &raw mut self.host
     }
 
+    /// `h_addr_list` = { `host_addr`, NULL }.
     fn single_addr(&mut self) {
         self.addr_ptrs[0] = self.host_addr.as_mut_ptr().cast::<c_char>();
         self.addr_ptrs[1] = core::ptr::null_mut();
@@ -77,10 +104,12 @@ impl Compat {
     }
 }
 
+/// The text of the NUL-terminated string at the start of `b` (all of `b` if it has no NUL).
 fn text(b: &[u8]) -> &[u8] {
     &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
 }
 
+/// `s`, or a copy of it in `local` when it lies in the static storage (it is read as it was at the call).
 fn detach<'a>(s: &'a [u8], local: &'a mut [u8; STATE_SIZE]) -> &'a [u8] {
     let a = STATE.as_ptr() as usize;
     let p = s.as_ptr() as usize;
@@ -93,16 +122,26 @@ fn detach<'a>(s: &'a [u8], local: &'a mut [u8; STATE_SIZE]) -> &'a [u8] {
     }
 }
 
+/// Run `f` on the static storage with the caller's input: the C string at `p` (`len` None) or the `len` bytes at `p`, copied
+/// first when it lies in the storage itself (see `detach`).
+///
+/// # Safety
+/// `p` is a C string (or has `len` readable bytes); `STATE`'s rule.
 unsafe fn with_input<R>(p: *const u8, len: Option<usize>, f: impl FnOnce(&mut Compat, &[u8]) -> R) -> R {
     let mut local = [0u8; STATE_SIZE];
     let s = match len {
+        // SAFETY: the caller's contract.
         None => unsafe { ffi::cstr_bytes(p) },
+        // SAFETY: the caller's contract.
         Some(n) => unsafe { ffi::bytes(p, n) },
     };
     let input = detach(s, &mut local);
+    // SAFETY: the caller's contract (STATE's rule).
     unsafe { with_state(|st| f(st, input)) }
 }
 
+/// glibc 2.43's `res_use_inet6` is a legacy function that always says no (resolv/resolv-internal.h): the IPv4-mapped
+/// results of the old `RES_USE_INET6` option are gone from the compat code too.
 fn use_inet6() -> bool {
     false
 }
@@ -111,6 +150,8 @@ fn herr(v: c_int) {
     set_h_errno(v);
 }
 
+/// Sort the first `offs.len()` addresses (offsets in `hostbuf`, 4 bytes each) by the state's sort list, as glibc's
+/// `addrsort` does (an insertion sort that keeps the order of equals).
 fn addrsort(hostbuf: &[u8], offs: &mut [usize], st: &ResState) {
     let nsort = (st.bits >> 4) & 0xf;
     let num = offs.len();
@@ -154,12 +195,15 @@ fn be16(b: &[u8], i: usize) -> c_int {
     u16::from_be_bytes([b[i], b[i + 1]]) as c_int
 }
 
+/// `dn_expand(answer, eom, answer + cp, hostbuf + bp, buflen)`.
 fn expand_at(st: &mut Compat, m: &[u8], cp: usize, bp: usize, buflen: c_int) -> c_int {
     let start = bp.min(HOSTBUF);
     let len = (buflen.max(0) as usize).min(HOSTBUF - start);
     crate::resolv::expand(m, Some(cp), &mut st.hostbuf[start..start + len])
 }
 
+/// The answer parser of the old resolver: fills the static host entry from a response to a `T_A`, `T_AAAA` or `T_PTR` query
+/// (`full` is the receive buffer, `anslen` the bytes of the answer in it). False with h_errno set when nothing usable came.
 fn getanswer(st: &mut Compat, rs: &ResState, full: &[u8; 4096], anslen: usize, qname: &[u8], qtype: c_int) -> bool {
     st.host.h_name = core::ptr::null_mut();
     let m = &full[..anslen];
@@ -169,6 +213,7 @@ fn getanswer(st: &mut Compat, rs: &ResState, full: &[u8; 4096], anslen: usize, q
         T_PTR => dname_ok,
         _ => return false,
     };
+    // (glibc reads the counts before it checks the length: they come from the receive buffer)
     let ancount_hdr = be16(full, 6);
     let qdcount = be16(full, 4);
     let mut bp = 0usize;
@@ -202,6 +247,7 @@ fn getanswer(st: &mut Compat, rs: &ResState, full: &[u8; 4096], anslen: usize, q
         return false;
     }
     bounded_incr!(n as usize + QFIXEDSZ);
+    // the name the answers are about: None for the caller's `qname`, else an offset in hostbuf
     let mut hname: Option<usize> = None;
     let mut qname_at: Option<usize> = None;
     if qtype == T_A || qtype == T_AAAA {
@@ -369,6 +415,7 @@ fn getanswer(st: &mut Compat, rs: &ResState, full: &[u8; 4096], anslen: usize, q
                     bp += nn as usize;
                     buflen -= nn;
                 }
+                // glibc aligns the address on its absolute address (and always moves at least one byte)
                 let pad = 4 - ((st.hostbuf.as_ptr() as usize).wrapping_add(bp) % 4);
                 buflen -= pad as c_int;
                 bp += pad;
@@ -393,6 +440,7 @@ fn getanswer(st: &mut Compat, rs: &ResState, full: &[u8; 4096], anslen: usize, q
                 }
             }
             _ => {
+                // glibc aborts: the type was checked against qtype above
                 return false;
             }
         }
@@ -434,9 +482,11 @@ fn getanswer(st: &mut Compat, rs: &ResState, full: &[u8; 4096], anslen: usize, q
     false
 }
 
+/// The host entry of a numeric name: the name (strncpy'd to MAXDNAME bytes) and `host_addr`.
 fn fill_literal(st: &mut Compat, name: &[u8]) {
     let n = name.len().min(MAXDNAME);
     st.hostbuf[..n].copy_from_slice(&name[..n]);
+    // strncpy zero fills the rest up to MAXDNAME
     st.hostbuf[n..=MAXDNAME].fill(0);
     st.host.h_name = st.buf_ptr(0);
     st.aliases[0] = core::ptr::null_mut();
@@ -444,6 +494,7 @@ fn fill_literal(st: &mut Compat, name: &[u8]) {
     st.single_addr();
 }
 
+/// `inet_pton(af, name, host_addr)` (af is AF_INET or AF_INET6 here).
 fn pton_into(af: c_int, name: &[u8], dst: &mut [u8; 16]) -> c_int {
     if af == AF_INET {
         match crate::inet::parse_ipv4(name) {
@@ -540,11 +591,15 @@ fn lookup_name(st: &mut Compat, rs: &mut ResState, name: &[u8], af: c_int, ty: c
         }
         return core::ptr::null_mut();
     }
+    // (a longer TCP answer was cut to the buffer; its whole length is what res_nsearch returned)
     if getanswer(st, rs, &buf, (n as usize).min(4096), name, ty) { st.host_ptr() } else { core::ptr::null_mut() }
 }
 
+/// # Safety
+/// `name` is a C string. The result points to static storage.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __rl_res_gethostbyname(name: *const c_char) -> *mut hostent {
+    // SAFETY: glibc's contract: a C string; STATE's rule (glibc's MT-Unsafe contract).
     unsafe { with_input(name.cast::<u8>(), None, res_gethostbyname) }
 }
 
@@ -558,11 +613,16 @@ fn res_gethostbyname(st: &mut Compat, name: &[u8]) -> *mut hostent {
     res_gethostbyname2_context(st, name, AF_INET)
 }
 
+/// # Safety
+/// `name` is a C string. The result points to static storage.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __rl_res_gethostbyname2(name: *const c_char, _af: c_int) -> *mut hostent {
+    // glibc 2.43 passes AF_INET whatever the caller asked for (an upstream quirk of the compat copy)
+    // SAFETY: glibc's contract: a C string; STATE's rule (glibc's MT-Unsafe contract).
     unsafe { with_input(name.cast::<u8>(), None, |st, name| res_gethostbyname2_context(st, name, AF_INET)) }
 }
 
+/// `res_gethostbyaddr` of the address bytes `addr` (4 for AF_INET, 16 for AF_INET6, already checked).
 fn gethostbyaddr(st: &mut Compat, addr: &[u8], af: c_int) -> *mut hostent {
     let len = addr.len();
     let mut q = crate::util::Buf::<80>::new();
@@ -602,15 +662,20 @@ fn gethostbyaddr(st: &mut Compat, addr: &[u8], af: c_int) -> *mut hostent {
     st.host_ptr()
 }
 
+/// # Safety
+/// `addr` has `len` readable bytes. The result points to static storage.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __rl_res_gethostbyaddr(addr: *const c_void, len: u32, af: c_int) -> *mut hostent {
     let uaddr = addr as *const u8;
     let mut af = af;
     let mut len = len;
+    // the address bytes, read before the static storage is written (they may lie in it)
     let mut a = [0u8; 16];
     const MAPPED: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
     const TUNNELLED: [u8; 12] = [0; 12];
+    // only an address of a supported family and size is read (glibc refuses the others first)
     let n = if (af == AF_INET && len == 4) || (af == AF_INET6 && len == 16) { len as usize } else { 0 };
+    // SAFETY: the caller's contract: `addr` has `len` readable bytes.
     a[..n].copy_from_slice(unsafe { ffi::bytes(uaddr, n) });
     if af == AF_INET6 && len == 16 && (a[..12] == MAPPED || a[..12] == TUNNELLED) {
         a.copy_within(12..16, 0);
@@ -631,10 +696,14 @@ pub unsafe extern "C" fn __rl_res_gethostbyaddr(addr: *const c_void, len: u32, a
         herr(NETDB_INTERNAL);
         return core::ptr::null_mut();
     }
+    // SAFETY: STATE's rule (glibc's MT-Unsafe contract).
     unsafe { with_state(|st| gethostbyaddr(st, &a[..len as usize], af)) }
 }
 
+// ---------------------------------------------------------------- /etc/hosts readers
+
 fn hostf_open(st: &mut Compat) -> bool {
+    // SAFETY: a NUL-terminated literal path.
     let Ok(fd) = (unsafe { rusty_libc_core::unistd::open(c"/etc/hosts".as_ptr(), 0o2000000, 0) }) else { return false };
     HOSTF.store(fd, Ordering::Relaxed);
     st.file_pos = 0;
@@ -654,8 +723,13 @@ fn sethtent(st: &mut Compat, f: c_int) {
     st.stayopen = f;
 }
 
+/// `_sethtent`: open `/etc/hosts` or rewind it; `f` keeps it open between lookups.
+///
+/// # Safety
+/// Not thread safe, as in glibc.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __rl_sethtent(f: c_int) {
+    // SAFETY: STATE's rule (glibc's MT-Unsafe contract).
     unsafe { with_state(|st| sethtent(st, f)) }
 }
 
@@ -667,6 +741,7 @@ fn endhtent(st: &mut Compat) {
     }
 }
 
+/// `fgets(hostbuf, 8192, hostf)`: up to 8191 bytes of the next line, NUL terminated; None at end of file.
 fn fgets_hosts(st: &mut Compat) -> Option<usize> {
     let fd = HOSTF.load(Ordering::Relaxed);
     let mut n = 0usize;
@@ -695,10 +770,12 @@ fn fgets_hosts(st: &mut Compat) -> Option<usize> {
     Some(n)
 }
 
+/// `strpbrk` on the NUL-terminated string at `from` in `b`: the index (in `b`) of the first byte of `set`.
 fn strpbrk(b: &[u8], from: usize, set: &[u8]) -> Option<usize> {
     text(&b[from..]).iter().position(|c| set.contains(c)).map(|i| from + i)
 }
 
+/// `_gethtent` on the state: the next entry of `/etc/hosts` into the static host entry (and `ent_*`); false at the end.
 fn gethtent(st: &mut Compat) -> bool {
     if HOSTF.load(Ordering::Relaxed) < 0 && !hostf_open(st) {
         herr(NETDB_INTERNAL);
@@ -772,8 +849,13 @@ fn gethtent(st: &mut Compat) -> bool {
     }
 }
 
+/// `_gethtent`: the next entry of `/etc/hosts`.
+///
+/// # Safety
+/// Not thread safe; the result points to static storage.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __rl_gethtent() -> *mut hostent {
+    // SAFETY: STATE's rule (glibc's MT-Unsafe contract).
     unsafe { with_state(|st| if gethtent(st) { st.host_ptr() } else { core::ptr::null_mut() }) }
 }
 
@@ -799,13 +881,19 @@ fn gethtbyname2(st: &mut Compat, name: &[u8], af: c_int) -> *mut hostent {
     if found { st.host_ptr() } else { core::ptr::null_mut() }
 }
 
+/// # Safety
+/// `name` is a C string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __rl_gethtbyname2(name: *const c_char, af: c_int) -> *mut hostent {
+    // SAFETY: glibc's contract: a C string; STATE's rule (glibc's MT-Unsafe contract).
     unsafe { with_input(name.cast::<u8>(), None, |st, name| gethtbyname2(st, name, af)) }
 }
 
+/// # Safety
+/// `name` is a C string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __rl_gethtbyname(name: *const c_char) -> *mut hostent {
+    // SAFETY: glibc's contract: a C string; STATE's rule (glibc's MT-Unsafe contract).
     unsafe { with_input(name.cast::<u8>(), None, gethtbyname) }
 }
 
@@ -819,6 +907,7 @@ fn gethtbyname(st: &mut Compat, name: &[u8]) -> *mut hostent {
     gethtbyname2(st, name, AF_INET)
 }
 
+/// `_gethtbyaddr` of the address bytes `addr` (an address longer than `host_addr`'s 16 bytes never matches).
 fn gethtbyaddr(st: &mut Compat, addr: &[u8], af: c_int) -> *mut hostent {
     sethtent(st, 0);
     let found = loop {
@@ -833,8 +922,62 @@ fn gethtbyaddr(st: &mut Compat, addr: &[u8], af: c_int) -> *mut hostent {
     if found { st.host_ptr() } else { core::ptr::null_mut() }
 }
 
+/// # Safety
+/// `addr` has `len` readable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __rl_gethtbyaddr(addr: *const c_char, len: usize, af: c_int) -> *mut hostent {
+    // SAFETY: the caller's contract: `len` readable bytes; STATE's rule (glibc's MT-Unsafe contract).
     unsafe { with_input(addr.cast::<u8>(), Some(len), |st, addr| gethtbyaddr(st, addr, af)) }
 }
 
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
+    use super::*;
+    use core::ffi::CStr;
+
+    unsafe fn names(hp: *mut hostent) -> (Vec<u8>, Vec<Vec<u8>>) {
+        unsafe {
+            let name = CStr::from_ptr((*hp).h_name).to_bytes().to_vec();
+            let mut al = Vec::new();
+            let mut p = (*hp).h_aliases;
+            while !(*p).is_null() {
+                al.push(CStr::from_ptr(*p).to_bytes().to_vec());
+                p = p.add(1);
+            }
+            (name, al)
+        }
+    }
+
+    #[test]
+    fn literal_and_hosts_file() {
+        let _g = crate::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let hp = __rl_res_gethostbyname(c"127.0.0.1".as_ptr());
+            assert!(!hp.is_null());
+            assert_eq!((*hp).h_length, 4);
+            assert_eq!(names(hp).0, b"127.0.0.1");
+            assert_eq!(core::slice::from_raw_parts(*(*hp).h_addr_list as *const u8, 4), [127, 0, 0, 1]);
+            assert!((*(*hp).h_addr_list.add(1)).is_null());
+            // the name of the previous result as the argument (it lies in the static storage)
+            let again = __rl_res_gethostbyname((*hp).h_name);
+            assert_eq!(names(again).0, b"127.0.0.1");
+
+            let hp = __rl_gethtbyname2(c"localhost".as_ptr(), AF_INET);
+            if !hp.is_null() {
+                let (n, al) = names(hp);
+                assert!(n.eq_ignore_ascii_case(b"localhost") || al.iter().any(|a| a.eq_ignore_ascii_case(b"localhost")));
+                let a = *(*hp).h_addr_list as *const u8;
+                let hp2 = __rl_gethtbyaddr(a as *const c_char, 4, AF_INET);
+                assert!(!hp2.is_null());
+            }
+            __rl_sethtent(1);
+            let mut n = 0;
+            while !__rl_gethtent().is_null() {
+                n += 1;
+            }
+            assert!(n > 0 || HOSTF.load(Ordering::Relaxed) >= 0);
+            __rl_sethtent(0);
+        }
+    }
+}

@@ -1,3 +1,10 @@
+//! The XPG message catalog functions `catopen`, `catgets`, `catclose`.
+//!
+//! Catalogs are the binary files `gencat` writes (layout of glibc's `catgets/catgetsinfo.h` and
+//! `open_catalog.c`, LGPL, which also give the `NLSPATH` rules implemented here): a header
+//! (magic 0x960408de, plane size, plane depth), two copies of a table of (set, message, string
+//! offset) triples hashed into `plane_depth` planes of `plane_size` entries (one copy per byte
+//! order), then the strings.
 use crate::find;
 use crate::mem::{self, rd32};
 use core::ffi::{c_char, c_int, c_void};
@@ -12,8 +19,10 @@ const EBADF: i32 = 9;
 const EINVAL: i32 = 22;
 const DEFAULT_NLSPATH: &[u8] = b"/usr/share/locale/%L/%N:/usr/share/locale/%L/LC_MESSAGES/%N:/usr/share/locale/%l/%N:/usr/share/locale/%l/LC_MESSAGES/%N:";
 
+/// glibc's `struct catalog_info` (catgets/catgetsinfo.h), field for field: `gencat` reads one that `__open_catalog` filled.
 #[repr(C)]
 struct Catalog {
+    /// 0 = mmapped, 1 = malloced (glibc's enum; only 0 is produced here)
     status: c_int,
     plane_size: usize,
     plane_depth: usize,
@@ -24,11 +33,16 @@ struct Catalog {
 }
 
 impl Catalog {
+    /// The mapped catalog file.
     fn file(&self) -> &[u8] {
+        // SAFETY: a Catalog is filled by `open_catalog` from a mapping of `file_size` bytes at `file_ptr`, which stays
+        // mapped until `catclose` unmaps it and frees the Catalog itself.
         unsafe { ffi::bytes(self.file_ptr, self.file_size) }
     }
 }
 
+/// Expand one NLSPATH element into `buf` (the % substitutions of XPG). Returns the length, or
+/// None if the element has an unknown variable (glibc ignores such an element).
 fn expand(elem: &[u8], cat_name: &[u8], env_var: &[u8], buf: &mut [u8; 1024]) -> Option<usize> {
     let mut n = 0;
     let mut put = |s: &[u8], n: &mut usize| -> bool {
@@ -40,6 +54,7 @@ fn expand(elem: &[u8], cat_name: &[u8], env_var: &[u8], buf: &mut [u8; 1024]) ->
         true
     };
     if elem.is_empty() {
+        // a leading or doubled colon counts as %N
         return if put(cat_name, &mut n) { Some(n) } else { None };
     }
     let mut i = 0;
@@ -58,6 +73,7 @@ fn expand(elem: &[u8], cat_name: &[u8], env_var: &[u8], buf: &mut [u8; 1024]) ->
             b'N' => put(cat_name, &mut n),
             b'L' => put(env_var, &mut n),
             b'l' => {
+                // the language: up to `_` or `.` (at least one character, like glibc's do-while)
                 let mut e = 1.min(env_var.len());
                 while e < env_var.len() && env_var[e] != b'_' && env_var[e] != b'.' {
                     e += 1;
@@ -97,12 +113,14 @@ fn expand(elem: &[u8], cat_name: &[u8], env_var: &[u8], buf: &mut [u8; 1024]) ->
     Some(n)
 }
 
+/// Map a file read-only; None if it cannot be opened or is not a regular file big enough for a header.
 fn open_file(path: &[u8]) -> Option<(*const u8, usize)> {
     const S_IFMT: u32 = 0o170000;
     const S_IFREG: u32 = 0o100000;
     let fd = match mem::open_ro(path) {
         Ok(fd) => fd,
         Err(e) => {
+            // gencat tells "no such catalog" (fine) from a real error by errno
             errno::set(e.0);
             return None;
         }
@@ -119,6 +137,8 @@ fn open_file(path: &[u8]) -> Option<(*const u8, usize)> {
     r
 }
 
+/// glibc's `__open_catalog`: find the catalog (a name with a slash is a path; otherwise NLSPATH
+/// is searched) and validate it.
 fn open_catalog(cat_name: &[u8], nlspath: Option<&[u8]>, env_var: &[u8]) -> Option<Catalog> {
     let mut found: Option<(*const u8, usize)> = None;
     let mut name0 = [0u8; 1100];
@@ -142,10 +162,12 @@ fn open_catalog(cat_name: &[u8], nlspath: Option<&[u8]>, env_var: &[u8]) -> Opti
                     break;
                 }
             }
+            // an unknown variable ends the element's processing at the next colon
             run = if e < run.len() { &run[e + 1..] } else { &run[e..] };
         }
     }
     let (ptr, size) = found?;
+    // SAFETY: a fresh read-only mapping of `size` bytes, alive until catclose (or for good when the catalog is rejected).
     let file = unsafe { ffi::bytes(ptr, size) };
     if rd32(file, 0) != CATGETS_MAGIC && rd32(file, 0) != CATGETS_MAGIC.swap_bytes() {
         return None;
@@ -155,6 +177,7 @@ fn open_catalog(cat_name: &[u8], nlspath: Option<&[u8]>, env_var: &[u8]) -> Opti
     let plane_size = sw(rd32(file, 4)) as usize;
     let plane_depth = sw(rd32(file, 8)) as usize;
     let tab_size = plane_size.checked_mul(plane_depth)?.checked_mul(3)?;
+    // the table starts after the 12 byte header; the big-endian copy follows the little-endian one
     let tables_end = 12usize.checked_add(tab_size.checked_mul(8)?)?;
     if tables_end > size {
         return None;
@@ -168,11 +191,13 @@ fn open_catalog(cat_name: &[u8], nlspath: Option<&[u8]>, env_var: &[u8]) -> Opti
         }
         cnt += 3;
     }
+    // is the file large enough to hold the last string? (glibc's test, including its precedence)
     if size <= 12 + 2 * tab_size + max_offset {
         return None;
     }
     let mut lastp = max_offset;
     let mut left = size.wrapping_sub(12).wrapping_add(2 * tab_size).wrapping_add(max_offset);
+    // (strings + lastp is inside the file; the scan stops at the end)
     while file.get(tables_end + lastp).is_some_and(|&b| b != 0) {
         left = left.wrapping_sub(1);
         if left == 0 || tables_end + lastp + 1 >= size {
@@ -186,13 +211,23 @@ fn open_catalog(cat_name: &[u8], nlspath: Option<&[u8]>, env_var: &[u8]) -> Opti
     Some(Catalog { status: 0, file_ptr: ptr, file_size: size, plane_size, plane_depth, name_ptr: ptr.wrapping_add(12).cast(), strings: ptr.wrapping_add(tables_end) })
 }
 
+/// glibc's private `int __open_catalog(const char *cat_name, const char *nlspath, const char *env_var, __nl_catd catalog)`
+/// (`gencat` calls it to read the catalog it is about to update, with a NULL `nlspath`): fills `*catalog` and returns 0, or
+/// returns -1 with `errno` set (ENOENT when there is no such file).
+///
+/// # Safety
+/// The strings are C strings (`nlspath` and `env_var` may be NULL), `catalog` is writable.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __open_catalog(cat_name: *const c_char, nlspath: *const c_char, env_var: *const c_char, catalog: *mut c_void) -> c_int {
+    // SAFETY: a C string (the caller's contract).
     let name = unsafe { ffi::cstr_bytes_scalar(cat_name) };
+    // SAFETY: NULL or a C string.
     let nls = unsafe { ffi::cstr(nlspath) }.map(|c| c.to_bytes());
+    // SAFETY: as above.
     let env: &[u8] = unsafe { ffi::cstr(env_var) }.map_or(b"", |c| c.to_bytes());
     match open_catalog(name, nls, env) {
         Some(c) => {
+            // SAFETY: `catalog` points to a writable `struct catalog_info` (the caller's contract).
             unsafe { catalog.cast::<Catalog>().write(c) };
             0
         }
@@ -200,12 +235,18 @@ pub unsafe extern "C" fn __open_catalog(cat_name: *const c_char, nlspath: *const
     }
 }
 
+/// `catopen(name, flag)`: open a message catalog; (nl_catd) -1 on failure.
+///
+/// # Safety
+/// `cat_name` is a valid C string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn catopen(cat_name: *const c_char, flag: c_int) -> *mut c_void {
+    // SAFETY: a C string (the caller's contract).
     let name = unsafe { ffi::cstr_bytes_scalar(cat_name) };
     catopen_bytes(name, flag)
 }
 
+/// `catopen` on the name's bytes: the catalog handle or (nl_catd) -1.
 pub fn catopen_bytes(name: &[u8], flag: c_int) -> *mut c_void {
     let mut env_var: &[u8] = b"C";
     let mut nlspath_buf = [0u8; 2048];
@@ -233,6 +274,7 @@ pub fn catopen_bytes(name: &[u8], flag: c_int) -> *mut c_void {
             if p.is_null() {
                 return usize::MAX as *mut c_void;
             }
+            // SAFETY: a fresh block big enough for a Catalog, 16-aligned (freed by catclose).
             unsafe { p.write(c) };
             p.cast()
         }
@@ -240,12 +282,17 @@ pub fn catopen_bytes(name: &[u8], flag: c_int) -> *mut c_void {
     }
 }
 
+/// `catgets(catalog, set, message, string)`: the message, or `string` if there is none.
+///
+/// # Safety
+/// `catalog` is from `catopen`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn catgets(catalog: *mut c_void, set: c_int, message: c_int, string: *const c_char) -> *mut c_char {
     let set = set.wrapping_add(1);
     if catalog as usize == usize::MAX || set <= 0 || message < 0 {
         return string as *mut c_char;
     }
+    // SAFETY: a catalog from catopen (the caller's contract), alive until catclose.
     let cat = unsafe { &*(catalog as *const Catalog) };
     match lookup(cat, set as u32, message as u32) {
         Some(p) => p.cast_mut().cast(),
@@ -256,6 +303,7 @@ pub unsafe extern "C" fn catgets(catalog: *mut c_void, set: c_int, message: c_in
     }
 }
 
+/// The message (`set`, `message`) of the catalog: a pointer into its strings, or None.
 fn lookup(cat: &Catalog, set: u32, message_u: u32) -> Option<*const u8> {
     if cat.plane_size == 0 {
         return None;
@@ -280,15 +328,22 @@ fn lookup(cat: &Catalog, set: u32, message_u: u32) -> Option<*const u8> {
     }
 }
 
+/// `catclose(catalog)`.
+///
+/// # Safety
+/// `catalog` is from `catopen` and not used afterwards.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn catclose(catalog: *mut c_void) -> c_int {
     if catalog as usize == usize::MAX {
         errno::set(EBADF);
         return -1;
     }
+    // SAFETY: a catalog from catopen (the caller's contract).
     let cat = unsafe { &*(catalog as *const Catalog) };
     let (fp, fsize) = (cat.file_ptr, cat.file_size);
+    // SAFETY: the catalog's own mapping, not used again (the catalog is freed next).
     let _ = unsafe { syscall::syscall2(syscall::SYS_MUNMAP, fp as usize, fsize) };
+    // SAFETY: the Catalog block from catopen's malloc, not used again (the caller's contract).
     unsafe { mem::free(catalog) };
     0
 }

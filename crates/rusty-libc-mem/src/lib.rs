@@ -1,4 +1,26 @@
-#![no_std]
+//! string.h and strings.h: memory and string functions, C ABI, raw pointers.
+//! Written from the C standard, POSIX and observed glibc behaviour (see SYMBOLS.csv).
+//! `no_builtins` stops the compiler turning these loops back into calls to themselves.
+//!
+//! Unsafe code (BRIEF-UNSAFE.md U2; U3 documents it further). Every unsafe block holds one unsafe operation and says why
+//! it holds (denied below). What stays unsafe, and why:
+//! - The exported C functions take raw pointers (C ABI); most hot ones are naked functions whose AVX2 fast path is
+//!   hand-written assembly (`simd::avx2_front!`), with the dispatch slots (`simd::slot_table!`) and resolvers.
+//! - The vector kernels (`mem`, `str`, `search`): unaligned and aligned loads and stores through the caller's pointers.
+//!   String scans read whole vectors past the terminator but never past its page (the page rule in `str`); copies and
+//!   fills access whole vectors at offsets inside the buffer (overlapping head and tail stores). Safe slices would cost
+//!   bounds checks and, worse, change the code layout these functions were tuned for (a memcmp written over arrays took
+//!   1.13x the time for small sizes with the same instructions), so the kernels keep their statement order and their
+//!   machine code.
+//! - `simd::Vector`: a vector value proves its instruction set (token pattern), so compare, mask and the other value
+//!   operations are safe; the constructors, loads and stores stay unsafe.
+//! - CPU detection (`xgetbv`), the large-copy streaming stores, `explicit_bzero`'s compiler barrier.
+//!
+//! Safe Rust API on slices and C strings: `swab_bytes`, `memfrob_bytes`, `strverscmp_cstr`.
+// `#[rustc_align(64)]` on the hot entry points: a naked function is otherwise placed at 4-byte alignment (the
+// -align-all-functions option does not reach it), and an entry in the last bytes of a 64-byte line costs a cycle in small calls.
+#![feature(fn_align)]
+#![cfg_attr(not(test), no_std)]
 #![no_builtins]
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 
@@ -32,6 +54,7 @@ simd::slot_table! {
     (STRRCHR, resolve_strrchr, crate::str::strrchr_sse2, crate::str::strrchr_avx2),
     (STRSPN, resolve_strspn, crate::str::strspn_sse2, crate::str::strspn_avx2),
     (STRCSPN, resolve_strcspn, crate::str::strcspn_sse2, crate::str::strcspn_avx2),
+    (STRPBRK, resolve_strpbrk, crate::str::strpbrk_sse2, crate::str::strpbrk_avx2),
     (STRSTR, resolve_strstr, crate::search::strstr_sse2, crate::search::strstr_avx2),
     (MEMMEM, resolve_memmem, crate::search::memmem_sse2, crate::search::memmem_avx2),
 }
@@ -41,9 +64,18 @@ pub use search::*;
 pub use slices::*;
 pub use str::*;
 
+#[cfg(test)]
+mod tests;
+
+/// glibc's `__`-prefixed strong aliases (`__strcoll_l` for `strcoll_l`, ...) that libstdc++ and other compiled objects
+/// import: a function that is one tail jump to the real one, so any signature (also an x87 result) passes through.
+/// Place it next to the real function; it is exported with the crate's `export` feature like the real one. Every function
+/// is its own object in the static library, so a program pulls in only the aliases it uses.
 #[macro_export]
 macro_rules! tail_alias {
     ($alias:ident => $real:path) => {
+        /// # Safety
+        /// As the function it jumps to.
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         #[unsafe(naked)]
         pub unsafe extern "C" fn $alias() {

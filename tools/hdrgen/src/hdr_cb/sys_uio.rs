@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("UIO_MAXIOV", V::Dec(1024)),
         ("RWF_HIPRI", V::Txt("0x00000001")),
@@ -13,6 +14,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("RWF_DONTCACHE", V::Txt("0x00000080")),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Consts(&[
         ("UIO_MAXIOV", V::Dec(1024)),
     ]),

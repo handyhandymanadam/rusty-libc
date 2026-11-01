@@ -9,9 +9,10 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("MB_CUR_MAX", V::Txt("(__ctype_get_mb_cur_max ())")),
     ]),
     Item::Blank,
+    Item::Comment("/* glibc: the wait status macros (WIFEXITED, WEXITSTATUS, ...) come with <stdlib.h> too */"),
     Item::Gate(&[
         Branch { head: "ifdef __USE_MISC", items: &[
-            Item::Include("<sys/types.h>"),
+            Item::Include("<sys/types.h>   /* glibc: u_int8_t.., endian macros (BYTE_ORDER, htobe32, ...), FD_SET, ... come with <stdlib.h> */"),
         ] },
     ], ""),
     Item::Gate(&[
@@ -21,12 +22,14 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ] },
     ], ""),
     Item::Blank,
+    Item::Comment("/* glibc declares alloca here (default and GNU modes) */"),
     Item::Gate(&[
         Branch { head: "ifndef __STRICT_ANSI__", items: &[
             Item::Include("<alloca.h>"),
         ] },
     ], ""),
     Item::Blank,
+    Item::Comment("/* The integer parsers: C23 mode (and only it) also reads a 0b prefix, like glibc's headers choose. */"),
     Item::Gate(&[
         Branch { head: "if __GLIBC_USE (C23_STRTOL)", items: &[
             Item::Raw(Reason::GlibcMacro, r#"# define __RLIBC_C23(n) __asm__("__isoc23_" #n)"#),
@@ -72,6 +75,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
 pub const AFTER_INCLUDES_CHOMP: bool = false;
 
 pub static TRAILER: &[Item] = &[
+    // glibc's bits/stdlib-bsearch.h: with optimisation the search is inlined, so the compiler can inline the comparison
     Item::Gate(&[
         Branch { head: "if defined __OPTIMIZE__ && !defined __OPTIMIZE_SIZE__ && !defined __NO_INLINE__ && defined __extern_inline", items: &[
             Item::Raw(Reason::StaticInline, r#"# ifndef _RLIBC_BSEARCH_INLINE

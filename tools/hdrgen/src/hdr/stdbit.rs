@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "stdbit.h",
     items: &[
+        Item::Comment(r#"/* stdbit.h (C23 bit utilities) for the Rust libc: functions per unsigned type plus the type-generic
+   macros (written by hand, generated once by a script from the family list). */"#),
         Item::Guard { name: "_RLIBC_STDBIT_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),
@@ -106,7 +108,7 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_leading_zeros)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_leading_zeros(x) (__builtin_stdc_leading_zeros (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_leading_zeros(x) (__builtin_stdc_leading_zeros (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_leading_zeros(x) _Generic ((x), unsigned char: stdc_leading_zeros_uc, unsigned short: stdc_leading_zeros_us, unsigned int: stdc_leading_zeros_ui, unsigned long: stdc_leading_zeros_ul, unsigned long long: stdc_leading_zeros_ull) (x)"),
@@ -114,7 +116,7 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_leading_ones)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_leading_ones(x) (__builtin_stdc_leading_ones (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_leading_ones(x) (__builtin_stdc_leading_ones (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_leading_ones(x) _Generic ((x), unsigned char: stdc_leading_ones_uc, unsigned short: stdc_leading_ones_us, unsigned int: stdc_leading_ones_ui, unsigned long: stdc_leading_ones_ul, unsigned long long: stdc_leading_ones_ull) (x)"),
@@ -122,7 +124,7 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_trailing_zeros)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_trailing_zeros(x) (__builtin_stdc_trailing_zeros (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_trailing_zeros(x) (__builtin_stdc_trailing_zeros (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_trailing_zeros(x) _Generic ((x), unsigned char: stdc_trailing_zeros_uc, unsigned short: stdc_trailing_zeros_us, unsigned int: stdc_trailing_zeros_ui, unsigned long: stdc_trailing_zeros_ul, unsigned long long: stdc_trailing_zeros_ull) (x)"),
@@ -130,7 +132,7 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_trailing_ones)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_trailing_ones(x) (__builtin_stdc_trailing_ones (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_trailing_ones(x) (__builtin_stdc_trailing_ones (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_trailing_ones(x) _Generic ((x), unsigned char: stdc_trailing_ones_uc, unsigned short: stdc_trailing_ones_us, unsigned int: stdc_trailing_ones_ui, unsigned long: stdc_trailing_ones_ul, unsigned long long: stdc_trailing_ones_ull) (x)"),
@@ -138,7 +140,7 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_first_leading_zero)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_first_leading_zero(x) (__builtin_stdc_first_leading_zero (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_first_leading_zero(x) (__builtin_stdc_first_leading_zero (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_first_leading_zero(x) _Generic ((x), unsigned char: stdc_first_leading_zero_uc, unsigned short: stdc_first_leading_zero_us, unsigned int: stdc_first_leading_zero_ui, unsigned long: stdc_first_leading_zero_ul, unsigned long long: stdc_first_leading_zero_ull) (x)"),
@@ -146,7 +148,7 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_first_leading_one)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_first_leading_one(x) (__builtin_stdc_first_leading_one (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_first_leading_one(x) (__builtin_stdc_first_leading_one (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_first_leading_one(x) _Generic ((x), unsigned char: stdc_first_leading_one_uc, unsigned short: stdc_first_leading_one_us, unsigned int: stdc_first_leading_one_ui, unsigned long: stdc_first_leading_one_ul, unsigned long long: stdc_first_leading_one_ull) (x)"),
@@ -154,7 +156,7 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_first_trailing_zero)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_first_trailing_zero(x) (__builtin_stdc_first_trailing_zero (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_first_trailing_zero(x) (__builtin_stdc_first_trailing_zero (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_first_trailing_zero(x) _Generic ((x), unsigned char: stdc_first_trailing_zero_uc, unsigned short: stdc_first_trailing_zero_us, unsigned int: stdc_first_trailing_zero_ui, unsigned long: stdc_first_trailing_zero_ul, unsigned long long: stdc_first_trailing_zero_ull) (x)"),
@@ -162,7 +164,7 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_first_trailing_one)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_first_trailing_one(x) (__builtin_stdc_first_trailing_one (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_first_trailing_one(x) (__builtin_stdc_first_trailing_one (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_first_trailing_one(x) _Generic ((x), unsigned char: stdc_first_trailing_one_uc, unsigned short: stdc_first_trailing_one_us, unsigned int: stdc_first_trailing_one_ui, unsigned long: stdc_first_trailing_one_ul, unsigned long long: stdc_first_trailing_one_ull) (x)"),
@@ -170,7 +172,7 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_count_zeros)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_count_zeros(x) (__builtin_stdc_count_zeros (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_count_zeros(x) (__builtin_stdc_count_zeros (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_count_zeros(x) _Generic ((x), unsigned char: stdc_count_zeros_uc, unsigned short: stdc_count_zeros_us, unsigned int: stdc_count_zeros_ui, unsigned long: stdc_count_zeros_ul, unsigned long long: stdc_count_zeros_ull) (x)"),
@@ -178,7 +180,7 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_count_ones)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_count_ones(x) (__builtin_stdc_count_ones (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_count_ones(x) (__builtin_stdc_count_ones (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_count_ones(x) _Generic ((x), unsigned char: stdc_count_ones_uc, unsigned short: stdc_count_ones_us, unsigned int: stdc_count_ones_ui, unsigned long: stdc_count_ones_ul, unsigned long long: stdc_count_ones_ull) (x)"),
@@ -186,7 +188,7 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_has_single_bit)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_has_single_bit(x) (__builtin_stdc_has_single_bit (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_has_single_bit(x) (__builtin_stdc_has_single_bit (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_has_single_bit(x) _Generic ((x), unsigned char: stdc_has_single_bit_uc, unsigned short: stdc_has_single_bit_us, unsigned int: stdc_has_single_bit_ui, unsigned long: stdc_has_single_bit_ul, unsigned long long: stdc_has_single_bit_ull) (x)"),
@@ -194,7 +196,7 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_bit_width)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_bit_width(x) (__builtin_stdc_bit_width (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_bit_width(x) (__builtin_stdc_bit_width (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_bit_width(x) _Generic ((x), unsigned char: stdc_bit_width_uc, unsigned short: stdc_bit_width_us, unsigned int: stdc_bit_width_ui, unsigned long: stdc_bit_width_ul, unsigned long long: stdc_bit_width_ull) (x)"),
@@ -202,7 +204,7 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_bit_floor)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_bit_floor(x) (__builtin_stdc_bit_floor (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_bit_floor(x) (__builtin_stdc_bit_floor (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_bit_floor(x) _Generic ((x), unsigned char: stdc_bit_floor_uc, unsigned short: stdc_bit_floor_us, unsigned int: stdc_bit_floor_ui, unsigned long: stdc_bit_floor_ul, unsigned long long: stdc_bit_floor_ull) (x)"),
@@ -210,7 +212,7 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "if defined __has_builtin && __has_builtin (__builtin_stdc_bit_ceil)", items: &[
-                    Item::Raw(Reason::StdMacro, "# define stdc_bit_ceil(x) (__builtin_stdc_bit_ceil (x))"),
+                    Item::Raw(Reason::StdMacro, "# define stdc_bit_ceil(x) (__builtin_stdc_bit_ceil (x))   /* any unsigned type, unsigned __int128 and _BitInt included, like glibc with GCC 15 or later */"),
                 ] },
                 Branch { head: "else", items: &[
                     Item::Raw(Reason::Generic, "#define stdc_bit_ceil(x) _Generic ((x), unsigned char: stdc_bit_ceil_uc, unsigned short: stdc_bit_ceil_us, unsigned int: stdc_bit_ceil_ui, unsigned long: stdc_bit_ceil_ul, unsigned long long: stdc_bit_ceil_ull) (x)"),

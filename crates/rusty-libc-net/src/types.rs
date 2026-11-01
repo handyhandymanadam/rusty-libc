@@ -1,3 +1,5 @@
+//! C types and the numeric constants the Rust code needs. Layouts are glibc's x86-64 ABI (checked
+//! against the system headers by tests/c/net_diff.c); the C headers are in include-static/.
 use core::ffi::{c_char, c_int, c_uint, c_void};
 
 pub type socklen_t = u32;
@@ -7,6 +9,7 @@ pub type in_addr_t = u32;
 #[allow(non_camel_case_types)]
 pub type ssize_t = isize;
 
+// ---- address families, socket types, levels, flags (the ones the library itself uses)
 pub const AF_UNSPEC: c_int = 0;
 pub const AF_UNIX: c_int = 1;
 pub const AF_LOCAL: c_int = 1;
@@ -71,6 +74,7 @@ pub const INADDR_NONE: u32 = 0xffff_ffff;
 pub const INET_ADDRSTRLEN: usize = 16;
 pub const INET6_ADDRSTRLEN: usize = 46;
 
+// ---- netdb.h
 pub const AI_PASSIVE: c_int = 1;
 pub const AI_CANONNAME: c_int = 2;
 pub const AI_NUMERICHOST: c_int = 4;
@@ -117,6 +121,7 @@ pub const NO_RECOVERY: c_int = 3;
 pub const NO_DATA: c_int = 4;
 pub const NO_ADDRESS: c_int = 4;
 
+// errno values used here
 pub const EINTR: i32 = 4;
 pub const ENOENT: i32 = 2;
 pub const ESRCH: i32 = 3;
@@ -142,6 +147,7 @@ pub const EPERM: i32 = 1;
 pub const EACCES: i32 = 13;
 pub const EADDRINUSE: i32 = 98;
 
+// ---- structures
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct iovec {
@@ -149,6 +155,7 @@ pub struct iovec {
     pub iov_len: usize,
 }
 
+/// `struct sockaddr`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct sockaddr {
@@ -156,18 +163,21 @@ pub struct sockaddr {
     pub sa_data: [u8; 14],
 }
 
+/// `struct in_addr` (`s_addr` in network byte order).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct in_addr {
     pub s_addr: u32,
 }
 
+/// `struct in6_addr`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct in6_addr {
     pub s6_addr: [u8; 16],
 }
 
+/// `struct sockaddr_in`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct sockaddr_in {
@@ -177,6 +187,7 @@ pub struct sockaddr_in {
     pub sin_zero: [u8; 8],
 }
 
+/// `struct sockaddr_in6`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct sockaddr_in6 {
@@ -187,6 +198,7 @@ pub struct sockaddr_in6 {
     pub sin6_scope_id: u32,
 }
 
+/// `struct sockaddr_un`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct sockaddr_un {
@@ -194,6 +206,7 @@ pub struct sockaddr_un {
     pub sun_path: [u8; 108],
 }
 
+/// `struct sockaddr_storage`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct sockaddr_storage {
@@ -202,6 +215,7 @@ pub struct sockaddr_storage {
     pub __ss_align: u64,
 }
 
+/// `struct sockaddr_nl` (linux/netlink.h).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct sockaddr_nl {
@@ -211,6 +225,7 @@ pub struct sockaddr_nl {
     pub nl_groups: u32,
 }
 
+/// `struct sockaddr_ll` (netpacket/packet.h).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct sockaddr_ll {
@@ -234,6 +249,7 @@ impl Default for sockaddr_storage {
     }
 }
 
+/// `struct msghdr`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct msghdr {
@@ -246,6 +262,7 @@ pub struct msghdr {
     pub msg_flags: c_int,
 }
 
+/// `struct cmsghdr`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct cmsghdr {
@@ -254,6 +271,7 @@ pub struct cmsghdr {
     pub cmsg_type: c_int,
 }
 
+/// `struct mmsghdr`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct mmsghdr {
@@ -261,6 +279,7 @@ pub struct mmsghdr {
     pub msg_len: c_uint,
 }
 
+/// `struct ucred`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ucred {
@@ -269,6 +288,7 @@ pub struct ucred {
     pub gid: u32,
 }
 
+/// `struct linger`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct linger {
@@ -276,6 +296,7 @@ pub struct linger {
     pub l_linger: c_int,
 }
 
+/// `struct timespec` (for recvmmsg).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct timespec {
@@ -283,6 +304,7 @@ pub struct timespec {
     pub tv_nsec: i64,
 }
 
+// ---- netdb.h
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct hostent {
@@ -364,6 +386,7 @@ impl Default for addrinfo {
     }
 }
 
+// ---- net/if.h, ifaddrs.h
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct if_nameindex {
@@ -390,10 +413,12 @@ pub struct ifaddrs {
     pub ifa_data: *mut c_void,
 }
 
+/// `struct ether_addr`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ether_addr {
     pub ether_addr_octet: [u8; 6],
 }
 
+/// glibc's `struct __res_state` is in [`crate::resolv`].
 pub const NS_PACKETSZ: usize = 512;

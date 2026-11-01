@@ -3,8 +3,23 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "features.h",
     items: &[
+        Item::Comment(r#"/* features.h for the Rust libc: the glibc identity macros and the feature-test logic, written from
+   glibc's documented rules (feature_test_macros(7)); the _ISOC2X_SOURCE remap and the POSIX-level block follow glibc 2.43's
+   include/features.h conditions (LGPL-2.1-or-later, see LICENSES.md). Every public header includes it, so
+   __GLIBC__ and the __USE_* macros are visible after any standard include, as programs expect. The
+   compiler-helper macros (__THROW, __BEGIN_DECLS, __nonnull, ...) are in bits/rlibc-cdefs.h. */"#),
         Item::Guard { name: "_FEATURES_H", value: "1", end: "", items: &[
             Item::Blank,
+            Item::Comment("/* what the program asked for (_ISOC2X_SOURCE is the old name of _ISOC23_SOURCE) */"),
+            Item::Gate(&[
+                Branch { head: "ifdef _ISOC2X_SOURCE", items: &[
+                    Item::Undef("_ISOC2X_SOURCE"),
+                    Item::Undef("_ISOC23_SOURCE"),
+                    Item::Consts(&[
+                        ("_ISOC23_SOURCE", V::Dec(1)),
+                    ]),
+                ] },
+            ], ""),
             Item::Gate(&[
                 Branch { head: "if defined _GNU_SOURCE", items: &[
                     Item::Undef("_ISOC95_SOURCE"),
@@ -66,9 +81,10 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* no feature macro at all: the default mode */"),
             Item::Gate(&[
                 Branch { head: r#"if (defined _DEFAULT_SOURCE || (!defined __STRICT_ANSI__ && !defined _ISOC99_SOURCE && !defined _ISOC11_SOURCE \
-     && !defined _ISOC23_SOURCE && !defined _POSIX_SOURCE && !defined _POSIX_C_SOURCE && !defined _XOPEN_SOURCE))"#, items: &[
+     && !defined _ISOC23_SOURCE && !defined _ISOC2Y_SOURCE && !defined _POSIX_SOURCE && !defined _POSIX_C_SOURCE && !defined _XOPEN_SOURCE))"#, items: &[
                     Item::Undef("_DEFAULT_SOURCE"),
                     Item::Consts(&[
                         ("_DEFAULT_SOURCE", V::Dec(1)),
@@ -76,48 +92,42 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
-            Item::Gate(&[
-                Branch { head: "if defined _DEFAULT_SOURCE && !defined _POSIX_SOURCE && !defined _POSIX_C_SOURCE", items: &[
-                    Item::Consts(&[
-                        ("_POSIX_C_SOURCE", V::Txt("202405L")),
-                    ]),
-                ] },
-            ], ""),
+            Item::Comment(r#"/* the POSIX level (as glibc 2.43): _DEFAULT_SOURCE selects POSIX.1-2024; a program that names no POSIX level
+   gets one implicitly unless it is strict ISO C (then only from _XOPEN_SOURCE 500 or later), matching _XOPEN_SOURCE;
+   _REENTRANT and _THREAD_SAFE raise it to 199506L */"#),
+            Item::Raw(Reason::FeatureTest, r#"#ifdef _DEFAULT_SOURCE
+# if !defined _POSIX_SOURCE && !defined _POSIX_C_SOURCE
+#  define __USE_POSIX_IMPLICITLY 1
+# endif
+# undef _POSIX_SOURCE
+# define _POSIX_SOURCE 1
+# undef _POSIX_C_SOURCE
+# define _POSIX_C_SOURCE 202405L
+#endif
+#if ((!defined __STRICT_ANSI__ || (defined _XOPEN_SOURCE && (_XOPEN_SOURCE - 0) >= 500)) \
+     && !defined _POSIX_SOURCE && !defined _POSIX_C_SOURCE)
+# define _POSIX_SOURCE 1
+# if defined _XOPEN_SOURCE && (_XOPEN_SOURCE - 0) < 500
+#  define _POSIX_C_SOURCE 2
+# elif defined _XOPEN_SOURCE && (_XOPEN_SOURCE - 0) < 600
+#  define _POSIX_C_SOURCE 199506L
+# elif defined _XOPEN_SOURCE && (_XOPEN_SOURCE - 0) < 700
+#  define _POSIX_C_SOURCE 200112L
+# elif defined _XOPEN_SOURCE && (_XOPEN_SOURCE - 0) < 800
+#  define _POSIX_C_SOURCE 200809L
+# else
+#  define _POSIX_C_SOURCE 202405L
+# endif
+# define __USE_POSIX_IMPLICITLY 1
+#endif
+#if ((!defined _POSIX_C_SOURCE || (_POSIX_C_SOURCE - 0) < 199506L) && (defined _REENTRANT || defined _THREAD_SAFE))
+# define _POSIX_SOURCE 1
+# undef _POSIX_C_SOURCE
+# define _POSIX_C_SOURCE 199506L
+#endif"#),
             Item::Blank,
             Item::Gate(&[
-                Branch { head: "if defined _XOPEN_SOURCE && !defined _POSIX_C_SOURCE", items: &[
-                    Item::Gate(&[
-                        Branch { head: "if (_XOPEN_SOURCE - 0) >= 800", items: &[
-                            Item::Consts(&[
-                                ("_POSIX_C_SOURCE", V::Txt("202405L")),
-                            ]),
-                        ] },
-                        Branch { head: "elif (_XOPEN_SOURCE - 0) >= 700", items: &[
-                            Item::Consts(&[
-                                ("_POSIX_C_SOURCE", V::Txt("200809L")),
-                            ]),
-                        ] },
-                        Branch { head: "elif (_XOPEN_SOURCE - 0) >= 600", items: &[
-                            Item::Consts(&[
-                                ("_POSIX_C_SOURCE", V::Txt("200112L")),
-                            ]),
-                        ] },
-                        Branch { head: "elif (_XOPEN_SOURCE - 0) >= 500", items: &[
-                            Item::Consts(&[
-                                ("_POSIX_C_SOURCE", V::Txt("199506L")),
-                            ]),
-                        ] },
-                        Branch { head: "else", items: &[
-                            Item::Consts(&[
-                                ("_POSIX_C_SOURCE", V::Dec(2)),
-                            ]),
-                        ] },
-                    ], ""),
-                ] },
-            ], ""),
-            Item::Blank,
-            Item::Gate(&[
-                Branch { head: "if defined _ISOC23_SOURCE || (defined __STDC_VERSION__ && __STDC_VERSION__ > 201710L)", items: &[
+                Branch { head: "if defined _ISOC23_SOURCE || defined _ISOC2Y_SOURCE || (defined __STDC_VERSION__ && __STDC_VERSION__ > 201710L)", items: &[
                     Item::Consts(&[
                         ("__GLIBC_USE_ISOC23", V::Dec(1)),
                     ]),
@@ -140,6 +150,7 @@ pub static HDR: Header = Header {
                     ]),
                 ] },
             ], ""),
+            Item::Comment("/* C23 added a 0b prefix to the strtol family; glibc's headers select the C23 entry points with this */"),
             Item::Gate(&[
                 Branch { head: "if __GLIBC_USE_ISOC23", items: &[
                     Item::Consts(&[
@@ -176,10 +187,9 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* POSIX and X/Open levels */"),
             Item::Gate(&[
-                Branch { head: r#"if (defined _POSIX_SOURCE || defined _POSIX_C_SOURCE || defined _XOPEN_SOURCE || defined _DEFAULT_SOURCE) \
-    && !(defined __STRICT_ANSI__ && !defined _POSIX_SOURCE && !defined _POSIX_C_SOURCE && !defined _XOPEN_SOURCE \
-         && !defined _DEFAULT_SOURCE)"#, items: &[
+                Branch { head: "if defined _POSIX_SOURCE || (defined _POSIX_C_SOURCE && _POSIX_C_SOURCE >= 1) || defined _XOPEN_SOURCE", items: &[
                     Item::Consts(&[
                         ("__USE_POSIX", V::Dec(1)),
                     ]),
@@ -344,9 +354,11 @@ pub static HDR: Header = Header {
                     ]),
                 ] },
             ], ""),
+            Item::Comment("/* x86-64: time_t is 64 bits, no 32-bit variants */"),
             Item::Consts(&[
                 ("__USE_TIME_BITS64", V::Dec(1)),
             ]),
+            Item::Comment("/* _FORTIFY_SOURCE: level 1, 2 or 3 (3 needs gcc 12 or clang 9 for __builtin_dynamic_object_size); the wrappers need optimization */"),
             Item::Gate(&[
                 Branch { head: "if defined _FORTIFY_SOURCE && _FORTIFY_SOURCE > 0", items: &[
                     Item::Gate(&[
@@ -389,6 +401,7 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* which glibc this library follows */"),
             Item::Consts(&[
                 ("__GNU_LIBRARY__", V::Dec(6)),
                 ("__GLIBC__", V::Dec(2)),
@@ -396,6 +409,7 @@ pub static HDR: Header = Header {
             ]),
             Item::Raw(Reason::GlibcMacro, "#define __GLIBC_PREREQ(maj, min) ((__GLIBC__ << 16) + __GLIBC_MINOR__ >= ((maj) << 16) + (min))"),
             Item::Blank,
+            Item::Comment("/* gets is gone from C11 (and C++14); scanf's old %a (allocate a string) extension is what -std=c89/gnu89 with _GNU_SOURCE selects */"),
             Item::Gate(&[
                 Branch { head: "if defined __cplusplus ? __cplusplus >= 201402L : defined __USE_ISOC11", items: &[
                     Item::Consts(&[
@@ -426,6 +440,8 @@ pub static HDR: Header = Header {
             Item::Include("<bits/rlibc-cdefs.h>"),
             Item::Include("<bits/types.h>"),
             Item::Blank,
+            Item::Comment(r#"/* Headers may define `extern inline' functions (stdio.h's getc_unlocked, ...) when the code is optimized for speed and
+   inlining is on, as glibc decides it. */"#),
             Item::Gate(&[
                 Branch { head: "if defined __GNUC__ && defined __OPTIMIZE__ && !defined __OPTIMIZE_SIZE__ && !defined __NO_INLINE__ && defined __extern_inline", items: &[
                     Item::Consts(&[

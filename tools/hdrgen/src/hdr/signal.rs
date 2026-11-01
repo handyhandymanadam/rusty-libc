@@ -3,6 +3,16 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "signal.h",
     items: &[
+        Item::Comment(r#"/* signal.h for the Rust libc (crates/rusty-libc-signal). Written by hand: types, unions, constants and
+   macros in glibc's x86-64 layout and values, under the feature tests glibc's header uses (simplified:
+   the tiers are derived from the standard macros only). The plain function prototypes come from
+   generated files, bits/rlibc-sigcalls-*.h (cbindgen, tools/gen_headers.py), one per feature tier.
+     MISC        _DEFAULT_SOURCE (the default mode), _GNU_SOURCE, _BSD_SOURCE, _SVID_SOURCE
+     XOPEN_EXT   _XOPEN_SOURCE >= 500 or _GNU_SOURCE
+     2K8         POSIX.1-2008 (_POSIX_C_SOURCE >= 200809L, _XOPEN_SOURCE >= 700, or MISC)
+     GNU         _GNU_SOURCE
+   Left out: the old BSD sigvec (not in glibc's headers either), sys_siglist/sys_sigabbrev (old
+   symbol versions only). */"#),
         Item::Guard { name: "_RLIBC_SIGNAL_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),
@@ -273,8 +283,9 @@ pub static HDR: Header = Header {
                         ] },
                     ], ""),
                 ] },
-            ], ""),
+            ], " /* __RLIBC_SIG_POSIX */"),
             Item::Blank,
+            Item::Comment("/* ISO C functions, then the feature tiers (generated prototypes) */"),
             Item::Decl("extern int raise (int __sig);"),
             Item::Gate(&[
                 Branch { head: "ifdef __RLIBC_SIG_MISC", items: &[
@@ -320,6 +331,7 @@ pub static HDR: Header = Header {
                             Item::Include("<bits/rlibc-sigcalls-gnu.h>"),
                         ] },
                     ], ""),
+                    Item::Comment("/* thread-directed signals: defined by rusty-libc-pthread (pthread_t is unsigned long) */"),
                     Item::Decl("extern int pthread_sigmask (int __how, const sigset_t *__restrict __newmask, sigset_t *__restrict __oldmask);"),
                     Item::Decl("extern int pthread_kill (unsigned long int __threadid, int __signo);"),
                     Item::Gate(&[

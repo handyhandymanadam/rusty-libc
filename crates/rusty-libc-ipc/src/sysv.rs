@@ -1,3 +1,10 @@
+//! System V IPC: sys/ipc.h (`ftok`), sys/msg.h, sys/sem.h, sys/shm.h. x86-64 has one system call per
+//! function and always uses the 64-bit structure layout, so glibc passes `cmd` unchanged (no IPC_64
+//! flag; checked with strace on the host: msgctl(IPC_STAT) goes out as cmd 2). Every function sets
+//! errno and returns -1 on failure, like glibc. msgsnd and msgrcv are cancellation points; semop and
+//! semtimedop are NOT, because glibc's are not (checked 2026-10-05 with tests/c/ipc_cancel.c: a thread
+//! blocked in glibc's semop is not cancelled, the cancellation signal just interrupts it with EINTR).
+//! The brief asked for cancellation points there; glibc is the oracle, so these follow glibc.
 use crate::kernel;
 use crate::util::{sc, sci};
 use core::ffi::{c_int, c_long, c_ulong, c_void};
@@ -17,6 +24,7 @@ pub const SYS_MSGRCV: usize = 70;
 pub const SYS_MSGCTL: usize = 71;
 pub const SYS_SEMTIMEDOP: usize = 220;
 
+// ---- sys/ipc.h ----
 pub const IPC_CREAT: c_int = 0o1000;
 pub const IPC_EXCL: c_int = 0o2000;
 pub const IPC_NOWAIT: c_int = 0o4000;
@@ -26,6 +34,7 @@ pub const IPC_STAT: c_int = 2;
 pub const IPC_INFO: c_int = 3;
 pub const IPC_PRIVATE: key_t = 0;
 
+// ---- sys/msg.h ----
 pub const MSG_NOERROR: c_int = 0o10000;
 pub const MSG_EXCEPT: c_int = 0o20000;
 pub const MSG_COPY: c_int = 0o40000;
@@ -33,6 +42,7 @@ pub const MSG_STAT: c_int = 11;
 pub const MSG_INFO: c_int = 12;
 pub const MSG_STAT_ANY: c_int = 13;
 
+// ---- sys/sem.h ----
 pub const SEM_UNDO: c_int = 0x1000;
 pub const GETPID: c_int = 11;
 pub const GETVAL: c_int = 12;
@@ -45,6 +55,7 @@ pub const SEM_STAT: c_int = 18;
 pub const SEM_INFO: c_int = 19;
 pub const SEM_STAT_ANY: c_int = 20;
 
+// ---- sys/shm.h ----
 pub const SHM_R: c_int = 0o400;
 pub const SHM_W: c_int = 0o200;
 pub const SHM_RDONLY: c_int = 0o10000;
@@ -159,6 +170,7 @@ pub struct SemInfo {
     pub semaem: c_int,
 }
 
+/// `struct shminfo` (IPC_INFO on shared memory).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShmInfoLimits {
@@ -173,6 +185,7 @@ pub struct ShmInfoLimits {
     pub reserved4: c_ulong,
 }
 
+/// `struct shm_info` (SHM_INFO).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShmInfo {
@@ -184,6 +197,7 @@ pub struct ShmInfo {
     pub swap_successes: c_ulong,
 }
 
+/// `struct msgbuf` as glibc declares it under _GNU_SOURCE: the type word and a one-byte text template.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MsgBuf {
@@ -199,6 +213,8 @@ pub struct Sembuf {
     pub sem_flg: i16,
 }
 
+/// The fourth argument of `semctl`, which C programs declare themselves (glibc defines
+/// `_SEM_SEMUN_UNDEFINED`).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union Semun {
@@ -208,6 +224,7 @@ pub union Semun {
     pub info: *mut SemInfo,
 }
 
+/// `struct timespec`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Timespec {
@@ -228,84 +245,139 @@ const _: () = {
     assert!(core::mem::size_of::<Semun>() == 8);
 };
 
+/// The key `ftok` makes from a file's device and inode numbers and a project id (glibc's formula: the low 16 bits of the
+/// inode, the low 8 bits of the device, the low 8 bits of `id`).
 pub fn key_from(dev: u64, ino: u64, id: c_int) -> key_t {
     (((ino & 0xffff) | ((dev & 0xff) << 16) | (((id as u64) & 0xff) << 24)) as u32) as key_t
 }
 
+/// Make a System V key from a file's device and inode number and a project id.
+///
+/// # Safety
+/// `path` is a NUL-terminated string (handed to the kernel as it is: NULL or a bad pointer gives EFAULT).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ftok(path: *const core::ffi::c_char, id: c_int) -> key_t {
+    // struct stat (x86-64): st_dev at 0, st_ino at 8, 144 bytes in all
     let mut st = [0u64; 18];
+    // SAFETY: the kernel reads the caller's path (its contract) and writes 144 bytes into the local `st`.
     if sc(unsafe { rusty_libc_core::syscall::sys_stat(path as usize, st.as_mut_ptr() as usize) }) < 0 {
         return -1;
     }
     key_from(st[0], st[1], id)
 }
 
+// ---- messages ----
+
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn msgget(key: key_t, flags: c_int) -> c_int {
     sci(kernel::msgget(key as usize, flags as usize))
 }
 
+/// # Safety
+/// `buf` is null or points to a `struct msqid_ds` (or the info structure of `cmd`).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn msgctl(id: c_int, cmd: c_int, buf: *mut MsqidDs) -> c_int {
+    // SAFETY: the caller's buffer goes to the kernel untouched (its contract; the kernel checks it, EFAULT).
     sci(unsafe { syscall3(SYS_MSGCTL, id as usize, cmd as usize, buf as usize) })
 }
 
+/// Cancellation point.
+///
+/// # Safety
+/// `msg` points to `size` bytes of text after a `long` message type.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn msgsnd(id: c_int, msg: *const c_void, size: usize, flags: c_int) -> c_int {
+    // SAFETY: the caller's message goes to the kernel untouched (its contract).
     sci(unsafe { syscall_cp(SYS_MSGSND, id as usize, msg as usize, size, flags as usize, 0, 0) })
 }
 
+/// Cancellation point.
+///
+/// # Safety
+/// `msg` has room for a `long` message type and `size` bytes of text.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn msgrcv(id: c_int, msg: *mut c_void, size: usize, ty: c_long, flags: c_int) -> ssize_t {
+    // SAFETY: the kernel writes into the caller's buffer (its contract).
     sc(unsafe { syscall_cp(SYS_MSGRCV, id as usize, msg as usize, size, ty as usize, flags as usize, 0) })
 }
+
+// ---- semaphores ----
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn semget(key: key_t, nsems: c_int, flags: c_int) -> c_int {
     sci(kernel::semget(key as usize, nsems as usize, flags as usize))
 }
 
+/// Not a cancellation point (as in glibc).
+///
+/// # Safety
+/// `ops` points to `n` operations.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn semop(id: c_int, ops: *mut Sembuf, n: usize) -> c_int {
+    // glibc's semop is semtimedop with no timeout (sysdeps/unix/sysv/linux/semop.c): the semop call is never made
+    // SAFETY: the caller's operations go to the kernel untouched (its contract).
     sci(unsafe { syscall4(SYS_SEMTIMEDOP, id as usize, ops as usize, n, 0) })
 }
 
+/// Not a cancellation point (as in glibc).
+///
+/// # Safety
+/// `ops` points to `n` operations; `timeout` is null or a timespec.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn semtimedop(id: c_int, ops: *mut Sembuf, n: usize, timeout: *const Timespec) -> c_int {
+    // SAFETY: the caller's operations and timeout go to the kernel untouched (its contract).
     sci(unsafe { syscall4(SYS_SEMTIMEDOP, id as usize, ops as usize, n, timeout as usize) })
 }
 
+/// Whether `semctl` command `cmd` takes the fourth (`union semun`) argument, as glibc reads it.
 pub fn semctl_has_arg(cmd: c_int) -> bool {
     matches!(cmd, SETVAL | GETALL | SETALL | IPC_STAT | IPC_SET | SEM_STAT | SEM_STAT_ANY | IPC_INFO | SEM_INFO)
 }
 
+/// `semctl(id, num, cmd, ...)`: the fourth argument (a `union semun` by value) is read for the
+/// commands that take one, as glibc does.
+///
+/// # Safety
+/// The variadic argument must match `cmd`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn semctl(id: c_int, num: c_int, cmd: c_int, mut args: ...) -> c_int {
     let arg: usize = if semctl_has_arg(cmd) {
+        // SAFETY: for these commands the caller passed a `union semun` (8 bytes, passed like a long), its contract.
         unsafe { args.next_arg::<usize>() }
     } else {
         0
     };
+    // SAFETY: `arg` is the caller's value or pointer for `cmd`, handed to the kernel untouched.
     sci(unsafe { syscall4(SYS_SEMCTL, id as usize, num as usize, cmd as usize, arg) })
 }
+
+// ---- shared memory ----
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn shmget(key: key_t, size: usize, flags: c_int) -> c_int {
     sci(kernel::shmget(key as usize, size, flags as usize))
 }
 
+/// # Safety
+/// `buf` is null or points to a `struct shmid_ds` (or the info structure of `cmd`).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn shmctl(id: c_int, cmd: c_int, buf: *mut ShmidDs) -> c_int {
+    // SAFETY: the caller's buffer goes to the kernel untouched (its contract).
     sci(unsafe { syscall3(SYS_SHMCTL, id as usize, cmd as usize, buf as usize) })
 }
 
+/// # Safety
+/// `addr` is null or a valid attach address (see shmat(2)).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn shmat(id: c_int, addr: *const c_void, flags: c_int) -> *mut c_void {
+    // SAFETY: mapping at the caller's address (with SHM_REMAP it may replace a mapping) is the caller's request (its contract).
     sc(unsafe { syscall3(SYS_SHMAT, id as usize, addr as usize, flags as usize) }) as *mut c_void
 }
 
+/// # Safety
+/// `addr` is an address returned by `shmat`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn shmdt(addr: *const c_void) -> c_int {
+    // SAFETY: unmapping the caller's segment is the caller's request; nothing of ours lives there (its contract).
     sci(unsafe { syscall1(SYS_SHMDT, addr as usize) })
 }

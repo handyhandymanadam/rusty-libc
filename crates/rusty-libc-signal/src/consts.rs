@@ -1,3 +1,6 @@
+//! Constants of signal.h, sys/ucontext.h and setjmp.h (glibc 2.43, x86-64 Linux values; the C test
+//! prints every one from our header and from the system header and compares).
+
 pub const SIGHUP: i32 = 1;
 pub const SIGINT: i32 = 2;
 pub const SIGQUIT: i32 = 3;
@@ -29,13 +32,18 @@ pub const SIGWINCH: i32 = 28;
 pub const SIGPOLL: i32 = 29;
 pub const SIGPWR: i32 = 30;
 pub const SIGSYS: i32 = 31;
+/// First and last real-time signal the kernel has.
 pub const SIGRTMIN_KERNEL: i32 = 32;
 pub const SIGRTMAX_KERNEL: i32 = 64;
+/// `_NSIG` and `NSIG`: one past the last signal.
 pub const NSIG: i32 = 65;
 
+/// The signal glibc uses for thread cancellation and timers (`__SIGRTMIN`), and for setuid and
+/// friends (`__SIGRTMIN + 1`). They cannot be caught, blocked or sent by the program.
 pub const SIGCANCEL: i32 = 32;
 pub const SIGSETXID: i32 = 33;
 
+/// `sa_handler` values (`SIG_ERR` is -1).
 pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;
 pub const SIG_HOLD: usize = 2;
@@ -49,6 +57,7 @@ pub const SA_RESTART: i32 = 0x1000_0000;
 pub const SA_INTERRUPT: i32 = 0x2000_0000;
 pub const SA_NODEFER: i32 = 0x4000_0000;
 pub const SA_RESETHAND: i32 = 0x8000_0000_u32 as i32;
+/// Kernel-only: the `sa_restorer` field is valid.
 pub const SA_RESTORER: i32 = 0x0400_0000;
 
 pub const SIG_BLOCK: i32 = 0;
@@ -65,6 +74,7 @@ pub const SIGEV_NONE: i32 = 1;
 pub const SIGEV_THREAD: i32 = 2;
 pub const SIGEV_THREAD_ID: i32 = 4;
 
+// si_code values
 pub const SI_ASYNCNL: i32 = -60;
 pub const SI_DETHREAD: i32 = -7;
 pub const SI_TKILL: i32 = -6;
@@ -131,6 +141,7 @@ pub const POLL_HUP: i32 = 6;
 pub const SYS_SECCOMP: i32 = 1;
 pub const SYS_USER_DISPATCH: i32 = 2;
 
+/// Indices into `mcontext_t.gregs` (`REG_R8` and so on).
 pub const REG_R8: usize = 0;
 pub const REG_R9: usize = 1;
 pub const REG_R10: usize = 2;
@@ -156,11 +167,13 @@ pub const REG_OLDMASK: usize = 21;
 pub const REG_CR2: usize = 22;
 pub const NGREG: usize = 23;
 
+// system call numbers (x86-64)
 pub(crate) const SYS_RT_SIGPENDING: usize = 127;
 pub(crate) const SYS_RT_SIGTIMEDWAIT: usize = 128;
 pub(crate) const SYS_RT_SIGQUEUEINFO: usize = 129;
 pub(crate) const SYS_RT_SIGSUSPEND: usize = 130;
 pub(crate) const SYS_SIGALTSTACK: usize = 131;
+/// The kernel's signal-set size in bytes (`_NSIG / 8`).
 pub(crate) const KSIGSET_BYTES: usize = 8;
 
 pub(crate) const EINVAL: i32 = 22;

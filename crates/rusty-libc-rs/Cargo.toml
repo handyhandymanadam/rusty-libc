@@ -1,13 +1,38 @@
 [package]
 name = "rusty-libc-rs"
 version = "0.1.0"
+# explicit (not inherited from the workspace) so a git dependency on this crate alone resolves cleanly
 edition = "2024"
-license = "LGPL-2.1-or-later"
+license = "MIT"
 rust-version = "1.88"
+repository = "https://github.com/handyhandymanadam/rusty-libc"
+readme = "README.md"
 keywords = ["libc", "linux", "posix", "syscall", "safe"]
 categories = ["os::linux-apis", "api-bindings"]
 description = "Safe Rust API (std, stable Rust) for Rust ports on rusty-libc: rustix's system-call API re-exported plus spawn, signal dispositions, waitid with pid/uid, confstr"
 
 [dependencies]
 rusty-libc-rs-core = { path = "../rusty-libc-rs-core", version = "0.1.0", features = ["std", "libc-services"] }
+# FIXLIST #127 stage 2 (Adam: "integrate rustix into ours then. I don't want two seperate libraries."): rustix's stateless
+# system-call API, re-exported (see lib.rs). linux_raw backend (rustix's default on x86-64 Linux: raw syscalls, no C
+# library calls; auxv from /proc/self/auxv). Features: every public API module a port may need except `runtime` (an
+# explicitly unstable, unsafe-only module for libc implementers), `io_uring`, `mount` and `shm` (not asked for yet; one
+# word each to add). Not `all-apis`, which would pull in `runtime`.
 rustix = { version = "1.1.5", default-features = false, features = ["std", "event", "fs", "mm", "net", "param", "pipe", "process", "pty", "rand", "stdio", "system", "termios", "thread", "time"] }
+
+[dev-dependencies]
+# only for the comparison tests (the same steps through the host C library)
+libc = "0.2"
+
+# FIXLIST #127 stage 4: checks that need a single-threaded process (environment changes, exec with descriptor numbers
+# above 2): no libtest harness, which always runs tests on a second thread.
+[[test]]
+name = "single"
+harness = false
+
+# FIXLIST #127 stage 5: a shared object containing this crate, loaded with dlopen by tests/stage5.rs (the inherited-fd
+# snapshot must not be taken there). `cargo test` builds it into target/<profile>/examples/.
+[[example]]
+name = "dlopen_probe"
+crate-type = ["cdylib"]
+

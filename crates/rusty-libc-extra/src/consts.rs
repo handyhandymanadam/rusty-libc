@@ -1,3 +1,4 @@
+//! Error numbers and system call numbers (Linux x86-64) used by this crate.
 #![allow(dead_code)]
 
 pub const EPERM: i32 = 1;

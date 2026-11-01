@@ -4,6 +4,8 @@ include_guard = "_RLIBC_RPC_XDR_DECLS_H"
 usize_is_size_t = true
 no_includes = true
 documentation = false
+# Included by tools/hdrgen/src/hdr/rpc/*.h (structures, constants and macros are there, as in Sun's
+# headers); only the function declarations are generated here.
 [export]
 item_types = ["functions"]
 [export.rename]

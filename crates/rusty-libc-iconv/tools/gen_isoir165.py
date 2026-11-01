@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""Generate crates/rusty-libc-iconv/src/mbdata/isoir165.rs: the ISO-IR-165 (CCITT Chinese) 94x94 set that
+ISO-2022-CN-EXT uses (glibc keeps it in libISOIR165.so; no charset name of its own is listed).
+
+Both directions are read from the host's libISOIR165.so tables (__isoir165_to_tab and the gap
+index / from table behind ucs4_to_isoir165), reproduced here from the table layout and checked to
+be exact inverses of each other before anything is written (the table-driven code in
+src/iso2022cn.rs relies on one table plus its inverse).
+Usage: gen_isoir165.py   (writes ../src/mbdata/isoir165.rs)
+"""
 import ctypes, os, struct, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -44,7 +53,7 @@ for ch in range(0xffe6):
 assert len(set(dec.values())) == len(dec), "two codes share a character"
 assert all(dec.get(rc) == ch for ch, rc in rev.items()) and len(rev) == len(dec), "tables are not inverse"
 
-base = 256
+base = 256  # position of the first two-byte entry (set 0 is the 256 single bytes, all unused)
 data = [dec.get((k // 94, k % 94), 0) for k in range(94 * 94)]
 pairs = sorted((ch, base + r * 94 + c) for ch, (r, c) in rev.items())
 

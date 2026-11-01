@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("_IOC_NRBITS", V::Dec(8)),
         ("_IOC_TYPEBITS", V::Dec(8)),
@@ -224,6 +225,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("N_HCI", V::Dec(15)),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Block { head: "struct termio ", body: &["", "  unsigned short c_iflag;", "  unsigned short c_oflag;", "  unsigned short c_cflag;", "  unsigned short c_lflag;", "  unsigned char c_line;", "  unsigned char c_cc[8];", ""], tail: "" },
     Item::Raw(Reason::GlibcMacro, r#"#define _IOC(dir, type, nr, size) \
   (((dir) << _IOC_DIRSHIFT) | ((type) << _IOC_TYPESHIFT) | ((nr) << _IOC_NRSHIFT) | ((size) << _IOC_SIZESHIFT))"#),

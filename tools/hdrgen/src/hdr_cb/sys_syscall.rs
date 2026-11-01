@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("SYS__sysctl", V::Dec(156)),
         ("SYS_accept", V::Dec(43)),
@@ -385,6 +386,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("SYS_write", V::Dec(1)),
         ("SYS_writev", V::Dec(20)),
     ]),
+    Item::Comment("/* the kernel's spelling of the same numbers (glibc takes them from <asm/unistd.h>) */"),
     Item::Consts(&[
         ("__NR__sysctl", V::Dec(156)),
         ("__NR_accept", V::Dec(43)),

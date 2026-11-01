@@ -1,3 +1,6 @@
+//! `_Float128` erf, erfc, lgamma, lgamma_r, tgamma, j0, j1, jn, y0, y1, yn: the series and recurrences of
+//! `longdouble::special` run in `Ext` arithmetic (128-bit significands), with the thresholds and the
+//! argument reduction of the binary128 range (113-bit arguments, results to 113 bits).
 use super::*;
 use super::arith;
 use crate::longdouble::consts::*;
@@ -13,6 +16,10 @@ fn fin(x: &Ext, ex: Exact) -> F128 {
     r
 }
 
+// ---- erf and erfc ----
+
+/// As [`fin`] for erfc: ERANGE also when the result is a nonzero number the rounding raised to the smallest
+/// subnormal (the exact value is below it).
 fn fin_strict(x: &Ext, ex: Exact) -> F128 {
     let r = finish_ext(x, ex);
     if r.is_inf() || r.is_zero() || (x.is_fin() && x.e < -16494) {
@@ -21,6 +28,7 @@ fn fin_strict(x: &Ext, ex: Exact) -> F128 {
     r
 }
 
+/// erf(ax) for 0 < ax < 9.
 fn erf_series(ax: Ext) -> Ext {
     let x2 = ax.mul(ax);
     let two_x2 = x2.scale(1);
@@ -37,6 +45,7 @@ fn erf_series(ax: Ext) -> Ext {
     TWO_OVER_SQRT_PI.mul(ax).mul(s).mul(exp_ext(x2.negate()))
 }
 
+/// erfc(x) for x >= 2 by the Laplace continued fraction (`depth` terms).
 fn erfc_cf(x: Ext, depth: u64) -> Ext {
     let mut f = x;
     for k in (1..=depth).rev() {
@@ -83,6 +92,7 @@ pub fn erf(x: F128) -> F128 {
     }
     let e = x.to_ext();
     if e.e >= 4 {
+        // erf is 1 to the last bit from 16 on: no flags for a positive x, inexact for a negative one
         if x.is_neg() {
             raise_rnd_flags(fenv::FE_INEXACT as u32);
         }
@@ -108,10 +118,13 @@ pub fn erfc(x: F128) -> F128 {
     fin_strict(&r, ex)
 }
 
+// ---- ln Gamma and Gamma ----
+
 fn is_neg_int(e: &Ext) -> bool {
     e.neg && e.is_integer()
 }
 
+/// ln |Gamma(x)| and the sign (+1 or -1) of Gamma(x).
 pub fn lgamma_r(x: F128, sign: &mut i32) -> F128 {
     *sign = 1;
     if x.is_nan() {
@@ -128,6 +141,7 @@ pub fn lgamma_r(x: F128, sign: &mut i32) -> F128 {
     if is_neg_int(&e) {
         return pole(false);
     }
+    // x = 1 and 2 are exact zeros
     if !e.neg && (e.cmp_abs(&Ext::ONE) == Ordering::Equal || e.cmp_abs(&Ext::from_u64(2)) == Ordering::Equal) {
         return F128::ZERO;
     }
@@ -161,17 +175,24 @@ pub fn tgamma(x: F128) -> F128 {
     fin(&tgamma_ext(e), if small_int { Exact::IfClose } else { Exact::Never })
 }
 
+// ---- Bessel functions ----
+
+/// Results of one backward sweep at x (positive).
 struct Sweep {
     j0: Ext,
     j1: Ext,
     jn: Ext,
+    /// sum_{k>=1} (-1)^k J(2k) / k
     y0_sum: Ext,
+    /// sum_{k>=1} (-1)^k (J(2k-1) - J(2k+1)) / k
     y1_sum: Ext,
 }
 
+/// Miller's algorithm for J(k, x), k = 0..: start above x + n + 100, recur downward, normalize with
+/// 1 = J0 + 2 (J2 + J4 + ...).
 fn miller(x: Ext, n: u64) -> Sweep {
     let top = x.floor_i64().max(0) as u64 + n.max(1) + 100;
-    let top = top + (top & 1);
+    let top = top + (top & 1); // even
     let c = Ext::from_u64(2).div(x);
     let (mut up, mut cur) = (Ext::ZERO, Ext::ONE);
     let (mut j0, mut j1, mut jn) = (Ext::ZERO, Ext::ZERO, Ext::ZERO);
@@ -226,6 +247,7 @@ fn miller(x: Ext, n: u64) -> Sweep {
     Sweep { j0: j0.mul(inv), j1: j1.mul(inv), jn: jn.mul(inv), y0_sum: ys.mul(inv), y1_sum: y1s.mul(inv) }
 }
 
+/// (P, Q) of Hankel's expansion for order nu in {0, 1} at x > 40.
 fn hankel_pq(x: Ext, nu: u64) -> (Ext, Ext) {
     let mu = 4 * nu * nu;
     let (mut p, mut q) = (Ext::ONE, Ext::ZERO);
@@ -252,10 +274,12 @@ fn hankel_pq(x: Ext, nu: u64) -> (Ext, Ext) {
     (p, q)
 }
 
+/// sin and cos of a finite x with up to 113 significant bits (any magnitude).
 fn sincos_wide(x: Ext) -> (Ext, Ext) {
     super::trigfn::sincos_q(x)
 }
 
+/// J(nu, x) and Y(nu, x) for nu in {0, 1} and x > 48 (asymptotic expansion).
 fn hankel(x: Ext, nu: u64) -> (Ext, Ext) {
     let (p, q) = hankel_pq(x, nu);
     let (s, c) = sincos_wide(x);
@@ -271,6 +295,7 @@ fn forty8() -> Ext {
     Ext::from_u64(48)
 }
 
+/// (J0, J1, Y0, Y1) at x > 0 (finite).
 fn bessel01(x: Ext) -> (Ext, Ext, Ext, Ext) {
     if x.cmp_abs(&forty8()) == Ordering::Greater {
         let (j0, y0) = hankel(x, 0);
@@ -293,6 +318,7 @@ pub fn j0(x: F128) -> F128 {
         return F128::ZERO;
     }
     if x.is_zero() || x.to_ext().e < -57 {
+        // j0 is 1 to the last bit below 2^-57, with no flags
         return F128::ONE;
     }
     fin(&bessel01(x.to_ext().abs()).0, Exact::Less)
@@ -310,6 +336,7 @@ pub fn j1(x: F128) -> F128 {
     }
     let e = x.to_ext();
     if e.e < -58 {
+        // x/2, exact (a subnormal x loses a bit: underflow and inexact; ERANGE when nothing is left)
         let r = arith::mul(x, F128::from_bits(0x3ffe << 112));
         if r.is_subnormal() || r.is_zero() {
             raise_rnd_flags((fenv::FE_UNDERFLOW | fenv::FE_INEXACT) as u32);
@@ -323,12 +350,14 @@ pub fn j1(x: F128) -> F128 {
     fin(&r.with_sign(r.neg ^ e.neg), Exact::Less)
 }
 
+/// y0 and y1 at a zero: +0 gives -infinity with ERANGE, -0 a NaN with "invalid" and ERANGE as well.
 fn y_at_zero(_x: F128) -> F128 {
     erange();
     fenv::raise_exceptions(fenv::FE_DIVBYZERO as u32);
     F128::NEG_INF
 }
 
+/// y1 of a tiny x: -(2/pi)/x with the flags of that division (ERANGE for an overflow).
 fn y1_tiny(x: F128) -> F128 {
     let r = arith::div(F128::from_bits(0xbffe45f306dc9c882a53f84eafa3ea6a), x);
     if r.is_inf() {
@@ -372,6 +401,7 @@ pub fn y1(x: F128) -> F128 {
     fin(&bessel01(x.to_ext()).3, Exact::Never)
 }
 
+/// J(n, x) for x > 0, n >= 0.
 fn jn_pos(n: u64, x: Ext) -> Ext {
     if n == 0 {
         return bessel01(x).0;
@@ -380,6 +410,7 @@ fn jn_pos(n: u64, x: Ext) -> Ext {
         return bessel01(x).1;
     }
     let nn = Ext::from_u64(n);
+    // series when x^2/4 < n + 1: no cancellation
     let q = x.mul(x).scale(-2);
     if q.cmp_abs(&Ext::from_u64(n + 1)) == Ordering::Less {
         let (mut t, mut s) = (Ext::ONE, Ext::ONE);
@@ -395,6 +426,7 @@ fn jn_pos(n: u64, x: Ext) -> Ext {
         return exp_ext(lnpre).mul(s);
     }
     if x.cmp_abs(&nn) == Ordering::Greater && x.cmp_abs(&forty8()) == Ordering::Greater {
+        // forward recurrence from J0, J1 (stable for n < x)
         let (j0, j1, _, _) = bessel01(x);
         let c = Ext::from_u64(2).div(x);
         let (mut a, mut b) = (j0, j1);
@@ -408,6 +440,7 @@ fn jn_pos(n: u64, x: Ext) -> Ext {
     miller(x, n).jn
 }
 
+/// ln Gamma(x) for x > 0.
 fn lgamma_pos_q(x: Ext) -> Ext {
     lgamma_ext(x).0
 }
@@ -418,6 +451,7 @@ pub fn jn(n: i32, x: F128) -> F128 {
     }
     let neg_n = n < 0;
     let nn = (n as i64).unsigned_abs();
+    // J(-n, x) = (-1)^n J(n, x); J(n, -x) = (-1)^n J(n, x)
     let odd = nn % 2 == 1;
     let mut sign = false;
     if neg_n && odd {
@@ -427,6 +461,7 @@ pub fn jn(n: i32, x: F128) -> F128 {
         sign = !sign;
     }
     if x.is_inf() {
+        // glibc: jn(+-1, +-inf) is j1(+-inf) = +0 (j1 has no sign for an infinite argument)
         return F128::zero(sign && nn != 1);
     }
     if x.is_zero() {
@@ -441,6 +476,7 @@ pub fn jn(n: i32, x: F128) -> F128 {
 }
 
 fn sign_of_zero_jn(x: F128, n: i32) -> bool {
+    // jn(n, +-0) = +-0 with the sign of x^n (and of n for negative n)
     let odd = n % 2 != 0;
     (x.is_neg() && odd) ^ (n < 0 && odd)
 }
@@ -458,6 +494,7 @@ pub fn yn(n: i32, x: F128) -> F128 {
         return domain();
     }
     if x.is_inf() {
+        // glibc: y0(inf) = 0, y1(inf) carries the sign of n, higher orders give +0
         return F128::zero(nn == 1 && sign);
     }
     let e = x.to_ext();
@@ -473,7 +510,7 @@ pub fn yn(n: i32, x: F128) -> F128 {
                 a = b;
                 b = nx;
                 if b.e > 20000 {
-                    break;
+                    break; // overflowing: the rest only grows
                 }
             }
             b
@@ -501,11 +538,14 @@ pub extern "C" fn ynf128(n: i32, x: f128) -> f128 {
     yn(n, F128(x.to_bits())).to_f128()
 }
 
+/// # Safety
+/// `sign` is NULL or valid.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn lgammaf128_r(x: f128, sign: *mut i32) -> f128 {
     let mut s = 1;
     let r = lgamma_r(F128(x.to_bits()), &mut s);
     if !sign.is_null() {
+        // SAFETY: not NULL, so by the C contract a writable int (NULL is skipped, as the library always did).
         unsafe { sign.write(s) };
     }
     r.to_f128()

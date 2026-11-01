@@ -15,8 +15,16 @@ rusty-libc-sys = { path = "../rusty-libc-sys" }
 rusty-libc-wchar = { path = "../rusty-libc-wchar" }
 rusty-libc-net = { path = "../rusty-libc-net" }
 rusty-libc-util = { path = "../rusty-libc-util" }
+# __syslog_chk, __vsyslog_chk (and the obstack _chk forms)
 rusty-libc-extra = { path = "../rusty-libc-extra" }
 
+[dev-dependencies]
+libc = "0.2"
+rusty-libc-malloc = { path = "../rusty-libc-malloc", features = ["no-brk"] }
+
 [features]
+# Export the C symbols. Off for host tests so they never replace the host libc.
 export = ["start"]
+# Take the vDSO address from rusty-libc-core's startup code (programs started by its `_start`) instead of
+# reading /proc/self/auxv.
 start = ["rusty-libc-core/start"]

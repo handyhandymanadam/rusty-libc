@@ -1,23 +1,36 @@
 #!/usr/bin/env python3
+"""Generate crates/rusty-libc-iconv/src/charsets_gen.rs: the single-byte charset tables and the alias table.
+
+Inputs, all from the host: /usr/lib64/gconv/gconv-modules and gconv-modules.d/*.conf (the list of
+charsets and their alias names; names are facts), and the behaviour of the host's iconv, probed by
+sbprobe.c (every byte decoded, every character below U+30000 encoded). A charset is "simple" when
+the probe finds only one-byte-to-one-character mappings and no state; those become tables. The
+others are listed on stderr (they need hand-written or CJK code, see the other generators).
+Run: python3 gen_charsets.py > ../src/charsets_gen.rs   (needs gcc and the glibc gconv modules)
+"""
 import glob, os, re, subprocess, sys, tempfile
 
 GCONV = "/usr/lib64/gconv"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# charsets implemented by hand in unicode.rs / utf7.rs / cjk: canonical key -> special code
 SPECIAL = {
     "ISO-10646/UCS4/": 0, "UCS-4LE//": 1, "ISO-10646/UTF8/": 2, "ISO-10646/UCS2/": 3, "UNICODEBIG//": 4,
     "ANSI_X3.4-1968//": 5, "UTF-16//": 6, "UTF-16LE//": 7, "UTF-16BE//": 8, "UTF-32//": 9,
     "UTF-32LE//": 10, "UTF-32BE//": 11, "UNICODE//": 12, "UTF-7//": 13, "UTF-7-IMAP//": 14, "INTERNAL": 15,
+    # multibyte charsets (cjk.rs): the order is that of cjk::KINDS, the first has code 16
     "EUC-KR//": 16, "EUC-CN//": 17, "EUC-JP//": 18, "UHC//": 19, "GBK//": 20, "SJIS//": 21,
     "CP932//": 22, "BIG5//": 23, "JOHAB//": 24, "EUC-TW//": 25, "GB18030//": 26,
     "EUC-JP-MS//": 27, "ISO_6937//": 28, "ISO_6937-2//": 29, "T.61-8BIT//": 30, "ANSI_X3.110//": 31, "IBM932//": 32, "IBM943//": 33,
+    # stateful 7-bit charsets (their own modules)
     "ISO-2022-JP//": 40, "ISO-2022-JP-2//": 41, "ISO-2022-KR//": 42, "ISO-2022-CN//": 43, "BIG5HKSCS//": 44, "ISO-2022-CN-EXT//": 63, "TSCII//": 64,
+    # composing 8-bit charsets (compose.rs), EBCDIC with a double-byte set (ebcdic.rs), JIS X 0213 (jisx0213.rs)
     "CP1255//": 45, "CP1258//": 46, "TCVN5712-1//": 47,
     "IBM930//": 48, "IBM933//": 49, "IBM935//": 50, "IBM937//": 51, "IBM939//": 52,
     "IBM1364//": 53, "IBM1371//": 54, "IBM1388//": 55, "IBM1390//": 56, "IBM1399//": 57,
     "EUC-JISX0213//": 60, "SHIFT_JISX0213//": 61, "ISO-2022-JP-3//": 62,
 }
-BUILTIN_ALIASES = [
+BUILTIN_ALIASES = [  # from the list of built-in aliases of the host's glibc (checked against `iconv -l`)
     ("UCS4//", "ISO-10646/UCS4/"), ("UCS-4//", "ISO-10646/UCS4/"), ("UCS-4BE//", "ISO-10646/UCS4/"), ("CSUCS4//", "ISO-10646/UCS4/"),
     ("ISO-10646//", "ISO-10646/UCS4/"), ("10646-1:1993//", "ISO-10646/UCS4/"), ("10646-1:1993/UCS4/", "ISO-10646/UCS4/"),
     ("OSF00010104//", "ISO-10646/UCS4/"), ("OSF00010105//", "ISO-10646/UCS4/"), ("OSF00010106//", "ISO-10646/UCS4/"),
@@ -87,6 +100,8 @@ def main():
     for n in sb_names:
         dec, encl = res[n]
         enc = {e >> 8: e & 255 for e in encl}
+        # the encoding side as a two-level index: hi[cp >> 8] selects a block of 256 bytes (0 = no
+        # block); a byte of 0 means "no code", so the characters whose code is 0 are listed apart
         blocks, hi, zero = [], [0] * 256, []
         for cp in sorted(enc):
             if cp >= 0x10000: continue
@@ -120,6 +135,7 @@ def main():
         i = ident_name(n)
         print('    Sb { name: "%s", dec: &D_%s, hi: &H_%s, blocks: &B_%s, zero: &Z_%s, ident: %d, dec_ident: %d },' % (n.rstrip("/"), i, i, i, i, meta[n][0], meta[n][1]))
     print("];\n")
+    # alias table: key -> code (SB index, or 0x8000 + special)
     table = {}
     def code_of(c):
         if c in SPECIAL: return 0x8000 + SPECIAL[c]
@@ -135,6 +151,7 @@ def main():
     print("pub static ALIASES: [(&str, u16); %d] = [" % len(items))
     for k, v in items: print('    ("%s", 0x%x),' % (k, v))
     print("];")
+    # canonical names of hand-written charsets (for canonical_name)
     print("\n/// (code, name) of the hand-written charsets, sorted by code.")
     print("pub static SPECIAL_NAMES: [(u8, &str); %d] = [" % len(SPECIAL))
     inv = sorted(SPECIAL.items(), key=lambda kv: kv[1])

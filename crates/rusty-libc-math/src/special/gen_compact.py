@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""Compact fixed-stride copies of leading coefficients of the node tables (derived from tab_erf.rs, no new numbers):
+
+    python3 gen_compact.py   -> tab_erf8.rs (ERF8[k] = [erf(k/16), q_0 .. q_7] high parts) and tab_lg12.rs (LG12[k - 4] = [lgamma F0, q_0 .. q_11]), the rows the binary32 functions use
+"""
 import os
 import re
 
@@ -33,6 +37,7 @@ out.append("];")
 open(os.path.join(here, "tab_erf8.rs"), "w").write("\n".join(out) + "\n")
 
 
+# ---- lgamma rows for the binary32 function: [F0 high part, q_0 .. q_11 high parts] per node (k = 4..128 -> index k - 4)
 src = open(os.path.join(here, "tab_gamma.rs")).read()
 f0 = pairs(table("LG_F0"))
 q = pairs(table("LG_Q"))

@@ -1,3 +1,9 @@
+//! Floating-point plumbing for the long double complex functions: the same templates as the double and
+//! float ones (copied from `complex/`, derived from glibc 2.43's `s_c*_template.c`, LGPL-2.1-or-later),
+//! with the arithmetic done on x87 values by the processor (rusty_libc_core::x87: single instructions, so the
+//! exception flags are the hardware's) and the sibling functions of this module tree (`expfn`, `trigfn`,
+//! `arith`) for exp, log, sincos, sinh, cosh, atan2, hypot, scalbn. `CF` is the trait the templates are
+//! generic over; here it has one implementer, `L80`.
 #![allow(dead_code)]
 use crate::longdouble::common::{F80, F80Access, f80_from_bits};
 use crate::longdouble::{arith, basic, expfn, trigfn};
@@ -5,6 +11,7 @@ use core::hint::black_box;
 use core::ops::{Add, Div, Mul, Neg, Sub};
 use rusty_libc_core::x87;
 
+/// `fpclassify` values of glibc.
 pub const FP_NAN: i32 = 0;
 pub const FP_INFINITE: i32 = 1;
 pub const FP_ZERO: i32 = 2;
@@ -17,12 +24,14 @@ const fn c80(m: u64, se: u16) -> F80 {
     F80([mb[0], mb[1], mb[2], mb[3], mb[4], mb[5], mb[6], mb[7], sb[0], sb[1], 0, 0, 0, 0, 0, 0])
 }
 
+/// Raise "invalid" for a signaling NaN, as a comparison does.
 fn snan_invalid(x: F80) {
     if x.is_nan() && x.mant_() & (1 << 62) == 0 {
         crate::fenv::raise_exceptions(crate::fenv::FE_INVALID as u32);
     }
 }
 
+/// An x87 value.
 #[derive(Clone, Copy)]
 pub struct L80(pub F80);
 
@@ -52,11 +61,13 @@ impl PartialOrd for L80 {
 }
 
 pub trait CF: Copy + PartialEq + PartialOrd + 'static {
+    /// Smallest normal, largest finite, epsilon.
     const MIN: Self;
     const MAX: Self;
     const EPS: Self;
     const MANT_DIG: i32;
     const MAX_EXP: i32;
+    /// Veltkamp splitting constant 2^ceil(p/2) + 1.
     const SPLIT: Self;
     const PI: Self;
     const PI_2: Self;
@@ -66,6 +77,7 @@ pub trait CF: Copy + PartialEq + PartialOrd + 'static {
     const LOG10_2: Self;
     const PI_LOG10E: Self;
     const ZERO: Self;
+    /// glibc's internal atan2 sets errno itself (ERANGE on a subnormal result): float only.
     const ATAN2_ERRNO: bool;
     fn lit(v: f64) -> Self;
     fn add_(self, o: Self) -> Self;
@@ -145,6 +157,8 @@ impl CF for L80 {
     fn sqrt_(self) -> L80 {
         L80(arith::sqrtl_impl(self.0))
     }
+    // The classification macros on x87 values compare the number (fucomi), which raises "invalid"
+    // for a signaling NaN: so does glibc's complex code, and so do these.
     fn is_nan_(self) -> bool {
         snan_invalid(self.0);
         self.0.is_nan()
@@ -200,6 +214,7 @@ impl CF for L80 {
     }
 }
 
+/// A float whose arithmetic operators are one instruction each.
 #[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
 pub struct W<F: CF>(pub F);
 
@@ -237,6 +252,7 @@ impl<F: CF> W<F> {
     pub fn is_finite(self) -> bool {
         self.0.is_finite_()
     }
+    /// `fpclassify`.
     #[inline]
     pub fn cls(self) -> i32 {
         self.0.cls_()
@@ -257,6 +273,8 @@ impl<F: CF> W<F> {
         let (s, c) = F::c_sincos(self.0);
         (W(s), W(c))
     }
+    // sinh, cosh, atan2, hypot and scalbn: glibc's templates call the internal `__ieee754_*`
+    // forms, which leave errno alone (the public wrappers set it); errno is restored here.
     pub fn sinh(self) -> W<F> {
         quiet(|| W(F::c_sinh(self.0)))
     }
@@ -272,6 +290,8 @@ impl<F: CF> W<F> {
     pub fn scalbn(self, n: i32) -> W<F> {
         quiet(|| W(F::c_scalbn(self.0, n)))
     }
+    /// glibc `math_check_force_underflow`: raise "underflow" when `self` is a nonzero value
+    /// below the smallest normal.
     #[inline(never)]
     pub fn force_underflow(self) {
         let x = black_box(self);
@@ -279,6 +299,7 @@ impl<F: CF> W<F> {
             black_box(x * x);
         }
     }
+    /// `math_check_force_underflow_nonneg`.
     #[inline(never)]
     pub fn force_underflow_nonneg(self) {
         let x = black_box(self);
@@ -338,11 +359,13 @@ impl<F: CF> PartialOrd<f64> for W<F> {
     }
 }
 
+/// Raise the "invalid" exception.
 #[inline(never)]
 pub fn raise_invalid() {
     crate::fenv::feraiseexcept(crate::fenv::FE_INVALID);
 }
 
+/// The quiet NaN `NAN` of C.
 #[inline(always)]
 pub fn nan<F: CF>() -> W<F> {
     W(F::nan_val())
@@ -353,6 +376,8 @@ pub fn inf<F: CF>() -> W<F> {
     W(F::inf_val())
 }
 
+/// Dekker/Veltkamp exact product: `(hi, lo)` with `hi + lo == x * y` (no overflow or underflow
+/// assumed).
 pub fn mul_split<F: CF>(x: W<F>, y: W<F>) -> (W<F>, W<F>) {
     let hi = x * y;
     let split = |a: W<F>| {
@@ -366,7 +391,11 @@ pub fn mul_split<F: CF>(x: W<F>, y: W<F>) -> (W<F>, W<F>) {
     (hi, lo)
 }
 
+/// `x^2 + y^2 - 1` without large cancellation error, for 1 > x >= y >= epsilon/2 and
+/// x^2 + y^2 >= 0.5 (glibc `__x2y2m1`: exact squares, then a compensated sum in order of
+/// increasing magnitude), computed in round to nearest whatever the current mode.
 pub fn x2y2m1<F: CF>(x: W<F>, y: W<F>) -> W<F> {
+    // glibc: SET_RESTORE_ROUND (FE_TONEAREST); the exact splitting needs round to nearest
     crate::fenv::with_round_mode(crate::fenv::RoundMode::Nearest, || x2y2m1_nearest(x, y))
 }
 
@@ -401,6 +430,8 @@ fn sort_abs<F: CF>(v: &mut [W<F>]) {
     }
 }
 
+/// C99 Annex G complex multiplication as libgcc's `__muldc3` does it (recovers infinities
+/// from NaN results).
 pub fn cmul<F: CF>(a: W<F>, b: W<F>, c: W<F>, d: W<F>) -> (W<F>, W<F>) {
     let (mut a, mut b, mut c, mut d) = (a, b, c, d);
     let ac = a * c;
@@ -457,6 +488,7 @@ pub fn cmul<F: CF>(a: W<F>, b: W<F>, c: W<F>, d: W<F>) -> (W<F>, W<F>) {
     (x, y)
 }
 
+/// Run `f` and put errno back as it was.
 #[inline]
 pub fn quiet<R>(f: impl FnOnce() -> R) -> R {
     let saved = Errno::save();
@@ -465,7 +497,9 @@ pub fn quiet<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+#[cfg(not(test))]
 struct Errno(i32);
+#[cfg(not(test))]
 impl Errno {
     #[inline(always)]
     fn save() -> Errno {
@@ -477,3 +511,29 @@ impl Errno {
     }
 }
 
+/// Test builds keep two errnos: the host's (what exp, log, trig set) and the per-thread one of
+/// the rounding functions.
+#[cfg(test)]
+struct Errno(i32, i32);
+#[cfg(test)]
+impl Errno {
+    fn save() -> Errno {
+        unsafe extern "C" {
+            fn __errno_location() -> *mut i32;
+        }
+        // SAFETY: the host glibc's __errno_location takes no arguments.
+        let p = unsafe { __errno_location() };
+        // SAFETY: it points to this thread's errno.
+        Errno(unsafe { *p }, crate::rounding::fp::test_errno())
+    }
+    fn restore(self) {
+        unsafe extern "C" {
+            fn __errno_location() -> *mut i32;
+        }
+        // SAFETY: the host glibc's __errno_location takes no arguments.
+        let p = unsafe { __errno_location() };
+        // SAFETY: it points to this thread's errno, valid for writes.
+        unsafe { *p = self.0 };
+        crate::rounding::fp::set_errno(self.1);
+    }
+}

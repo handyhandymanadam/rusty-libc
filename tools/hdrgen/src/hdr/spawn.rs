@@ -3,6 +3,10 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "spawn.h",
     items: &[
+        Item::Comment(r#"/* spawn.h for the Rust libc (crates/rusty-libc-extra/src/spawn.rs). Written by hand: the structures (glibc's
+   x86-64 layout: posix_spawnattr_t 336 bytes, posix_spawn_file_actions_t 80 bytes) and the flags; the
+   prototypes are generated (bits/rlibc-spawncalls.h and, behind _DEFAULT_SOURCE, the _np functions,
+   cgroup and pidfd variants in bits/rlibc-spawncalls-misc.h). */"#),
         Item::Guard { name: "_RLIBC_SPAWN_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<bits/rlibc-features.h>"),

@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "sys/shm.h",
     items: &[
+        Item::Comment(r#"/* sys/shm.h for the Rust libc (crates/rusty-libc-ipc): System V shared memory. struct shmid_ds is 112
+   bytes, as in glibc on x86-64. The prototypes are generated (bits/rlibc-ipc-shm.h). */"#),
         Item::Guard { name: "_SYS_SHM_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),

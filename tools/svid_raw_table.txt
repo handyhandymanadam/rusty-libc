@@ -1,3 +1,4 @@
+# derived from glibc 2.43's libm by hdrgen svid-raw: name type errno nan
 acos d r n
 acos f k n
 acos l r p

@@ -3,6 +3,10 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "sys/sem.h",
     items: &[
+        Item::Comment(r#"/* sys/sem.h for the Rust libc (crates/rusty-libc-ipc): System V semaphores. struct semid_ds is 104 bytes,
+   as in glibc on x86-64. Like glibc, the header does not define union semun (programs declare it;
+   _SEM_SEMUN_UNDEFINED says so). The prototypes are generated (bits/rlibc-ipc-sem.h, and
+   bits/rlibc-ipc-semgnu.h for semtimedop). */"#),
         Item::Guard { name: "_SYS_SEM_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),

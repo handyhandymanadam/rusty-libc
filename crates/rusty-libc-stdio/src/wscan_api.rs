@@ -1,3 +1,6 @@
+//! wchar.h formatted input: wscanf, fwscanf, swscanf and their `v` forms, in the three flavours glibc
+//! exports (legacy `%as` allocation, C99, C23 binary prefix). The engine is the narrow one (`scan`)
+//! over a source of wide characters.
 use crate::flock::locked;
 use crate::file::{self, File as FILE};
 use crate::scan::{self, MODE_C23_BIN, MODE_LEGACY_A, Src};
@@ -6,15 +9,19 @@ use crate::wfile;
 use core::ffi::{VaList, c_int};
 use rusty_libc_wchar::wchar_t;
 
+/// A wide stream as a source of characters.
 pub struct WFileSrc(*mut FILE);
 
 impl WFileSrc {
+    /// # Safety
+    /// `f` is an open stream that the calling thread may use (locked) while the source lives.
     pub unsafe fn new(f: *mut FILE) -> WFileSrc {
         WFileSrc(f)
     }
 
     #[inline(always)]
     fn stream(&mut self) -> &mut FILE {
+        // SAFETY: `new`'s contract: an open stream, locked for the whole call; borrowed per call.
         unsafe { file::stream(self.0) }
     }
 }
@@ -29,19 +36,24 @@ impl Src for WFileSrc {
     }
 }
 
+/// A NUL-terminated wide string as a source of characters.
 pub struct WStrSrc {
     p: *const u32,
 }
 
 impl WStrSrc {
+    /// # Safety
+    /// `p` is a wide string ending in 0 that outlives the source.
     pub unsafe fn new(p: *const u32) -> WStrSrc {
         WStrSrc { p }
     }
 }
 
+// `p` stays inside the string: `get` steps over non-zero characters only, `unget` back over the one `get` returned.
 impl Src for WStrSrc {
     const WIDE: bool = true;
     fn get(&mut self) -> c_int {
+        // SAFETY: `new`'s contract and the rule above: `p` is inside the string (at most at its 0).
         let c = unsafe { *self.p };
         if c == 0 {
             scan::EOF
@@ -55,46 +67,73 @@ impl Src for WStrSrc {
     }
 }
 
+/// The stream scan: the stream must be (or become) wide.
+///
+/// # Safety
+/// `f` is an open stream, `format` a NUL-terminated wide format whose conversions match the pointers in `va`.
 unsafe fn stream_scan(f: *mut FILE, format: *const wchar_t, va: &mut VaList, mode: u32) -> c_int {
     locked!(f, |s| {
         if !wfile::wide_ok(s) {
             return scan::EOF;
         }
+        // glibc's `ARGCHECK`, right after `ORIENT`: a stream that cannot be read fails with EBADF, error indicator untouched
         if s.flags & crate::file::F_READ == 0 {
             rusty_libc_core::errno::set(9);
             return scan::EOF;
         }
+        // SAFETY: the caller's contract for the stream (held locked here).
         let mut src = unsafe { WFileSrc::new(f) };
+        // SAFETY: the caller's contract for `format` and `va`.
         unsafe { scan_run_fmt::<WFileSrc, u32>(&mut src, format as *const u32, va, mode) }
     })
 }
 
 macro_rules! wscanf_family {
     ($mode:expr, $fwscanf:ident, $wscanf:ident, $swscanf:ident, $vfwscanf:ident, $vwscanf:ident, $vswscanf:ident) => {
+        /// # Safety
+        /// `f` must be an open stream; `format` must match the pointer arguments.
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $vfwscanf(f: *mut FILE, format: *const wchar_t, mut ap: VaList) -> c_int {
+            // SAFETY: the caller's contract (`stdin`, when used, names an open stream).
             unsafe { stream_scan(f, format, &mut ap, $mode) }
         }
+        /// # Safety
+        /// As the `v` stream form.
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $vwscanf(format: *const wchar_t, mut ap: VaList) -> c_int {
+            // SAFETY: the caller's contract (`stdin`, when used, names an open stream).
             unsafe { stream_scan(file::stdin_ptr(), format, &mut ap, $mode) }
         }
+        /// # Safety
+        /// `s` and `format` must be NUL-terminated.
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $vswscanf(s: *const wchar_t, format: *const wchar_t, mut ap: VaList) -> c_int {
+            // SAFETY: the caller's contract: `s` ends in 0.
             let mut src = unsafe { WStrSrc::new(s as *const u32) };
+            // SAFETY: the caller's contract: the format and its pointer arguments.
             unsafe { scan_run_fmt::<WStrSrc, u32>(&mut src, format as *const u32, &mut ap, $mode) }
         }
+        /// # Safety
+        /// As the `v` stream form.
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $fwscanf(f: *mut FILE, format: *const wchar_t, mut args: ...) -> c_int {
+            // SAFETY: the caller's contract (`stdin`, when used, names an open stream).
             unsafe { stream_scan(f, format, &mut args, $mode) }
         }
+        /// # Safety
+        /// As the `v` stream form.
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $wscanf(format: *const wchar_t, mut args: ...) -> c_int {
+            // SAFETY: the caller's contract (`stdin`, when used, names an open stream).
             unsafe { stream_scan(file::stdin_ptr(), format, &mut args, $mode) }
         }
+        /// # Safety
+        /// As the `v` string form.
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         pub unsafe extern "C" fn $swscanf(s: *const wchar_t, format: *const wchar_t, mut args: ...) -> c_int {
+            // SAFETY: the caller's contract: `s` ends in 0.
             let mut src = unsafe { WStrSrc::new(s as *const u32) };
+            // SAFETY: the caller's contract: the format and its pointer arguments.
             unsafe { scan_run_fmt::<WStrSrc, u32>(&mut src, format as *const u32, &mut args, $mode) }
         }
     };

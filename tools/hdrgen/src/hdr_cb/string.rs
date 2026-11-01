@@ -2,6 +2,7 @@ use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
     Item::Include("<bits/types/locale_t.h>"),
+    Item::Comment("/* glibc: string.h also brings strcasecmp and friends (strings.h) in the default and GNU modes */"),
     Item::Gate(&[
         Branch { head: "ifdef __USE_MISC", items: &[
             Item::Include("<strings.h>"),
@@ -15,11 +16,14 @@ pub static AFTER_INCLUDES: &[Item] = &[
             Item::Decl(r#"int strerror_r(int, char *, size_t) __asm__("__xpg_strerror_r");"#),
         ] },
     ], ""),
+    Item::Comment("/* glibc 2.35: memcmp with a result that is only good for comparing with zero (compilers use it; programs use memcmp) */"),
     Item::Decl("extern int __memcmpeq(const void *, const void *, size_t);"),
 ];
 pub const AFTER_INCLUDES_CHOMP: bool = false;
 
 pub static TRAILER: &[Item] = &[
+    Item::Comment(r#"/* C23 qualifier-generic search functions: the result keeps the const of the argument (glibc defines these macros when ISOC23 is in
+   force, which _GNU_SOURCE and -std=c23 both do) */"#),
     Item::Gate(&[
         Branch { head: "if __GLIBC_USE (ISOC23) && defined __glibc_const_generic && !defined _LIBC", items: &[
             Item::Raw(Reason::GlibcMacro, "# define memchr(S, C, N) __glibc_const_generic (S, const void *, memchr (S, C, N))"),

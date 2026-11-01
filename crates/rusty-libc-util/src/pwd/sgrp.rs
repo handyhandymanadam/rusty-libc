@@ -1,6 +1,15 @@
+//! gshadow.h with the "files" backend (`/etc/gshadow`): `getsgent`, `getsgnam` (and the `_r` forms),
+//! `setsgent`, `endsgent`, `fgetsgent`, `sgetsgent` and `putsgent`.
+//!
+//! A line is `name:password:admins:members`, the last two comma separated lists; the parser, the
+//! buffer rules (the pointer vectors live in the caller's buffer after the line, `ERANGE` when they do
+//! not fit), the NIS entries (`+`/`-` names are returned by the `*ent` functions but never match a
+//! lookup) and the retry rules of the non-reentrant forms are the ones of `pwd.rs`, which this file
+//! extends (it is a child module so that it shares the line readers and static buffers).
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use super::*;
 
+/// `struct sgrp`.
 #[repr(C)]
 pub struct Sgrp {
     pub sg_namp: *mut c_char,
@@ -15,6 +24,8 @@ impl Sgrp {
     }
 }
 
+/// glibc's `parse_list` with a terminator character and `,` as the item separator: the vector of pointers goes into
+/// `v`; None (errno ERANGE) when it does not fit; else its address and the offset in the room just past its NULL.
 fn parse_list_term(c: &mut Cur, mut v: Vec8, terminator: u8) -> Option<(*mut *mut c_char, usize)> {
     'outer: loop {
         if !v.room() {
@@ -58,6 +69,7 @@ impl Entry for Sgrp {
         let mut c = Cur { line, i: 0 };
         c.chop_newline();
         r.sg_namp = c.string_field();
+        // where the member vector starts in `area`
         let mut mem_from = 0;
         if c.at_end() && c.first_is_nis() {
             r.sg_passwd = null_mut();
@@ -82,53 +94,77 @@ static SGETSG: Locked<StaticBuf<Sgrp>> = Locked::new(StaticBuf::new(Sgrp::zero()
 static SG_DB: EntDb = EntDb::new();
 const SG_NAMES: EntNames = EntNames { db: b"gshadow", set: b"setsgent", get: b"getsgent_r", end: b"endsgent" };
 
+/// `getsgnam_r` on Rust values.
 fn sgnam_r(k: Key, out: &mut Out<Sgrp>) -> c_int {
     lookup(b"gshadow", b"getsgnam_r", out, |r: &Sgrp| !k.nis() && name_is(k.b, r.sg_namp), |f, r, b, l, en| call_by_name(f, k.p, r, b, l, en))
 }
 
+/// # Safety
+/// As `getgrnam_r`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getsgnam_r(name: *const c_char, resbuf: *mut Sgrp, buffer: *mut c_char, buflen: usize, result: *mut *mut Sgrp) -> c_int {
+    // SAFETY: the caller's arguments (caller's contract).
     let (k, mut out) = unsafe { r_args(name, resbuf, buffer, buflen, result) };
     sgnam_r(k, &mut out)
 }
 
+/// # Safety
+/// `name` is a C string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getsgnam(name: *const c_char) -> *mut Sgrp {
+    // SAFETY: a C string (caller's contract).
     let k = unsafe { Key::new(name) };
     by_buf(&SGNAM, false, false, |out| sgnam_r(k, out))
 }
 
+/// # Safety
+/// Always safe to call.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setsgent() {
     db_setent::<Sgrp>(&SG_DB, &SG_NAMES)
 }
 
+/// # Safety
+/// Always safe to call.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn endsgent() {
     db_endent::<Sgrp>(&SG_DB, &SG_NAMES)
 }
 
+/// # Safety
+/// As `getgrent_r`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getsgent_r(resbuf: *mut Sgrp, buffer: *mut c_char, buflen: usize, result: *mut *mut Sgrp) -> c_int {
+    // SAFETY: the caller's arguments (caller's contract).
     let mut out = unsafe { Out::from_c(resbuf, buffer, buflen, result) };
     db_getent::<Sgrp>(&SG_DB, &SG_NAMES, &mut out)
 }
 
+/// # Safety
+/// Always safe to call.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getsgent() -> *mut Sgrp {
     by_buf(&SGENT, false, true, |out| db_getent::<Sgrp>(&SG_DB, &SG_NAMES, out))
 }
 
+/// # Safety
+/// As `fgetgrent_r`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fgetsgent_r(stream: *mut File, resbuf: *mut Sgrp, buffer: *mut c_char, buflen: usize, result: *mut *mut Sgrp) -> c_int {
+    // SAFETY: forwarded contract.
     unsafe { fget_r::<Sgrp>(stream, resbuf, buffer, buflen, result) }
 }
 
+/// # Safety
+/// `stream` is an open stdio stream.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn fgetsgent(stream: *mut File) -> *mut Sgrp {
+    // SAFETY: forwarded contract.
     unsafe { fget::<Sgrp>(stream, &FGETSG) }
 }
 
+/// `sgetsgent_r` on Rust values: a string outside the buffer is copied in (ERANGE when it does not fit), one inside it
+/// is parsed where it is (the vectors after it).
 fn sgetsg_r(s: SrcStr, out: &mut Out<Sgrp>) -> c_int {
     let buflen = out.buf.len();
     if buflen == 0 {
@@ -137,6 +173,7 @@ fn sgetsg_r(s: SrcStr, out: &mut Out<Sgrp>) -> c_int {
     }
     let base = out.buf.as_ptr() as usize;
     let pr = if s.addr < base || s.addr >= base + buflen {
+        // strncpy with a marker in the last byte: a string that does not fit gives ERANGE
         if !strncpy_fits(s, out.buf) {
             errno::set(ERANGE);
             return ERANGE;
@@ -152,18 +189,25 @@ fn sgetsg_r(s: SrcStr, out: &mut Out<Sgrp>) -> c_int {
     if pr > 0 { 0 } else { errno::get() }
 }
 
+/// # Safety
+/// `string` is a C string; the rest valid. Returns ERANGE when the line does not fit in `buffer`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sgetsgent_r(string: *const c_char, resbuf: *mut Sgrp, buffer: *mut c_char, buflen: usize, result: *mut *mut Sgrp) -> c_int {
+    // SAFETY: the caller's arguments (caller's contract).
     let (s, mut out) = unsafe { sget_args(string, resbuf, buffer, buflen, result) };
     sgetsg_r(s, &mut out)
 }
 
+/// # Safety
+/// `string` is a C string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sgetsgent(string: *const c_char) -> *mut Sgrp {
+    // SAFETY: a C string (caller's contract).
     let s = unsafe { SrcStr::new(string) };
     by_buf(&SGETSG, true, true, |out| sgetsg_r(s, out))
 }
 
+/// `putsgent`'s line (None when a field cannot be written: EINVAL).
 fn sgrp_line(name: Option<&[u8]>, passwd: Option<&[u8]>, adm: CList, mem: CList) -> Option<Line> {
     if name.is_none() || !valid_field(name) || !valid_field(passwd) || !valid_list_field(adm) || !valid_list_field(mem) {
         return None;
@@ -188,13 +232,18 @@ fn sgrp_line(name: Option<&[u8]>, passwd: Option<&[u8]>, adm: CList, mem: CList)
     Some(l)
 }
 
+/// # Safety
+/// `g` is a valid entry, `stream` an open stream.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn putsgent(g: *const Sgrp, stream: *mut File) -> c_int {
+    // SAFETY: the caller's entry and stream (caller's contract).
     let (Some(g), Some(mut f)) = (unsafe { put_args(g, stream) }) else {
         errno::set(EINVAL);
         return -1;
     };
+    // SAFETY: its strings are NULL or C strings (caller's contract).
     let s = |q: *mut c_char| unsafe { opt(q) };
+    // SAFETY: its lists are NULL or NULL-terminated vectors of C strings (caller's contract).
     let l = |q: *mut *mut c_char| unsafe { CList::new(q) };
     let Some(line) = sgrp_line(s(g.sg_namp), s(g.sg_passwd), l(g.sg_adm), l(g.sg_mem)) else {
         errno::set(EINVAL);

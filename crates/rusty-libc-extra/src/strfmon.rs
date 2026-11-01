@@ -1,3 +1,19 @@
+//! monetary.h: strfmon and strfmon_l, the formatting of monetary values.
+//!
+//! The format language is the one of glibc: `%` flags (`=f` fill character, `^` no grouping, `+` signs from
+//! the locale, `(` parentheses for negative values, `!` no currency symbol, `-` left justify), a field width,
+//! `#n` left precision (digits before the point, so columns line up), `.p` right precision, an optional `L`
+//! for a long double, then `n` (national format) or `i` (international format); `%%` is a percent sign. The
+//! currency symbol, signs and their positions come from the monetary conventions of the locale
+//! (`lconv_of`: LC_MONETARY of the locale in force for `strfmon`, of the passed locale for `strfmon_l`;
+//! in the C locale the fields are all "not available", so values print as plain numbers with two
+//! decimals). Errors: EINVAL for a bad
+//! format, E2BIG for a field width that does not fit a long or an output that does not fit `maxsize` (the
+//! bytes that fit are in the buffer and there is no terminating NUL).
+//!
+//! Structure (U2): the C functions convert the buffer to a slice and the format to bytes once, the formatting loop is
+//! safe code ([`strfmon_r`] is its Rust form); what stays unsafe is reading the C variadic arguments (the long double by
+//! hand from the va_list record), the locale's string pointers (read once per call) and the scratch buffer from malloc.
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use crate::consts::*;
 use core::ffi::{VaList, c_char, c_int, c_long};
@@ -7,6 +23,7 @@ use rusty_libc_stdio::rust_api::{Arg, snprintf};
 
 const E2BIG_: c_int = E2BIG;
 
+/// The output buffer: `maxsize` bytes of the caller; what does not fit marks the buffer failed (E2BIG).
 struct Out<'a> {
     buf: &'a mut [u8],
     pos: usize,
@@ -46,10 +63,13 @@ impl Out<'_> {
     }
 }
 
+/// The bytes of a C string from the locale data; NULL reads as "".
 unsafe fn cbytes<'a>(p: *const c_char) -> &'a [u8] {
+    // SAFETY: a non-NULL `p` is a NUL-terminated string that lives as long as the locale (caller's contract).
     unsafe { rusty_libc_core::ffi::cstr(p) }.map_or(b"", core::ffi::CStr::to_bytes)
 }
 
+/// The strings of the monetary conventions this code reads, as bytes (NULL fields read as "").
 struct Mon<'a> {
     decimal_point: &'a [u8],
     thousands_sep: &'a [u8],
@@ -63,10 +83,15 @@ struct Mon<'a> {
 fn mon_strings(lc: &Lconv) -> Mon<'_> {
     let [decimal_point, thousands_sep, grouping, int_curr_symbol, currency_symbol, negative_sign, positive_sign] =
         [lc.mon_decimal_point, lc.mon_thousands_sep, lc.mon_grouping, lc.int_curr_symbol, lc.currency_symbol, lc.negative_sign, lc.positive_sign]
+            // SAFETY: an `Lconv` from `lconv_of` holds NULL or NUL-terminated strings of the locale's data, which live at
+            // least as long as the `Lconv` value is used (one strfmon call).
             .map(|p| unsafe { cbytes(p) });
     Mon { decimal_point, thousands_sep, grouping, int_curr_symbol, currency_symbol, negative_sign, positive_sign }
 }
 
+/// A scratch buffer from malloc (freed on drop): the number text of one field. Only its first `init` bytes are
+/// initialised (and visible as a slice): most numbers need a few dozen bytes of the `prec + 5200` that are allocated (as
+/// before), so the zeroing is done in steps.
 struct Scratch {
     p: core::ptr::NonNull<u8>,
     len: usize,
@@ -75,27 +100,33 @@ struct Scratch {
 
 impl Scratch {
     fn new(len: usize) -> Option<Scratch> {
+        // SAFETY: malloc has no precondition.
         let p = unsafe { rusty_libc_malloc::malloc(len) }.cast::<u8>();
         let p = core::ptr::NonNull::new(p)?;
         Some(Scratch { p, len, init: 0 })
     }
 
+    /// The first `n` bytes (at most the whole buffer), zeroed where they were not initialised yet.
     fn prefix_mut(&mut self, n: usize) -> &mut [u8] {
         let n = n.min(self.len);
         if n > self.init {
+            // SAFETY: bytes `init..n` lie inside the block (n <= len) and are ours.
             unsafe { core::ptr::write_bytes(self.p.as_ptr().wrapping_add(self.init), 0, n - self.init) };
             self.init = n;
         }
+        // SAFETY: the first `n` bytes are initialised (above) and owned by `self`; `&mut self` makes the borrow exclusive.
         unsafe { core::slice::from_raw_parts_mut(self.p.as_ptr(), n) }
     }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        // SAFETY: the block came from malloc in `new` and is freed once, here.
         unsafe { rusty_libc_malloc::free(self.p.as_ptr().cast()) };
     }
 }
 
+/// "Not available" in a monetary field: glibc's internal data say '\377', `localeconv` says CHAR_MAX.
 fn unspec(v: i32) -> bool {
     v == -1 || v == 127
 }
@@ -104,12 +135,15 @@ fn is_digit(c: u8) -> bool {
     c.is_ascii_digit()
 }
 
+/// The digits a grouping specification puts a separator before: the number of separators for `digits`
+/// integer digits, and for each digit (from the left) whether a separator comes before it.
 fn grouping(grouping: &[u8], digits: usize) -> (usize, BitSet) {
     let mut marks = BitSet::new();
     let g0 = grouping.first().copied().unwrap_or(0) as i8;
     if g0 == i8::MAX || g0 <= 0 {
         return (0, marks);
     }
+    // group sizes from the right; the last one repeats unless the list ends with CHAR_MAX
     let mut sizes: [usize; 16] = [0; 16];
     let mut n = 0;
     let mut repeat = 0usize;
@@ -128,11 +162,13 @@ fn grouping(grouping: &[u8], digits: usize) -> (usize, BitSet) {
         i += 1;
     }
     if i == grouping.len() && n > 0 {
+        // the list ends (the terminating NUL means "repeat the last group")
         repeat = sizes[n - 1];
     }
+    // walk from the right placing boundaries
     let mut boundaries = [false; 4096];
     let digits = digits.min(4095);
-    let mut pos = 0usize;
+    let mut pos = 0usize; // digits consumed from the right
     let mut idx = 0usize;
     let mut count = 0usize;
     loop {
@@ -144,7 +180,7 @@ fn grouping(grouping: &[u8], digits: usize) -> (usize, BitSet) {
         if pos >= digits {
             break;
         }
-        boundaries[digits - pos] = true;
+        boundaries[digits - pos] = true; // a separator before the digit at this offset from the left
         count += 1;
         idx += 1;
     }
@@ -156,6 +192,7 @@ fn grouping(grouping: &[u8], digits: usize) -> (usize, BitSet) {
     (count, marks)
 }
 
+/// A bit set for up to 4096 digit positions.
 struct BitSet([u64; 64]);
 
 impl BitSet {
@@ -170,15 +207,25 @@ impl BitSet {
     }
 }
 
+/// The long double argument (x87 extended, 16 bytes on the stack, 16-byte aligned) as 16 bytes.
+///
+/// # Safety
+/// The next variadic argument is a long double.
 unsafe fn read_long_double(va: &mut VaList) -> [u8; 16] {
+    // the x86-64 va_list record: gp_offset, fp_offset (u32 each), overflow_arg_area, reg_save_area; long doubles are
+    // always passed in the overflow area
     let rec = (va as *mut VaList).cast::<[usize; 3]>();
+    // SAFETY: `va` is a live va_list record of the x86-64 ABI (24 bytes, word aligned); word 1 is overflow_arg_area.
     let area = unsafe { (*rec)[1] };
     let aligned = (area + 15) & !15;
+    // SAFETY: the next argument (caller's contract) is 16 readable bytes at the 16-aligned overflow area.
     let out = unsafe { (aligned as *const [u8; 16]).read() };
+    // SAFETY: as above: step the overflow area past the argument.
     unsafe { (*rec)[1] = aligned + 16 };
     out
 }
 
+/// Whether an x87 value (as 16 bytes) is negative, a NaN or an infinity.
 fn ld_class(b: &[u8; 16]) -> (bool, bool, bool) {
     let sign = b[9] & 0x80 != 0;
     let exp = u16::from_le_bytes([b[8], b[9]]) & 0x7fff;
@@ -188,7 +235,10 @@ fn ld_class(b: &[u8; 16]) -> (bool, bool, bool) {
     (sign, special && !inf, inf)
 }
 
+/// Format one monetary field's number: the digits with `prec` decimals, padded on the left with `pad` to
+/// `width`, grouped when `group` is set and the locale has a separator and grouping.
 fn number(out: &mut Out, value: Num, prec: usize, width: i64, pad: u8, group: bool, mon: &Mon) {
+    // the text of the value: "%.{prec}f" of a finite value, or inf / nan
     let cap = prec + 5200;
     let Some(mut scratch) = Scratch::new(cap) else {
         out.fail(ENOMEM);
@@ -217,12 +267,15 @@ fn number(out: &mut Out, value: Num, prec: usize, width: i64, pad: u8, group: bo
     };
     let tmp = scratch.prefix_mut(len + 1);
     let mut text = &tmp[..len];
+    // a negative zero (the value was not < 0, but its sign bit is set) prints with a minus sign: the sign
+    // comes before zero padding and after other padding, and takes one place of the width
     let mut sign_in_text = false;
     if !special && text.first() == Some(&b'-') {
         sign_in_text = true;
         text = &text[1..];
     }
     if special {
+        // not digits: the sign if any, then the word, padded with blanks
         let mut w = width;
         if is_neg_fp {
             w -= 1;
@@ -238,10 +291,15 @@ fn number(out: &mut Out, value: Num, prec: usize, width: i64, pad: u8, group: bo
     let decimal: &[u8] = if mon.decimal_point.is_empty() { b"." } else { mon.decimal_point };
     let sep = mon.thousands_sep;
     let grp = mon.grouping;
+    // the integer digits, and the rest (the decimal point and the fraction)
+    // (`fixed` wrote the radix character of the numeric locale in force, which need not be '.': the
+    // fraction has exactly `prec` digits, so the integer part ends that many places plus one
+    // radix character before the end)
     let radix_len = rusty_libc_core::locale::numeric().decimal_point.len();
     let int_len = if prec > 0 { text.len().saturating_sub(prec + radix_len) } else { text.len() };
     let (digits, rest) = text.split_at(int_len);
     let (nsep, marks) = if !sep.is_empty() && group { grouping(grp, int_len) } else { (0, BitSet::new()) };
+    // the width counts the digits, the decimal point and fraction, and one per separator
     let w = width - text.len() as i64 - nsep as i64 - sign_in_text as i64;
     if pad != b'0' {
         out.pad(pad, w);
@@ -269,8 +327,12 @@ enum Num {
     L([u8; 16]),
 }
 
+/// `%.{prec}f` of a non-negative finite value into `out`; its length.
+/// How much of the scratch buffer is zeroed for the first try (enough for any double or long double of ordinary size).
 const SMALL: usize = 512;
 
+/// "%.{prec}f" of `arg` into the scratch buffer: first into its first SMALL bytes, then, when that did not fit, into all
+/// of it. The text's length (cut at the buffer's size).
 fn fixed(scratch: &mut Scratch, arg: Arg, prec: usize, long: bool) -> usize {
     let fmt: &core::ffi::CStr = if long { c"%.*Lf" } else { c"%.*f" };
     let args = [Arg::Int(prec as i64), arg];
@@ -284,6 +346,7 @@ fn fixed(scratch: &mut Scratch, arg: Arg, prec: usize, long: bool) -> usize {
     (n.max(0) as usize).min(all.len() - 1)
 }
 
+/// The formatting loop; `Err(errno)` when the format is bad or the width overflows.
 fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) -> Num) {
     {
         let mon = mon_strings(lc);
@@ -295,6 +358,7 @@ fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) ->
                 f += 1;
                 continue;
             }
+            // "%%" is one percent sign
             if c(f + 1) == b'%' {
                 f += 1;
                 out.put(c(f));
@@ -311,6 +375,7 @@ fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) ->
             let mut width: i64 = -1;
             let mut left = false;
             let mut is_long_double = false;
+            // flags
             loop {
                 f += 1;
                 match c(f) {
@@ -393,6 +458,7 @@ fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) ->
                 f += 1;
                 is_long_double = true;
             }
+            // the conversion
             let int_format;
             let mut int_symbol = [0u8; 4];
             let currency_symbol: &[u8];
@@ -402,6 +468,7 @@ fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) ->
                 b'i' => {
                     f += 1;
                     let ics = mon.int_curr_symbol;
+                    // strncpy (int_symbol, int_curr_symbol, 3): three bytes, padded with NULs
                     for (i, d) in int_symbol.iter_mut().enumerate().take(3) {
                         *d = ics.get(i).copied().unwrap_or(0);
                     }
@@ -422,6 +489,7 @@ fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) ->
                     return;
                 }
             }
+            // values the format string did not give come from the locale
             if p_sign_posn == -2 {
                 p_sign_posn = (if int_format { lc.int_p_sign_posn } else { lc.p_sign_posn }) as i32;
             }
@@ -434,13 +502,16 @@ fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) ->
                     right_prec = 2;
                 }
             }
+            // room for the separators of a grouped integer part
             if group && left_prec != -1 {
                 let (nsep, _) = grouping(mon.grouping, left_prec as usize);
                 left_prec += nsep as i64;
             }
+            // the value
             let (num, is_negative): (Num, bool) = match next(is_long_double) {
                 Num::L(mut b) => {
                     let (neg, nan, _inf) = ld_class(&b);
+                    // is_negative = value < 0 (NaN is not); the magnitude is printed
                     let negative = neg && !nan && !is_zero_ld(&b);
                     if negative {
                         b[9] &= 0x7f;
@@ -478,18 +549,21 @@ fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) ->
                 other_sep_by_space = pick(lc.n_sep_by_space, lc.int_n_sep_by_space) as i32;
                 other_sign_posn = n_sign_posn;
             }
+            // defaults for unspecified information
             let cs_precedes = if cs_precedes != 0 { 1 } else { 0 };
             let other_cs_precedes = if other_cs_precedes != 0 { 1 } else { 0 };
             let mut sep_by_space = if unspec(sep_by_space) { 0 } else { sep_by_space };
             let mut other_sep_by_space = if unspec(other_sep_by_space) { 0 } else { other_sep_by_space };
             let sign_posn = if unspec(sign_posn) { 1 } else { sign_posn };
             let other_sign_posn = if unspec(other_sign_posn) { 1 } else { other_sign_posn };
+            // degenerate cases
             if sep_by_space == 2 && (sign_posn == 0 || (sign_posn == 1 && cs_precedes == 0) || (sign_posn == 2 && cs_precedes != 0)) {
                 sep_by_space = 0;
             }
             if other_sep_by_space == 2 && (other_sign_posn == 0 || (other_sign_posn == 1 && other_cs_precedes == 0) || (other_sign_posn == 2 && other_cs_precedes != 0)) {
                 other_sep_by_space = 0;
             }
+            // the left precision and the padding that aligns positive and negative formats
             let left_pad: i64;
             if left_prec == -1 {
                 left_prec = 0;
@@ -528,6 +602,7 @@ fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) ->
             }
             let symbol_shown = |o: &mut Out| {
                 if print_curr_symbol {
+                    // the international symbol is exactly three bytes (NULs included) unless shorter
                     o.puts(&currency_symbol[..currency_symbol.iter().position(|&c| c == 0).unwrap_or(currency_symbol.len())]);
                 }
             };
@@ -545,6 +620,7 @@ fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) ->
                     }
                     out.puts(sign_string);
                     if sep_by_space == 1 {
+                        // C99: a space follows the adjacent symbol and sign
                         out.put(b' ');
                     }
                 } else if print_curr_symbol && sep_by_space == 1 {
@@ -553,6 +629,7 @@ fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) ->
             } else if sign_posn != 0 && sign_posn != 2 && sign_posn != 3 && sign_posn != 4 && sign_posn != 5 {
                 out.puts(sign_string);
             }
+            // the number
             let w = left_prec + if right_prec != 0 { right_prec + 1 } else { 0 };
             number(out, num, right_prec.max(0) as usize, w, pad, group, &mon);
             if out.failed {
@@ -588,6 +665,7 @@ fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) ->
             if sign_posn == 0 && is_negative {
                 out.put(b')');
             }
+            // fill the field width
             let produced = (out.pos - start) as i64;
             if !out.failed && produced < width {
                 let pad_width = width - produced;
@@ -595,6 +673,7 @@ fn vstrfmon(out: &mut Out, lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) ->
                 if out.failed {
                     return;
                 }
+                // left padding is in place; otherwise move the contents to the right
                 if !left {
                     let pw = pad_width as usize;
                     let len = (out.pos - start) - pw;
@@ -611,12 +690,16 @@ fn is_zero_ld(b: &[u8; 16]) -> bool {
     exp == 0 && u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) == 0
 }
 
+/// The Rust form of strfmon: format into `buf` with the conventions `lc`; `next(long_double)` gives each value. The
+/// length without the NUL, or -1 with errno set (EINVAL, E2BIG).
 pub fn strfmon_r(buf: &mut [u8], lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bool) -> MonArg) -> isize {
     let mut out = Out { buf, pos: 0, failed: false };
     vstrfmon(&mut out, lc, fmt, &mut |l| match next(l) {
         MonArg::Double(d) => Num::D(d),
         MonArg::LongDouble(b) => Num::L(b),
     });
+    // the terminating NUL goes in even after a format error (glibc does that), if there is room; with
+    // no room the output did not fit (E2BIG, unless a format error set its errno already)
     if let Some(slot) = out.buf.get_mut(out.pos) {
         *slot = 0;
         out.pos += 1;
@@ -627,38 +710,66 @@ pub fn strfmon_r(buf: &mut [u8], lc: &Lconv, fmt: &[u8], next: &mut dyn FnMut(bo
     if out.failed { -1 } else { out.pos as isize - 1 }
 }
 
+/// One value for [`strfmon_r`]: a double, or a long double as its 16 bytes (x87 extended).
 #[derive(Clone, Copy, Debug)]
 pub enum MonArg {
     Double(f64),
     LongDouble([u8; 16]),
 }
 
+/// The C entry's body: the buffer and the format converted once, the values read from the va_list.
+///
+/// # Safety
+/// `s` has `maxsize` writable bytes, `fmt` is a C string, `ap` holds the values the format asks for.
 unsafe fn strfmon_body(s: *mut c_char, maxsize: usize, lc: &Lconv, fmt: *const c_char, ap: &mut VaList) -> isize {
+    // (a larger `maxsize` than isize::MAX cannot describe a real buffer)
+    // SAFETY: `maxsize` writable bytes (caller's contract).
     let buf = unsafe { rusty_libc_core::ffi::bytes_mut(s.cast::<u8>(), maxsize.min(isize::MAX as usize)) };
+    // SAFETY: a C string (caller's contract).
     let fmt = unsafe { rusty_libc_core::ffi::cstr_bytes(fmt) };
     strfmon_r(buf, lc, fmt, &mut |long| {
         if long {
+            // SAFETY: the format asks for a long double here (caller's contract).
             MonArg::LongDouble(unsafe { read_long_double(ap) })
         } else {
+            // SAFETY: the format asks for a double here (caller's contract).
             MonArg::Double(unsafe { ap.next_arg::<f64>() })
         }
     })
 }
 
+/// strfmon: format monetary values into `s` (at most `maxsize` bytes, the NUL included) following `format`;
+/// the length without the NUL, or -1 with errno EINVAL or E2BIG.
+///
+/// # Safety
+/// As `printf`; `s` has `maxsize` bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strfmon(s: *mut c_char, maxsize: usize, format: *const c_char, mut args: ...) -> isize {
     let lc = rusty_libc_locale::lconv_of(Loc::CURRENT);
+    // SAFETY: forwarded contract.
     unsafe { strfmon_body(s, maxsize, &lc, format, &mut args) }
 }
 
+/// strfmon_l: strfmon with the monetary conventions of the locale `loc`.
+///
+/// # Safety
+/// As `strfmon`; `loc` is a locale object (or LC_GLOBAL_LOCALE).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn strfmon_l(s: *mut c_char, maxsize: usize, loc: *mut LocaleStruct, format: *const c_char, mut args: ...) -> isize {
+    // SAFETY: `loc` is LC_GLOBAL_LOCALE or a live locale object (the caller's contract).
     let lc = rusty_libc_locale::lconv_of(unsafe { Loc::from_raw(loc as usize) });
+    // SAFETY: forwarded contract.
     unsafe { strfmon_body(s, maxsize, &lc, format, &mut args) }
 }
 
+/// `__strfmon_l`, the exported internal name.
+///
+/// # Safety
+/// As `strfmon_l`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __strfmon_l(s: *mut c_char, maxsize: usize, loc: *mut LocaleStruct, format: *const c_char, mut args: ...) -> isize {
+    // SAFETY: `loc` is LC_GLOBAL_LOCALE or a live locale object (the caller's contract).
     let lc = rusty_libc_locale::lconv_of(unsafe { Loc::from_raw(loc as usize) });
+    // SAFETY: forwarded contract.
     unsafe { strfmon_body(s, maxsize, &lc, format, &mut args) }
 }

@@ -1,3 +1,17 @@
+//! The PLT trampoline used while profiling (`LD_PROFILE`) or auditing (`LD_AUDIT`): `_dl_runtime_profile`, glibc's name for it.
+//!
+//! With either feature every object's lazy PLT enters here instead of `_dl_runtime_resolve`, and the PLT slot is never patched,
+//! so each call comes back: the first one looks the target up (and asks the audit libraries, `la_symbind64`), every call then
+//! gives the audit libraries' `la_pltenter` the registers (glibc's `La_x86_64_regs`), may be redirected by them, is counted by
+//! the profiler (`profile::mcount`), and is made. When a `la_pltenter` asked for a frame size the call is made from a copy
+//! of the stack arguments and returns here, and `la_pltexit` sees (and may change) the return registers (`La_x86_64_retval`)
+//! before the original caller gets them back. Without such a request the target is jumped to and returns to the caller itself.
+//!
+//! The whole vector state is saved and restored exactly (xsave); the audit library sees the full ymm (AVX) or zmm
+//! (AVX-512) registers in `lr_vector` and `lrv_vector0/1`, as with glibc, and a register it changed there (or its
+//! `lr_xmm` / `lrv_xmm0/1`) is what the function gets; after `la_pltenter` the two views of a register are made to agree, so
+//! `la_pltexit` sees the changed values in both. Not handled: the registers zmm8-31 and the mask registers are
+//! restored but not shown.
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use crate::audit;
 use crate::map::*;
@@ -5,8 +19,10 @@ use crate::sys;
 use crate::util::*;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
 
+/// Size of one cached PLT slot (`Slot`).
 pub const SLOT_SIZE: usize = 32;
 
+/// glibc's `struct reloc_result` for one PLT slot: what the first call found.
 #[repr(C)]
 pub struct Slot {
     pub addr: usize,
@@ -17,6 +33,8 @@ pub struct Slot {
     pub init: u32,
 }
 
+/// The fields of a `Slot` before `init` (bytes 0..28): what the first call stores and every call reads. Kept apart so that
+/// `init`, which threads read and publish atomically, is never touched by a plain access.
 #[repr(C, packed(4))]
 #[derive(Clone, Copy)]
 struct SlotHead {
@@ -30,20 +48,26 @@ const _: () = assert!(core::mem::size_of::<SlotHead>() == core::mem::offset_of!(
 const _: () = assert!(core::mem::offset_of!(SlotHead, enterexit) == core::mem::offset_of!(Slot, enterexit));
 const _: () = assert!(core::mem::size_of::<Slot>() == SLOT_SIZE);
 
+/// The address of a slot record's `init` word.
 fn slot_init(s: *mut Slot) -> *mut u32 {
     (s as *mut u8).wrapping_add(core::mem::offset_of!(Slot, init)) as *mut u32
 }
 
+/// Do lazily bound PLT slots go through the tracing trampoline?
 #[inline(always)]
 pub fn wanted() -> bool {
     crate::profile::enabled() || audit::au().n != 0
 }
 
+/// The cached record of PLT slot `idx` of `m` (the table is made on first use; NULL when `idx` is not a PLT slot or there is no
+/// memory).
 fn slot_of(m: Map, idx: usize) -> *mut Slot {
     let n = m.pltrelsz() / core::mem::size_of::<crate::elf::Rela>();
     if idx >= n {
         return core::ptr::null_mut();
     }
+    // SAFETY: the `plt_cache` word of a live link map; every access after the map was zeroed is through this atomic (dlclose
+    // clears it with a plain store only when no thread can call through the object any more).
     let cache = unsafe { AtomicUsize::from_ptr(m.plt_cache_field()) };
     if cache.load(Acquire) == 0 {
         let len = (n * SLOT_SIZE).max(SLOT_SIZE);
@@ -51,25 +75,38 @@ fn slot_of(m: Map, idx: usize) -> *mut Slot {
         if mem < 0 && mem > -4096 {
             return core::ptr::null_mut();
         }
+        // another thread may have been first: keep the winner's table
         let table = mem as usize;
         if cache.compare_exchange(0, table, AcqRel, Acquire).is_err() {
+            // SAFETY: our own fresh mapping, which lost the race and was never published.
             unsafe { sys::munmap(table, len) };
         }
     }
     (cache.load(Acquire) as *mut Slot).wrapping_add(idx)
 }
 
+/// Called by the trampoline: resolve (once per slot), audit, count; returns the address to call. `framesize` is set to -1 (no
+/// la_pltexit) or the number of stack-argument bytes to copy.
+///
+/// # Safety
+/// Called by `_dl_runtime_profile` with the link map PLT0 pushed (GOT[1]), the PLT relocation index, the caller's return
+/// address and the trampoline's register block and frame-size word.
 unsafe extern "C" fn plt_fixup(m: *mut LinkMap, idx: usize, retaddr: usize, regs: *mut audit::Regs, framesize: *mut isize) -> usize {
+    // SAFETY: the frame-size word of the trampoline's frame (caller's contract).
     let framesize = unsafe { &mut *framesize };
     *framesize = -1;
+    // SAFETY: GOT[1] holds the address of the object's link map (caller's contract).
     let Some(m) = (unsafe { Map::from_ptr(m) }) else { sys::exit(127) };
     let slot = slot_of(m, idx);
     let mut local = Slot { addr: 0, bound: None, boundndx: 0, enterexit: 0xffff, flags: 0, init: 0 };
     let s: *mut Slot = if slot.is_null() { &mut local } else { slot };
+    // SAFETY: `s` is the slot's record in the object's table (32-byte records, made by `slot_of`) or `local`; its `init`
+    // word is only accessed atomically.
     let init = unsafe { AtomicU32::from_ptr(slot_init(s)) };
     if init.load(Acquire) == 0 {
         let r = &m.jmprels()[idx];
         let symidx = (r.info >> 32) as usize;
+        // SAFETY: the symbol of one of the object's PLT relocations; the program is running, so resolvers may run.
         match unsafe { crate::reloc::bind_ex(m, symidx, true, false, false) } {
             Some(res) => {
                 let mut value = res.addr;
@@ -85,6 +122,8 @@ unsafe extern "C" fn plt_fixup(m: *mut LinkMap, idx: usize, retaddr: usize, regs
                         fl = f;
                     }
                 }
+                // SAFETY: the record's fields before `init` (see above); until `init` is published only threads that also
+                // found it 0 write them, all with the same values (glibc's reloc_result has the same benign race).
                 unsafe { (s as *mut SlotHead).write(SlotHead { addr: value, bound: res.map, boundndx: ndx, enterexit: ee, flags: fl }) };
                 init.store(1, Release);
             }
@@ -94,11 +133,14 @@ unsafe extern "C" fn plt_fixup(m: *mut LinkMap, idx: usize, retaddr: usize, regs
             }
         }
     }
+    // SAFETY: the record's fields are initialised (`init` is 1, published with Release and read with Acquire); a copy.
     let rec = unsafe { (s as *const SlotHead).read() };
     let mut value = rec.addr;
     if audit::active() && rec.enterexit & audit::LA_SYMB_NOPLTENTER == 0 {
         let mut ee = rec.enterexit;
+        // SAFETY: the trampoline's register block (caller's contract).
         unsafe { audit::pltenter(m, rec.bound, rec.boundndx, &mut ee, rec.flags, &mut value, regs, framesize) };
+        // SAFETY: the slot's `enterexit` word (glibc updates it the same way).
         unsafe { (*s).enterexit = ee };
     }
     if crate::profile::enabled() {
@@ -107,51 +149,116 @@ unsafe extern "C" fn plt_fixup(m: *mut LinkMap, idx: usize, retaddr: usize, regs
     value
 }
 
+/// Called by the trampoline after the function returned (only when a la_pltenter asked for it).
+///
+/// # Safety
+/// As [`plt_fixup`], with the trampoline's register blocks for the call and its return.
 unsafe extern "C" fn plt_exit(m: *mut LinkMap, idx: usize, inregs: *const audit::Regs, outregs: *mut audit::Retval) {
+    // SAFETY: GOT[1] holds the address of the object's link map (caller's contract).
     let Some(m) = (unsafe { Map::from_ptr(m) }) else { return };
     let slot = slot_of(m, idx);
     if slot.is_null() {
         return;
     }
+    // SAFETY: the slot's record in the object's table; `init` is read atomically.
     if unsafe { AtomicU32::from_ptr(slot_init(slot)) }.load(Acquire) == 0 {
         return;
     }
+    // SAFETY: an initialised record (see above); a copy of its fields before `init`.
     let rec = unsafe { (slot as *const SlotHead).read() };
+    // SAFETY: the trampoline's register blocks (caller's contract).
     unsafe { audit::pltexit(m, rec.bound, rec.boundndx, rec.enterexit, rec.addr, inregs, outregs) };
 }
 
+/// What the audit libraries are shown of the vector registers: 0 the xmm registers only, 1 ymm, 2 zmm (glibc picks the
+/// matching `_dl_runtime_profile` variant by the CPU features; here one trampoline branches on this byte). Set by
+/// `init_vector_level` before the first trampoline is installed.
 static VEC_LEVEL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+/// 1 when the trampolines that save the whole vector state must use fxsave/fxrstor (512 bytes, the legacy SSE area) because
+/// the processor has no XSAVE or the operating system has not enabled it (CPUID.1:ECX bits 26 and 27: pre-2008 Intel, QEMU's
+/// Nehalem and qemu64 models); 0 (the initial value) means xsave/xrstor. glibc has `_xsave`/`_fxsave` variants for the same reason.
+/// Read by the assembly of `_dl_runtime_profile` and `_dl_tlsdesc_dynamic`.
 pub static NO_XSAVE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+/// Choose the save instruction (`force` is the test hook LD_RL_FORCE_FXSAVE). Called once, early in the loader's start.
 pub fn init_xsave(force: bool) {
     let l1 = core::arch::x86_64::__cpuid(1);
     let no = force || l1.ecx & (1 << 26) == 0 || l1.ecx & (1 << 27) == 0;
     NO_XSAVE.store(no as u8, Relaxed);
 }
 
+/// The bytes the state-saving trampolines reserve for one save area (a multiple of 64): what xsave writes for the components
+/// the operating system enabled (XCR0) except AMX's tile configuration and data (bits 17 and 18, call-clobbered like glibc's
+/// STATE_SAVE_MASK leaves them out: 8 KB of tile data would not fit, and glibc does not save them either), or 576 for fxsave
+/// (the 512-byte legacy area and the 64-byte header the trampolines clear). Starts at 4096 (the old fixed size: enough for
+/// AVX-512's 2696 bytes) until `init_xsave_size` measures it, before the first trampoline that reads it can run. Read by the
+/// assembly of `_dl_runtime_profile` and `_dl_tlsdesc_dynamic`, which reserve this much instead of a fixed 4096 (FIXLIST #79:
+/// with AVX2 the area is 832 bytes, so 3 KB of stack less under every call that needs a dynamic TLS block).
+pub static XSAVE_SIZE: AtomicUsize = AtomicUsize::new(4096);
+
+/// The xsave/xrstor component mask the trampolines pass in edx:eax: everything but AMX (bits 17 and 18; see `XSAVE_SIZE`).
+pub const XSAVE_MASK_LO: u32 = !((1 << 17) | (1 << 18));
+
+/// Measure `XSAVE_SIZE` (once; `init_xsave` has run). Called before the first TLS descriptor that uses
+/// `_dl_tlsdesc_dynamic` is written and before profiling or auditing trampolines are installed (`init_vector_level`).
+pub fn init_xsave_size() {
+    use core::arch::x86_64::{__cpuid_count, _xgetbv};
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Relaxed) {
+        return;
+    }
+    let mut size = 576u32;
+    if NO_XSAVE.load(Relaxed) == 0 {
+        // SAFETY: XGETBV with ECX 0 only reads XCR0; NO_XSAVE is 0 only when CPUID.1:ECX says XSAVE and OSXSAVE are set.
+        let xcr0 = unsafe { _xgetbv(0) } & XSAVE_MASK_LO as u64;
+        // components 0 and 1 are the legacy area; each other one is at CPUID.(0xD, i).EBX, EAX bytes long (standard format)
+        for i in 2..63u32 {
+            if xcr0 & (1 << i) != 0 {
+                let c = __cpuid_count(0xd, i);
+                size = size.max(c.ebx.saturating_add(c.eax));
+            }
+        }
+    }
+    XSAVE_SIZE.store((size as usize + 63) & !63, Relaxed);
+}
+
+/// Find out what the processor and the operating system save (CPUID leaf 1 and 7, XCR0).
 pub fn init_vector_level() {
     use core::arch::x86_64::{__cpuid, __cpuid_count, _xgetbv};
     static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if DONE.swap(true, Relaxed) {
         return;
     }
+    // xgetbv(0) reads XCR0; it is executed only when CPUID says OSXSAVE is set (the `||` stops before it otherwise)
     let xcr0 = || {
+        // SAFETY: XGETBV with ECX 0 only reads processor state; reached only when CPUID.1:ECX.OSXSAVE is set (see above).
         unsafe { _xgetbv(0) }
     };
     let level = {
         let l1 = __cpuid(1);
+        // OSXSAVE (bit 27) and AVX (bit 28), then the OS saving the SSE and AVX state (XCR0 bits 1, 2)
         if l1.ecx & (1 << 27) == 0 || l1.ecx & (1 << 28) == 0 || xcr0() & 6 != 6 {
             0
         } else if __cpuid(0).eax >= 7 && __cpuid_count(7, 0).ebx & (1 << 16) != 0 && xcr0() & 0xe0 == 0xe0 {
+            // AVX512F, and the OS saving opmask, ZMM_Hi256 and Hi16_ZMM (XCR0 bits 5, 6, 7)
             2
         } else {
             1
         }
     };
     VEC_LEVEL.store(level, Relaxed);
+    init_xsave_size();
 }
 
+/// GOT[2] of every object while profiling or auditing. Stack on entry: link map, relocation index, return address, arguments.
+/// Frame: `[rbx]` regs, `[rbx+8]` frame size, `[rbx+16]` saved rax, `[rbx+24]` saved rbx, `[rbx+32]` link map,
+/// `[rbx+40]` index, `[rbx+48]` return address, `[rbx+56]` the first stack argument; below: `XSAVE_SIZE` + 256 bytes of save
+/// area (the state at entry; reused after the call for the return value and, 256 bytes up, a second save area) and
+/// `La_x86_64_regs` (768 bytes).
+///
+/// # Safety
+/// Entered only from PLT0 of an object `reloc::setup_lazy_got` set up (never called from Rust).
 #[unsafe(naked)]
 pub unsafe extern "C" fn _dl_runtime_profile() {
     core::arch::naked_asm!(
@@ -160,10 +267,15 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         "push 0",
         "push 0",
         "mov rbx, rsp",
-        "sub rsp, 4864",
+        // the save area: XSAVE_SIZE + 256 bytes (at the exit a La_x86_64_retval and a second save area share it)
+        "mov r11, qword ptr [rip + {xs}]",
+        "add r11, 256",
+        "sub rsp, r11",
+        "sub rsp, 768",
         "and rsp, -64",
-        "lea r11, [rsp + 4096]",
+        "add r11, rsp",
         "mov [rbx], r11",
+        // the integer argument registers
         "mov [r11], rdx",
         "mov [r11 + 8], r8",
         "mov [r11 + 16], r9",
@@ -173,6 +285,7 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         "mov [r11 + 48], rbp",
         "lea r10, [rbx + 48]",
         "mov [r11 + 56], r10",
+        // the whole vector state: the header of the xsave area must be zero except what xsave writes
         "xor r10d, r10d",
         "mov [rsp + 512], r10",
         "mov [rsp + 520], r10",
@@ -184,13 +297,14 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         "mov [rsp + 568], r10",
         "cmp byte ptr [rip + {nox}], 0",
         "jne 818f",
-        "mov eax, -1",
+        "mov eax, {mask}",
         "mov edx, -1",
         "xsave [rsp]",
         "jmp 819f",
         "818:",
         "fxsave [rsp]",
         "819:",
+        // lr_xmm, and lr_vector (zero but for the low 16 bytes)
         "movups [r11 + 64], xmm0",
         "movups [r11 + 80], xmm1",
         "movups [r11 + 96], xmm2",
@@ -203,6 +317,7 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         "mov ecx, 72",
         "xor eax, eax",
         "rep stosq",
+        // lr_vector: the whole register (ymm or zmm, by what the OS saves), the rest zero
         "movzx r10d, byte ptr [rip + {lvl}]",
         "cmp r10d, 2",
         "je 6f",
@@ -244,9 +359,10 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         "lea r8, [rbx + 8]",
         "call {fixup}",
         "mov r11, rax",
+        // everything back as it was, except what an audit library changed in the registers it was shown
         "cmp byte ptr [rip + {nox}], 0",
         "jne 828f",
-        "mov eax, -1",
+        "mov eax, {mask}",
         "mov edx, -1",
         "xrstor [rsp]",
         "jmp 829f",
@@ -425,11 +541,13 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         "mov r10, [rbx + 8]",
         "test r10, r10",
         "jns 3f",
+        // no la_pltexit: drop our frame (and the link map and index the PLT pushed) and jump; the target returns to the caller
         "mov rsp, rbx",
         "mov rbx, [rsp + 24]",
         "add rsp, 48",
         "jmp r11",
         "3:",
+        // call the target from a copy of its stack arguments
         "lea rsi, [rbx + 56]",
         "lea rcx, [r10 + 8]",
         "and rcx, -16",
@@ -441,8 +559,11 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         "mov rsi, [r10 + 32]",
         "mov rdi, [r10 + 40]",
         "call r11",
+        // the return registers into a La_x86_64_retval at the bottom of the old xsave area, a second xsave area above it
         "mov r10, [rbx]",
-        "lea rsp, [r10 - 4096]",
+        "mov rsp, r10",
+        "sub rsp, qword ptr [rip + {xs}]",
+        "sub rsp, 256",
         "mov [rsp], rax",
         "mov [rsp + 8], rdx",
         "fstp tbyte ptr [rsp + 48]",
@@ -458,7 +579,7 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         "mov [rsp + 824], r11",
         "cmp byte ptr [rip + {nox}], 0",
         "jne 838f",
-        "mov eax, -1",
+        "mov eax, {mask}",
         "mov edx, -1",
         "xsave [rsp + 256]",
         "jmp 839f",
@@ -494,7 +615,7 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         "call {exit}",
         "cmp byte ptr [rip + {nox}], 0",
         "jne 848f",
-        "mov eax, -1",
+        "mov eax, {mask}",
         "mov edx, -1",
         "xrstor [rsp + 256]",
         "jmp 849f",
@@ -548,5 +669,7 @@ pub unsafe extern "C" fn _dl_runtime_profile() {
         exit = sym plt_exit,
         lvl = sym VEC_LEVEL,
         nox = sym NO_XSAVE,
+        xs = sym XSAVE_SIZE,
+        mask = const XSAVE_MASK_LO,
     )
 }

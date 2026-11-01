@@ -3,7 +3,10 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "bits/types.h",
     items: &[
-        Item::Guard { name: "_BITS_TYPES_H", value: "1", end: "", items: &[
+        Item::Comment(r#"/* bits/types.h: the reserved-name types glibc's headers define for x86-64 Linux (__time_t, __pid_t, __off64_t, ...).
+   glibc programs and libraries use them directly (glibc's own test support code, for one), so they must exist under the same
+   names; each is the same C type as the public name it backs (time_t is long, pid_t is int, ...). */"#),
+        Item::Guard { name: "_BITS_TYPES_H", value: "1", end: " /* bits/types.h */", items: &[
             Item::Blank,
             Item::Typedef("unsigned char", "__u_char"),
             Item::Typedef("unsigned short int", "__u_short"),

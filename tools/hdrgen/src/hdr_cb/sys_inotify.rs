@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("IN_CLOEXEC", V::Hex(0x80000)),
         ("IN_NONBLOCK", V::Dec(2048)),
@@ -31,6 +32,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("IN_ALL_EVENTS", V::Dec(4095)),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Block { head: "struct inotify_event ", body: &["", "  int wd;", "  uint32_t mask;", "  uint32_t cookie;", "  uint32_t len;", "  char name[];", ""], tail: "" },
 ];
 pub const AFTER_INCLUDES_CHOMP: bool = false;

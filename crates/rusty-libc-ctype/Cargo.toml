@@ -7,5 +7,9 @@ license.workspace = true
 [dependencies]
 rusty-libc-core = { path = "../rusty-libc-core" }
 
+[dev-dependencies]
+libc = "0.2"
+
 [features]
+# Export the C symbols (isalpha, toupper, ...). Off for host tests so they never replace the host libc.
 export = []

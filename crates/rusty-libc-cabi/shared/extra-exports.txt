@@ -1,3 +1,4 @@
+# exported by rusty-libc although the system glibc 2.43 does not define them: name NODE
 posix_spawn_file_actions_addchdir GLIBC_2.43
 __libc_walk_threads GLIBC_PRIVATE
 __ctype_b GLIBC_2.2.5

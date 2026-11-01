@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* shared types, behind glibc's guard macros so every header can be included together */"),
     Item::Consts(&[
         ("__need_wint_t", V::Txt("")),
     ]),
@@ -40,6 +41,9 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("WCHAR_MIN", V::Txt("(-__WCHAR_MAX__ - 1)")),
     ]),
     Item::Blank,
+    Item::Comment(r#"/* The wcsto* integer parsers: C23 mode (and only it) also reads a 0b prefix, like glibc's headers.
+   The macro-generated names are written by hand (cbindgen cannot see them), as are the long double
+   ones (the Rust side returns them in the x87 register through a naked wrapper). */"#),
     Item::Gate(&[
         Branch { head: "if __GLIBC_USE (C23_STRTOL)", items: &[
             Item::Raw(Reason::GlibcMacro, r#"# define __RLIBC_C23(n) __asm__("__isoc23_" #n)"#),
@@ -50,6 +54,9 @@ pub static AFTER_INCLUDES: &[Item] = &[
             Item::Raw(Reason::GlibcMacro, "# define __RLIBC_C23_AS(n)"),
         ] },
     ], ""),
+    Item::Comment(r#"/* The wide scanf family: the names choose the C99 behaviour (%a reads a float), or the C23 one (also %i
+   accepts a 0b prefix) when compiled as C23 or with _GNU_SOURCE, like glibc's headers do; none of them (the plain names)
+   for a pre-C99 mode with _GNU_SOURCE (glibc's DEPRECATED_SCANF). */"#),
     Item::Gate(&[
         Branch { head: "if __GLIBC_USE (DEPRECATED_SCANF)", items: &[
             Item::Raw(Reason::GlibcMacro, "# define __RLIBC_WSCANF(n)"),
@@ -61,6 +68,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
             Item::Raw(Reason::GlibcMacro, r#"# define __RLIBC_WSCANF(n) __asm__("__isoc99_" #n)"#),
         ] },
     ], ""),
+    Item::Comment("/* wide stream I/O made by macros on the Rust side (cbindgen cannot see them) */"),
     Item::Decl("wint_t fgetwc(FILE *);"),
     Item::Decl("wint_t getwc(FILE *);"),
     Item::Decl("wint_t fgetwc_unlocked(FILE *);"),

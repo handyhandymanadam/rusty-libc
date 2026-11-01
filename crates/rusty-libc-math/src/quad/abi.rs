@@ -1,3 +1,9 @@
+//! C entry points for the `_Float128` functions. A `_Float128` argument or result is passed in an xmm
+//! register (the Rust type `f128` carries the bits and is never computed with); an x87 `long double`
+//! result needs a few instructions of naked assembly. In every macro `$imp` is the Rust function
+//! that does the work, taking and returning [`F128`].
+
+/// `_Float128 f(_Float128)`; `$imp: fn(F128) -> F128`.
 macro_rules! q_un {
     ($(#[$m:meta])* $name:ident, $imp:path) => {
         $(#[$m])*
@@ -8,6 +14,7 @@ macro_rules! q_un {
     };
 }
 
+/// `_Float128 f(_Float128, _Float128)`.
 macro_rules! q_bin {
     ($(#[$m:meta])* $name:ident, $imp:path) => {
         $(#[$m])*
@@ -18,6 +25,7 @@ macro_rules! q_bin {
     };
 }
 
+/// `_Float128 f(_Float128, _Float128, _Float128)`.
 macro_rules! q_tern {
     ($(#[$m:meta])* $name:ident, $imp:path) => {
         $(#[$m])*
@@ -28,6 +36,7 @@ macro_rules! q_tern {
     };
 }
 
+/// `_Float128 f(_Float128, integer type $t)`.
 macro_rules! q_int {
     ($(#[$m:meta])* $name:ident, $imp:path, $t:ty) => {
         $(#[$m])*
@@ -38,6 +47,7 @@ macro_rules! q_int {
     };
 }
 
+/// `$r f(_Float128)` for an integer or float result type `$r`; `$imp: fn(F128) -> $r`.
 macro_rules! q_to {
     ($(#[$m:meta])* $name:ident, $imp:path, $r:ty) => {
         $(#[$m])*
@@ -48,6 +58,7 @@ macro_rules! q_to {
     };
 }
 
+/// `$r f(_Float128, _Float128)`.
 macro_rules! q_to2 {
     ($(#[$m:meta])* $name:ident, $imp:path, $r:ty) => {
         $(#[$m])*
@@ -58,6 +69,7 @@ macro_rules! q_to2 {
     };
 }
 
+/// `long double f(_Float128, _Float128)`: the result comes back in st(0).
 macro_rules! q2_to_ld {
     ($name:ident, $imp:path) => {
         #[allow(non_snake_case)]
@@ -70,6 +82,8 @@ macro_rules! q2_to_ld {
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         #[unsafe(naked)]
+        /// # Safety
+        /// C ABI: two `_Float128` arguments in xmm0 and xmm1, the `long double` result in st(0).
         pub unsafe extern "C" fn $name(_x: f128, _y: f128) -> f64 {
             core::arch::naked_asm!(
                 "sub rsp, 24",
@@ -84,6 +98,7 @@ macro_rules! q2_to_ld {
     };
 }
 
+/// `long double f(_Float128, _Float128, _Float128)`.
 macro_rules! q3_to_ld {
     ($name:ident, $imp:path) => {
         #[allow(non_snake_case)]
@@ -96,6 +111,8 @@ macro_rules! q3_to_ld {
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         #[unsafe(naked)]
+        /// # Safety
+        /// C ABI: three `_Float128` arguments in xmm0 to xmm2, the `long double` result in st(0).
         pub unsafe extern "C" fn $name(_x: f128, _y: f128, _z: f128) -> f64 {
             core::arch::naked_asm!(
                 "sub rsp, 24",
@@ -110,6 +127,7 @@ macro_rules! q3_to_ld {
     };
 }
 
+/// `long double f(_Float128)`.
 macro_rules! q1_to_ld {
     ($name:ident, $imp:path) => {
         #[allow(non_snake_case)]
@@ -122,6 +140,8 @@ macro_rules! q1_to_ld {
         }
         #[cfg_attr(feature = "export", unsafe(no_mangle))]
         #[unsafe(naked)]
+        /// # Safety
+        /// C ABI: one `_Float128` argument in xmm0, the `long double` result in st(0).
         pub unsafe extern "C" fn $name(_x: f128) -> f64 {
             core::arch::naked_asm!(
                 "sub rsp, 24",

@@ -4,6 +4,7 @@ pub static HDR: Header = Header {
     path: "stdint.h",
     items: &[
         Item::Guard { name: "_RLIBC_STDINT_H", value: "", end: "", items: &[
+            Item::Comment("/* Fixed-width integer types for Linux x86-64 (LP64), as glibc defines them. */"),
             Item::Typedef("signed char", "int8_t"),
             Item::Typedef("short int", "int16_t"),
             Item::Typedef("int", "int32_t"),
@@ -96,6 +97,7 @@ pub static HDR: Header = Header {
             Item::Raw(Reason::StdMacro, "#define UINT64_C(c) c ## UL"),
             Item::Raw(Reason::StdMacro, "#define INTMAX_C(c) c ## L"),
             Item::Raw(Reason::StdMacro, "#define UINTMAX_C(c) c ## UL"),
+            Item::Comment("/* C23 width macros (glibc defines them under the same condition) */"),
             Item::Gate(&[
                 Branch { head: "if defined _GNU_SOURCE || (defined __STDC_VERSION__ && __STDC_VERSION__ > 201710L)", items: &[
                     Item::Consts(&[

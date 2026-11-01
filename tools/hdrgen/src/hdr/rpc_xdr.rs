@@ -32,7 +32,9 @@ pub static HDR: Header = Header {
  *   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */"#),
-        Item::Guard { name: "_RPC_XDR_H", value: "1", end: "", items: &[
+        Item::Comment(r#"/* Structure layouts and constants follow Sun's RPC headers (as in glibc's sunrpc/rpc/);
+   the function prototypes are generated from the Rust sources (bits/rlibc-rpc-*.h). */"#),
+        Item::Guard { name: "_RPC_XDR_H", value: "1", end: " /* rpc/xdr.h */", items: &[
             Item::Blank,
             Item::Include("<stdint.h>"),
             Item::Include("<sys/types.h>"),
@@ -48,10 +50,11 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::Typedef("struct XDR", "XDR"),
             Item::Block { head: r#"struct XDR
-  "#, body: &["", r#"    enum xdr_op x_op;"#, "    struct xdr_ops", "      {", r#"	bool_t (*x_getlong) (XDR *__xdrs, long *__lp);"#, r#"	bool_t (*x_putlong) (XDR *__xdrs, const long *__lp);"#, r#"	bool_t (*x_getbytes) (XDR *__xdrs, caddr_t __addr, u_int __len);"#, r#"	bool_t (*x_putbytes) (XDR *__xdrs, const char *__addr, u_int __len);"#, r#"	u_int (*x_getpostn) (const XDR *__xdrs);"#, r#"	bool_t (*x_setpostn) (XDR *__xdrs, u_int __pos);"#, r#"	int32_t *(*x_inline) (XDR *__xdrs, u_int __len);"#, r#"	void (*x_destroy) (XDR *__xdrs);"#, r#"	bool_t (*x_getint32) (XDR *__xdrs, int32_t *__ip);"#, r#"	bool_t (*x_putint32) (XDR *__xdrs, const int32_t *__ip);"#, "      }", "     *x_ops;", r#"    caddr_t x_public;"#, r#"    caddr_t x_private;"#, r#"    caddr_t x_base;"#, r#"    u_int x_handy;"#, "  "], tail: "" },
+  "#, body: &["", r#"    enum xdr_op x_op;		/* operation; fast additional param */"#, "    struct xdr_ops", "      {", r#"	bool_t (*x_getlong) (XDR *__xdrs, long *__lp);"#, r#"	bool_t (*x_putlong) (XDR *__xdrs, const long *__lp);"#, r#"	bool_t (*x_getbytes) (XDR *__xdrs, caddr_t __addr, u_int __len);"#, r#"	bool_t (*x_putbytes) (XDR *__xdrs, const char *__addr, u_int __len);"#, r#"	u_int (*x_getpostn) (const XDR *__xdrs);"#, r#"	bool_t (*x_setpostn) (XDR *__xdrs, u_int __pos);"#, r#"	int32_t *(*x_inline) (XDR *__xdrs, u_int __len);"#, r#"	void (*x_destroy) (XDR *__xdrs);"#, r#"	bool_t (*x_getint32) (XDR *__xdrs, int32_t *__ip);"#, r#"	bool_t (*x_putint32) (XDR *__xdrs, const int32_t *__ip);"#, "      }", "     *x_ops;", r#"    caddr_t x_public;		/* users' data */"#, r#"    caddr_t x_private;		/* pointer to private data */"#, r#"    caddr_t x_base;		/* private used for position info */"#, r#"    u_int x_handy;		/* extra private word */"#, "  "], tail: "" },
             Item::Blank,
             Item::Decl("typedef bool_t (*xdrproc_t) (XDR *, void *,...);"),
             Item::Blank,
+            Item::Comment("/* the type of the read and write routines of xdrrec_create */"),
             Item::Decl("typedef int (*__xdr_io_fn_t) (char *, char *, int);"),
             Item::Blank,
             Item::Raw(Reason::GlibcMacro, "#define XDR_GETINT32(xdrs, int32p) (*(xdrs)->x_ops->x_getint32)(xdrs, int32p)"),

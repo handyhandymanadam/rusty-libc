@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
+"""Generates consts.rs for the long double functions: constants and tables as 128-bit significands
+(`(e, m)`: value = m * 2^(e-127), top bit of m set), and the bits of 2/pi for Payne-Hanek argument
+reduction. Everything is computed here with exact big-integer arithmetic (nothing is copied from
+another library). Usage: python3 gen_consts.py > consts.rs"""
 import math
 
 P = 700
 ONE = 1 << P
 
 
-def atanh_inv(n, prec=P):
+def atanh_inv(n, prec=P):  # atanh(1/n) fixed point
     one = 1 << prec
     x = one // n
     n2 = n * n
@@ -18,7 +22,7 @@ def atanh_inv(n, prec=P):
     return s
 
 
-def ln_ratio(num, den):
+def ln_ratio(num, den):  # ln(num/den) = 2 atanh((num-den)/(num+den)), fixed point, num>den>0 or num<den
     a, b = num - den, num + den
     sign = 1
     if a < 0:
@@ -61,7 +65,7 @@ def pi_fp(prec):
 PI = pi_fp(P)
 
 
-def atan_fp(num, den):
+def atan_fp(num, den):  # atan(num/den) for 0 <= num/den <= 1
     x = (num * ONE) // den
     for _ in range(5):
         s = math.isqrt(ONE * ONE + x * x)
@@ -79,7 +83,7 @@ def atan_fp(num, den):
     return s << 5
 
 
-def ext(f):
+def ext(f):  # fixed point (P fractional bits) -> (e, m)
     assert f > 0
     L = f.bit_length()
     sh = L - 128
@@ -96,7 +100,7 @@ def fmt(f):
     return "Ext::c(false, %d, 0x%032x)" % (e, m)
 
 
-def recip(f):
+def recip(f):  # 1/x for fixed point
     return (ONE * ONE) // f
 
 
@@ -109,6 +113,7 @@ consts = {
 }
 for n, f in consts.items():
     out.append("pub const %s: Ext = %s;" % (n, fmt(f)))
+# ln(1 + j/128), j = 0..128  (j = 0 is zero: stored as ZERO via a flag, so skip the first entry)
 out.append("/// ln(1 + j/128) for j = 1..=128 (entry j - 1).")
 out.append("pub static LOG_TAB: [Ext; 128] = [")
 for j in range(1, 129):
@@ -119,12 +124,14 @@ out.append("pub static ATAN_TAB: [Ext; 32] = [")
 for j in range(1, 33):
     out.append("    %s," % fmt(atan_fp(j, 32)))
 out.append("];")
+# 2/pi bits: 16900 bits after the binary point, as big-endian u64 words
 NB = 16900 + 128
 pi_big = pi_fp(NB + 64)
-two_over_pi = (((1 << (NB + 64)) * 2) << (NB + 64)) // pi_big >> 64
+two_over_pi = (((1 << (NB + 64)) * 2) << (NB + 64)) // pi_big >> 64  # 2/pi * 2^NB
 words = []
 nwords = NB // 64
 v = two_over_pi
+# fractional bits: value 2/pi < 1, so bits i = 1.. are the top bits of an NB-bit integer
 for w in range(nwords):
     words.append((v >> (NB - 64 * (w + 1))) & ((1 << 64) - 1))
 out.append("/// The bits of 2/pi after the binary point (word 0 holds bits 1..=64).")
@@ -133,10 +140,11 @@ for i in range(0, len(words), 4):
     out.append("    " + ", ".join("0x%016x" % w for w in words[i:i + 4]) + ",")
 out.append("];")
 
+# ---- constants for the special functions ----
 from fractions import Fraction
 
 
-def bernoulli(n):
+def bernoulli(n):  # B_0..B_n as Fractions
     B = [Fraction(0)] * (n + 1)
     B[0] = Fraction(1)
     for m in range(1, n + 1):
@@ -151,7 +159,7 @@ def fp_frac(fr):
     return (fr.numerator * ONE) // fr.denominator
 
 
-def ln_real(v):
+def ln_real(v):  # ln of a positive fixed-point real
     k = 0
     while v >= (3 * ONE) // 2:
         v >>= 1
@@ -175,7 +183,7 @@ def ln_real(v):
 BERN_FP = [fp_frac(b) for b in BERN]
 
 
-def zeta_fp(k, N=60):
+def zeta_fp(k, N=60):  # Euler-Maclaurin in fixed point
     s = sum(ONE // (n ** k) for n in range(1, N))
     s += ONE // ((k - 1) * N ** (k - 1)) + ONE // (2 * N ** k)
     for j in range(1, 40):
@@ -194,7 +202,7 @@ def gamma_euler_fp(N=100):
     return s - ln_real(N * ONE)
 
 
-def fmts(f):
+def fmts(f):  # signed fixed point
     return ("Ext::c(true, %d, 0x%032x)" % ext(-f)[:1] + "") if False else None
 
 
@@ -232,7 +240,8 @@ for n in range(1, 1101):
     out.append("    %s," % fmt(ONE // n))
 out.append("];")
 
-def q126(f):
+# ---- fixed-point coefficient tables for the fast kernels (Q126: value * 2^126) ----
+def q126(f):  # fixed point (P fractional bits) -> u128, round to nearest
     return (f * (1 << 126) + (ONE >> 1)) // ONE
 
 
@@ -258,7 +267,7 @@ out.append("/// 1/(2n+1), n = 0..=11: atanh and atan series")
 fmtq("ODDRECIP", [ONE // (2 * n + 1) for n in range(12)])
 
 
-def exp_fp(xf):
+def exp_fp(xf):  # exp of a nonnegative fixed-point number
     t = ONE
     s = ONE
     n = 1

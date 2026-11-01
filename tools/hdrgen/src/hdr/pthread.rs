@@ -3,12 +3,19 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "pthread.h",
     items: &[
+        Item::Comment(r#"/* pthread.h for the Rust libc. Written by hand: types (bits/pthreadtypes.h), enumerations and
+   constants with glibc's values, the static initializers (same bytes as glibc's) and the cleanup
+   macros. The function declarations are generated (bits/rlibc-pthreadcalls.h, cbindgen, from the
+   Rust sources of crates/rusty-libc-pthread).
+   Differences from glibc: without exceptions (no -fexceptions) the cleanup macros keep their handlers in a
+   linked list (_pthread_cleanup_push/_pop, the C version glibc also has) and the stack is not unwound. */"#),
         Item::Guard { name: "_RLIBC_PTHREAD_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),
             Item::Include("<sched.h>"),
             Item::Include("<time.h>"),
             Item::Include("<bits/types/struct_timespec.h>"),
+            Item::Comment("/* pthread_attr_getsigmask_np: no mask set in the attribute */"),
             Item::Consts(&[
                 ("PTHREAD_ATTR_NO_SIGMASK_NP", V::Txt("(-1)")),
             ]),
@@ -76,6 +83,7 @@ pub static HDR: Header = Header {
                 ("PTHREAD_COND_INITIALIZER", V::Txt("{ { {0}, {0}, {0, 0}, 0, 0, {0, 0}, 0, 0 } }")),
             ]),
             Item::Blank,
+            Item::Comment("/* Cleanup handlers (what the macros below put on the caller's stack). */"),
             Item::Block { head: "struct _pthread_cleanup_buffer ", body: &["", "  void (*__routine) (void *);", "  void *__arg;", "  int __canceltype;", "  struct _pthread_cleanup_buffer *__prev;", ""], tail: "" },
             Item::Blank,
             Item::Block { head: "enum ", body: &["", "  PTHREAD_CANCEL_ENABLE,", "#define PTHREAD_CANCEL_ENABLE PTHREAD_CANCEL_ENABLE", "  PTHREAD_CANCEL_DISABLE", "#define PTHREAD_CANCEL_DISABLE PTHREAD_CANCEL_DISABLE", ""], tail: "" },
@@ -95,6 +103,12 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::ExternEnd,
             Item::Blank,
+            Item::Comment(r#"/* Install a cleanup handler: ROUTINE will be called with argument ARG when the thread is cancelled
+   or calls pthread_exit, or (with EXECUTE nonzero) at the matching pthread_cleanup_pop. The two
+   macros must be used in pairs in the same block. With exceptions enabled (GNU C -fexceptions, C++) the
+   handler lives in a frame with a cleanup attribute (a destructor in C++), so it runs among the other
+   destructors of the block in the order of the declarations, as in glibc; without exceptions it is
+   kept in a linked list. */"#),
             Item::Raw(Reason::GlibcMacro, r#"#if defined __GNUC__ && defined __EXCEPTIONS
 # ifdef __cplusplus
 class __pthread_cleanup_class

@@ -1,8 +1,13 @@
+//! Correctly rounded binary128 arithmetic (+ - * / fma sqrt), conversions to the narrower formats, and
+//! comparisons. All in integer arithmetic; the current rounding direction is honoured and the
+//! exception flags are raised as an IEEE 754 implementation does (invalid, divide-by-zero, overflow,
+//! underflow, inexact). errno is not touched here (the libm functions that set it are in `basic`).
 use super::*;
 use crate::fenv::FE_INVALID;
 use crate::longdouble::common::F80;
 use crate::longdouble::ext::{F32F, F64F, F80F, add_wide, div_256_128, rnd_to_f32_bits, rnd_to_f64_bits, rnd_to_f80, round_wide};
 
+/// Shift a 256-bit number right by `d` bits; the third result says that nonzero bits fell off.
 fn shr256(hi: u128, lo: u128, d: u64) -> (u128, u128, bool) {
     if d == 0 {
         (hi, lo, false)
@@ -17,6 +22,8 @@ fn shr256(hi: u128, lo: u128, d: u64) -> (u128, u128, bool) {
     }
 }
 
+/// The exact sum of two nonzero numbers of 256-bit significands (normalized, no sticky), as a
+/// normalized [`Wide`]; `sticky` when bits fell below the 256th.
 pub(crate) fn add256(a: &Wide, b: &Wide) -> Wide {
     let (x, y) = if (a.e, a.hi, a.lo) >= (b.e, b.hi, b.lo) { (a, b) } else { (b, a) };
     let d = (x.e - y.e) as u64;
@@ -36,6 +43,7 @@ pub(crate) fn add256(a: &Wide, b: &Wide) -> Wide {
     } else {
         let (lo, b1) = x.lo.overflowing_sub(yl);
         let hi = x.hi.wrapping_sub(yh).wrapping_sub(b1 as u128);
+        // dropped bits of y are below the last place: subtract one more unit, keep sticky
         let (lo, hi) = if st {
             let (l2, b) = lo.overflowing_sub(1);
             (l2, hi.wrapping_sub(b as u128))
@@ -78,14 +86,17 @@ fn addsub(x: F128, y: F128, sub: bool) -> F128 {
     round_wide_f128(&w)
 }
 
+/// x + y.
 pub fn add(x: F128, y: F128) -> F128 {
     addsub(x, y, false)
 }
 
+/// x - y.
 pub fn sub(x: F128, y: F128) -> F128 {
     addsub(x, y, true)
 }
 
+/// x * y.
 pub fn mul(x: F128, y: F128) -> F128 {
     if x.is_nan() || y.is_nan() {
         return super::narrow::pick_nan(super::narrow::Rule::SoftFpMul, &[x, y]).unwrap_or(x);
@@ -101,11 +112,13 @@ pub fn mul(x: F128, y: F128) -> F128 {
     round_wide_f128(&mul_exact(neg, a.e, a.m, b.e, b.m))
 }
 
+/// The exact quotient of two finite nonzero numbers, as a [`Wide`].
 pub(crate) fn div_exact(neg: bool, a: &Ext, b: &Ext) -> Wide {
     let (q, e) = if a.m < b.m { (div_256_128(a.m, 0, b.m), a.e - b.e - 1) } else { (div_256_128(a.m >> 1, a.m << 127, b.m), a.e - b.e) };
     Wide { neg, e, hi: q.0, lo: 0, sticky: q.1 }
 }
 
+/// x / y.
 pub fn div(x: F128, y: F128) -> F128 {
     if x.is_nan() || y.is_nan() {
         return super::narrow::pick_nan(super::narrow::Rule::SoftFp, &[x, y]).unwrap_or(x);
@@ -126,6 +139,7 @@ pub fn div(x: F128, y: F128) -> F128 {
     round_wide_f128(&div_exact(neg, &x.to_ext(), &y.to_ext()))
 }
 
+/// The exact square root as a [`Wide`] (x finite, positive, nonzero).
 pub(crate) fn sqrt_exact(x: &Ext) -> Wide {
     let m = x.m;
     let (n_hi, n_lo) = if x.e & 1 == 0 { (m >> 1, m << 127) } else { (m, 0u128) };
@@ -134,6 +148,7 @@ pub(crate) fn sqrt_exact(x: &Ext) -> Wide {
     Wide { neg: false, e: s.e, hi: s.m, lo: 0, sticky: (h, l) != (n_hi, n_lo) }
 }
 
+/// sqrt(x).
 pub fn sqrt(x: F128) -> F128 {
     if x.is_nan() {
         return nan1(x);
@@ -150,6 +165,8 @@ pub fn sqrt(x: F128) -> F128 {
     round_wide_f128(&sqrt_exact(&x.to_ext()))
 }
 
+/// The exact value of x*y + z for finite nonzero x, y (z finite), as a [`Wide`]; `None` if it is
+/// exactly zero.
 pub(crate) fn fma_exact(x: F128, y: F128, z: F128) -> Option<Wide> {
     let (a, b) = (x.to_ext(), y.to_ext());
     let p = mul_exact(x.is_neg() != y.is_neg(), a.e, a.m, b.e, b.m);
@@ -162,6 +179,8 @@ pub(crate) fn fma_exact(x: F128, y: F128, z: F128) -> Option<Wide> {
     if w.is_zero() { None } else { Some(w) }
 }
 
+/// x * y + z with one rounding. NaN operands: the product's NaN (the one of x and y with the larger fraction, x on a
+/// tie) wins over a NaN z; an invalid product (infinity times zero) gives the default NaN even beside a NaN z.
 pub fn fma(x: F128, y: F128, z: F128) -> F128 {
     let invalid_product = (x.is_inf() && y.is_zero()) || (x.is_zero() && y.is_inf());
     if x.is_nan() || y.is_nan() || z.is_nan() {
@@ -199,6 +218,9 @@ pub fn fma(x: F128, y: F128, z: F128) -> F128 {
     }
 }
 
+// ---- conversions to the narrower formats (single rounding, flags raised) ----
+
+/// Narrow to binary64.
 pub fn to_f64(x: F128) -> f64 {
     let s = if x.is_neg() { 1u64 << 63 } else { 0 };
     if x.is_nan() {
@@ -218,6 +240,7 @@ pub fn to_f64(x: F128) -> f64 {
     f64::from_bits(rnd_to_f64_bits(&r))
 }
 
+/// Narrow to binary32.
 pub fn to_f32(x: F128) -> f32 {
     let s = if x.is_neg() { 1u32 << 31 } else { 0 };
     if x.is_nan() {
@@ -237,6 +260,7 @@ pub fn to_f32(x: F128) -> f32 {
     f32::from_bits(rnd_to_f32_bits(&r))
 }
 
+/// Narrow to the x87 extended format.
 pub fn to_f80(x: F128) -> F80 {
     use crate::longdouble::common::f80_from_bits;
     let se: u16 = if x.is_neg() { 0x8000 } else { 0 };
@@ -257,6 +281,9 @@ pub fn to_f80(x: F128) -> F80 {
     rnd_to_f80(&r)
 }
 
+// ---- comparison ----
+
+/// The ordering of two non-NaN numbers (+0 equals -0).
 pub fn cmp(x: F128, y: F128) -> core::cmp::Ordering {
     use core::cmp::Ordering::*;
     if x.is_zero() && y.is_zero() {
@@ -270,14 +297,17 @@ pub fn cmp(x: F128, y: F128) -> core::cmp::Ordering {
     if xn { o.reverse() } else { o }
 }
 
+/// `x < y` for non-NaN operands.
 pub fn lt(x: F128, y: F128) -> bool {
     cmp(x, y) == core::cmp::Ordering::Less
 }
 
+/// `x > y` for non-NaN operands.
 pub fn gt(x: F128, y: F128) -> bool {
     cmp(x, y) == core::cmp::Ordering::Greater
 }
 
+/// Convert a signed integer exactly or with rounding (i128 values need 127 bits).
 pub fn from_i128(n: i128) -> F128 {
     if n == 0 {
         return F128::ZERO;
@@ -289,6 +319,7 @@ pub fn from_i128(n: i128) -> F128 {
     round_wide_f128(&w)
 }
 
+/// Convert an unsigned 128-bit integer.
 pub fn from_u128(m: u128) -> F128 {
     if m == 0 {
         return F128::ZERO;

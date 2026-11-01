@@ -3,38 +3,32 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "sys/queue.h",
     items: &[
-        Item::Comment(r#"/*
- * Copyright (c) 1991, 1993
- *	The Regents of the University of California.  All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
- *
- *	@(#)queue.h	8.5 (Berkeley) 8/20/94
- */"#),
-        Item::Guard { name: "_SYS_QUEUE_H_", value: "1", end: "", items: &[
+        Item::Comment(r#"/* sys/queue.h for the Rust libc: the BSD list and queue macros (LIST, SLIST, STAILQ, SIMPLEQ, TAILQ, CIRCLEQ),
+   written to the behaviour of the header glibc 2.43 ships (member names, argument order and evaluation are the same:
+   programs reach into the structures directly, so the names are the interface). Macros only; no library code.
+
+   The macro definitions follow queue.h of the 4.4BSD-Lite tree, which glibc carries, so its notice is kept:
+
+   Copyright (c) 1991, 1993
+        The Regents of the University of California.  All rights reserved.
+
+   Redistribution and use in source and binary forms, with or without modification, are permitted provided that the
+   following conditions are met: 1. Redistributions of source code must retain the above copyright notice, this list
+   of conditions and the following disclaimer. 2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided
+   with the distribution. 3. Neither the name of the University nor the names of its contributors may be used to
+   endorse or promote products derived from this software without specific prior written permission.
+
+   THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES,
+   INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+   DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+   CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */"#),
+        Item::Guard { name: "_SYS_QUEUE_H_", value: "1", end: " /* sys/queue.h */", items: &[
             Item::Blank,
+            Item::Comment("/* ---- LIST: a list with one head pointer; elements are doubly linked, traversal goes forward only ---- */"),
             Item::Blank,
             Item::Raw(Reason::GlibcMacro, r#"#define LIST_HEAD(name, type) \
 struct name { \
@@ -85,6 +79,7 @@ struct { \
             Item::Raw(Reason::GlibcMacro, "#define LIST_FIRST(head) ((head)->lh_first)"),
             Item::Raw(Reason::GlibcMacro, "#define LIST_NEXT(elm, field) ((elm)->field.le_next)"),
             Item::Blank,
+            Item::Comment("/* ---- SLIST: singly linked list ---- */"),
             Item::Blank,
             Item::Raw(Reason::GlibcMacro, r#"#define SLIST_HEAD(name, type) \
 struct name { \
@@ -132,6 +127,7 @@ struct { \
             Item::Raw(Reason::GlibcMacro, "#define SLIST_FIRST(head) ((head)->slh_first)"),
             Item::Raw(Reason::GlibcMacro, "#define SLIST_NEXT(elm, field) ((elm)->field.sle_next)"),
             Item::Blank,
+            Item::Comment("/* ---- STAILQ: singly linked tail queue ---- */"),
             Item::Blank,
             Item::Raw(Reason::GlibcMacro, r#"#define STAILQ_HEAD(name, type) \
 struct name { \
@@ -199,6 +195,7 @@ struct { \
             Item::Raw(Reason::GlibcMacro, "#define STAILQ_FIRST(head) ((head)->stqh_first)"),
             Item::Raw(Reason::GlibcMacro, "#define STAILQ_NEXT(elm, field) ((elm)->field.stqe_next)"),
             Item::Blank,
+            Item::Comment("/* ---- SIMPLEQ: the same structure as STAILQ under its older name ---- */"),
             Item::Blank,
             Item::Raw(Reason::GlibcMacro, r#"#define SIMPLEQ_HEAD(name, type) \
 struct name { \
@@ -258,6 +255,7 @@ struct { \
             Item::Raw(Reason::GlibcMacro, "#define SIMPLEQ_FIRST(head) ((head)->sqh_first)"),
             Item::Raw(Reason::GlibcMacro, "#define SIMPLEQ_NEXT(elm, field) ((elm)->field.sqe_next)"),
             Item::Blank,
+            Item::Comment("/* ---- TAILQ: doubly linked tail queue ---- */"),
             Item::Blank,
             Item::Raw(Reason::GlibcMacro, r#"#define _TAILQ_HEAD(name, type, qual) \
 struct name { \
@@ -343,6 +341,7 @@ struct { \
             Item::Raw(Reason::GlibcMacro, r#"#define TAILQ_PREV(elm, headname, field) \
 	(*(((struct headname *)((elm)->field.tqe_prev))->tqh_last))"#),
             Item::Blank,
+            Item::Comment("/* ---- CIRCLEQ: circular queue; the head itself ends the circle ---- */"),
             Item::Blank,
             Item::Raw(Reason::GlibcMacro, r#"#define CIRCLEQ_HEAD(name, type) \
 struct name { \

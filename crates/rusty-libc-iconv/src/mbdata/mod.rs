@@ -1,3 +1,4 @@
+//! Generated multibyte tables (tools/gen_mb.py).
 pub mod ansi_x3_110;
 pub mod big5;
 pub mod big5hkscs;

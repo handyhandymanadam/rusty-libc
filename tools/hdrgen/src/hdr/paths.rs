@@ -3,11 +3,14 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "paths.h",
     items: &[
+        Item::Comment("/* paths.h for the Rust libc: the standard file names (same values as glibc's, 4.4BSD heritage). */"),
         Item::Guard { name: "_PATHS_H_", value: "", end: "", items: &[
             Item::Blank,
+            Item::Comment("/* Default search path. */"),
             Item::Consts(&[
                 ("_PATH_DEFPATH", V::Txt(r#""/usr/bin:/bin""#)),
             ]),
+            Item::Comment("/* All standard utilities path. */"),
             Item::Consts(&[
                 ("_PATH_STDPATH", V::Txt(r#""/usr/bin:/bin:/usr/sbin:/sbin""#)),
             ]),
@@ -41,6 +44,7 @@ pub static HDR: Header = Header {
                 ("_PATH_WTMP", V::Txt(r#""/var/log/wtmp""#)),
             ]),
             Item::Blank,
+            Item::Comment("/* Provide trailing slash, since mostly used for building pathnames. */"),
             Item::Consts(&[
                 ("_PATH_DEV", V::Txt(r#""/dev/""#)),
                 ("_PATH_TMP", V::Txt(r#""/tmp/""#)),

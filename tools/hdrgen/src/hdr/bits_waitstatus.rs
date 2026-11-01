@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "bits/waitstatus.h",
     items: &[
+        Item::Comment(r#"/* bits/waitstatus.h: the macros that take a wait status apart (glibc's header of the same name); <stdlib.h> and <sys/wait.h>
+   both include it, so WIFEXITED and WEXITSTATUS work after <stdlib.h> alone, as with glibc */"#),
         Item::Guard { name: "_BITS_WAITSTATUS_H", value: "1", end: "", items: &[
             Item::Raw(Reason::StdMacro, "#define WEXITSTATUS(status) (((status) & 0xff00) >> 8)"),
             Item::Raw(Reason::StdMacro, "#define WTERMSIG(status) ((status) & 0x7f)"),

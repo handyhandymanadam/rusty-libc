@@ -1,6 +1,8 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment(r#"/* The types, as glibc lays them out (struct qelem, ENTRY, struct hsearch_data are shared with
+   rusty-libc-util's Rust structs; the Rust names differ, the layouts are the same). */"#),
     Item::Block { head: "struct qelem ", body: &["", "  struct qelem *q_forw;", "  struct qelem *q_back;", "  char q_data[1];", ""], tail: "" },
     Item::Blank,
     Item::Gate(&[
@@ -33,6 +35,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
     ], ""),
     Item::Decl("typedef void (*__free_fn_t)(void *__nodep);"),
     Item::Blank,
+    Item::Comment("/* twalk and twalk_r take VISIT, which cbindgen sees as an int. */"),
     Item::Decl("void twalk(const void *__root, __action_fn_t __action);"),
     Item::Decl("void twalk_r(const void *__root, void (*__action)(const void *__nodep, VISIT __value, void *__closure), void *__closure);"),
 ];

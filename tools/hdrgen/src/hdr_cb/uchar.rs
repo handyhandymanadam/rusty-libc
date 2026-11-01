@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* shared types, behind glibc's guard macros so every header can be included together */"),
     Item::Consts(&[
         ("__need_wint_t", V::Txt("")),
     ]),

@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "bits/waitflags.h",
     items: &[
+        Item::Comment("/* bits/waitflags.h: waitpid/waitid option bits (glibc's header of the same name); <stdlib.h> and <sys/wait.h> both include it */"),
         Item::Guard { name: "_BITS_WAITFLAGS_H", value: "1", end: "", items: &[
             Item::Consts(&[
                 ("WNOHANG", V::Dec(1)),

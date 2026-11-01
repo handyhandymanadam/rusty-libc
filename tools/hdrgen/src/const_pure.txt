@@ -1,3 +1,7 @@
+# Functions glibc 2.43's installed headers declare with __attribute__ ((__const__)) or ((__pure__)) (__attribute_const__,
+# __attribute_pure__): name, then const or pure. Facts read from the headers (gcc -E -D_GNU_SOURCE -O2 over the standard
+# headers, declarations with the attribute), not their text. tools/hdrgen gives our prototypes of these names the same
+# attribute (gen.rs add_const_pure), so a compiler can fold repeated calls (pthread_self, __errno_location, getpagesize, ...).
 __argz_count pure
 __ctype_b_loc const
 __ctype_tolower_loc const

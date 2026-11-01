@@ -12,5 +12,10 @@ rusty-libc-ctype = { path = "../rusty-libc-ctype" }
 rusty-libc-stdlib = { path = "../rusty-libc-stdlib" }
 rusty-libc-time = { path = "../rusty-libc-time" }
 
+[dev-dependencies]
+libc = "0.2"
+rusty-libc-malloc = { path = "../rusty-libc-malloc", features = ["no-brk"] }
+
 [features]
+# Export the C symbols. Off for host tests so they never replace the host libc.
 export = []

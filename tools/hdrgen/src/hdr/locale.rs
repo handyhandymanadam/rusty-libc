@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "locale.h",
     items: &[
+        Item::Comment(r#"/* locale.h for the Rust libc (hand-written; constants and the struct lconv layout are glibc's).
+   Built-in locales: "C"/"POSIX" and "C.UTF-8". */"#),
         Item::Guard { name: "_RLIBC_LOCALE_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),

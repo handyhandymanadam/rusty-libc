@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "sys/syslog.h",
     items: &[
+        Item::Comment(r#"/* sys/syslog.h for the Rust libc (crates/rusty-libc-extra/src/syslog.rs): the priority, facility and option
+   constants and the macros; the prototypes are generated (bits/rlibc-syslogcalls.h). */"#),
         Item::Guard { name: "_RLIBC_SYS_SYSLOG_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stdarg.h>"),
@@ -13,6 +15,7 @@ pub static HDR: Header = Header {
                 ("_PATH_LOG", V::Txt(r#""/dev/log""#)),
             ]),
             Item::Blank,
+            Item::Comment("/* priorities (the severity of a message) */"),
             Item::Consts(&[
                 ("LOG_EMERG", V::Dec(0)),
                 ("LOG_ALERT", V::Dec(1)),
@@ -30,6 +33,7 @@ pub static HDR: Header = Header {
             Item::Raw(Reason::GlibcMacro, "#define LOG_PRI(p) ((p) & LOG_PRIMASK)"),
             Item::Raw(Reason::GlibcMacro, "#define LOG_MAKEPRI(fac, pri) ((fac) | (pri))"),
             Item::Blank,
+            Item::Comment("/* facilities (the kind of program) */"),
             Item::Consts(&[
                 ("LOG_KERN", V::Txt("(0 << 3)")),
                 ("LOG_USER", V::Txt("(1 << 3)")),
@@ -62,9 +66,11 @@ pub static HDR: Header = Header {
             ]),
             Item::Raw(Reason::GlibcMacro, "#define LOG_FAC(p) (((p) & LOG_FACMASK) >> 3)"),
             Item::Blank,
+            Item::Comment("/* the mask of one priority, and of all up to one */"),
             Item::Raw(Reason::GlibcMacro, "#define LOG_MASK(pri) (1 << (pri))"),
             Item::Raw(Reason::GlibcMacro, "#define LOG_UPTO(pri) ((1 << ((pri) + 1)) - 1)"),
             Item::Blank,
+            Item::Comment("/* option flags for openlog */"),
             Item::Consts(&[
                 ("LOG_PID", V::Txt("0x01")),
                 ("LOG_CONS", V::Txt("0x02")),

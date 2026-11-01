@@ -1,5 +1,12 @@
+//! ISO-2022-JP and ISO-2022-JP-2 (RFC 1468, RFC 1554): 7-bit escape-sequence encodings of the
+//! Japanese (and in JP-2 Chinese, Korean and Western European) character sets. The control flow
+//! follows glibc's module: decoding keeps the current set and the G2 designation; encoding also
+//! keeps the language tag state of JP-2, tries the current set first, then a list of sets whose
+//! order depends on the tag, and writes a designation escape before a character from another set.
+//! (An escape written before a character that then does not fit stays written, as in glibc.)
 use crate::engine::*;
 use crate::jpextra;
+use crate::mb::ool;
 use crate::mbdata::{euc_cn, euc_jp, euc_kr};
 use crate::unicode::Sb;
 
@@ -27,6 +34,7 @@ const TAG_KO: u8 = 2;
 const TAG_Z: u8 = 7;
 const TAG_ZH: u8 = 3;
 
+/// The state: current set, G2 designation, language tag.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct JpState {
     pub set: u8,
@@ -45,6 +53,8 @@ pub(crate) enum SetRes {
     Incomplete,
 }
 
+/// Decode a two-byte code of a 94x94 set (bytes 0x21..0x7e), as glibc's helper functions do: the
+/// order of the checks decides between "incomplete" and "invalid".
 pub(crate) fn dec_set(set: u8, s: &[u8]) -> SetRes {
     let (b1, avail) = (s[0], s.len());
     let lead_ok = match set {
@@ -73,10 +83,10 @@ pub(crate) fn dec_set(set: u8, s: &[u8]) -> SetRes {
         return SetRes::Unknown;
     }
     let (m, si) = match set {
-        J0208_1978 | J0208_1983 => (&euc_jp::MB, 2),
-        J0212 => (&euc_jp::MB, 3),
-        GB2312 => (&euc_cn::MB, 1),
-        _ => (&euc_kr::MB, 1),
+        J0208_1978 | J0208_1983 => (ool(euc_jp::mb), 2),
+        J0212 => (ool(euc_jp::mb), 3),
+        GB2312 => (ool(euc_cn::mb), 1),
+        _ => (ool(euc_kr::mb), 1),
     };
     match m.dec2(si, b1 | 0x80, b2 | 0x80) {
         Some(c) => SetRes::Char(c),
@@ -192,6 +202,8 @@ pub fn dec(st: &mut JpState, jp2: bool, flags: u32, inp: &[u8], ip: &mut usize, 
     })
 }
 
+// ------------------------------------------------------------------ encoding
+
 pub(crate) fn jis0201(c: u32) -> Option<u8> {
     if c == 0xa5 {
         Some(0x5c)
@@ -214,6 +226,7 @@ fn two(code: crate::mb::Code, lo: u8) -> Option<[u8; 2]> {
     }
 }
 
+/// The low characters (up to U+00FF and U+203E) come from the table of what the host writes.
 fn low(table: &[(u16, u16)], c: u32) -> Option<[u8; 2]> {
     let i = table.binary_search_by(|e| e.0.cmp(&(c as u16))).ok()?;
     let v = table[i].1;
@@ -228,7 +241,7 @@ pub(crate) fn jis0208(c: u32) -> Option<[u8; 2]> {
     if is_low(c) {
         return low(&jpextra::J0208, c);
     }
-    euc_jp::MB.enc(c).and_then(|x| two(x, 0xa1))
+    euc_jp::mb().enc(c).and_then(|x| two(x, 0xa1))
 }
 
 fn jis0212(c: u32) -> Option<[u8; 2]> {
@@ -238,22 +251,23 @@ fn jis0212(c: u32) -> Option<[u8; 2]> {
     if c >= 0xffff {
         return None;
     }
-    if let Some(x) = euc_jp::MB.enc(c) {
+    if let Some(x) = euc_jp::mb().enc(c) {
         if x.len == 3 && x.bytes[0] == 0x8f {
             return Some([x.bytes[1] - 0x80, x.bytes[2] - 0x80]);
         }
     }
-    let s = &euc_jp::MB.sets[3];
+    // shadowed by JIS X 0208 in EUC-JP: look in the table of the set itself
+    let s = &euc_jp::mb().sets[3];
     let cols = (s.trail_hi - s.trail_lo) as usize + 1;
     let want = if c == 0 { 0xfffe } else { c as u16 };
-    s.data.iter().position(|&v| v == want).map(|i| [(s.lead_lo as usize + i / cols) as u8 - 0x80, (s.trail_lo as usize + i % cols) as u8 - 0x80])
+    euc_jp::mb().set_data(s).iter().position(|&v| v == want).map(|i| [(s.lead_lo as usize + i / cols) as u8 - 0x80, (s.trail_lo as usize + i % cols) as u8 - 0x80])
 }
 
 pub(crate) fn gb2312(c: u32) -> Option<[u8; 2]> {
     if is_low(c) {
         return low(&jpextra::GB2312, c);
     }
-    euc_cn::MB.enc(c).and_then(|x| two(x, 0xa1))
+    euc_cn::mb().enc(c).and_then(|x| two(x, 0xa1))
 }
 
 pub(crate) fn ksc5601(c: u32) -> Option<[u8; 2]> {
@@ -263,7 +277,7 @@ pub(crate) fn ksc5601(c: u32) -> Option<[u8; 2]> {
     if c == 0x20a9 {
         return None;
     }
-    euc_kr::MB.enc(c).and_then(|x| two(x, 0xa1))
+    euc_kr::mb().enc(c).and_then(|x| two(x, 0xa1))
 }
 
 fn iso8859_7_high(c: u32) -> Option<u8> {
@@ -276,6 +290,7 @@ fn iso8859_7_high(c: u32) -> Option<u8> {
     }
 }
 
+// the conversion lists: (japanese, european, chinese, korean, other) in the order for each tag
 const JAPANESE: u8 = 2;
 const EUROPEAN: u8 = 1;
 const CHINESE: u8 = 3;
@@ -318,9 +333,10 @@ pub fn enc(st: &mut JpState, jp2: bool, flags: u32, inp: &[u32], ip: &mut usize,
                 st.tag = TAG_NONE;
             }
         }
+        // try the current set (unless the language tag prefers another)
         let tag = st.tag;
         let ja = tag == TAG_NONE || tag == TAG_JA;
-        let mut written: Option<usize> = None;
+        let mut written: Option<usize> = None; // Some(n) bytes written into o; None = unknown
         match st.set {
             ASCII_SET => {
                 if ch <= 0x7f {
@@ -348,6 +364,7 @@ pub fn enc(st: &mut JpState, jp2: bool, flags: u32, inp: &[u32], ip: &mut usize,
                 }
             }
             set => {
+                // None = unknown, Some(Err) = no room
                 let avail = o.len();
                 let r: Option<Result<[u8; 2], ()>> = match set {
                     J0208_1978 | J0208_1983 if ja => {
@@ -399,7 +416,8 @@ pub fn enc(st: &mut JpState, jp2: bool, flags: u32, inp: &[u32], ip: &mut usize,
         if let Some(n) = written {
             return EBody::Ok(1, n);
         }
-        let mut n = 0usize;
+        // The current set does not do: switch.
+        let mut n = 0usize; // bytes written so far (designations stay written if we run out of room)
         if ch <= 0x7f {
             if o.len() < 3 {
                 return EBody::Full;
@@ -420,6 +438,8 @@ pub fn enc(st: &mut JpState, jp2: bool, flags: u32, inp: &[u32], ip: &mut usize,
             return EBody::Ok(1, n);
         }
         let list: &[u8] = if jp2 { &LISTS[(st.tag & 3) as usize] } else { &[JAPANESE] };
+        // Write an optional designation escape and then the data; reports whether the escape went
+        // out (the state changes then, even if the data does not fit).
         fn put(o: &mut [u8], n: &mut usize, esc: &[u8], data: &[u8]) -> (Result<(), ()>, bool) {
             let mut esc_done = false;
             if !esc.is_empty() {
@@ -516,6 +536,7 @@ pub fn enc(st: &mut JpState, jp2: bool, flags: u32, inp: &[u32], ip: &mut usize,
     })
 }
 
+/// Flush: back to ASCII (`ESC ( B`) if a non-ASCII set is selected; the decoder just resets.
 pub fn emit_reset(st: &mut JpState, out: &mut [u8], op: &mut usize) -> St {
     if st.set != ASCII_SET || st.set2 != G2_NONE || st.tag != TAG_NONE {
         if st.set == ASCII_SET {

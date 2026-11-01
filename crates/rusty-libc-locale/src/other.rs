@@ -1,13 +1,39 @@
+//! `mbrtowc` and `wcrtomb` for the locale charsets that are neither C nor UTF-8 (EUC-JP, GBK, ISO-8859-x ...), done with
+//! rusty-libc-iconv. They are the hooks rusty-libc-wchar calls (`set_other_hooks`): the tables live behind them so that a program that
+//! never leaves the C and UTF-8 locales does not carry them.
 use core::sync::atomic::{AtomicBool, Ordering};
 use rusty_libc_core::sync_cell::SyncCell;
 use rusty_libc_iconv::Converter;
 use rusty_libc_wchar::mbstate_t;
 use rusty_libc_wchar::mbyte::{Status, codeset_name};
 
+/// Install the hooks (called when a locale with another charset is installed or created).
 pub(crate) fn install() {
     rusty_libc_wchar::mbyte::set_other_hooks(towc, encode, each, tomb);
+    rusty_libc_wchar::mbyte::set_other_rows_hook(rows);
+    rusty_libc_wchar::mbyte::set_other_singles_hook(singles);
 }
 
+/// The single-byte characters of the codeset in force (`Converter::single_bytes`).
+pub(crate) fn singles() -> Option<[u64; 4]> {
+    let (name, nl) = codeset_name();
+    let conv = take(0, &name[..nl])?;
+    let s = conv.single_bytes();
+    give_back(0, &name[..nl], conv);
+    s
+}
+
+/// The multibyte characters of the codeset in force as rows (`Converter::each_row`).
+pub(crate) fn rows(ranges: Option<&[(u32, u32)]>, f: &mut dyn FnMut(&[u8], &[u64; 4]), runs: &mut dyn FnMut(&[u8], u32, u32)) -> bool {
+    let (name, nl) = codeset_name();
+    let Some(conv) = take(0, &name[..nl]) else { return false };
+    let ok = conv.each_row(ranges, f, runs);
+    give_back(0, &name[..nl], conv);
+    ok
+}
+
+/// One converter of each direction is kept for the next call (opening one costs more than a conversion): a call takes it
+/// out of its slot and puts it back, so two threads never share one; a thread that finds the slot empty opens its own.
 struct Slot {
     name: [u8; 48],
     len: usize,
@@ -15,17 +41,21 @@ struct Slot {
 }
 
 static LOCK: AtomicBool = AtomicBool::new(false);
+/// The kept converters: touched only while LOCK (a spin lock: a slot is taken or given back in a few instructions) is held.
 static SLOTS: SyncCell<[Slot; 3]> = SyncCell::new([Slot { name: [0; 48], len: 0, conv: None }, Slot { name: [0; 48], len: 0, conv: None }, Slot { name: [0; 48], len: 0, conv: None }]);
 
+/// Run `f` on slot `dir` with LOCK held.
 fn with_slot<R>(dir: usize, f: impl FnOnce(&mut Slot) -> R) -> R {
     while LOCK.swap(true, Ordering::Acquire) {
         core::hint::spin_loop();
     }
+    // SAFETY: LOCK is held, so nothing else touches SLOTS; `f` does not reach SLOTS again.
     let r = unsafe { SLOTS.with_unsync(|s| f(&mut s[dir])) };
     LOCK.store(false, Ordering::Release);
     r
 }
 
+/// A converter for `dir` (0: charset to UCS-4, 1: UCS-4 to charset, 2: INTERNAL to charset: only the encoder step) in the codeset in force, reset to its initial state.
 fn take(dir: usize, name: &[u8]) -> Option<Converter> {
     let have = with_slot(dir, |slot| if slot.len == name.len() && slot.name[..slot.len] == *name { slot.conv.take() } else { None });
     match have {
@@ -51,14 +81,21 @@ fn give_back(dir: usize, name: &[u8], conv: Converter) {
     });
 }
 
-pub(crate) unsafe fn towc(st: &mut mbstate_t, src: &mut *const u8, avail: usize, out: *mut u32, cap: usize) -> (Status, usize) {
-    let (name, nl) = codeset_name();
-    let Some(mut conv) = take(0, &name[..nl]) else { return (Status::Illegal, 0) };
+/// `mbrtowc`-style decoding for a stateless multibyte charset (single byte sets and EUC): characters
+/// are tried byte by byte until rusty-libc-iconv accepts them; a half-read character is kept in the state
+/// (its length in `count`, its bytes in `value`).
+pub(crate) unsafe fn towc(name: &[u8], st: &mut mbstate_t, src: &mut *const u8, avail: usize, out: *mut u32, cap: usize) -> (Status, usize) {
+    let Some(mut conv) = take(0, name) else { return (Status::Illegal, 0) };
+    // SAFETY: the hook's contract (up to `avail` readable bytes at `*src`, `cap` writable characters at `out`) is
+    // towc_with's.
     let r = unsafe { towc_with(&mut conv, st, src, avail, out, cap) };
-    give_back(0, &name[..nl], conv);
+    give_back(0, name, conv);
     r
 }
 
+/// # Safety
+/// Up to `avail` bytes at `*src` are readable (reading stops at the first character that completes, so `avail` may be
+/// larger than the buffer, as mbrtowc's `n` may be); `cap` characters at `out` are writable.
 unsafe fn towc_with(conv: &mut Converter, st: &mut mbstate_t, src: &mut *const u8, mut avail: usize, out: *mut u32, cap: usize) -> (Status, usize) {
     let mut produced = 0usize;
     loop {
@@ -74,11 +111,15 @@ unsafe fn towc_with(conv: &mut Converter, st: &mut mbstate_t, src: &mut *const u
         for (i, b) in buf.iter_mut().enumerate().take(n) {
             *b = (st.value >> (8 * i)) as u8;
         }
+        // the character CP1255/CP1258/TCVN/BIG5-HKSCS hold back lives in the state's upper bits
+        // (shifted left by 3, the lower 3 bits count the bytes of a half-read character), as in glibc
         let high = (st.count as u32) & !7;
         let mut taken = 0usize;
         let mut give_back = 0usize;
+        // None: the byte went into the decoder (a base letter waiting for a combining mark)
         let (ch, new_high) = loop {
             if taken == avail {
+                // the input ends inside a character: keep what was read
                 let mut v = 0u32;
                 for (i, b) in buf.iter().enumerate().take(n) {
                     v |= u32::from(*b) << (8 * i);
@@ -91,10 +132,13 @@ unsafe fn towc_with(conv: &mut Converter, st: &mut mbstate_t, src: &mut *const u
             if n >= 4 {
                 return (Status::Illegal, produced);
             }
+            // SAFETY: `taken < avail`: a readable byte (the caller's contract).
             buf[n] = unsafe { (*src).wrapping_add(taken).read() };
             n += 1;
             taken += 1;
             conv.set_dec_state_word(high);
+            // room for one character, as in glibc's mbrtowc: when the held-back character comes out
+            // first the new byte stays unread (E2big) and is read again by the next call
             let mut o = [0u32; 1];
             let (mut ip, mut op) = (0usize, 0usize);
             let Some(res) = conv.decode_ucs4(&buf[..n], &mut ip, &mut o, &mut op) else { return (Status::Illegal, produced) };
@@ -115,21 +159,22 @@ unsafe fn towc_with(conv: &mut Converter, st: &mut mbstate_t, src: &mut *const u
         avail -= used;
         st.count = new_high as i32;
         if let Some(ch) = ch {
+            // SAFETY: `produced < cap`: a writable character (the caller's contract).
             unsafe { out.wrapping_add(produced).write(ch) };
             produced += 1;
         }
     }
 }
 
-pub(crate) fn encode(wc: u32, out: &mut [u8; 6]) -> Option<usize> {
-    let (name, nl) = codeset_name();
-    let mut conv = take(1, &name[..nl])?;
+/// Encode `wc` in codeset `name` (the locale's, or a wide stream's) with rusty-libc-iconv.
+pub(crate) fn encode(name: &[u8], wc: u32, out: &mut [u8; 6]) -> Option<usize> {
+    let mut conv = take(1, name)?;
     let inp = wc.to_le_bytes();
     let mut o = [0u8; 16];
     let (mut ip, mut op) = (0usize, 0usize);
     let r = conv.convert_raw(&inp, &mut ip, &mut o, &mut op);
     let ok = r.is_ok() && ip == 4 && op != 0 && op <= 6;
-    give_back(1, &name[..nl], conv);
+    give_back(1, name, conv);
     if !ok {
         return None;
     }
@@ -137,15 +182,21 @@ pub(crate) fn encode(wc: u32, out: &mut [u8; 6]) -> Option<usize> {
     Some(op)
 }
 
+/// `wcsrtombs`-style encoding: the wide characters at `*src` (`avail` of them) into at most `cap` bytes at `out`, through
+/// the whole encoder step with its state (BIG5-HKSCS holds U+00CA and U+00EA back in `count`, shifted left by 3). The step
+/// decides in glibc's order between a full output, an unencodable character and a skipped tag character.
 pub(crate) unsafe fn tomb(st: &mut mbstate_t, src: &mut *const u32, avail: usize, out: *mut u8, cap: usize) -> (Status, usize) {
     let (name, nl) = codeset_name();
     let Some(mut conv) = take(2, &name[..nl]) else { return (Status::Illegal, 0) };
     conv.set_enc_state_word((st.count as u32) & !7);
+    // SAFETY: the caller passes `avail` readable wide characters at `*src`.
     let inp = unsafe { rusty_libc_core::ffi::bytes((*src).cast::<u8>(), avail * 4) };
+    // SAFETY: and `cap` writable bytes at `out`, apart from the input.
     let o = unsafe { rusty_libc_core::ffi::bytes_mut(out, cap) };
     let (mut ip, mut op) = (0usize, 0usize);
     let r = conv.convert_raw(inp, &mut ip, o, &mut op);
     st.count = ((conv.enc_state_word() & !7) | (st.count as u32 & 7)) as i32;
+    // (`ip / 4` characters were read)
     *src = (*src).wrapping_add(ip / 4);
     give_back(2, &name[..nl], conv);
     let status = match r {
@@ -157,11 +208,18 @@ pub(crate) unsafe fn tomb(st: &mut mbstate_t, src: &mut *const u32, avail: usize
     (status, op)
 }
 
-pub(crate) fn each(f: &mut dyn FnMut(&[u8], u32)) {
+/// Every character of the codeset in force, found by trying the byte sequences: with one converter for the whole walk, which
+/// is what makes the first bracket expression compiled in an EUC locale cost a few milliseconds less than character-wise
+/// `mbrtowc` calls would.
+pub(crate) fn each(f: &mut dyn FnMut(&[u8], u32, u32)) {
     let (name, nl) = codeset_name();
     let Some(mut conv) = take(0, &name[..nl]) else { return };
-    let mut prefix = [0u8; 4];
-    walk(&mut conv, &mut prefix, 0, f);
+    // the stateless CJK charsets: the same walk with the decoder's per-character bodies called directly, without a reset
+    // and the conversion loop for each candidate (same characters in the same order; EUC-JP has about 50,000 candidates)
+    if !conv.each_char(f) {
+        let mut prefix = [0u8; 4];
+        walk(&mut conv, &mut prefix, 0, &mut |b, wc| f(b, wc, 1));
+    }
     give_back(0, &name[..nl], conv);
 }
 

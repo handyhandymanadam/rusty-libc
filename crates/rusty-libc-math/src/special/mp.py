@@ -1,3 +1,5 @@
+"""Tiny ctypes binding to libmpfr.so.6 for the table generators of this folder (no third-party
+Python packages on this machine). Values come back as exact fractions.Fraction."""
 import ctypes
 from fractions import Fraction
 
@@ -21,6 +23,7 @@ _lib.mpfr_get_z_2exp.restype = ctypes.c_long
 
 
 class MP:
+    """One MPFR number of PREC bits."""
 
     def __init__(self, v=0):
         self.x = _mpfr()
@@ -66,6 +69,7 @@ class MP:
 
 
 def fn(name, *args):
+    """name(args) at PREC bits as a Fraction; args are Fractions/ints/floats."""
     ms = [MP(a) for a in args]
     out = MP()
     f = getattr(_lib, "mpfr_" + name)
@@ -85,6 +89,7 @@ def lgamma(x):
 
 
 def to_dd(q):
+    """Fraction -> (hi, lo) doubles with hi = round(q), lo = round(q - hi)."""
     hi = float(q)
     lo = float(q - Fraction(hi))
     return hi, lo

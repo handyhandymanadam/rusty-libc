@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("RLIMIT_CPU", V::Dec(0)),
         ("RLIMIT_FSIZE", V::Dec(1)),
@@ -36,6 +37,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("PRIO_USER", V::Dec(2)),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Block { head: "struct rlimit64 ", body: &["", "  rlim64_t rlim_cur;", "  rlim64_t rlim_max;", ""], tail: "" },
 ];
 pub const AFTER_INCLUDES_CHOMP: bool = false;

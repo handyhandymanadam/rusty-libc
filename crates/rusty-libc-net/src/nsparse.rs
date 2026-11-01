@@ -1,3 +1,25 @@
+//! Resolver message parsing and printing, the part of glibc's libresolv that works on DNS messages:
+//! `ns_initparse`, `ns_parserr`, `ns_skiprr`, `ns_msg_getflag`, `ns_sprintrr`, `ns_sprintrrf`,
+//! `ns_format_ttl`, `ns_parse_ttl`, `ns_datetosecs`, `ns_get16/32`, `ns_put16/32`, `ns_makecanon`,
+//! `ns_samename`, `ns_samedomain`, `ns_subdomain`, `ns_name_ntol`, `ns_name_rollback`, plus `__loc_ntoa`
+//! (used by the LOC record printer) and the `__p_type_syms` / `__p_class_syms` name tables.
+//!
+//! Behaviour oracle: glibc 2.43 as installed here (its libresolv matches the release/2.43 branch of
+//! resolv/ns_print.c, which differs from the 2.43 tarball: `CLASSnnn`/`TYPEnnn` names, RFC 3597 `\#` form for
+//! types without a printer, no CERT/TKEY/TSIG/OPT printers). Written by hand from reading glibc's ns_parse.c,
+//! ns_print.c, ns_ttl.c, ns_samedomain.c, ns_makecanon.c, ns_samename.c, ns_date.c, ns_netint.c, ns_name.c,
+//! res_debug.c (LGPL / ISC licences; no code copied).
+//!
+//! Where glibc reads outside the record (A6 suffix shorter than its prefix length says, LOC of the wrong size)
+//! the checks of the 2.43 branch are the ones implemented here; everything else is the same as glibc.
+//!
+//! Two faces: the C functions (`ns_*`, raw pointers, errno) and a safe Rust API ([`Msg`], [`Rr`],
+//! [`sprint_rrf`], [`format_ttl`], ...) whose errors are errno values and which never touch errno.
+//!
+//! U2 (BRIEF-UNSAFE.md): the C functions turn their pointers into slices once (the message `msg..eom`, the record data,
+//! the output buffer) and the parser and printer work on slices with offsets. What stays unsafe is that conversion, the
+//! byte view of `ns_rr`'s name buffer, the 0x5e fill of a new handle (padding included, as glibc) and the walk of
+//! `ns_name_ntol`'s source name, which has no length.
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
 use crate::inet::format_ipv6;
 use crate::resolv::{msg_slice, skip_name, uncompress_name};
@@ -17,6 +39,7 @@ pub const ns_s_ns: c_int = 2;
 pub const ns_s_ar: c_int = 3;
 pub const ns_s_max: c_int = 4;
 
+/// Mnemonics of the flag indexes of [`ns_msg_getflag`].
 pub const ns_f_qr: c_int = 0;
 pub const ns_f_opcode: c_int = 1;
 pub const ns_f_aa: c_int = 2;
@@ -55,10 +78,12 @@ const T_NAPTR: c_int = 35;
 const T_A6: c_int = 38;
 const T_DNAME: c_int = 39;
 
+/// `ns_sect`, `ns_class` and `ns_type` of arpa/nameser.h (C enums, passed as `int`).
 pub type ns_sect = c_int;
 pub type ns_class = c_int;
 pub type ns_type = c_int;
 
+/// `ns_msg`: a message handle (caller allocated, no dynamic data).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ns_msg {
@@ -79,6 +104,7 @@ impl ns_msg {
     }
 }
 
+/// `ns_rr`: a parsed record (caller allocated, no dynamic data).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ns_rr {
@@ -96,23 +122,25 @@ impl ns_rr {
     }
 }
 
+/// `struct _ns_flagdata`.
 #[repr(C)]
 pub struct FlagData {
     pub mask: c_int,
     pub shift: c_int,
 }
 
+/// glibc's `_ns_flagdata` (not exported by glibc either).
 pub static NS_FLAGDATA: [FlagData; 16] = [
-    FlagData { mask: 0x8000, shift: 15 },
-    FlagData { mask: 0x7800, shift: 11 },
-    FlagData { mask: 0x0400, shift: 10 },
-    FlagData { mask: 0x0200, shift: 9 },
-    FlagData { mask: 0x0100, shift: 8 },
-    FlagData { mask: 0x0080, shift: 7 },
-    FlagData { mask: 0x0040, shift: 6 },
-    FlagData { mask: 0x0020, shift: 5 },
-    FlagData { mask: 0x0010, shift: 4 },
-    FlagData { mask: 0x000f, shift: 0 },
+    FlagData { mask: 0x8000, shift: 15 }, // qr
+    FlagData { mask: 0x7800, shift: 11 }, // opcode
+    FlagData { mask: 0x0400, shift: 10 }, // aa
+    FlagData { mask: 0x0200, shift: 9 },  // tc
+    FlagData { mask: 0x0100, shift: 8 },  // rd
+    FlagData { mask: 0x0080, shift: 7 },  // ra
+    FlagData { mask: 0x0040, shift: 6 },  // z
+    FlagData { mask: 0x0020, shift: 5 },  // ad
+    FlagData { mask: 0x0010, shift: 4 },  // cd
+    FlagData { mask: 0x000f, shift: 0 },  // rcode
     FlagData { mask: 0, shift: 0 },
     FlagData { mask: 0, shift: 0 },
     FlagData { mask: 0, shift: 0 },
@@ -121,19 +149,27 @@ pub static NS_FLAGDATA: [FlagData; 16] = [
     FlagData { mask: 0, shift: 0 },
 ];
 
+/// `struct res_sym`.
 #[repr(C)]
 pub struct res_sym {
     pub number: c_int,
     pub name: *const c_char,
     pub humanname: *const c_char,
 }
+// SAFETY: the tables of this type hold pointers to 'static C string literals (made by `sym`) that are never written, so
+// sharing them between threads shares immutable data.
 unsafe impl Sync for res_sym {}
 
+/// The name of a table entry with a non-NULL `name`. Only for the entries of this module's tables, all made by `sym`.
 fn sym_name(s: &res_sym) -> &'static [u8] {
     sym_text(s.name)
 }
 
+/// The text of a (non-NULL) name or human name of the crate's own symbol tables (`__p_class_syms`, `__p_type_syms` here and
+/// resdebug's `P_*_SYMS`), all made from 'static C string literals by the tables' `sym` functions. Never for a table a
+/// program passes.
 pub(crate) fn sym_text(p: *const c_char) -> &'static [u8] {
+    // SAFETY: only pointers from those tables come here; each is a 'static NUL-terminated literal.
     unsafe { CStr::from_ptr(p) }.to_bytes()
 }
 
@@ -142,6 +178,7 @@ const fn sym(number: c_int, name: &'static CStr, human: Option<&'static CStr>) -
 }
 const END: res_sym = res_sym { number: 0, name: core::ptr::null(), humanname: core::ptr::null() };
 
+/// Names of RR classes (`__p_class_syms`); the last entry is the default (`C_IN`, no name).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub static __p_class_syms: [res_sym; 7] = [
     sym(1, c"IN", None),
@@ -153,6 +190,7 @@ pub static __p_class_syms: [res_sym; 7] = [
     res_sym { number: 1, name: core::ptr::null(), humanname: core::ptr::null() },
 ];
 
+/// Names of RR types (`__p_type_syms`); the list is incomplete (its size is part of the ABI).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub static __p_type_syms: [res_sym; 46] = [
     sym(1, c"A", Some(c"address")),
@@ -203,6 +241,8 @@ pub static __p_type_syms: [res_sym; 46] = [
     END,
 ];
 
+/// Presentation name of `number` in `syms` (up to the entry without a name), else `<prefix><number>`:
+/// the form `ns_sprintrrf` prints.
 fn sym_or_number(syms: &[res_sym], number: c_int, prefix: &[u8]) -> Buf<24> {
     let mut b = Buf::<24>::new();
     for s in syms {
@@ -219,6 +259,7 @@ fn sym_or_number(syms: &[res_sym], number: c_int, prefix: &[u8]) -> Buf<24> {
     b
 }
 
+/// Name of an RR type as `ns_sprintrr` prints it (`A`, `MX`, ... or `TYPE<n>`; A6 is printed as `A6`).
 pub fn type_name(ty: c_int) -> Buf<24> {
     if ty == T_A6 {
         return Buf::from(b"A6").unwrap();
@@ -226,12 +267,14 @@ pub fn type_name(ty: c_int) -> Buf<24> {
     sym_or_number(&__p_type_syms, ty, b"TYPE")
 }
 
+/// Name of an RR class as `ns_sprintrr` prints it (`IN`, `CHAOS`, ... or `CLASS<n>`).
 pub fn class_name(class: c_int) -> Buf<24> {
     sym_or_number(&__p_class_syms, class, b"CLASS")
 }
 
 type R<T> = Result<T, c_int>;
 
+/// Set errno from an error code (0 = glibc leaves errno alone) and give the C result.
 fn cret(r: R<usize>) -> c_int {
     match r {
         Ok(n) => n as c_int,
@@ -243,6 +286,8 @@ fn cret(r: R<usize>) -> c_int {
         }
     }
 }
+
+// ---------------------------------------------------------------- number text
 
 fn put_unum<const N: usize>(b: &mut Buf<N>, mut v: u64, mindigits: usize) {
     let mut t = [0u8; 20];
@@ -258,6 +303,7 @@ fn put_unum<const N: usize>(b: &mut Buf<N>, mut v: u64, mindigits: usize) {
     b.push_all(&t[i..]);
 }
 
+/// `%d` / `%.<mindigits>d`.
 fn put_num<const N: usize>(b: &mut Buf<N>, v: i64, mindigits: usize) {
     if v < 0 {
         b.push(b'-');
@@ -265,6 +311,9 @@ fn put_num<const N: usize>(b: &mut Buf<N>, v: i64, mindigits: usize) {
     put_unum(b, v.unsigned_abs(), mindigits);
 }
 
+// ---------------------------------------------------------------- byte order
+
+// one range check and one load each (four checks of single bytes made a call of `rd32`)
 #[inline(always)]
 fn rd16(m: &[u8], i: usize) -> u16 {
     u16::from_be_bytes(*m[i..].first_chunk().unwrap_or_else(|| oob()))
@@ -275,31 +324,46 @@ fn rd32(m: &[u8], i: usize) -> u32 {
     u32::from_be_bytes(*m[i..].first_chunk().unwrap_or_else(|| oob()))
 }
 
+/// A read past the message that the callers' length checks rule out.
 #[cold]
 #[inline(never)]
 fn oob() -> ! {
     panic!("read past the message")
 }
 
+/// # Safety
+/// `src` points to 2 bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_get16(src: *const c_uchar) -> u32 {
+    // SAFETY: the caller's contract.
     rd16(unsafe { ffi::bytes(src, 2) }, 0) as u32
 }
 
+/// # Safety
+/// `src` points to 4 bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_get32(src: *const c_uchar) -> c_ulong {
+    // SAFETY: the caller's contract.
     rd32(unsafe { ffi::bytes(src, 4) }, 0) as c_ulong
 }
 
+/// # Safety
+/// `dst` points to 2 writable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_put16(src: u32, dst: *mut c_uchar) {
+    // SAFETY: the caller's contract.
     unsafe { ffi::bytes_mut(dst, 2) }.copy_from_slice(&(src as u16).to_be_bytes());
 }
 
+/// # Safety
+/// `dst` points to 4 writable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_put32(src: c_ulong, dst: *mut c_uchar) {
+    // SAFETY: the caller's contract.
     unsafe { ffi::bytes_mut(dst, 4) }.copy_from_slice(&(src as u32).to_be_bytes());
 }
+
+// ---------------------------------------------------------------- message parsing
 
 #[inline]
 fn setsection(h: &mut ns_msg, sect: c_int) {
@@ -313,6 +377,7 @@ fn setsection(h: &mut ns_msg, sect: c_int) {
     }
 }
 
+/// Skip `count` records of `section` at the start of `m` (the rest of the message); the number of bytes skipped.
 #[inline(always)]
 fn skiprr(m: &[u8], section: c_int, count: c_int) -> R<usize> {
     let eom = m.len();
@@ -337,6 +402,8 @@ fn skiprr(m: &[u8], section: c_int, count: c_int) -> R<usize> {
     Ok(ptr)
 }
 
+/// `ns_initparse` into `h`: `msg` and `eom` are the pointers the handle keeps (`eom` may lie before `msg` for a negative
+/// length), `m` the readable message (empty then).
 #[inline]
 fn initparse(h: &mut ns_msg, msg: *const u8, eom: *const u8, m: &[u8]) -> R<()> {
     h._msg = msg;
@@ -376,6 +443,7 @@ fn initparse(h: &mut ns_msg, msg: *const u8, eom: *const u8, m: &[u8]) -> R<()> 
     Ok(())
 }
 
+/// Expand the name at `off` of `m` into `dst` (glibc's `__libc_dn_expand`: the root comes back as an empty string).
 #[inline]
 fn expand(m: &[u8], off: Option<usize>, dst: &mut [u8]) -> Option<usize> {
     let n = uncompress_name(m, off?, dst)?;
@@ -385,20 +453,26 @@ fn expand(m: &[u8], off: Option<usize>, dst: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
+/// The owner name buffer of an `ns_rr` as bytes.
 fn name_bytes(n: &[c_char; NS_MAXDNAME]) -> &[u8; NS_MAXDNAME] {
+    // SAFETY: `c_char` and `u8` have the same size and alignment and the same valid values (all bit patterns).
     unsafe { &*(n as *const [c_char; NS_MAXDNAME]).cast::<[u8; NS_MAXDNAME]>() }
 }
 
+/// [`name_bytes`], writable.
 fn name_bytes_mut(n: &mut [c_char; NS_MAXDNAME]) -> &mut [u8; NS_MAXDNAME] {
+    // SAFETY: as in `name_bytes`; the exclusive borrow carries over.
     unsafe { &mut *(n as *mut [c_char; NS_MAXDNAME]).cast::<[u8; NS_MAXDNAME]>() }
 }
 
+/// The text of an owner name buffer up to its NUL.
 pub(crate) fn name_text(n: &[c_char; NS_MAXDNAME]) -> &[u8] {
     let b = name_bytes(n);
     let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
     &b[..end]
 }
 
+/// `ns_parserr` on the handle `h` of the message `m` (the bytes `h._msg..h._eom`).
 fn parserr(h: &mut ns_msg, m: &[u8], section: c_int, rrnum: c_int, rr: &mut ns_rr) -> R<()> {
     if !(0..ns_s_max).contains(&section) {
         return Err(ENODEV);
@@ -418,6 +492,7 @@ fn parserr(h: &mut ns_msg, m: &[u8], section: c_int, rrnum: c_int, rr: &mut ns_r
     }
     let base = h._msg;
     let at = |p: usize| base.wrapping_add(p);
+    // the cursor as an offset into the message (a handle from ns_initparse keeps it inside)
     let mut p = (h._msg_ptr as usize).wrapping_sub(base as usize);
     if rrnum > h._rrnum {
         let b = skiprr(m.get(p..).unwrap_or(&[]), section, rrnum - h._rrnum)?;
@@ -463,34 +538,55 @@ fn parserr(h: &mut ns_msg, m: &[u8], section: c_int, rrnum: c_int, rr: &mut ns_r
     Ok(())
 }
 
+/// The message a handle describes.
+///
+/// # Safety
+/// `h` came from a successful `ns_initparse` and its message is still readable and unchanged for `'a`.
 unsafe fn handle_msg<'a>(h: &ns_msg) -> &'a [u8] {
+    // SAFETY: the caller's contract: `_msg.._eom` is the message.
     unsafe { msg_slice(h._msg, h._eom) }
 }
 
+/// # Safety
+/// `ptr..eom` is (part of) a message.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_skiprr(ptr: *const c_uchar, eom: *const c_uchar, section: ns_sect, count: c_int) -> c_int {
+    // the end before the start: glibc fails on the first name, or (no records to skip) on the final check
     if (eom as usize) < (ptr as usize) {
         return cret(Err(EMSGSIZE));
     }
+    // SAFETY: the caller's contract.
     cret(skiprr(unsafe { msg_slice(ptr, eom) }, section, count))
 }
 
+/// # Safety
+/// `msg` points to `msglen` bytes that stay valid while `handle` is used.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_initparse(msg: *const c_uchar, msglen: c_int, handle: *mut ns_msg) -> c_int {
+    // glibc fills the whole handle (padding included) with 0x5e first; the fields not reached keep it
+    // SAFETY: the caller's contract: `handle` is writable for a whole `ns_msg`.
     unsafe { core::ptr::write_bytes(handle.cast::<u8>(), 0x5e, core::mem::size_of::<ns_msg>()) };
+    // SAFETY: `handle` is writable (above) and now holds valid values (integers and raw pointers of 0x5e bytes).
     let h = unsafe { &mut *handle };
+    // SAFETY: the caller's contract: `msg` has `msglen` readable bytes (none for a negative length).
     let m = unsafe { ffi::bytes(msg, msglen.max(0) as usize) };
     cret(initparse(h, msg, msg.wrapping_offset(msglen as isize), m).map(|_| 0))
 }
 
+/// # Safety
+/// `handle` came from `ns_initparse`; `rr` is writable.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_parserr(handle: *mut ns_msg, section: ns_sect, rrnum: c_int, rr: *mut ns_rr) -> c_int {
+    // SAFETY: the caller's contract: a handle set up by ns_initparse.
     let h = unsafe { &mut *handle };
+    // SAFETY: the caller's contract: `rr` is a writable record (its fields are plain values, written before any is read).
     let rr = unsafe { &mut *rr };
+    // SAFETY: the handle's message is still there (the caller's contract).
     let m = unsafe { handle_msg(h) };
     cret(parserr(h, m, section, rrnum, rr).map(|_| 0))
 }
 
+/// The bit field `flag` (`ns_f_*`) of the message flags; 0 for an index with no field.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn ns_msg_getflag(handle: ns_msg, flag: c_int) -> c_int {
     match NS_FLAGDATA.get(flag as usize) {
@@ -499,8 +595,12 @@ pub extern "C" fn ns_msg_getflag(handle: ns_msg, flag: c_int) -> c_int {
     }
 }
 
+// ---------------------------------------------------------------- TTL text
+
+/// `%d<unit>` into `dst` at `*pos`; false (nothing written) if it does not fit with its NUL.
 #[inline]
 fn fmt1(t: i32, unit: u8, dst: &mut [u8], pos: &mut usize) -> bool {
+    // `%d` and the unit, built from the end of a small stack buffer
     let mut tmp = [0u8; 16];
     let mut i = 15;
     tmp[15] = unit;
@@ -528,6 +628,8 @@ fn fmt1(t: i32, unit: u8, dst: &mut [u8], pos: &mut usize) -> bool {
     true
 }
 
+/// Format a TTL in seconds the BIND way (`1w2d3h4m5s`, a single unit stays upper case: `30S`).
+/// Err(0) if `out` is too small (glibc gives -1 without an errno).
 pub fn format_ttl(src: u64, out: &mut [u8]) -> Result<usize, c_int> {
     let mut pos = 0usize;
     let mut s = src;
@@ -539,8 +641,9 @@ pub fn format_ttl(src: u64, out: &mut [u8]) -> Result<usize, c_int> {
     s /= 24;
     let days = (s % 7) as i32;
     s /= 7;
-    let weeks = s as i32;
+    let weeks = s as i32; // glibc stores the quotient in an int
     let mut x = 0;
+    // a failed fmt1 returns -1 without setting errno
     if weeks != 0 {
         if !fmt1(weeks, b'W', out, &mut pos) {
             return Err(0);
@@ -577,11 +680,15 @@ pub fn format_ttl(src: u64, out: &mut [u8]) -> Result<usize, c_int> {
     Ok(pos)
 }
 
+/// # Safety
+/// `dst` has `dstlen` writable bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_format_ttl(src: c_ulong, dst: *mut c_char, dstlen: usize) -> c_int {
+    // SAFETY: the caller's contract.
     cret(format_ttl(src, unsafe { ffi::bytes_mut(dst.cast::<u8>(), dstlen) }))
 }
 
+/// Parse a TTL text: plain seconds, or digit groups with units W D H M S (either case); EINVAL on error.
 pub fn parse_ttl(src: &[u8]) -> Result<u64, c_int> {
     let mut ttl: u64 = 0;
     let mut tmp: u64 = 0;
@@ -623,10 +730,14 @@ pub fn parse_ttl(src: &[u8]) -> Result<u64, c_int> {
     Ok(ttl)
 }
 
+/// # Safety
+/// `src` is a C string; `dst` is writable.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_parse_ttl(src: *const c_char, dst: *mut c_ulong) -> c_int {
+    // SAFETY: the caller's contract: `src` is a C string.
     match parse_ttl(unsafe { ffi::cstr_bytes(src) }) {
         Ok(v) => {
+            // SAFETY: the caller's contract: `dst` is writable.
             unsafe { *dst = v as c_ulong };
             0
         }
@@ -636,6 +747,8 @@ pub unsafe extern "C" fn ns_parse_ttl(src: *const c_char, dst: *mut c_ulong) -> 
         }
     }
 }
+
+// ---------------------------------------------------------------- dates
 
 fn datepart(buf: &[u8], min: i32, max: i32, err: &mut bool) -> i32 {
     let mut result: i32 = 0;
@@ -651,6 +764,8 @@ fn datepart(buf: &[u8], min: i32, max: i32, err: &mut bool) -> i32 {
     result
 }
 
+/// `YYYYMMDDHHMMSS` (UTC, years 1990 to 9999) to seconds since the epoch, modulo 2^32 as in glibc;
+/// Err(()) for a malformed date.
 pub fn datetosecs(cp: &[u8]) -> Result<u32, ()> {
     if cp.len() != 14 {
         return Err(());
@@ -689,16 +804,23 @@ pub fn datetosecs(cp: &[u8]) -> Result<u32, ()> {
     Ok(result)
 }
 
+/// # Safety
+/// `cp` is a C string; `errp` is writable.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_datetosecs(cp: *const c_char, errp: *mut c_int) -> u32 {
+    // SAFETY: the caller's contract: `cp` is a C string.
     let (v, e) = match datetosecs(unsafe { ffi::cstr_bytes(cp) }) {
         Ok(v) => (v, 0),
         Err(()) => (0, 1),
     };
+    // SAFETY: the caller's contract: `errp` is writable.
     unsafe { *errp = e };
     v
 }
 
+// ---------------------------------------------------------------- names
+
+/// Lower-case a wire-form name (no compression) into `dst`; the bytes written.
 fn ntol_core(get: impl Fn(usize) -> Option<u8>, dst: &mut [u8]) -> R<usize> {
     let eom = dst.len();
     let mut ci = 0usize;
@@ -718,7 +840,7 @@ fn ntol_core(get: impl Fn(usize) -> Option<u8>, dst: &mut [u8]) -> R<usize> {
         dst[di] = n as u8;
         di += 1;
         if n > 63 {
-            return Err(EMSGSIZE);
+            return Err(EMSGSIZE); // extended label types
         }
         if di + n >= eom {
             return Err(EMSGSIZE);
@@ -734,23 +856,33 @@ fn ntol_core(get: impl Fn(usize) -> Option<u8>, dst: &mut [u8]) -> R<usize> {
     Ok(di + 1)
 }
 
+/// Safe `ns_name_ntol`: `src` is an uncompressed wire name (a name that runs off the slice is EMSGSIZE).
 pub fn name_ntol(src: &[u8], dst: &mut [u8]) -> Result<usize, c_int> {
     ntol_core(|i| src.get(i).copied(), dst)
 }
 
+/// # Safety
+/// `src` is an uncompressed wire name ending in its root label; `dst` has `dstsiz` bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_name_ntol(src: *const c_uchar, dst: *mut c_uchar, dstsiz: usize) -> c_int {
+    // SAFETY: the caller's contract: `dst` has `dstsiz` writable bytes.
     let d = unsafe { ffi::bytes_mut(dst, dstsiz) };
+    // SAFETY: the caller's contract: `src` is a wire name ending in its root label; `ntol_core` reads it label by label in
+    // order and stops at the root label or at the first bad label byte, so every index it asks for is inside the name.
     cret(ntol_core(|i| Some(unsafe { *src.wrapping_add(i) }), d))
 }
 
+/// # Safety
+/// `dnptrs..lastdnptr` is the compression pointer table of `ns_name_pack`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_name_rollback(src: *const c_uchar, dnptrs: *mut *const c_uchar, lastdnptr: *mut *const c_uchar) {
     let n = if lastdnptr > dnptrs { (lastdnptr as usize - dnptrs as usize) / core::mem::size_of::<*const c_uchar>() } else { 0 };
+    // SAFETY: the caller's contract: `dnptrs..lastdnptr` is the (readable and writable) table.
     let table = unsafe { ffi::slice_mut(dnptrs, n) };
     name_rollback(src, table);
 }
 
+/// `ns_name_rollback` over the table: forget the first entry at or after `src` (entries end at a NULL one).
 pub fn name_rollback(src: *const c_uchar, table: &mut [*const c_uchar]) {
     for p in table.iter_mut() {
         if p.is_null() {
@@ -763,6 +895,8 @@ pub fn name_rollback(src: *const c_uchar, table: &mut [*const c_uchar]) {
     }
 }
 
+/// `foo` -> `foo.`, `foo..` -> `foo.`, `foo\.` -> `foo\..`; the length of the result (without NUL).
+/// EMSGSIZE if `dst` cannot hold it with its NUL.
 pub fn makecanon(src: &[u8], dst: &mut [u8]) -> Result<usize, c_int> {
     let mut n = src.len();
     if n + 2 > dst.len() {
@@ -783,6 +917,7 @@ pub fn makecanon(src: &[u8], dst: &mut [u8]) -> Result<usize, c_int> {
     Ok(n)
 }
 
+/// 1 if the names are the same (case-insensitively, trailing dots ignored), 0 if not; EMSGSIZE if one is too long.
 pub fn samename(a: &[u8], b: &[u8]) -> Result<bool, c_int> {
     let mut ta = [0u8; NS_MAXDNAME];
     let mut tb = [0u8; NS_MAXDNAME];
@@ -799,6 +934,7 @@ fn samename_c(a: &[u8], b: &[u8]) -> c_int {
     }
 }
 
+/// Is the label separator at the end of `a[..len]` (an unescaped dot) there? Drop it from `len` if so.
 fn trim_dot(a: &[u8]) -> usize {
     let mut la = a.len();
     if la != 0 && a[la - 1] == b'.' {
@@ -819,6 +955,7 @@ fn trim_dot(a: &[u8]) -> usize {
     la
 }
 
+/// Is `a` equal to `b` or inside the domain `b` (case-insensitive, escapes respected)?
 pub fn samedomain(a: &[u8], b: &[u8]) -> bool {
     let la = trim_dot(a);
     let lb = trim_dot(b);
@@ -854,30 +991,47 @@ pub fn samedomain(a: &[u8], b: &[u8]) -> bool {
     a[diff..diff + lb].eq_ignore_ascii_case(&b[..lb])
 }
 
+/// Is `a` strictly inside the domain `b` (inside it and not the same name)?
 pub fn subdomain(a: &[u8], b: &[u8]) -> bool {
     samename_c(a, b) != 1 && samedomain(a, b)
 }
 
+/// Two C string arguments as bytes.
+///
+/// # Safety
+/// `a` and `b` are C strings valid for `'a`.
 unsafe fn two_names<'a>(a: *const c_char, b: *const c_char) -> (&'a [u8], &'a [u8]) {
+    // SAFETY: the caller's contract.
     let a = unsafe { ffi::cstr_bytes(a) };
+    // SAFETY: the caller's contract.
     (a, unsafe { ffi::cstr_bytes(b) })
 }
 
+/// # Safety
+/// `a` and `b` are C strings.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_samedomain(a: *const c_char, b: *const c_char) -> c_int {
+    // SAFETY: the caller's contract: C strings.
     let (a, b) = unsafe { two_names(a, b) };
     samedomain(a, b) as c_int
 }
 
+/// # Safety
+/// `a` and `b` are C strings.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_subdomain(a: *const c_char, b: *const c_char) -> c_int {
+    // SAFETY: the caller's contract: C strings.
     let (a, b) = unsafe { two_names(a, b) };
     subdomain(a, b) as c_int
 }
 
+/// # Safety
+/// `src` is a C string; `dst` has `dstsize` bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_makecanon(src: *const c_char, dst: *mut c_char, dstsize: usize) -> c_int {
+    // SAFETY: the caller's contract: `src` is a C string.
     let src = unsafe { ffi::cstr_bytes(src) };
+    // SAFETY: the caller's contract: `dst` has `dstsize` writable bytes.
     let dst = unsafe { ffi::bytes_mut(dst.cast::<u8>(), dstsize) };
     match makecanon(src, dst) {
         Ok(_) => 0,
@@ -888,14 +1042,20 @@ pub unsafe extern "C" fn ns_makecanon(src: *const c_char, dst: *mut c_char, dsts
     }
 }
 
+/// # Safety
+/// `a` and `b` are C strings.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_samename(a: *const c_char, b: *const c_char) -> c_int {
+    // SAFETY: the caller's contract: C strings.
     let (a, b) = unsafe { two_names(a, b) };
     samename_errno(a, b)
 }
 
+// ---------------------------------------------------------------- LOC text
+
 const POWEROFTEN: [u32; 10] = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000];
 
+/// An XeY precision/size byte as `<cm / 100>.<cm % 100>` (glibc's `precsize_ntoa`, 32-bit multiply included).
 fn precsize_ntoa(prec: u8, b: &mut Buf<128>) {
     let mantissa = (((prec >> 4) & 0x0f) % 10) as u32;
     let exponent = ((prec & 0x0f) % 10) as usize;
@@ -905,6 +1065,7 @@ fn precsize_ntoa(prec: u8, b: &mut Buf<128>) {
     put_unum(b, val % 100, 2);
 }
 
+/// Format the 16 bytes of a LOC record as text (RFC 1876), like glibc's `loc_ntoa`.
 pub fn loc_ntoa(rd: &[u8; 16]) -> Buf<128> {
     let mut o = Buf::<128>::new();
     if rd[0] != 0 {
@@ -915,6 +1076,8 @@ pub fn loc_ntoa(rd: &[u8; 16]) -> Buf<128> {
     let hpval = rd[2];
     let vpval = rd[3];
     let be = |i: usize| u32::from_be_bytes([rd[i], rd[i + 1], rd[i + 2], rd[i + 3]]);
+    // glibc negates the signed value and then divides it as if it were not negative (the compiler assumes that),
+    // so the magnitude of the most negative value (2^31) prints as 596 31 23.648
     let latval = be(4).wrapping_sub(1 << 31) as i32;
     let longval = be(8).wrapping_sub(1 << 31) as i32;
     let templ = be(12);
@@ -979,16 +1142,22 @@ pub fn loc_ntoa(rd: &[u8; 16]) -> Buf<128> {
 
 static LOC_TMPBUF: crate::util::Spin<[u8; 128]> = crate::util::Spin::new([0; 128]);
 
+/// # Safety
+/// `binary` points to a LOC record (16 bytes, or 1 byte when its version is not 0); `ascii` is null (a static
+/// buffer is used) or has room for the text (up to 100 bytes).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __loc_ntoa(binary: *const c_uchar, ascii: *mut c_char) -> *const c_char {
     let mut rd = [0u8; 16];
+    // SAFETY: the caller's contract: the version byte is readable.
     let n = if unsafe { *binary } != 0 { 1 } else { 16 };
+    // SAFETY: the caller's contract: a version-0 record has 16 readable bytes.
     rd[..n].copy_from_slice(unsafe { ffi::bytes(binary, n) });
     let t = loc_ntoa(&rd);
     let mut guard = LOC_TMPBUF.lock();
     let out: &mut [u8] = if ascii.is_null() {
         &mut guard[..]
     } else {
+        // SAFETY: the caller's contract: `ascii` has room for the text and its NUL.
         unsafe { ffi::bytes_mut(ascii.cast::<u8>(), t.len + 1) }
     };
     out[..t.len].copy_from_slice(t.as_bytes());
@@ -996,6 +1165,9 @@ pub unsafe extern "C" fn __loc_ntoa(binary: *const c_uchar, ascii: *mut c_char) 
     out.as_ptr().cast::<c_char>()
 }
 
+// ---------------------------------------------------------------- record printing
+
+/// The output: the caller's buffer and the next position (bytes left include the NUL).
 struct W<'b> {
     out: &'b mut [u8],
     pos: usize,
@@ -1042,7 +1214,9 @@ impl W<'_> {
     }
 }
 
+/// Number of characters of `name` before the start of `origin` (or the whole length if `origin` is not a suffix).
 fn prune_origin(name: &[u8], origin: Option<&[u8]>) -> usize {
+    // without an origin the walk below only stops at the end of the name (its first NUL)
     let Some(_) = origin else { return name.iter().position(|&c| c == 0).unwrap_or(name.len()) };
     let at = |j: usize| name.get(j).copied().unwrap_or(0);
     let mut i = 0usize;
@@ -1068,6 +1242,7 @@ fn prune_origin(name: &[u8], origin: Option<&[u8]>) -> usize {
     i
 }
 
+/// Does a name of `len` printed characters need a trailing dot, given the origin?
 fn needs_dot(name: &[u8], len: usize, origin: Option<&[u8]>) -> bool {
     let o = |j: usize| origin.and_then(|o| o.get(j).copied()).unwrap_or(0);
     let at = |j: usize| name.get(j).copied().unwrap_or(0);
@@ -1075,6 +1250,8 @@ fn needs_dot(name: &[u8], len: usize, origin: Option<&[u8]>) -> bool {
     (no_origin || (o(0) != b'.' && o(1) != 0 && at(len) == 0)) && at(len - 1) != b'.'
 }
 
+/// glibc's `inet_nsap_ntoa` text of (at most 255 bytes of) an NSAP address: hex digits in upper case, a dot after the first
+/// byte and then after every second one.
 fn nsap_text(b: &[u8], binlen: c_int, out: &mut Buf<{ 2 + 255 * 3 }>) {
     let binlen = binlen.min(255);
     let hexd = |n: u8| n + if n < 10 { b'0' } else { b'7' };
@@ -1087,12 +1264,16 @@ fn nsap_text(b: &[u8], binlen: c_int, out: &mut Buf<{ 2 + 255 * 3 }>) {
     }
 }
 
+/// The printer's state: the output, the message names are expanded against, the record data and a cursor into it.
 struct Ctx<'a> {
     w: W<'a>,
     msg: &'a [u8],
     origin: Option<&'a [u8]>,
+    /// The record data (`rdata`, `rdlen` bytes).
     rd: &'a [u8],
+    /// The cursor: the next byte of `rd` (it may pass the end after a name that runs past it).
     pos: usize,
+    /// Address of `rd` minus address of `msg` (where the data lies in the message; negative when before it).
     rd_base: isize,
     spaced: bool,
 }
@@ -1104,10 +1285,12 @@ enum Fin {
 }
 
 impl Ctx<'_> {
+    /// Bytes of record data after the cursor (negative when a name ran past the end).
     fn remaining(&self) -> isize {
         self.rd.len() as isize - self.pos as isize
     }
 
+    /// A `<character-string>`: octets consumed, 0 for a protocol format error.
     fn charstr(&mut self) -> R<usize> {
         let data = self.rd;
         let odata = self.pos;
@@ -1141,6 +1324,7 @@ impl Ctx<'_> {
         }
     }
 
+    /// A domain name from the rdata, relative to the origin.
     fn addname(&mut self) -> R<usize> {
         let off = self.rd_base.wrapping_add(self.pos as isize);
         let w = &mut self.w;
@@ -1178,12 +1362,15 @@ impl Ctx<'_> {
         Ok(newlen)
     }
 
+    /// An address as inet_ntop prints it.
     fn add_ntop(&mut self, text: Buf<48>) -> R<()> {
         self.add_text(text.as_bytes())
     }
 
+    /// The text of an address as inet_ntop writes it into the rest of the buffer.
     #[inline]
     fn add_text(&mut self, text: &[u8]) -> R<()> {
+        // inet_ntop's size is a socklen_t
         if text.len() + 1 > (self.w.left() as u32) as usize {
             return Err(ENOSPC);
         }
@@ -1194,6 +1381,7 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// The IPv4 address at the cursor (4 bytes there, checked by the caller).
     fn add_ipv4(&mut self) -> R<()> {
         let a: [u8; 4] = self.rd[self.pos..self.pos + 4].try_into().unwrap();
         let mut t = [0u8; 16];
@@ -1201,6 +1389,8 @@ impl Ctx<'_> {
         self.add_text(&t[..n])
     }
 
+    /// ` NAME` from the table (the blank and the name are written one after the other), or ` <prefix><number>`
+    /// written as one piece, as glibc does (it matters only for what is left in a buffer that was too small).
     fn add_sym(&mut self, syms: &[res_sym], number: c_int, prefix: &[u8]) -> R<()> {
         for s in syms {
             if s.name.is_null() {
@@ -1230,10 +1420,12 @@ impl Ctx<'_> {
         v
     }
 
+    /// The byte at the cursor (inside the data, checked by the caller).
     fn byte(&self) -> u8 {
         self.rd[self.pos]
     }
 
+    /// A text `<character-string>` that must not be empty of structure (0 = format error).
     fn word(&mut self) -> R<bool> {
         let len = self.charstr()?;
         if len == 0 {
@@ -1276,6 +1468,7 @@ impl Ctx<'_> {
                 if self.remaining() != 5 * NS_INT32SZ as isize {
                     return Ok(Fin::Formerr);
                 }
+                // serial
                 let t = self.u32_at();
                 self.w.addstr(b"\t\t\t\t\t")?;
                 tmp.len = 0;
@@ -1480,10 +1673,13 @@ impl Ctx<'_> {
     }
 }
 
+/// `ns_sprintrrf` over slices: `rd` is the record data and `rd_base` its address minus the address of `msg` (names in the
+/// data are expanded against `msg`).
 fn sprintrrf(msg: &[u8], rd: &[u8], rd_base: isize, name: &[u8], class: c_int, ty: c_int, ttl: u64, name_ctx: Option<&[u8]>, origin: Option<&[u8]>, buf: &mut [u8]) -> R<usize> {
     let rdlen = rd.len();
     let mut c = Ctx { w: W { out: buf, pos: 0 }, msg, origin, rd, pos: 0, rd_base, spaced: false };
 
+    // Owner.
     let same = match name_ctx {
         Some(nc) => samename_c(nc, name) == 1,
         None => false,
@@ -1514,17 +1710,20 @@ fn sprintrrf(msg: &[u8], rd: &[u8], rd_base: isize, name: &[u8], class: c_int, t
         }
     }
 
+    // TTL, class, type.
     let start = c.w.pos;
     let x = format_ttl(ttl, &mut c.w.out[start..])?;
     c.w.addlen(x);
     c.add_sym(&__p_class_syms, class, b"CLASS")?;
     if ty == T_A6 {
+        // A6 is not in the exported table; glibc special-cases it
         c.w.addstr(b" A6")?;
     } else {
         c.add_sym(&__p_type_syms, ty, b"TYPE")?;
     }
     c.spaced = c.w.addtab(c.w.pos - start, 16, c.spaced)?;
 
+    // RData.
     let comment: &[u8] = match c.rdata_body(ty, class, rdlen)? {
         Fin::Done => return Ok(c.w.pos),
         Fin::Formerr => b" ; RR format error",
@@ -1566,42 +1765,72 @@ fn sprintrrf(msg: &[u8], rd: &[u8], rd_base: isize, name: &[u8], class: c_int, t
     Ok(c.w.pos)
 }
 
+/// The arguments the two printers share: `name_ctx` and `origin` (C strings or NULL) and the output buffer.
+///
+/// # Safety
+/// `name_ctx` and `origin` are NULL or C strings valid for `'a`; `buf` is writable for `buflen` bytes and overlaps nothing
+/// else used.
 unsafe fn print_args<'a>(name_ctx: *const c_char, origin: *const c_char, buf: *mut c_char, buflen: usize) -> (Option<&'a [u8]>, Option<&'a [u8]>, &'a mut [u8]) {
+    // SAFETY: the caller's contract.
     let name_ctx = unsafe { ffi::cstr(name_ctx) }.map(CStr::to_bytes);
+    // SAFETY: the caller's contract.
     let origin = unsafe { ffi::cstr(origin) }.map(CStr::to_bytes);
+    // SAFETY: the caller's contract.
     (name_ctx, origin, unsafe { ffi::bytes_mut(buf.cast::<u8>(), buflen) })
 }
 
+/// # Safety
+/// `msg` points to `msglen` bytes (the message `rdata` lies in, for compressed names); `name`, `name_ctx` and
+/// `origin` are C strings (the last two may be null); `rdata` points to `rdlen` bytes; `buf` has `buflen` bytes.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_sprintrrf(msg: *const c_uchar, msglen: usize, name: *const c_char, class: ns_class, ty: ns_type, ttl: c_ulong, rdata: *const c_uchar, rdlen: usize, name_ctx: *const c_char, origin: *const c_char, buf: *mut c_char, buflen: usize) -> c_int {
+    // SAFETY: the caller's contract: `msg` has `msglen` readable bytes.
     let m = unsafe { ffi::bytes(msg, msglen) };
+    // SAFETY: the caller's contract: `rdata` has `rdlen` readable bytes.
     let rd = unsafe { ffi::bytes(rdata, rdlen) };
+    // SAFETY: the caller's contract: `name` is a C string.
     let name = unsafe { ffi::cstr_bytes(name) };
+    // SAFETY: the caller's contract: NULL or C strings, `buflen` writable bytes at `buf` (apart from the inputs).
     let (name_ctx, origin, out) = unsafe { print_args(name_ctx, origin, buf, buflen) };
     let rd_base = (rdata as isize).wrapping_sub(msg as isize);
     cret(sprintrrf(m, rd, rd_base, name, class, ty, ttl, name_ctx, origin, out))
 }
 
+/// # Safety
+/// `handle` and `rr` came from `ns_initparse` / `ns_parserr`; the other pointers as for `ns_sprintrrf`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn ns_sprintrr(handle: *const ns_msg, rr: *const ns_rr, name_ctx: *const c_char, origin: *const c_char, buf: *mut c_char, buflen: usize) -> c_int {
+    // SAFETY: the caller's contract: a handle from ns_initparse.
     let h = unsafe { &*handle };
+    // SAFETY: the caller's contract: a record from ns_parserr.
     let r = unsafe { &*rr };
+    // SAFETY: the handle's message is still there (the caller's contract).
     let m = unsafe { handle_msg(h) };
+    // SAFETY: the record's data lies in the message (ns_parserr put it there), `rdlength` bytes.
     let rd = unsafe { ffi::bytes(r.rdata, r.rdlength as usize) };
+    // ns_rr_name: the root is printed as "."
     let name: &[u8] = if r.name[0] != 0 { name_text(&r.name) } else { b"." };
+    // SAFETY: the caller's contract: NULL or C strings, `buflen` writable bytes at `buf`.
     let (name_ctx, origin, out) = unsafe { print_args(name_ctx, origin, buf, buflen) };
     let rd_base = (r.rdata as isize).wrapping_sub(h._msg as isize);
     cret(sprintrrf(m, rd, rd_base, name, r.rr_class as c_int, r.type_ as c_int, r.ttl as u64, name_ctx, origin, out))
 }
 
+// ---------------------------------------------------------------- for the debugging printers (resdebug)
+
+/// `ns_initparse` of the message `m` into `h`, with the C function's result and errno (no 0x5e fill: `h` is the caller's
+/// own initialised handle).
 pub(crate) fn initparse_c(h: &mut ns_msg, m: &[u8]) -> c_int {
     cret(initparse(h, m.as_ptr(), m.as_ptr().wrapping_add(m.len()), m).map(|_| 0))
 }
 
+/// `ns_parserr` on the handle `h` of the message `m`, with the C function's result and errno.
 pub(crate) fn parserr_c(h: &mut ns_msg, m: &[u8], section: c_int, rrnum: c_int, rr: &mut ns_rr) -> c_int {
     cret(parserr(h, m, section, rrnum, rr).map(|_| 0))
 }
 
+/// `ns_sprintrr(h, rr, NULL, NULL, out)` for a record `ns_parserr` took from the message `m`, with the C function's result
+/// and errno.
 pub(crate) fn sprintrr_c(h: &ns_msg, m: &[u8], r: &ns_rr, out: &mut [u8]) -> c_int {
     let rd: &[u8] = if r.rdata.is_null() {
         &[]
@@ -1609,11 +1838,13 @@ pub(crate) fn sprintrr_c(h: &ns_msg, m: &[u8], r: &ns_rr, out: &mut [u8]) -> c_i
         let off = r.rdata as usize - m.as_ptr() as usize;
         &m[off..off + r.rdlength as usize]
     };
+    // ns_rr_name: the root is printed as "."
     let name: &[u8] = if r.name[0] != 0 { name_text(&r.name) } else { b"." };
     let rd_base = (r.rdata as isize).wrapping_sub(h._msg as isize);
     cret(sprintrrf(m, rd, rd_base, name, r.rr_class as c_int, r.type_ as c_int, r.ttl as u64, None, None, out))
 }
 
+/// `ns_samename` on byte strings: 1, 0, or -1 with errno.
 pub(crate) fn samename_errno(a: &[u8], b: &[u8]) -> c_int {
     match samename(a, b) {
         Ok(v) => v as c_int,
@@ -1624,17 +1855,22 @@ pub(crate) fn samename_errno(a: &[u8], b: &[u8]) -> c_int {
     }
 }
 
+// ---------------------------------------------------------------- Rust API
+
+/// A parsed message: the header fields and a cursor over the records of each section.
 pub struct Msg<'a> {
     h: ns_msg,
     m: &'a [u8],
 }
 
+/// One parsed record; borrows the message it came from.
 pub struct Rr<'a> {
     raw: ns_rr,
     rd: &'a [u8],
 }
 
 impl<'a> Msg<'a> {
+    /// `ns_initparse`: checks the whole message (EMSGSIZE if it is cut short, has trailing bytes or a bad name).
     pub fn new(msg: &'a [u8]) -> Result<Msg<'a>, c_int> {
         if msg.len() > c_int::MAX as usize {
             return Err(EMSGSIZE);
@@ -1648,14 +1884,17 @@ impl<'a> Msg<'a> {
         self.h._id
     }
 
+    /// The raw 16 flag bits.
     pub fn flags(&self) -> u16 {
         self.h._flags
     }
 
+    /// One flag field (`ns_f_qr`, `ns_f_opcode`, ..., `ns_f_rcode`).
     pub fn flag(&self, flag: c_int) -> c_int {
         ns_msg_getflag(self.h, flag)
     }
 
+    /// Number of records in `section` (`ns_s_qd` ... `ns_s_ar`); 0 for a section that does not exist.
     pub fn count(&self, section: c_int) -> u16 {
         if (0..ns_s_max).contains(&section) { self.h._counts[section as usize] } else { 0 }
     }
@@ -1664,6 +1903,7 @@ impl<'a> Msg<'a> {
         self.m
     }
 
+    /// `ns_parserr` with a record number. ENODEV for a bad section or number, EMSGSIZE for a bad record.
     pub fn parse_rr(&mut self, section: c_int, index: usize) -> Result<Rr<'a>, c_int> {
         if index > c_int::MAX as usize {
             return Err(ENODEV);
@@ -1671,6 +1911,7 @@ impl<'a> Msg<'a> {
         self.parse(section, index as c_int)
     }
 
+    /// `ns_parserr` with record number -1: the record after the last one parsed in `section`.
     pub fn next_rr(&mut self, section: c_int) -> Result<Rr<'a>, c_int> {
         self.parse(section, -1)
     }
@@ -1687,6 +1928,7 @@ impl<'a> Msg<'a> {
         Ok(Rr { raw, rd })
     }
 
+    /// `ns_sprintrr` into `out`; the length written (without the NUL). ENOSPC if `out` is too small.
     pub fn sprint_rr(&self, rr: &Rr<'_>, name_ctx: Option<&CStr>, origin: Option<&CStr>, out: &mut [u8]) -> Result<usize, c_int> {
         let r = &rr.raw;
         let name: &[u8] = if r.name[0] != 0 { name_text(&r.name) } else { b"." };
@@ -1696,6 +1938,7 @@ impl<'a> Msg<'a> {
 }
 
 impl<'a> Rr<'a> {
+    /// The owner name as text (empty for the root; `ns_rr_name` would print ".").
     pub fn name(&self) -> &[u8] {
         name_text(&self.raw.name)
     }
@@ -1708,11 +1951,15 @@ impl<'a> Rr<'a> {
     pub fn ttl(&self) -> u32 {
         self.raw.ttl
     }
+    /// The record data (empty for a question).
     pub fn rdata(&self) -> &'a [u8] {
         self.rd
     }
 }
 
+/// `ns_sprintrrf` over slices. Domain names in `rdata` are expanded against `msg` (so `rdata` normally lies
+/// inside it); a name that points outside `msg` fails with ENOSPC, as glibc's `ns_sprintrrf` does. `name`,
+/// `name_ctx` and `origin` are names without a NUL.
 pub fn sprint_rrf(msg: &[u8], name: &CStr, class: c_int, ty: c_int, ttl: u64, rdata: &[u8], name_ctx: Option<&CStr>, origin: Option<&CStr>, out: &mut [u8]) -> Result<usize, c_int> {
     let rd_base = (rdata.as_ptr() as isize).wrapping_sub(msg.as_ptr() as isize);
     sprintrrf(msg, rdata, rd_base, name.to_bytes(), class, ty, ttl, name_ctx.map(CStr::to_bytes), origin.map(CStr::to_bytes), out)

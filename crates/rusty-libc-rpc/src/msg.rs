@@ -1,3 +1,9 @@
+//! RPC message encoding (RFC 5531 section 9): `xdr_opaque_auth`, `xdr_callhdr`, `xdr_callmsg`,
+//! `xdr_replymsg` and friends, `_seterr_reply`. Port of Sun's `rpc_prot.c` and `rpc_cmsg.c`.
+//!
+//! The exported routines are shells over the `*_in` functions, which take the stream and the message by reference.
+//! What stays unsafe: the authentication bodies (`oa_base`/`oa_length` describe a C buffer) and the result routine of
+//! an accepted reply (a C callback with its object pointer).
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 
 use crate::stream::{XdrStream, get_word, put_word};
@@ -7,9 +13,14 @@ use crate::xdr::*;
 use core::ffi::{c_int, c_long};
 use rusty_libc_core::ffi::bytes_mut;
 
+/// `xdr_opaque_auth` on a stream in hand.
+///
+/// # Safety
+/// `ap.oa_base` / `ap.oa_length` describe a buffer as `xdr_bytes` wants it ([`bytes_in`]).
 #[inline]
 pub unsafe fn opaque_auth_in(x: &mut XdrStream, ap: &mut opaque_auth) -> bool_t {
     if x.enum_(&mut ap.oa_flavor) != 0 {
+        // SAFETY: forwarded contract.
         return unsafe { bytes_in(x, &mut ap.oa_base, &mut ap.oa_length, MAX_AUTH_BYTES) };
     }
     FALSE
@@ -17,18 +28,29 @@ pub unsafe fn opaque_auth_in(x: &mut XdrStream, ap: &mut opaque_auth) -> bool_t 
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn xdr_opaque_auth(xdrs: *mut XDR, ap: *mut opaque_auth) -> bool_t {
+    // SAFETY: the C contract: `ap` points to an opaque_auth.
     let ap = unsafe { &mut *ap };
+    // SAFETY: `xdrs` is a live stream.
     let mut x = unsafe { XdrStream::from_ptr(xdrs) };
+    // SAFETY: `ap`'s body is a C buffer as the C contract says.
     unsafe { opaque_auth_in(&mut x, ap) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn xdr_des_block(xdrs: *mut XDR, blkp: *mut des_block) -> bool_t {
+    // SAFETY: the C contract: `blkp` points to a des_block.
     let blk = unsafe { &mut *blkp };
+    // SAFETY: `xdrs` is a live stream.
     unsafe { XdrStream::from_ptr(xdrs) }.opaque(blk.bytes_mut())
 }
 
+/// `xdr_accepted_reply` on a stream in hand.
+///
+/// # Safety
+/// As [`opaque_auth_in`] for `ar.ar_verf`; when the status is SUCCESS, `ar.ru.AR_results` names an XDR routine and the
+/// object it codes.
 pub unsafe fn accepted_reply_in(x: &mut XdrStream, ar: &mut accepted_reply) -> bool_t {
+    // SAFETY: forwarded contract.
     if unsafe { opaque_auth_in(x, &mut ar.ar_verf) } == 0 {
         return FALSE;
     }
@@ -39,6 +61,7 @@ pub unsafe fn accepted_reply_in(x: &mut XdrStream, ar: &mut accepted_reply) -> b
         SUCCESS => {
             let r = *ar.ru.results();
             match r.proc_ {
+                // SAFETY: the routine codes the object at `where_` (forwarded contract).
                 Some(f) => unsafe { f(x.as_ptr(), r.where_.cast()) },
                 None => FALSE,
             }
@@ -56,11 +79,15 @@ pub unsafe fn accepted_reply_in(x: &mut XdrStream, ar: &mut accepted_reply) -> b
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn xdr_accepted_reply(xdrs: *mut XDR, ar: *mut accepted_reply) -> bool_t {
+    // SAFETY: the C contract: `ar` points to an accepted_reply.
     let ar = unsafe { &mut *ar };
+    // SAFETY: `xdrs` is a live stream.
     let mut x = unsafe { XdrStream::from_ptr(xdrs) };
+    // SAFETY: the reply's buffers and result routine are what the C contract says.
     unsafe { accepted_reply_in(&mut x, ar) }
 }
 
+/// `xdr_rejected_reply` (safe: a rejected reply is integers only).
 pub fn rejected_reply_in(x: &mut XdrStream, rr: &mut rejected_reply) -> bool_t {
     if x.enum_(&mut rr.rj_stat) == 0 {
         return FALSE;
@@ -80,10 +107,16 @@ pub fn rejected_reply_in(x: &mut XdrStream, rr: &mut rejected_reply) -> bool_t {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn xdr_rejected_reply(xdrs: *mut XDR, rr: *mut rejected_reply) -> bool_t {
+    // SAFETY: the C contract: `rr` points to a rejected_reply.
     let rr = unsafe { &mut *rr };
+    // SAFETY: `xdrs` is a live stream.
     rejected_reply_in(&mut unsafe { XdrStream::from_ptr(xdrs) }, rr)
 }
 
+/// `xdr_replymsg` on a stream in hand: the union of `xdr_union` with the accepted and rejected arms and no default.
+///
+/// # Safety
+/// As [`accepted_reply_in`] for the accepted arm.
 pub unsafe fn replymsg_in(x: &mut XdrStream, rmsg: &mut rpc_msg) -> bool_t {
     if x.u_long(&mut rmsg.rm_xid) != 0 && x.enum_(&mut rmsg.rm_direction) != 0 && rmsg.rm_direction == REPLY {
         let rb = rmsg.ru.rmb_mut();
@@ -91,6 +124,7 @@ pub unsafe fn replymsg_in(x: &mut XdrStream, rmsg: &mut rpc_msg) -> bool_t {
             return FALSE;
         }
         return match rb.rp_stat {
+            // SAFETY: forwarded contract.
             MSG_ACCEPTED => unsafe { accepted_reply_in(x, rb.ru.ar_mut()) },
             MSG_DENIED => rejected_reply_in(x, rb.ru.dr_mut()),
             _ => FALSE,
@@ -101,11 +135,15 @@ pub unsafe fn replymsg_in(x: &mut XdrStream, rmsg: &mut rpc_msg) -> bool_t {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn xdr_replymsg(xdrs: *mut XDR, rmsg: *mut rpc_msg) -> bool_t {
+    // SAFETY: the C contract: `rmsg` points to an rpc_msg.
     let rmsg = unsafe { &mut *rmsg };
+    // SAFETY: `xdrs` is a live stream.
     let mut x = unsafe { XdrStream::from_ptr(xdrs) };
+    // SAFETY: the message's buffers and result routine are what the C contract says.
     unsafe { replymsg_in(&mut x, rmsg) }
 }
 
+/// `xdr_callhdr`: the fixed part of a call message (encoding only; safe: integers only).
 pub fn callhdr_in(x: &mut XdrStream, cmsg: &mut rpc_msg) -> bool_t {
     cmsg.rm_direction = CALL;
     cmsg.ru.cmb_mut().cb_rpcvers = RPC_MSG_VERSION;
@@ -120,7 +158,9 @@ pub fn callhdr_in(x: &mut XdrStream, cmsg: &mut rpc_msg) -> bool_t {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn xdr_callhdr(xdrs: *mut XDR, cmsg: *mut rpc_msg) -> bool_t {
+    // SAFETY: the C contract: `cmsg` points to an rpc_msg.
     let cmsg = unsafe { &mut *cmsg };
+    // SAFETY: `xdrs` is a live stream.
     callhdr_in(&mut unsafe { XdrStream::from_ptr(xdrs) }, cmsg)
 }
 
@@ -155,6 +195,7 @@ fn rejected(rjct_stat: c_int, error: &mut rpc_err) {
     }
 }
 
+/// `_seterr_reply`: translate a reply message into the client's error structure.
 pub fn seterr_reply(msg: &rpc_msg, error: &mut rpc_err) {
     let rb = msg.ru.rmb();
     match rb.rp_stat {
@@ -179,12 +220,21 @@ pub fn seterr_reply(msg: &rpc_msg, error: &mut rpc_err) {
     }
 }
 
+/// Translate a reply message into the client's error structure.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn _seterr_reply(msg: *mut rpc_msg, error: *mut rpc_err) {
+    // SAFETY: the C contract: `msg` points to a reply message.
     let msg = unsafe { &*msg };
+    // SAFETY: `error` points to the client's error structure.
     seterr_reply(msg, unsafe { &mut *error })
 }
 
+/// Decode the body of an authentication structure whose flavour and length are known: into a buffer allocated here when
+/// `oa_base` is NULL, from the stream's buffer when it lends one (a raw copy, as Sun's code does: this is the server's
+/// per-request path, and a checked cursor here cost the routine about a third of its speed), else through `xdr_opaque`.
+///
+/// # Safety
+/// `oa.oa_base` is NULL or points to at least `oa.oa_length` writable bytes.
 #[inline(always)]
 unsafe fn decode_auth_body(x: &mut XdrStream, oa: &mut opaque_auth) -> bool_t {
     if oa.oa_length != 0 {
@@ -196,18 +246,31 @@ unsafe fn decode_auth_body(x: &mut XdrStream, oa: &mut opaque_auth) -> bool_t {
         }
         let p = x.inline_ptr(rndup(oa.oa_length));
         if p.is_null() {
+            // SAFETY: `oa_base` is our fresh buffer or the caller's, `oa_length` bytes (contract; glibc does not check
+            // the allocation either).
             if x.opaque(unsafe { bytes_mut(oa.oa_base.cast(), oa.oa_length as usize) }) == FALSE {
                 return FALSE;
             }
         } else {
+            // SAFETY: the stream lent `rndup(oa_length)` >= `oa_length` bytes at `p` (the stream contract) and
+            // `oa_base` holds `oa_length` bytes (as above); the stream's buffer and the body are different memory.
             unsafe { core::ptr::copy_nonoverlapping(p as *const u8, oa.oa_base as *mut u8, oa.oa_length as usize) };
         }
     }
     TRUE
 }
 
+/// The inline fast path of encoding a call message, straight into the stream's buffer as Sun's code does. A hot path
+/// kept on raw writes: the checked cursor ([`crate::stream::Inline`]) measured about 10% slower on this routine (the
+/// lengths have to be checked again after the stream's callback, which could have changed the message as far as the
+/// compiler knows); four writes at offsets computed once.
+///
+/// # Safety
+/// `p` points to `8 * 4 + rndup(cred length) + 2 * 4 + rndup(verf length)` writable bytes that nothing else uses
+/// meanwhile; both lengths are at most MAX_AUTH_BYTES and the bodies are C buffers of those lengths.
 #[inline(always)]
 unsafe fn encode_callmsg_inline(p: *mut u8, cmsg: &rpc_msg) -> bool_t {
+    // SAFETY: the first 32 bytes are inside the room (caller's contract).
     let h = unsafe { &mut *p.cast::<[u8; 32]>() };
     put_word(h, 0, cmsg.rm_xid as i32);
     put_word(h, 4, cmsg.rm_direction);
@@ -227,19 +290,28 @@ unsafe fn encode_callmsg_inline(p: *mut u8, cmsg: &rpc_msg) -> bool_t {
     put_word(h, 28, oa.oa_length as i32);
     let mut at = 32;
     if oa.oa_length != 0 {
+        // SAFETY: the credential body (caller's contract) into the room after the header, `rndup(length)` bytes of
+        // which are reserved for it; the two do not overlap (the room is the stream's buffer).
         unsafe { core::ptr::copy_nonoverlapping(oa.oa_base as *const u8, p.wrapping_add(at), oa.oa_length as usize) };
         at += rndup(oa.oa_length) as usize;
     }
     let oa = &cm.cb_verf;
+    // SAFETY: the verifier's 8 header bytes follow the credential's room (caller's contract).
     let v = unsafe { &mut *p.wrapping_add(at).cast::<[u8; 8]>() };
     put_word(v, 0, oa.oa_flavor);
     put_word(v, 4, oa.oa_length as i32);
     if oa.oa_length != 0 {
+        // SAFETY: the verifier body into the last `rndup(length)` bytes of the room (caller's contract).
         unsafe { core::ptr::copy_nonoverlapping(oa.oa_base as *const u8, p.wrapping_add(at + 8), oa.oa_length as usize) };
     }
     TRUE
 }
 
+/// `xdr_callmsg` on a stream in hand: the call header and both authentication structures, through the stream's
+/// buffer when it lends one (the fast path of Sun's code), else field by field.
+///
+/// # Safety
+/// The credential and verifier bodies are C buffers as [`opaque_auth_in`] wants them.
 #[inline(always)]
 pub unsafe fn callmsg_in(x: &mut XdrStream, cmsg: &mut rpc_msg) -> bool_t {
     if x.op() == XDR_ENCODE {
@@ -253,11 +325,14 @@ pub unsafe fn callmsg_in(x: &mut XdrStream, cmsg: &mut rpc_msg) -> bool_t {
         let len = 8 * BYTES_PER_XDR_UNIT + rndup(cm.cb_cred.oa_length) + 2 * BYTES_PER_XDR_UNIT + rndup(cm.cb_verf.oa_length);
         let p = x.inline_ptr(len);
         if !p.is_null() {
+            // SAFETY: the stream lent `len` bytes at `p` (the stream contract), the room this message's lengths need;
+            // the bodies are C buffers of their lengths (forwarded contract).
             return unsafe { encode_callmsg_inline(p.cast(), cmsg) };
         }
     }
     if x.op() == XDR_DECODE {
         if let Some(mut buf) = x.inline(8 * BYTES_PER_XDR_UNIT) {
+            // IXDR_GET_LONG zero-extends the word
             let h = buf.take_array::<32>();
             let long = |off| get_word(h, off) as u32 as c_long;
             cmsg.rm_xid = long(0) as u_long;
@@ -276,6 +351,7 @@ pub unsafe fn callmsg_in(x: &mut XdrStream, cmsg: &mut rpc_msg) -> bool_t {
             let oa = &mut cm.cb_cred;
             oa.oa_flavor = long(24) as enum_t;
             oa.oa_length = get_word(h, 28) as u_int;
+            // SAFETY: the credential body is NULL or a C buffer big enough (contract).
             if unsafe { decode_auth_body(x, oa) } == FALSE {
                 return FALSE;
             }
@@ -292,12 +368,19 @@ pub unsafe fn callmsg_in(x: &mut XdrStream, cmsg: &mut rpc_msg) -> bool_t {
                     oa.oa_length = get_word(v, 4) as u_int;
                 }
             }
+            // SAFETY: the verifier body is NULL or a C buffer big enough (contract).
             return unsafe { decode_auth_body(x, oa) };
         }
     }
+    // SAFETY: forwarded contract.
     unsafe { callmsg_fields(x, cmsg) }
 }
 
+/// `xdr_callmsg` field by field (the stream lends no buffer): a function of its own, kept out of the fast paths'
+/// frame.
+///
+/// # Safety
+/// As [`callmsg_in`].
 #[inline(never)]
 unsafe fn callmsg_fields(x: &mut XdrStream, cmsg: &mut rpc_msg) -> bool_t {
     if x.u_long(&mut cmsg.rm_xid) != 0 && x.enum_(&mut cmsg.rm_direction) != 0 && cmsg.rm_direction == CALL {
@@ -307,8 +390,10 @@ unsafe fn callmsg_fields(x: &mut XdrStream, cmsg: &mut rpc_msg) -> bool_t {
             && x.u_long(&mut cm.cb_prog) != 0
             && x.u_long(&mut cm.cb_vers) != 0
             && x.u_long(&mut cm.cb_proc) != 0
+            // SAFETY: forwarded contract.
             && unsafe { opaque_auth_in(x, &mut cm.cb_cred) } != 0
         {
+            // SAFETY: forwarded contract.
             return unsafe { opaque_auth_in(x, &mut cm.cb_verf) };
         }
     }
@@ -317,7 +402,10 @@ unsafe fn callmsg_fields(x: &mut XdrStream, cmsg: &mut rpc_msg) -> bool_t {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn xdr_callmsg(xdrs: *mut XDR, cmsg: *mut rpc_msg) -> bool_t {
+    // SAFETY: the C contract: `cmsg` points to an rpc_msg.
     let cmsg = unsafe { &mut *cmsg };
+    // SAFETY: `xdrs` is a live stream.
     let mut x = unsafe { XdrStream::from_ptr(xdrs) };
+    // SAFETY: the message's authentication bodies are what the C contract says.
     unsafe { callmsg_in(&mut x, cmsg) }
 }

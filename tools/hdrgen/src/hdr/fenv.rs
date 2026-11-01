@@ -3,7 +3,11 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "fenv.h",
     items: &[
-        Item::Guard { name: "_RLIBC_FENV_H", value: "1", end: "", items: &[
+        Item::Comment(r#"/* fenv.h for the Rust libc, x86-64 (glibc's constants, values and type layout). Written by hand:
+   the constants and the three types; the function declarations are generated from
+   crates/rusty-libc-math/src/fenv.rs (bits/rlibc-fenvcalls.h). tests/c/math_diff.c checks sizes,
+   offsets and values against glibc's header. */"#),
+        Item::Guard { name: "_RLIBC_FENV_H", value: "1", end: " /* fenv.h */", items: &[
             Item::Blank,
             Item::Gate(&[
                 Branch { head: "ifdef _GNU_SOURCE", items: &[
@@ -29,6 +33,7 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* Exception flags: the bit positions of the x87 control word */"),
             Item::Consts(&[
                 ("FE_INVALID", V::Txt("0x01")),
                 ("__FE_DENORM", V::Txt("0x02")),
@@ -39,6 +44,7 @@ pub static HDR: Header = Header {
                 ("FE_ALL_EXCEPT", V::Txt("(FE_INEXACT | FE_DIVBYZERO | FE_UNDERFLOW | FE_OVERFLOW | FE_INVALID)")),
             ]),
             Item::Blank,
+            Item::Comment("/* Rounding modes: the bit positions of the x87 control word */"),
             Item::Consts(&[
                 ("FE_TONEAREST", V::Dec(0)),
                 ("FE_DOWNWARD", V::Hex(0x400)),
@@ -48,6 +54,7 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::Typedef("unsigned short int", "fexcept_t"),
             Item::Blank,
+            Item::Comment("/* The block fnstenv writes, then MXCSR (32 bytes) */"),
             Item::Block { head: "typedef struct ", body: &["", "  unsigned short int __control_word;", "  unsigned short int __glibc_reserved1;", "  unsigned short int __status_word;", "  unsigned short int __glibc_reserved2;", "  unsigned short int __tags;", "  unsigned short int __glibc_reserved3;", "  unsigned int __eip;", "  unsigned short int __cs_selector;", "  unsigned int __opcode:11;", "  unsigned int __glibc_reserved4:5;", "  unsigned int __data_offset;", "  unsigned short int __data_selector;", "  unsigned short int __glibc_reserved5;", "  unsigned int __mxcsr;", ""], tail: " fenv_t" },
             Item::Blank,
             Item::Consts(&[
@@ -55,6 +62,7 @@ pub static HDR: Header = Header {
             ]),
             Item::Gate(&[
                 Branch { head: "ifdef __RLIBC_MATH_GNU", items: &[
+                    Item::Comment("/* every exception unmasked (trapping) */"),
                     Item::Consts(&[
                         ("FE_NOMASK_ENV", V::Txt("((const fenv_t *) -2)")),
                     ]),
@@ -69,6 +77,7 @@ pub static HDR: Header = Header {
                     ]),
                 ] },
             ], ""),
+            Item::Comment("/* C23 (glibc 2.43): signalling NaNs always raise Invalid where the standard says they may, when the compiler is told to\n   keep them (-fsignaling-nans defines __SUPPORT_SNAN__) */"),
             Item::Gate(&[
                 Branch { head: "if defined __RLIBC_MATH_EXT && defined FE_INVALID && defined __SUPPORT_SNAN__", items: &[
                     Item::Consts(&[

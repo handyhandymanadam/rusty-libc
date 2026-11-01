@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "endian.h",
     items: &[
+        Item::Comment("/* endian.h for the Rust libc (x86-64: little-endian). */"),
         Item::Guard { name: "_ENDIAN_H", value: "1", end: "", items: &[
             Item::Include("<features.h>"),
             Item::Include("<bits/endian.h>"),

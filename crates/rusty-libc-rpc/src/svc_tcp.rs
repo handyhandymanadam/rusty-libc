@@ -1,3 +1,6 @@
+//! The TCP server transport (`svctcp_create`, `svcfd_create`): a listening "rendezvous" transport that
+//! makes one record-marking transport per accepted connection. Port of Sun's `svc_tcp.c`. The operations are
+//! svc_stream.rs's, shared with the UNIX transport.
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 
 use crate::svc_stream::*;
@@ -76,6 +79,7 @@ unsafe extern "C" fn rendezvous_request(xprt: *mut SVCXPRT, _errmsg: *mut rpc_ms
         nx.xp_raddr = *addr;
         nx.xp_addrlen = len as c_int;
     };
+    // SAFETY: an operation of SVCTCP_RENDEZVOUS_OP: `xprt` is a TCP listener.
     unsafe { stream_accept::<sockaddr_in>(xprt, makefd_xprt, fill) }
 }
 
@@ -84,39 +88,49 @@ unsafe extern "C" fn rendezvous_stat(_xprt: *mut SVCXPRT) -> c_int {
 }
 
 unsafe extern "C" fn svctcp_destroy(xprt: *mut SVCXPRT) {
+    // SAFETY: an operation of both TCP operation tables: a live transport, dead afterwards.
     unsafe { stream_destroy(xprt) }
 }
 
 unsafe extern "C" fn readtcp(xprtptr: *mut c_char, buf: *mut c_char, len: c_int) -> c_int {
     let rd = |sock: c_int| {
+        // SAFETY: the record stream passes `len` writable bytes of its buffer.
         read_fd(sock, unsafe { bytes_mut(buf.cast(), len as usize) }) as c_int
     };
+    // SAFETY: the record stream's handle is our transport.
     unsafe { stream_read(xprtptr, rd) }
 }
 
 unsafe extern "C" fn writetcp(xprtptr: *mut c_char, buf: *mut c_char, len: c_int) -> c_int {
     let wr = |sock: c_int, off: usize, n: usize| {
+        // SAFETY: the record stream passes `len` readable bytes; `off + n` is at most `len`.
         write_fd(sock, unsafe { bytes(buf.cast::<u8>().wrapping_add(off), n) })
     };
+    // SAFETY: the record stream's handle is our transport.
     unsafe { stream_write(xprtptr, len, wr) }
 }
 
 unsafe extern "C" fn svctcp_stat(xprt: *mut SVCXPRT) -> c_int {
+    // SAFETY: an operation of SVCTCP_OP: a live connection.
     unsafe { stream_stat(xprt) }
 }
 
 unsafe extern "C" fn svctcp_recv(xprt: *mut SVCXPRT, msg: *mut rpc_msg) -> bool_t {
+    // SAFETY: an operation of SVCTCP_OP: a live connection and the server's message.
     unsafe { stream_recv(xprt, msg, |_| {}) }
 }
 
 unsafe extern "C" fn svctcp_getargs(xprt: *mut SVCXPRT, xdr_args: xdrproc_t, args_ptr: caddr_t) -> bool_t {
+    // SAFETY: an operation of SVCTCP_OP; the routine and object are the caller's.
     unsafe { stream_args(xprt, xdr_args, args_ptr, false) }
 }
 
 unsafe extern "C" fn svctcp_freeargs(xprt: *mut SVCXPRT, xdr_args: xdrproc_t, args_ptr: caddr_t) -> bool_t {
+    // SAFETY: an operation of SVCTCP_OP; the routine and object are the caller's.
     unsafe { stream_args(xprt, xdr_args, args_ptr, true) }
 }
 
 unsafe extern "C" fn svctcp_reply(xprt: *mut SVCXPRT, msg: *mut rpc_msg) -> bool_t {
+    // SAFETY: an operation of SVCTCP_OP: a live connection and the server's reply.
     unsafe { stream_reply(xprt, msg) }
 }

@@ -1,14 +1,20 @@
+//! Which header declares which items of the Rust crates (the data of the old tools/gen_headers.py).
+
 #[derive(Clone, Default)]
 pub enum Subst {
     #[default]
     None,
+    /// whole-word replacement
     Word(&'static str, &'static str),
+    /// literal replacement
     Lit(&'static str, &'static str),
 }
 
 #[derive(Clone, Default)]
 pub struct Spec {
+    /// header path without ".h"
     pub name: String,
+    /// cbindgen/<config>.toml
     pub config: String,
     pub files: Vec<String>,
     pub fns: Vec<String>,
@@ -59,6 +65,7 @@ impl Spec {
 }
 
 pub const MEM_SRC: [&str; 3] = ["mem.rs", "str.rs", "search.rs"];
+/// (crate dir, file) pairs single functions are pulled from by name
 pub fn item_src() -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = MEM_SRC.iter().map(|n| ("rusty-libc-mem".to_string(), n.to_string())).collect();
     v.push(("rusty-libc-wchar".into(), "mbyte.rs".into()));
@@ -70,6 +77,7 @@ fn time_src() -> Vec<String> {
     ["clock.rs", "calendar.rs", "tz.rs", "strftime.rs"].iter().map(|f| format!("crates/rusty-libc-time/src/{f}")).collect()
 }
 
+/// The C objects of the time crate are atomics on the Rust side (U2: no `static mut`); cbindgen sees the C types.
 fn time_objects(t: Spec) -> Spec {
     t.subst(Subst::Lit("pub static __tzname: [AtomicPtr<c_char>; 2]", "pub static mut __tzname: [*mut c_char; 2]"))
         .subst(Subst::Lit("pub static __daylight: AtomicI32", "pub static mut __daylight: c_int"))
@@ -77,6 +85,7 @@ fn time_objects(t: Spec) -> Spec {
         .subst(Subst::Lit("pub static getdate_err: AtomicI32", "pub static mut getdate_err: c_int"))
 }
 
+/// The C objects of the ctype crate are atomics on the Rust side (U2: no `static mut`); cbindgen sees the C types.
 fn ctype_objects(t: Spec) -> Spec {
     t.subst(Subst::Lit("pub static __ctype32_b: AtomicPtr<u32>", "pub static mut __ctype32_b: *const u32"))
         .subst(Subst::Lit("pub static __ctype32_tolower: AtomicPtr<u32>", "pub static mut __ctype32_tolower: *const u32"))
@@ -86,6 +95,7 @@ fn ctype_objects(t: Spec) -> Spec {
         .subst(Subst::Lit("pub static __ctype_toupper: AtomicPtr<c_int>", "pub static mut __ctype_toupper: *const c_int"))
 }
 
+/// The C objects of the stdio crate are `SyncCell`s on the Rust side (U2: no `static mut`); cbindgen sees the C types.
 fn stdio_objects(t: Spec) -> Spec {
     t.subst(Subst::Lit("pub static stdin: SyncCell<*mut FILE>", "pub static mut stdin: *mut FILE"))
         .subst(Subst::Lit("pub static stdout: SyncCell<*mut FILE>", "pub static mut stdout: *mut FILE"))
@@ -159,6 +169,7 @@ pub fn build_specs() -> Vec<Spec> {
     h.push(spec("bits/rlibc-threadscalls", "threadscalls").files(&["crates/rusty-libc-pthread/src/c11.rs"]));
     h.push(spec("strings", "strings").fns("bcmp bcopy bzero index rindex strcasecmp strncasecmp strcasecmp_l strncasecmp_l").pick("crates/rusty-libc-extra/src/misc.rs", "ffs ffsl ffsll"));
 
+    // rusty-libc-net
     let net = "crates/rusty-libc-net/src/";
     let n = |f: &str| format!("{net}{f}");
     h.push(spec("bits/rlibc-net-sock", "net_sock").pick(&n("sock.rs"), "socket socketpair bind listen accept accept4 connect getsockname getpeername send recv sendto recvfrom sendmsg recvmsg sendmmsg recvmmsg shutdown getsockopt setsockopt isfdtype sockatmark __cmsg_nxthdr"));
@@ -185,6 +196,7 @@ pub fn build_specs() -> Vec<Spec> {
         .pick(&n("resolv.rs"), "res_query res_search res_querydomain res_mkquery res_send res_nquery res_nsearch res_nquerydomain res_nmkquery res_nsend __res_init __res_ninit __res_nclose __res_state dn_comp dn_expand dn_skipname res_hnok res_dnok res_ownok res_mailok")
         .pick(&n("nsparse.rs"), "__loc_ntoa"));
 
+    // rusty-libc-ipc
     let ipc = "crates/rusty-libc-ipc/src/";
     let i = |f: &str| format!("{ipc}{f}");
     h.push(spec("bits/rlibc-ipc-ipc", "ipc_ipc").pick(&i("sysv.rs"), "ftok"));
@@ -198,6 +210,7 @@ pub fn build_specs() -> Vec<Spec> {
     h.push(spec("bits/rlibc-aio-64", "aio_64").pick(&i("aio.rs"), "aio_read64 aio_write64 aio_fsync64 aio_error64 aio_return64 aio_cancel64 aio_suspend64 lio_listio64"));
     h.push(spec("bits/rlibc-aio-gnu", "aio_gnu").pick(&i("aio.rs"), "aio_init"));
 
+    // rusty-libc-extra
     struct Extra { name: &'static str, files: &'static [&'static str], only: Option<&'static str>, tiers: &'static str, subst: bool }
     let extras = [
         Extra { name: "spawncalls", files: &["spawn.rs"], only: None, tiers: "posix_spawn_file_actions_addchdir_np posix_spawn_file_actions_addfchdir_np posix_spawn_file_actions_addclosefrom_np posix_spawn_file_actions_addtcsetpgrp_np posix_spawnattr_getcgroup_np posix_spawnattr_setcgroup_np pidfd_spawn pidfd_spawnp", subst: false },
@@ -233,6 +246,7 @@ pub fn build_specs() -> Vec<Spec> {
         }
     }
 
+    // rusty-libc-rpc
     let rpc = "crates/rusty-libc-rpc/src/";
     let r = |f: &str| format!("{rpc}{f}");
     let mut rp: Vec<(&str, Spec)> = Vec::new();

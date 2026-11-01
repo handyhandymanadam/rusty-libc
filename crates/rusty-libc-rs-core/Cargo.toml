@@ -1,9 +1,12 @@
 [package]
 name = "rusty-libc-rs-core"
 version = "0.1.0"
+# explicit (not inherited from the workspace) so a path or git dependency on this crate alone resolves cleanly
 edition = "2024"
-license = "LGPL-2.1-or-later"
+license = "MIT"
 rust-version = "1.88"
+repository = "https://github.com/handyhandymanadam/rusty-libc"
+readme = "README.md"
 keywords = ["libc", "linux", "syscall", "no-std", "posix"]
 categories = ["os::linux-apis", "no-std::no-alloc", "api-bindings"]
 description = "The unsafe layer of rusty-libc's Rust face: raw Linux system calls, Errno, descriptor ownership types and typed structures (no_std, no alloc, stable Rust)"
@@ -11,5 +14,10 @@ description = "The unsafe layer of rusty-libc's Rust face: raw Linux system call
 [dependencies]
 
 [features]
+# Conversions to and from std's types (OwnedFd, BorrowedFd, io::Error, ExitStatus). rusty-libc-rs turns it on; the C face's
+# crates (no_std, built with -Zbuild-std=core) never do.
 std = []
+# FIXLIST #127 stage 3: the stateful services reached through the C library the process runs on (rusty-libc or glibc),
+# by its C ABI: users/groups (NSS), signal handler registration, the startup snapshot of inherited descriptors. Only
+# rusty-libc-rs enables it. The C face's crates must never enable it (they ARE that C library).
 libc-services = ["std"]

@@ -1,3 +1,17 @@
+//! pthread_cond_t (48 bytes, glibc's x86-64 layout) and pthread_condattr_t.
+//!
+//! The algorithm is glibc's group-based condition variable (glibc 2.25 and later), ported to Rust
+//! (derived from glibc's nptl/pthread_cond_*.c, LGPL-2.1; see LICENSES.md): waiters take a ticket from
+//! a 64-bit sequence, split into two groups G1 and G2 so that a signal can be handed to the
+//! oldest waiters (wake-up in arrival order) and never to a waiter that arrived after the signal; no
+//! wake-up is lost when a waiter is cancelled or times out (it hands its signal on), and
+//! pthread_cond_destroy waits until the last woken waiter has finished touching the variable.
+//! Layout: wseq 0 (u64), g1_start 8 (u64), g_size[2] 16, g1_orig_size 24 (low 2 bits are the
+//! signalers' lock), wrefs 28 (bit 0 shared, bit 1 monotonic clock, bit 2 destroy waits, waiter
+//! count << 3), g_signals[2] 32. All zero is the static initializer.
+//!
+//! Safe core: every field of a `Cond` is an atomic, so signal, broadcast and destroy work on `&Cond`; the wait keeps the
+//! mutex as a raw pointer (mutex.rs) and registers its cancellation handler with a pointer to a stack record.
 use crate::mutex::{Mutex, mutex_cond_lock, mutex_unlock_usercnt};
 use crate::sys::*;
 use core::ffi::{c_int, c_void};
@@ -72,6 +86,7 @@ fn set_orig_size(c: &Cond, size: u32) {
     }
 }
 
+/// Close G1, make G2 the new G1. False when the groups were not switched because G2 is empty.
 fn switch_g1(c: &Cond, wseq_in: u64, g1index: &mut u32) -> bool {
     let mut g1 = *g1index as usize;
     let old_orig_size = get_orig_size(c);
@@ -93,8 +108,11 @@ fn switch_g1(c: &Cond, wseq_in: u64, g1index: &mut u32) -> bool {
     c.g_size[g1].load(Ordering::Relaxed) != 0
 }
 
+/// The exported functions convert the condition pointer once: glibc uses it without a NULL check. Every field of a
+/// `Cond` is an atomic, so a shared reference is enough while other threads use it.
 macro_rules! cond_ref {
     ($p:expr) => {{
+        // SAFETY: the C caller passes an initialised pthread_cond_t that stays valid for the call; all its fields are atomics.
         unsafe { arg($p as *const Cond) }
     }};
 }
@@ -104,9 +122,11 @@ pub unsafe extern "C" fn pthread_cond_signal(cond: *mut Cond) -> c_int {
     signal(cond_ref!(cond))
 }
 
+/// `pthread_cond_signal`.
 #[inline(always)]
 pub fn signal(c: &Cond) -> c_int {
     let wrefs = c.wrefs.load(Ordering::Relaxed);
+    // no waiters: one load and return (the rest lives out of line so this path saves no registers)
     if wrefs >> 3 == 0 {
         return 0;
     }
@@ -140,9 +160,11 @@ pub unsafe extern "C" fn pthread_cond_broadcast(cond: *mut Cond) -> c_int {
     broadcast(cond_ref!(cond))
 }
 
+/// `pthread_cond_broadcast`.
 #[inline(always)]
 pub fn broadcast(c: &Cond) -> c_int {
     let wrefs = c.wrefs.load(Ordering::Relaxed);
+    // no waiters: one load and return (the rest lives out of line so this path saves no registers)
     if wrefs >> 3 == 0 {
         return 0;
     }
@@ -184,6 +206,8 @@ fn confirm_wakeup(c: &Cond, private: bool) {
     }
 }
 
+/// A waiter gives up (cancelled or timed out): shrink its group if it still can, or send on the
+/// signal it consumed.
 fn cancel_waiting(c: &Cond, seq: u64, g: usize, private: bool) {
     let mut consumed_signal = false;
     acquire_lock(c, private);
@@ -191,6 +215,7 @@ fn cancel_waiting(c: &Cond, seq: u64, g: usize, private: bool) {
     if g1_start > seq {
         consumed_signal = true;
     } else if g1_start + get_orig_size(c) as u64 <= seq {
+        // current G2: not signaled, make it smaller
         let sz = c.g_size[g].load(Ordering::Relaxed);
         if sz.wrapping_add(MAX_GROUP_SIZE) > 0 {
             c.g_size[g].store(sz.wrapping_sub(1), Ordering::Relaxed);
@@ -200,6 +225,7 @@ fn cancel_waiting(c: &Cond, seq: u64, g: usize, private: bool) {
             return;
         }
     } else {
+        // current G1
         let sz = c.g_size[g].load(Ordering::Relaxed);
         if sz == 0 {
             consumed_signal = true;
@@ -220,16 +246,25 @@ struct CleanupArg {
     private: bool,
 }
 
+/// The cancellation handler of a waiting thread (registered by `wait_common` with a pointer to its `CleanupArg`).
 unsafe extern "C" fn cleanup_waiting(arg: *mut c_void) {
+    // SAFETY: `arg` is the CleanupArg on the cancelled waiter's stack (wait_common), still live while handlers run.
     let a = unsafe { &*(arg as *const CleanupArg) };
+    // SAFETY: the condition variable the thread waits on stays valid while it waits (POSIX: no destroy with waiters).
     let c = unsafe { &*a.cond };
     let g = (a.wseq & 1) as usize;
     cancel_waiting(c, a.wseq >> 1, g, a.private);
+    // a cancelled thread may have consumed a futex wake-up another waiter needed
     futex_wake(&c.g_signals[g], 1, a.private);
     confirm_wakeup(c, a.private);
+    // SAFETY: the mutex the waiter released (still valid: the caller of pthread_cond_wait owns it).
     unsafe { mutex_cond_lock(a.mutex) };
 }
 
+/// Wait on `c` with `mutex` (held by the caller), until `abs` on `clock` at most (None: no timeout).
+///
+/// # Safety
+/// `mutex` is the initialised mutex the caller holds; it stays valid for the call.
 pub unsafe fn wait_common(c: &Cond, mutex: *mut Mutex, clock: c_int, abs: Option<&Timespec>) -> c_int {
     let mut result = 0;
     let wseq = c.wseq.fetch_add(2, Ordering::Acquire);
@@ -237,6 +272,7 @@ pub unsafe fn wait_common(c: &Cond, mutex: *mut Mutex, clock: c_int, abs: Option
     let seq = wseq >> 1;
     let flags = c.wrefs.fetch_add(8, Ordering::Relaxed);
     let private = is_private(flags);
+    // SAFETY: `mutex` is valid and held (caller's contract).
     let err = unsafe { mutex_unlock_usercnt(mutex, false) };
     if err != 0 {
         cancel_waiting(c, seq, g, private);
@@ -256,6 +292,7 @@ pub unsafe fn wait_common(c: &Cond, mutex: *mut Mutex, clock: c_int, abs: Option
             continue;
         }
         let mut arg = CleanupArg { wseq, cond: c, mutex, private };
+        // SAFETY: the handler gets a pointer to `arg`, which lives until with_cleanup returns (the handler only runs inside it).
         let e = unsafe {
             crate::cancel::with_cleanup(cleanup_waiting, &mut arg as *mut CleanupArg as *mut c_void, || match abs {
                 None => futex_wait_cp(&c.g_signals[g], signals, private),
@@ -269,6 +306,7 @@ pub unsafe fn wait_common(c: &Cond, mutex: *mut Mutex, clock: c_int, abs: Option
         }
     }
     confirm_wakeup(c, private);
+    // SAFETY: as above: the caller's mutex, relocked before returning.
     let err = unsafe { mutex_cond_lock(mutex) };
     if err != 0 { err } else { result }
 }
@@ -276,11 +314,13 @@ pub unsafe fn wait_common(c: &Cond, mutex: *mut Mutex, clock: c_int, abs: Option
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_cond_wait(cond: *mut Cond, mutex: *mut Mutex) -> c_int {
     let c = cond_ref!(cond);
+    // SAFETY: `mutex` is the caller's held mutex (C contract).
     unsafe { wait_common(c, mutex, 0, None) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_cond_timedwait(cond: *mut Cond, mutex: *mut Mutex, abstime: *const Timespec) -> c_int {
+    // SAFETY: `abstime` is a valid struct timespec (C contract; read without a NULL check, as glibc).
     let abs = unsafe { arg(abstime) };
     if !valid_nsec(abs) {
         return EINVAL;
@@ -288,11 +328,13 @@ pub unsafe extern "C" fn pthread_cond_timedwait(cond: *mut Cond, mutex: *mut Mut
     let c = cond_ref!(cond);
     let flags = c.wrefs.load(Ordering::Relaxed);
     let clock = if flags & CLOCK_MONOTONIC_MASK != 0 { CLOCK_MONOTONIC } else { CLOCK_REALTIME };
+    // SAFETY: `mutex` is the caller's held mutex (C contract).
     unsafe { wait_common(c, mutex, clock, Some(abs)) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_cond_clockwait(cond: *mut Cond, mutex: *mut Mutex, clockid: c_int, abstime: *const Timespec) -> c_int {
+    // SAFETY: `abstime` is a valid struct timespec (C contract; read without a NULL check, as glibc).
     let abs = unsafe { arg(abstime) };
     if !valid_nsec(abs) {
         return EINVAL;
@@ -301,10 +343,13 @@ pub unsafe extern "C" fn pthread_cond_clockwait(cond: *mut Cond, mutex: *mut Mut
         return EINVAL;
     }
     let c = cond_ref!(cond);
+    // SAFETY: `mutex` is the caller's held mutex (C contract).
     unsafe { wait_common(c, mutex, clockid, Some(abs)) }
 }
 
 impl Cond {
+    /// What `pthread_cond_init` makes from an attribute value (bit 0 process-shared, bit 1 CLOCK_MONOTONIC); all zero
+    /// (`with_attr(0)`) is the static initializer.
     pub const fn with_attr(value: c_int) -> Cond {
         let mut w = 0u32;
         if value & 1 != 0 {
@@ -325,6 +370,7 @@ impl Cond {
     }
 }
 
+/// `pthread_cond_destroy`: wait until the woken waiters have stopped touching `c`.
 pub fn destroy(c: &Cond) -> c_int {
     let mut wrefs = c.wrefs.fetch_or(4, Ordering::Acquire);
     let private = is_private(wrefs);
@@ -337,7 +383,9 @@ pub fn destroy(c: &Cond) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_cond_init(cond: *mut Cond, attr: *const CondAttr) -> c_int {
+    // SAFETY: `attr` is NULL or an initialised pthread_condattr_t (C contract).
     let v = unsafe { attr.as_ref() }.map_or(0, |a| a.value);
+    // SAFETY: `cond` is writable memory for one pthread_cond_t that no other thread uses during the init (C contract).
     unsafe { core::ptr::write(cond, Cond::with_attr(v)) };
     0
 }
@@ -367,22 +415,26 @@ impl CondAttr {
 
 macro_rules! attr_mut {
     ($p:expr) => {{
+        // SAFETY: the C caller passes a valid pthread_condattr_t that no other thread uses during the call.
         unsafe { arg_mut($p) }
     }};
 }
 macro_rules! attr_ref {
     ($p:expr) => {{
+        // SAFETY: the C caller passes an initialised pthread_condattr_t.
         unsafe { arg($p) }
     }};
 }
 macro_rules! out {
     ($p:expr) => {{
+        // SAFETY: the C caller passes a writable int (written without a NULL check, as glibc).
         unsafe { arg_mut($p) }
     }};
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_condattr_init(a: *mut CondAttr) -> c_int {
+    // SAFETY: `a` is writable memory for one pthread_condattr_t (C contract); the old contents are not read.
     unsafe { core::ptr::write(a, CondAttr { value: 0 }) };
     0
 }
@@ -414,3 +466,124 @@ pub unsafe extern "C" fn pthread_condattr_setclock(a: *mut CondAttr, clock: c_in
     attr_mut!(a).set_clock(clock)
 }
 
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
+    use super::*;
+    use crate::mutex::*;
+
+    #[test]
+    fn layout() {
+        assert_eq!(core::mem::size_of::<Cond>(), 48);
+        assert_eq!(core::mem::offset_of!(Cond, g1_orig_size), 24);
+        assert_eq!(core::mem::offset_of!(Cond, wrefs), 28);
+        assert_eq!(core::mem::offset_of!(Cond, g_signals), 32);
+    }
+
+    #[test]
+    fn timedwait_times_out() {
+        unsafe {
+            let mut m: Mutex = core::mem::zeroed();
+            let mut c: Cond = core::mem::zeroed();
+            pthread_mutex_init(&mut m, core::ptr::null());
+            pthread_mutex_lock(&mut m);
+            let mut now = Timespec::default();
+            clock_gettime(CLOCK_REALTIME, &mut now);
+            timespec_add_ns(&mut now, 20_000_000);
+            assert_eq!(pthread_cond_timedwait(&mut c, &mut m, &now), ETIMEDOUT);
+            // the mutex is held again
+            assert_eq!(pthread_mutex_trylock(&mut m), EBUSY);
+            let bad = Timespec { tv_sec: 0, tv_nsec: -1 };
+            assert_eq!(pthread_cond_timedwait(&mut c, &mut m, &bad), EINVAL);
+            assert_eq!(pthread_cond_clockwait(&mut c, &mut m, 5, &now), EINVAL);
+            pthread_mutex_unlock(&mut m);
+        }
+    }
+
+    #[test]
+    fn ping_pong_with_std_threads() {
+        use std::sync::Arc;
+        struct S {
+            m: core::cell::UnsafeCell<Mutex>,
+            c: core::cell::UnsafeCell<Cond>,
+            turn: core::cell::UnsafeCell<u32>,
+        }
+        unsafe impl Sync for S {}
+        unsafe impl Send for S {}
+        let s = Arc::new(S { m: core::cell::UnsafeCell::new(unsafe { core::mem::zeroed() }), c: core::cell::UnsafeCell::new(unsafe { core::mem::zeroed() }), turn: core::cell::UnsafeCell::new(0) });
+        let rounds = 2000;
+        let hs: Vec<_> = (0..2u32)
+            .map(|me| {
+                let s = s.clone();
+                std::thread::spawn(move || unsafe {
+                    for _ in 0..rounds {
+                        pthread_mutex_lock(s.m.get());
+                        while *s.turn.get() != me {
+                            pthread_cond_wait(s.c.get(), s.m.get());
+                        }
+                        *s.turn.get() = 1 - me;
+                        pthread_cond_broadcast(s.c.get());
+                        pthread_mutex_unlock(s.m.get());
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(unsafe { pthread_cond_destroy(s.c.get()) }, 0);
+        // the waits must leave the user count balanced: destroy used to fail with EBUSY (nslookup aborted on it)
+        assert_eq!(unsafe { crate::mutex::pthread_mutex_destroy(s.m.get()) }, 0);
+    }
+
+    #[test]
+    fn signal_wakes_exactly_one_at_a_time() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32 as A, Ordering::SeqCst};
+        struct S {
+            m: core::cell::UnsafeCell<Mutex>,
+            c: core::cell::UnsafeCell<Cond>,
+            go: A,
+            woke: A,
+            waiting: A,
+        }
+        unsafe impl Sync for S {}
+        unsafe impl Send for S {}
+        let s = Arc::new(S { m: core::cell::UnsafeCell::new(unsafe { core::mem::zeroed() }), c: core::cell::UnsafeCell::new(unsafe { core::mem::zeroed() }), go: A::new(0), woke: A::new(0), waiting: A::new(0) });
+        let n = 6;
+        let hs: Vec<_> = (0..n)
+            .map(|_| {
+                let s = s.clone();
+                std::thread::spawn(move || unsafe {
+                    pthread_mutex_lock(s.m.get());
+                    s.waiting.fetch_add(1, SeqCst);
+                    while s.go.load(SeqCst) == 0 {
+                        pthread_cond_wait(s.c.get(), s.m.get());
+                    }
+                    s.go.fetch_sub(1, SeqCst);
+                    s.woke.fetch_add(1, SeqCst);
+                    pthread_mutex_unlock(s.m.get());
+                })
+            })
+            .collect();
+        while s.waiting.load(SeqCst) < n {
+            std::thread::yield_now();
+        }
+        for i in 1..=n {
+            unsafe {
+                pthread_mutex_lock(s.m.get());
+                s.go.fetch_add(1, SeqCst);
+                pthread_cond_signal(s.c.get());
+                pthread_mutex_unlock(s.m.get());
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while s.woke.load(SeqCst) < i {
+                assert!(std::time::Instant::now() < deadline, "signal {i} did not wake anyone");
+                std::thread::yield_now();
+            }
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+    }
+}

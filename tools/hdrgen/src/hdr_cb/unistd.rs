@@ -1,13 +1,17 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* rusty-libc-util: getopt and the option variables, getlogin, the login shell list */"),
     Item::Include("<bits/getopt_posix.h>"),
     Item::Include("<bits/rlibc_util_unistd.h>"),
+    Item::Comment("/* also declared in time.h (identical declarations) */"),
     Item::Decl("int usleep(unsigned int usec);"),
     Item::Decl("unsigned int sleep(unsigned int seconds);"),
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("_POSIX_VERSION", V::Txt("200809L")),
     ]),
+    Item::Comment("/* POSIX.2 (shell and utilities) levels, tied to the POSIX level the program selected */"),
     Item::Gate(&[
         Branch { head: "ifdef __USE_XOPEN2K8", items: &[
             Item::Consts(&[
@@ -38,6 +42,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
     ]),
     Item::Gate(&[
         Branch { head: "if defined __USE_MISC || defined __USE_XOPEN_EXTENDED", items: &[
+            Item::Comment("/* lockf is declared here (and in fcntl.h for older programs) */"),
             Item::Decl("int lockf(int fd, int cmd, off_t len);"),
             Item::Gate(&[
                 Branch { head: "ifdef __USE_LARGEFILE64", items: &[
@@ -448,6 +453,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("CLOSE_RANGE_CLOEXEC", V::Txt("4U")),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Decl("extern char **__environ;"),
     Item::Decl("extern char **environ;"),
     Item::Raw(Reason::GlibcMacro, r#"#define TEMP_FAILURE_RETRY(expression) \

@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Generate crates/rusty-libc-iconv/src/translit_tables.rs from the host's glibc.
+
+The tables are what nl_langinfo(_NL_CTYPE_TRANSLIT_*) returns in the "C" locale: the sorted list
+of source strings (FROM_IDX indexes FROM_TBL), the replacement lists (TO_IDX indexes TO_TBL; each
+replacement is NUL-terminated, the list ends with an empty one) and the default replacement.
+No glibc source text is used; this is observed data. Run: python3 gen_translit.py > ../src/translit_tables.rs
+"""
 import os, subprocess, sys, tempfile
 
 C_SRC = r"""

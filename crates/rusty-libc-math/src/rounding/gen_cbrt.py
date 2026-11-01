@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
+"""Generates cbrt_tables.rs: Taylor rows of cbrt(m) on [1, 2) for the float cube root
+(cbrt_impl.rs). Row j covers m in [1 + j/128, 1 + (j+1)/128) around its centre c_j = 1 + (2j+1)/256:
+cbrt(c + d) = g0 + g1 d + ... + g5 d^5 with g_k = binom(1/3, k) cbrt(c) c^-k, |d| <= 2^-9. The
+truncation error is below 2^-54 of the value. Exact integer / Fraction arithmetic only; nothing is
+copied from another library. Usage: python3 gen_cbrt.py > cbrt_tables.rs"""
 from fractions import Fraction
 
 P = 200
 
 
 def icbrt(n):
+    """floor(cbrt(n)) for a non-negative integer."""
     x = 1 << ((n.bit_length() + 2) // 3 + 1)
     while True:
         y = (2 * x + n // (x * x)) // 3
@@ -19,6 +25,7 @@ def icbrt(n):
 
 
 def cbrt_frac(c):
+    """cbrt of a positive Fraction as a Fraction good to 2^-P."""
     n = (c.numerator << (3 * P)) // c.denominator
     return Fraction(icbrt(n), 1 << P)
 

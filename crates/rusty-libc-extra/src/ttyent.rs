@@ -1,3 +1,10 @@
+//! ttyent.h: `getttyent`, `getttynam`, `setttyent`, `endttyent` on `/etc/ttys`.
+//!
+//! The format (4.4BSD): `name getty-command type [off|on] [secure] [window=cmd] # comment`, fields
+//! separated by blanks, double quotes group a field (`\"` inside quotes is a quote), `#` starts the comment.
+//! Lines longer than 99 characters are skipped. The result is one static structure whose strings live in a
+//! 100 byte static line buffer. The structure of the code follows glibc 2.43 misc/getttyent.c (BSD
+//! licence), written in Rust.
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use crate::mntent::Stream;
 use core::ffi::{c_char, c_int};
@@ -9,6 +16,7 @@ use rusty_libc_stdio::file_api::fopen;
 pub const TTY_ON: c_int = 0x01;
 pub const TTY_SECURE: c_int = 0x02;
 
+/// `struct ttyent`.
 #[repr(C)]
 pub struct Ttyent {
     pub ty_name: *mut c_char,
@@ -21,6 +29,8 @@ pub struct Ttyent {
 
 const MAXLINELENGTH: usize = 100;
 
+/// glibc's static ttyent state: the stream (NULL: closed; otherwise open and owned here), the returned entry, the line
+/// its strings point into, the character a field was cut at, and the file name.
 struct State {
     zapchar: u8,
     tf: *mut FILE,
@@ -29,6 +39,8 @@ struct State {
     path: *const c_char,
 }
 
+/// Rule: the ttyent functions are MT-Unsafe in glibc (race:ttyent): callers do not run them concurrently; each exported
+/// function holds the state only for its own duration.
 static STATE: SyncCell<State> = SyncCell::new(State {
     zapchar: 0,
     tf: null_mut(),
@@ -37,10 +49,16 @@ static STATE: SyncCell<State> = SyncCell::new(State {
     path: c"/etc/ttys".as_ptr(),
 });
 
+/// Run `f` on the state.
+///
+/// # Safety
+/// The ttyent rule: no other ttyent function runs at the same time; `f` does not reach STATE again.
 unsafe fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
+    // SAFETY: exclusive by the ttyent rule (forwarded contract).
     unsafe { STATE.with_unsync(f) }
 }
 
+/// The address of `line[i]` and of the entry inside the static (what the C caller gets back).
 fn line_ptr(i: usize) -> *mut c_char {
     STATE.as_ptr().cast::<c_char>().wrapping_add(core::mem::offset_of!(State, line) + i)
 }
@@ -48,7 +66,12 @@ fn tty_ptr() -> *mut Ttyent {
     STATE.as_ptr().cast::<u8>().wrapping_add(core::mem::offset_of!(State, tty)).cast::<Ttyent>()
 }
 
+/// Read another file than `/etc/ttys` from the next `setttyent` on (tests; the C interface has no such call).
+///
+/// # Safety
+/// `path` stays valid while the stream is in use; it is not copied.
 pub unsafe fn set_path(path: *const c_char) {
+    // SAFETY: ttyent rule (set_path is used like the exported functions, never concurrently with them).
     unsafe { with_state(|st| st.path = if path.is_null() { c"/etc/ttys".as_ptr() } else { path }) };
 }
 
@@ -56,6 +79,7 @@ fn isspace(c: u8) -> bool {
     rusty_libc_ctype::is_space(c as i32)
 }
 
+/// Skip over the current field at `p`, removing quotes, and return the start of the next one.
 fn skip(line: &mut [u8], zapchar: &mut u8, mut p: usize) -> usize {
     let mut q = false;
     let mut t = p;
@@ -91,6 +115,7 @@ fn skip(line: &mut [u8], zapchar: &mut u8, mut p: usize) -> usize {
         }
         p += 1;
     }
+    // glibc writes t[-1]; t is past the field's first byte whenever the loop ran, and every call starts on a non-NUL byte
     t = t.saturating_sub(1);
     line[t] = 0;
     p
@@ -111,8 +136,10 @@ fn word_is(line: &[u8], p: usize, word: &[u8], next: impl Fn(u8) -> bool) -> boo
 }
 
 impl State {
+    /// The open stream (only while `tf` is not NULL).
     fn stream(&self) -> Stream {
         debug_assert!(!self.tf.is_null());
+        // SAFETY: a non-NULL `tf` is the stream setttyent opened, open until endttyent clears it.
         unsafe { Stream::new(self.tf) }
     }
 
@@ -121,8 +148,10 @@ impl State {
             self.stream().rewind();
             return 1;
         }
+        // SAFETY: `path` is a C string (the default or one set_path's caller keeps valid); the mode is a literal.
         self.tf = unsafe { fopen(self.path, c"rce".as_ptr()) };
         if !self.tf.is_null() {
+            // we do the locking ourselves
             self.stream().set_locking(2);
             return 1;
         }
@@ -151,6 +180,7 @@ impl State {
                 return null_mut();
             }
             let len = line.iter().position(|&c| c == 0).unwrap_or(MAXLINELENGTH);
+            // skip lines that are too big
             if !line[..len].contains(&b'\n') {
                 loop {
                     let c = stream.getc();
@@ -221,23 +251,31 @@ impl State {
     }
 }
 
+/// `setttyent ()`: open (or rewind) the file; 1 on success, 0 when it cannot be opened.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setttyent() -> c_int {
+    // SAFETY: ttyent rule (the exported functions are MT-Unsafe; callers do not overlap them).
     unsafe { with_state(State::set) }
 }
 
+/// `endttyent ()`: close the file; 1 on success.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn endttyent() -> c_int {
+    // SAFETY: ttyent rule.
     unsafe { with_state(State::end) }
 }
 
+/// `getttyent ()`: the next entry of the file (opened on the first call), NULL at the end.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getttyent() -> *mut Ttyent {
+    // SAFETY: ttyent rule.
     unsafe { with_state(State::get) }
 }
 
+/// `getttynam (tty)`: the entry named `tty` (the file is opened and closed again), NULL when there is none.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getttynam(tty: *const c_char) -> *mut Ttyent {
+    // SAFETY: `tty` is a C string (caller's contract).
     let name = unsafe { rusty_libc_core::ffi::cstr_bytes(tty) };
     let find = |st: &mut State| {
         st.set();
@@ -247,6 +285,7 @@ pub unsafe extern "C" fn getttynam(tty: *const c_char) -> *mut Ttyent {
             if t.is_null() {
                 break;
             }
+            // strcmp(tty, ty_name): the name is a NUL-terminated piece of the line (skip cut it)
             let rest = &st.line[st.tty.ty_name.addr() - line_ptr(0).addr()..];
             let end = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
             if rest[..end] == *name {
@@ -256,5 +295,6 @@ pub unsafe extern "C" fn getttynam(tty: *const c_char) -> *mut Ttyent {
         st.end();
         t
     };
+    // SAFETY: ttyent rule.
     unsafe { with_state(find) }
 }

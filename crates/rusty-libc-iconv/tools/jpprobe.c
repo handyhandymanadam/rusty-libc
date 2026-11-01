@@ -1,3 +1,7 @@
+/* Offline helper of gen_jp_extra.py: with the host's ISO-2022-JP-2 converter put into a given
+ * character set (by first writing a seed character that only that set has), report for every
+ * character below U+00FF (and U+203E) what the converter writes for it next: the bytes after the
+ * seed's own output. "cp hex" per line. */
 #include <iconv.h>
 #include <stdio.h>
 #include <stdlib.h>

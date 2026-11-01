@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Coefficients of the float fast paths (trig/fpi.rs sinpi_abs rows, exp/ffast.rs, exp/flog.rs,
+rounding/cbrt_impl.rs): Chebyshev interpolation (exact Fraction arithmetic) of the exact function
+(MPFR through special/mp.py, no third-party packages) at the Chebyshev nodes of the interval, which
+is within a small factor of the minimax polynomial. Prints each coefficient list with the maximum
+error of the polynomial with double-rounded coefficients on a grid. Nothing is copied from another
+library. Usage: python3 gen_float.py"""
 import math
 import os
 import sys
@@ -10,6 +16,7 @@ import mp
 
 
 def compose_shift(ps, x0, w):
+    """Coefficients in x of the polynomial with coefficients ps in s, x = x0 + w s."""
     n = len(ps)
     a, b = Fraction(1) / w, -x0 / w
     cur = [Fraction(0)]
@@ -68,6 +75,7 @@ LN10 = mp.fn("log", Fraction(10))
 
 
 def main():
+    # trig/fpi.rs ROWS: h_s(z) = sin(pi sqrt z) / sqrt z and h_c(z) = cos(pi sqrt z), z in [0, 1/16], degree 5
     def hs(z):
         if z == 0:
             return PI
@@ -81,24 +89,28 @@ def main():
         c = fit(f, 0, Fraction(1, 16), 5)
         show(name, c, maxerr(f, rnd(c), 0, Fraction(1, 16), 100))
 
+    # exp/ffast.rs Q: 2^rho = 1 + rho q(rho), q fitted to (2^rho - 1)/rho on [-1/64, 1/64], degree 3
     def g2(r):
         return LN2 if r == 0 else (mp.fn("exp", r * LN2) - 1) / r
 
     c = fit(g2, Fraction(-1, 64), Fraction(1, 64), 3)
     show("ffast q (c_i, scaled in the source by 32^-(i+1))", c, maxerr(g2, rnd(c), Fraction(-1, 64), Fraction(1, 64), 100))
 
+    # exp/ffast.rs G: (2^u - 1)/u on [-1/16, 1/16], degree 5
     def gm(u):
         return LN2 if u == 0 else (mp.fn("exp", u * LN2) - 1) / u
 
     c = fit(gm, Fraction(-1, 16), Fraction(1, 16), 5)
     show("ffast G", c, maxerr(gm, rnd(c), Fraction(-1, 16), Fraction(1, 16), 100))
 
+    # exp/flog.rs H: log1p(r)/r = 1 + r h(r) on [-1/28, 1/28]: fit log1p(r)/r with degree 6, c0 = 1
     def gl(r):
         return Fraction(1) if r == 0 else mp.fn("log1p", r) / r
 
     c = fit(gl, Fraction(-1, 28), Fraction(1, 28), 6)
     show("flog g = log1p(r)/r (H is c1..c6)", c, maxerr(gl, rnd(c), Fraction(-1, 28), Fraction(1, 28), 100))
 
+    # rounding/cbrt_impl.rs CB_P: cbrt(m) on [1, 2], degree 4
     def cb(x):
         return mp.fn("cbrt", x)
 

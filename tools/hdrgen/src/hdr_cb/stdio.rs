@@ -28,8 +28,11 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("TMP_MAX", V::Dec(238328)),
         ("P_tmpdir", V::Txt(r#""/tmp""#)),
     ]),
+    Item::Comment(r#"/* The scanf family: the names below choose the C99 behaviour (%a reads a float), or the C23 one
+   (also %i accepts a 0b prefix) when compiled as C23, like glibc's headers do. */"#),
     Item::Gate(&[
         Branch { head: "if __GLIBC_USE (DEPRECATED_SCANF)", items: &[
+            Item::Comment("/* -std=c89/gnu89 with _GNU_SOURCE: the old entry points, where %a (and %as, %a[) allocates a string */"),
             Item::Raw(Reason::GlibcMacro, "# define __RLIBC_SCANF_ASM(n)"),
         ] },
         Branch { head: "elif __GLIBC_USE (C23_STRTOL)", items: &[
@@ -48,6 +51,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
     Item::Decl("int vscanf(const char *, va_list) __RLIBC_SCANF_ASM(vscanf);"),
     Item::Decl("int vsscanf(const char *, const char *, va_list) __RLIBC_SCANF_ASM(vsscanf);"),
     Item::Blank,
+    Item::Comment("/* names that are the same function as another (no locks yet; offsets are 64-bit already) */"),
     Item::Decl("int fgetc_unlocked(FILE *);"),
     Item::Decl("int getc_unlocked(FILE *);"),
     Item::Decl("int getchar_unlocked(void);"),
@@ -73,6 +77,8 @@ pub static AFTER_INCLUDES: &[Item] = &[
 pub const AFTER_INCLUDES_CHOMP: bool = false;
 
 pub static TRAILER: &[Item] = &[
+    Item::Comment(r#"/* glibc: the 64-bit position type under the large-file feature macros (offsets are 64-bit already, so it is fpos_t) and the
+   renameat2 flags under _GNU_SOURCE */"#),
     Item::Gate(&[
         Branch { head: "if defined __USE_LARGEFILE64 || defined __USE_FILE_OFFSET64", items: &[
             Item::Typedef("fpos_t", "fpos64_t"),
@@ -110,10 +116,14 @@ pub static TRAILER: &[Item] = &[
             ]),
         ] },
     ], ""),
+    Item::Comment(r#"/* Optimized code reads and writes single bytes in the stream's buffer without a call, as with glibc's headers: a byte while
+   the buffer pointer is below its end, otherwise the library's __uflow / __overflow (empty buffer, end of file, a stream not
+   buffered or line buffered, a wide stream, an error). The functions stay in the library for -O0 code and for their addresses. */"#),
     Item::Gate(&[
         Branch { head: "ifdef __USE_EXTERN_INLINES", items: &[
             Item::Raw(Reason::GlibcMacro, "# define __rlibc_getc_inline(__s) \\\n  (__builtin_expect ((__s)->_IO_read_ptr < (__s)->_IO_read_end, 1) \\\n   ? (int) *(unsigned char *) (__s)->_IO_read_ptr++ : __uflow (__s))"),
             Item::Raw(Reason::GlibcMacro, "# define __rlibc_putc_inline(__b, __s) \\\n  (__builtin_expect ((__s)->_IO_write_ptr < (__s)->_IO_write_end, 1) \\\n   ? (int) (unsigned char) (*(__s)->_IO_write_ptr++ = (char) (__b)) : __overflow ((__s), (unsigned char) (__b)))"),
+            Item::Comment("/* (this part of the header is read again by every inclusion: each group is defined once) */"),
             Item::Gate(&[
                 Branch { head: "if defined __USE_POSIX199506 && !defined __RLIBC_STDIO_INLINE_POSIX", items: &[
                     Item::Raw(Reason::GlibcMacro, "# define __RLIBC_STDIO_INLINE_POSIX 1"),

@@ -32,7 +32,9 @@ pub static HDR: Header = Header {
  *   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */"#),
-        Item::Guard { name: "_RPC_MSG_H", value: "1", end: "", items: &[
+        Item::Comment(r#"/* Structure layouts and constants follow Sun's RPC headers (as in glibc's sunrpc/rpc/);
+   the function prototypes are generated from the Rust sources (bits/rlibc-rpc-*.h). */"#),
+        Item::Guard { name: "_RPC_MSG_H", value: "1", end: " /* rpc/rpc_msg.h */", items: &[
             Item::Blank,
             Item::Include("<rpc/xdr.h>"),
             Item::Include("<rpc/clnt.h>"),
@@ -56,7 +58,7 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::Block { head: "struct reply_body ", body: &["", r#"	enum reply_stat rp_stat;"#, r#"	union {"#, r#"		struct accepted_reply RP_ar;"#, r#"		struct rejected_reply RP_dr;"#, r#"	} ru;"#, r#"#define	rp_acpt	ru.RP_ar"#, r#"#define	rp_rjct	ru.RP_dr"#, ""], tail: "" },
             Item::Blank,
-            Item::Block { head: "struct call_body ", body: &["", r#"	u_long cb_rpcvers;"#, r#"	u_long cb_prog;"#, r#"	u_long cb_vers;"#, r#"	u_long cb_proc;"#, r#"	struct opaque_auth cb_cred;"#, r#"	struct opaque_auth cb_verf;"#, ""], tail: "" },
+            Item::Block { head: "struct call_body ", body: &["", r#"	u_long cb_rpcvers;	/* must be equal to two */"#, r#"	u_long cb_prog;"#, r#"	u_long cb_vers;"#, r#"	u_long cb_proc;"#, r#"	struct opaque_auth cb_cred;"#, r#"	struct opaque_auth cb_verf; /* protocol specific - provided by client */"#, ""], tail: "" },
             Item::Blank,
             Item::Block { head: "struct rpc_msg ", body: &["", r#"	u_long			rm_xid;"#, r#"	enum msg_type		rm_direction;"#, r#"	union {"#, r#"		struct call_body RM_cmb;"#, r#"		struct reply_body RM_rmb;"#, r#"	} ru;"#, r#"#define	rm_call		ru.RM_cmb"#, r#"#define	rm_reply	ru.RM_rmb"#, ""], tail: "" },
             Item::Raw(Reason::GlibcMacro, r#"#define	acpted_rply	ru.RM_rmb.ru.RP_ar"#),

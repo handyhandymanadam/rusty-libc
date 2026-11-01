@@ -3,8 +3,8 @@ name = "hdrgen"
 version = "0.1.0"
 edition = "2021"
 publish = false
-license = "LGPL-2.1-or-later"
 
+# A host tool, not part of the no_std library workspace.
 [workspace]
 
 [dependencies]

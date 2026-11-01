@@ -4,6 +4,8 @@ include_guard = "_RLIBC_IPC_SEM_DECLS_H"
 usize_is_size_t = true
 no_includes = true
 sys_includes = ["stddef.h"]
+# Included by tools/hdrgen/src/hdr/sys/*.h, which have the types, constants and macros by hand; only the
+# function declarations are generated here.
 [export]
 item_types = ["functions"]
 [export.rename]

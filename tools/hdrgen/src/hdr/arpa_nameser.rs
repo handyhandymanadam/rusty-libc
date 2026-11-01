@@ -4,6 +4,8 @@ pub static HDR: Header = Header {
     path: "arpa/nameser.h",
     items: &[
         Item::Guard { name: "_ARPA_NAMESER_H", value: "1", end: "", items: &[
+            Item::Comment(r#"/* Domain name service constants and the name functions of resolv.h. The enumerations carry glibc's
+   names and values. */"#),
             Item::Include("<stdint.h>"),
             Item::Include("<sys/types.h>"),
             Item::Include("<stddef.h>"),
@@ -56,10 +58,13 @@ pub static HDR: Header = Header {
             Item::Block { head: "typedef enum __ns_class ", body: &["", "  ns_c_invalid = 0,", "  ns_c_in = 1,", "  ns_c_2 = 2,", "  ns_c_chaos = 3,", "  ns_c_hs = 4,", "  ns_c_none = 254,", "  ns_c_any = 255,", "  ns_c_max = 65536", ""], tail: " ns_class" },
             Item::Blank,
             Item::Blank,
+            Item::Comment("/* Certificate type values in CERT resource records. */"),
             Item::Block { head: "typedef enum __ns_cert_types ", body: &["", "  cert_t_pkix = 1,", "  cert_t_spki = 2,", "  cert_t_pgp = 3,", "  cert_t_url = 253,", "  cert_t_oid = 254", ""], tail: " ns_cert_types" },
             Item::Blank,
+            Item::Comment("/* A message handle: caller allocated, no dynamic data, opaque (use the accessor macros). */"),
             Item::Block { head: "typedef struct __ns_msg ", body: &["", "  const unsigned char *_msg, *_eom;", "  uint16_t _id, _flags, _counts[ns_s_max];", "  const unsigned char *_sections[ns_s_max];", "  ns_sect _sect;", "  int _rrnum;", "  const unsigned char *_msg_ptr;", ""], tail: " ns_msg" },
             Item::Blank,
+            Item::Comment("/* Private data structure of the library (glibc does not export the table either). */"),
             Item::Block { head: "struct _ns_flagdata ", body: &[" int mask, shift; "], tail: "" },
             Item::Decl("extern const struct _ns_flagdata _ns_flagdata[];"),
             Item::Blank,
@@ -69,6 +74,7 @@ pub static HDR: Header = Header {
             Item::Raw(Reason::GlibcMacro, "#define ns_msg_size(handle) ((handle)._eom - (handle)._msg)"),
             Item::Raw(Reason::GlibcMacro, "#define ns_msg_count(handle, section) ((handle)._counts[section] + 0)"),
             Item::Blank,
+            Item::Comment("/* A parsed record: caller allocated, no dynamic data. */"),
             Item::Block { head: "typedef struct __ns_rr ", body: &["", "  char name[NS_MAXDNAME];", "  uint16_t type;", "  uint16_t rr_class;", "  uint32_t ttl;", "  uint16_t rdlength;", "  const unsigned char *rdata;", ""], tail: " ns_rr" },
             Item::Blank,
             Item::Raw(Reason::GlibcMacro, r#"#define ns_rr_name(rr) (((rr).name[0] != '\0') ? (rr).name : ".")"#),
@@ -78,6 +84,7 @@ pub static HDR: Header = Header {
             Item::Raw(Reason::GlibcMacro, "#define ns_rr_rdlen(rr) ((rr).rdlength + 0)"),
             Item::Raw(Reason::GlibcMacro, "#define ns_rr_rdata(rr) ((rr).rdata + 0)"),
             Item::Blank,
+            Item::Comment("/* TSIG authenticated messages. */"),
             Item::Block { head: "struct ns_tsig_key ", body: &["", "  char name[NS_MAXDNAME], alg[NS_MAXDNAME];", "  unsigned char *data;", "  int len;", ""], tail: "" },
             Item::Typedef("struct ns_tsig_key", "ns_tsig_key"),
             Item::Blank,

@@ -1,3 +1,17 @@
+//! Rounding to integers, square root, fused multiply-add, remainders, hypot, cbrt and the
+//! maximum/minimum family, double and float. These are exact functions: results are bit-identical
+//! to glibc 2.43 (zero signs and NaN payloads included), and so are errno and the exception
+//! flags. `hypot` and `cbrt` are computed to well under glibc's measured error.
+//!
+//! Each function is a plain `extern "C"` function (the C ABI) that Rust code calls directly:
+//! `rusty_libc_math::rounding::floor(x)`. Functions with a pointer output in C (`frexp`, `modf`,
+//! `remquo`) also have tuple-returning Rust versions with a `_pair` suffix.
+//!
+//! Method: `floor`, `ceil`, `trunc`, `rint`, `nearbyint` use `roundsd`/`roundss` when the CPU has
+//! SSE4.1 and exact integer bit manipulation (or the 2^52 add-subtract trick for the two that
+//! follow the rounding mode) otherwise; `sqrt` is the hardware instruction; `fma` is the
+//! hardware `vfmadd` when the CPU has it and an exact software version otherwise; `fmod` and
+//! `remainder` work on the integer significands.
 use crate::fenv;
 use crate::rounding::fp::{EDOM, ERANGE, Fp, has_sse41, invalid_nan, raise_inexact, set_errno};
 use core::arch::asm;
@@ -11,6 +25,8 @@ pub mod fmod_impl;
 pub mod fp;
 pub mod hypot_impl;
 pub mod minmax;
+#[cfg(test)]
+pub(crate) mod tests;
 
 pub use cbrt_impl::*;
 pub use fma_impl::*;
@@ -18,11 +34,15 @@ pub use fmod_impl::*;
 pub use hypot_impl::*;
 pub use minmax::*;
 
+/// C `FP_INT_*` rounding directions for the `fromfp` family.
 pub const FP_INT_UPWARD: c_int = 0;
 pub const FP_INT_DOWNWARD: c_int = 1;
 pub const FP_INT_TOWARDZERO: c_int = 2;
 pub const FP_INT_TONEARESTFROMZERO: c_int = 3;
 pub const FP_INT_TONEAREST: c_int = 4;
+
+// ---------------------------------------------------------------------------------------------
+// bit-manipulation rounding (exact, no flags except "invalid" for a signaling NaN)
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Op {
@@ -33,18 +53,20 @@ pub(crate) enum Op {
     Even,
 }
 
+/// Round `x` to an integer value by direction, with integer arithmetic on the bits.
 pub(crate) fn int_round_soft<F: Fp>(x: F, op: Op) -> F {
     let b = x.bits();
     let ex = x.exp_field() as i32;
     if ex == F::EMAX_FIELD as i32 {
-        return x.add(x);
+        return x.add(x); // NaN: quiet it (invalid for a signaling one); infinity: unchanged
     }
     let e = ex - F::BIAS;
     if e >= F::MANT as i32 {
-        return x;
+        return x; // already integral
     }
     let neg = b & F::SIGN != 0;
     if e < 0 {
+        // |x| < 1
         let zero = F::ZERO.copysign_(x);
         let one = F::ONE.copysign_(x);
         let is_zero = b & !F::SIGN == 0;
@@ -72,6 +94,7 @@ pub(crate) fn int_round_soft<F: Fp>(x: F, op: Op) -> F {
                 }
             }
             Op::Even => {
+                // 0.5 rounds to 0, anything above to 1
                 if e == -1 && b & F::FRAC_MASK != 0 {
                     one
                 } else {
@@ -112,6 +135,7 @@ pub(crate) fn int_round_soft<F: Fp>(x: F, op: Op) -> F {
     F::from_bits(r)
 }
 
+/// `rint` by the 2^MANT trick: the additions round in the current mode and raise "inexact".
 pub(crate) fn rint_soft<F: Fp>(x: F) -> F {
     let ex = x.exp_field();
     if ex >= F::BIAS as u32 + F::MANT {
@@ -122,6 +146,7 @@ pub(crate) fn rint_soft<F: Fp>(x: F) -> F {
     black_box(r).copysign_(x)
 }
 
+/// `nearbyint`: `rint` that leaves the "inexact" flag as it found it.
 pub(crate) fn nearbyint_soft<F: Fp>(x: F) -> F {
     let before = fenv::mxcsr_get();
     let r = rint_soft(x);
@@ -135,11 +160,18 @@ macro_rules! hw_round {
         #[inline(always)]
         pub(crate) fn $name(x: $ty) -> $ty {
             let r: $ty;
+            // one register for the source and the result: the legacy-encoded instruction keeps the upper bits of its
+            // destination, so a separate output register made each call wait for that register's last writer (in a loop
+            // of exp10f calls, the previous call: 2.2 times the time, FIXLIST #107 bench)
+            // SAFETY: one SSE4.1 round instruction on the declared register (nomem); every caller tests has_sse41()
+            // first. It only computes and may set MXCSR flags.
             unsafe { asm!(concat!($ins, " {0}, {0}, ", $imm), inout(xmm_reg) x => r, options(nomem, nostack, preserves_flags)) };
             r
         }
     };
 }
+// immediate: bits 0-1 direction (0 nearest even, 1 down, 2 up, 3 zero), bit 2 use the MXCSR
+// mode instead, bit 3 no "inexact"
 hw_round!(roundsd_floor, f64, "roundsd", "9");
 hw_round!(roundsd_ceil, f64, "roundsd", "10");
 hw_round!(roundsd_trunc, f64, "roundsd", "11");
@@ -152,6 +184,9 @@ hw_round!(roundss_trunc, f32, "roundss", "11");
 hw_round!(roundss_rint, f32, "roundss", "4");
 hw_round!(roundss_nearbyint, f32, "roundss", "12");
 hw_round!(roundss_roundeven, f32, "roundss", "8");
+
+// ---------------------------------------------------------------------------------------------
+// floor, ceil, trunc, round, roundeven, rint, nearbyint
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn floor(x: f64) -> f64 {
@@ -177,6 +212,7 @@ pub extern "C" fn trunc(x: f64) -> f64 {
 pub extern "C" fn truncf(x: f32) -> f32 {
     if has_sse41() { roundss_trunc(x) } else { int_round_soft(x, Op::Trunc) }
 }
+/// Round half away from zero.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn round(x: f64) -> f64 {
     int_round_soft(x, Op::Round)
@@ -185,6 +221,7 @@ pub extern "C" fn round(x: f64) -> f64 {
 pub extern "C" fn roundf(x: f32) -> f32 {
     int_round_soft(x, Op::Round)
 }
+/// Round half to even, whatever the rounding mode.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn roundeven(x: f64) -> f64 {
     if has_sse41() { roundsd_roundeven(x) } else { int_round_soft(x, Op::Even) }
@@ -193,6 +230,7 @@ pub extern "C" fn roundeven(x: f64) -> f64 {
 pub extern "C" fn roundevenf(x: f32) -> f32 {
     if has_sse41() { roundss_roundeven(x) } else { int_round_soft(x, Op::Even) }
 }
+/// Round to an integer in the current rounding mode, raising "inexact" for non-integers.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn rint(x: f64) -> f64 {
     if has_sse41() { roundsd_rint(x) } else { rint_soft(x) }
@@ -201,6 +239,7 @@ pub extern "C" fn rint(x: f64) -> f64 {
 pub extern "C" fn rintf(x: f32) -> f32 {
     if has_sse41() { roundss_rint(x) } else { rint_soft(x) }
 }
+/// Like `rint` without raising "inexact".
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn nearbyint(x: f64) -> f64 {
     if has_sse41() { roundsd_nearbyint(x) } else { nearbyint_soft(x) }
@@ -210,6 +249,11 @@ pub extern "C" fn nearbyintf(x: f32) -> f32 {
     if has_sse41() { roundss_nearbyint(x) } else { nearbyint_soft(x) }
 }
 
+// ---------------------------------------------------------------------------------------------
+// to integer: lrint, llrint, lround, llround
+
+/// `lrint`: the hardware conversion in the current rounding mode (0x8000... and "invalid" when
+/// out of range, as glibc's assembly does).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn lrint(x: f64) -> c_long {
     x.cvt_i64()
@@ -227,6 +271,8 @@ pub extern "C" fn llrintf(x: f32) -> c_longlong {
     x.cvt_i64()
 }
 
+/// Round half away from zero to an integer; too large values go through the truncating
+/// conversion (0x8000..., "invalid"), which is what glibc returns.
 pub(crate) fn lround_impl<F: Fp>(x: F) -> i64 {
     let e = x.exp_field() as i32 - F::BIAS;
     if e >= 63 {
@@ -269,16 +315,20 @@ pub extern "C" fn llroundf(x: f32) -> c_longlong {
     lround_impl(x)
 }
 
+// ---------------------------------------------------------------------------------------------
+// fromfp, ufromfp, fromfpx, ufromfpx (C23: the result is a floating-point integer value)
+
 fn fromfp_round<F: FpRound>(x: F, rm: c_int) -> F {
     match rm {
         FP_INT_UPWARD => x.r_ceil(),
         FP_INT_DOWNWARD => x.r_floor(),
         FP_INT_TONEARESTFROMZERO => x.r_round(),
         FP_INT_TONEAREST => x.r_roundeven(),
-        _ => x.r_trunc(),
+        _ => x.r_trunc(), // FP_INT_TOWARDZERO and unknown directions
     }
 }
 
+/// The public rounding functions of one format, by trait so the generic code can call them.
 pub(crate) trait FpRound: Fp {
     fn r_floor(self) -> Self;
     fn r_ceil(self) -> Self;
@@ -350,6 +400,7 @@ fn fromfp_impl<F: FpRound>(x: F, round: c_int, width: u32, unsigned: bool, inexa
     rx
 }
 
+/// Round to an integer by direction and check it fits in `width` bits (signed).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn fromfp(x: f64, round: c_int, width: u32) -> f64 {
     fromfp_impl(x, round, width, false, false)
@@ -383,6 +434,10 @@ pub extern "C" fn ufromfpxf(x: f32, round: c_int, width: u32) -> f32 {
     fromfp_impl(x, round, width, true, true)
 }
 
+// ---------------------------------------------------------------------------------------------
+// sqrt
+
+/// Correctly rounded square root (the hardware instruction); EDOM for a negative argument.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sqrt(x: f64) -> f64 {
     if x < 0.0 {
@@ -397,6 +452,9 @@ pub extern "C" fn sqrtf(x: f32) -> f32 {
     }
     x.sqrt()
 }
+
+// ---------------------------------------------------------------------------------------------
+// _Float32 / _Float64 / _Float32x names (the same functions)
 
 use crate::export_alias;
 

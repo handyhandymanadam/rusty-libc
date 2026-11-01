@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "sysexits.h",
     items: &[
+        Item::Comment("/* sysexits.h: exit codes of BSD programs. */"),
         Item::Guard { name: "_SYSEXITS_H", value: "1", end: "", items: &[
             Item::Consts(&[
                 ("EX_OK", V::Dec(0)),

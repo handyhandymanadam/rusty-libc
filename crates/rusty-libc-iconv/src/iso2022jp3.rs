@@ -1,3 +1,8 @@
+//! ISO-2022-JP-3: ASCII, JIS X 0201, JIS X 0208 and JIS X 0213 (planes 1 and 2) selected by escape
+//! sequences. Like the EUC and Shift JIS forms of JIS X 0213 it has codes for two characters
+//! (decoder: the second is queued when the output is full) and characters the encoder holds back
+//! (their code and whether the JIS X 0208 designation must be written before it are kept in the
+//! state). The designation for plane 1 depends on whether a character was added in 2004.
 use crate::engine::*;
 use crate::iso2022jp::{SetRes, dec_set, jis0201, jis0208};
 use crate::mbdata::euc_jisx0213 as e;
@@ -13,14 +18,18 @@ const X0213_2000: u8 = 5;
 const X0213_P2: u8 = 6;
 const X0213_2004: u8 = 7;
 
+/// The selected set (glibc's `set >> 3`) and either the character queued by the decoder or the two
+/// bytes (bit 16: "write ESC $ B first") held back by the encoder.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct State {
     pub set: u8,
     pub aux: u32,
 }
 
+/// The JIS X 0213 code of a character as glibc's table gives it: the two 7-bit bytes, 0x8000 for
+/// plane 2, 0x0080 for the characters that can start a combination; 0 if it is not in the set.
 fn jch(ch: u32) -> u32 {
-    let Some(c) = e::MB.enc(ch) else {
+    let Some(c) = e::mb().enc(ch) else {
         return 0;
     };
     let mut j = match (c.len, c.bytes[0]) {
@@ -45,8 +54,10 @@ fn added_in_2004(v: u32) -> bool {
     }
 }
 
+/// What the decoder found at the front of its input.
 enum Step {
     Char(u32, usize),
+    /// A code of two characters, and the bytes it used.
     Two(u32, u32, usize),
     Skip(usize),
     Incomplete,
@@ -132,7 +143,7 @@ fn step(st: &mut State, s: &[u8]) -> Step {
             if !((0x21..=0x7e).contains(&b1) && (0x21..=0x7e).contains(&b2)) {
                 return Step::Illegal(1);
             }
-            let r = if set == X0213_P2 { e::MB.dec2(3, b1 | 0x80, b2 | 0x80) } else { e::MB.dec2(2, b1 | 0x80, b2 | 0x80) };
+            let r = if set == X0213_P2 { e::mb().dec2(3, b1 | 0x80, b2 | 0x80) } else { e::mb().dec2(2, b1 | 0x80, b2 | 0x80) };
             if let Some(c) = r {
                 return Step::Char(c, 2);
             }
@@ -154,6 +165,7 @@ pub fn dec(st: &mut State, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u3
             result = St::Full;
             break;
         }
+        // a queued second character comes first
         if st.aux != 0 {
             out[o] = st.aux;
             o += 1;
@@ -201,6 +213,7 @@ pub fn dec(st: &mut State, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u3
 }
 
 fn put(o: &mut [u8], n: &mut usize, esc: &[u8], data: &[u8]) -> (bool, bool) {
+    // (everything written, designation written)
     let mut esc_done = false;
     if !esc.is_empty() {
         if o.len() < *n + esc.len() {
@@ -259,6 +272,7 @@ pub fn enc(st: &mut State, flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u
             st.aux = 0;
             return EBody::Ok(0, n + 2);
         }
+        // the current set first
         match st.set {
             ASCII => {
                 if ch <= 0x7f {
@@ -279,6 +293,7 @@ pub fn enc(st: &mut State, flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u
                 }
             }
             J1983 => {
+                // JIS X 0208: written = 0 when there is no room for two bytes (checked first)
                 let code = if o.len() < 2 { Some(None) } else { jis0208(ch).map(Some) };
                 if let Some(w) = code {
                     let j = jch(ch);
@@ -314,6 +329,7 @@ pub fn enc(st: &mut State, flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u
                 }
             }
         }
+        // switch to another set
         if ch <= 0x7f {
             if o.len() < 3 {
                 return EBody::Full;
@@ -385,6 +401,7 @@ pub fn enc(st: &mut State, flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u
     })
 }
 
+/// Flush: write the held-back character and return to ASCII.
 pub fn emit_reset(st: &mut State, out: &mut [u8], op: &mut usize) -> St {
     if st.set != ASCII || st.aux != 0 {
         let lasttwo = st.aux;

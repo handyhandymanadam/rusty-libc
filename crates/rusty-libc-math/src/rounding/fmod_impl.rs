@@ -1,13 +1,20 @@
+//! fmod, remainder (drem), remquo. All three are exact: the remainder of two floating-point
+//! numbers is representable, so it is computed on the integer significands (shift and reduce,
+//! `k` bits at a time). The special cases follow glibc 2.43 case by case: which NaN comes out
+//! (`(x*y)/(x*y)` and friends, evaluated with the real instructions), where errno is set, and
+//! when `*quo` is left alone.
 use super::fp::{EDOM, Fp, set_errno};
 use crate::export_alias;
 use core::ffi::c_int;
 
+/// `(x*y)/(x*y)`: the NaN glibc returns for fmod/remquo domain errors and NaN operands.
 #[inline(never)]
 fn nan_from<F: Fp>(x: F, y: F) -> F {
     let t = x.mul(y);
     t.div(x.mul(y))
 }
 
+/// Magnitude bits of fmod(|x|, |y|) for finite |x| >= |y| > 0.
 fn fmod_core<F: Fp>(hx: u64, hy: u64) -> u64 {
     let split = |h: u64| -> (u64, i32) {
         let e = (h >> F::MANT) as i32;
@@ -16,9 +23,10 @@ fn fmod_core<F: Fp>(hx: u64, hy: u64) -> u64 {
     let (mx, ex) = split(hx);
     let (my, ey) = split(hy);
     let mut d = ex - ey;
-    let chunk = 63 - F::MANT as i32;
+    let chunk = 63 - F::MANT as i32; // r < my < 2^(MANT+1), so r << chunk fits in 64 bits
     let mut r;
     if d <= chunk {
+        // close exponents: one reduction of mx * 2^d (fits in 64 bits)
         r = (mx << d) % my;
         d = 0;
     } else {
@@ -32,9 +40,10 @@ fn fmod_core<F: Fp>(hx: u64, hy: u64) -> u64 {
     if r == 0 {
         return 0;
     }
+    // value = r * 2^(ey - BIAS - MANT) with ey >= 1: normalise as far as the exponent allows
     let mut e = ey;
     let lead = 63 - r.leading_zeros() as i32;
-    let want = F::MANT as i32 - lead;
+    let want = F::MANT as i32 - lead; // left shifts to put the top bit at MANT
     if want > 0 {
         let sh = want.min(e - 1);
         r <<= sh;
@@ -49,6 +58,7 @@ pub(crate) fn fmod_g<F: Fp>(x: F, y: F) -> F {
     let hx = hx0 ^ sx;
     let hy = y.bits() & !F::SIGN;
     if hx < hy {
+        // x smaller in magnitude: x itself, unless y is a NaN
         if hy > F::EXP_MASK {
             return x.mul(y);
         }
@@ -56,8 +66,9 @@ pub(crate) fn fmod_g<F: Fp>(x: F, y: F) -> F {
     }
     if hy == 0 || hx >= F::EXP_MASK {
         if hx > F::EXP_MASK {
-            return x.mul(y);
+            return x.mul(y); // x is a NaN
         }
+        // x infinite or y zero
         set_errno(EDOM);
         return nan_from(x, y);
     }
@@ -65,6 +76,7 @@ pub(crate) fn fmod_g<F: Fp>(x: F, y: F) -> F {
     F::from_bits(sx | m)
 }
 
+/// `__math_invalid`: NaN from `(v - v) / (v - v)`; errno EDOM unless `v` was already a NaN.
 #[inline(never)]
 fn math_invalid<F: Fp>(v: F) -> F {
     let d = v.sub(v);
@@ -88,7 +100,7 @@ pub(crate) fn remainder_g<F: Fp>(x: F, y: F) -> F {
             if r.add(r) >= yy {
                 r = r.sub(yy);
             } else if r == F::ZERO {
-                r = F::ZERO;
+                r = F::ZERO; // not -0 (round-downward gives -0 for x - x)
             }
         }
     } else {
@@ -109,6 +121,7 @@ pub(crate) fn remainder_g<F: Fp>(x: F, y: F) -> F {
     if neg { r.neg_() } else { r }
 }
 
+/// remquo: the remainder and the low quotient bits (`None` when glibc leaves `*quo` untouched).
 pub(crate) fn remquo_g<F: Fp>(x: F, y: F) -> (F, Option<i32>) {
     let hx0 = x.bits();
     let hy0 = y.bits();
@@ -122,7 +135,7 @@ pub(crate) fn remquo_g<F: Fp>(x: F, y: F) -> (F, Option<i32>) {
     let emax = u64::from(F::EMAX_FIELD);
     let mut x = x;
     if hy < (emax - 3) << F::MANT {
-        x = fmod_g(x, y.mul(F::from_bits(((F::BIAS + 3) as u64) << F::MANT)));
+        x = fmod_g(x, y.mul(F::from_bits(((F::BIAS + 3) as u64) << F::MANT))); // 8 * y
     }
     if hx == hy {
         let q = if qs != 0 { -1 } else { 1 };
@@ -172,8 +185,11 @@ pub(crate) fn remquo_g<F: Fp>(x: F, y: F) -> (F, Option<i32>) {
     (x, Some(q))
 }
 
+/// Remainder of `x / y` with the sign of `x` (C `fmod`); EDOM for infinite `x` or zero `y`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn fmod(x: f64, y: f64) -> f64 {
+    // fast path on the bits: finite |x| >= |y| >= 2^-1022 with at most 11 binades between them:
+    // one 64-bit remainder of the significands
     let (bx, by) = (x.to_bits(), y.to_bits());
     let (ax, ay) = (bx & !(1u64 << 63), by & !(1u64 << 63));
     if ax >= ay && ax < 0x7ff0_0000_0000_0000 && ay >= 0x0010_0000_0000_0000 {
@@ -187,6 +203,7 @@ pub extern "C" fn fmod(x: f64, y: f64) -> f64 {
             if r == 0 {
                 return f64::from_bits(sign);
             }
+            // value r 2^(ey - 1075): move the top bit to bit 52 if the exponent allows
             let shift = r.leading_zeros() as i32 - 11;
             let e = (ay >> 52) as i32 - shift;
             if e >= 1 {
@@ -200,12 +217,15 @@ pub extern "C" fn fmod(x: f64, y: f64) -> f64 {
 pub extern "C" fn fmodf(x: f32, y: f32) -> f32 {
     fmod_g(x, y)
 }
+/// IEEE remainder: `x - n*y` with `n` the integer nearest `x/y` (ties to even).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn remainder(x: f64, y: f64) -> f64 {
+    // fast path on the bits (as in fmod): finite normal |x|, |y| below 2^1023, at most 11 binades
+    // between |x| and 2|y|; every floating-point operation below is exact
     let (bx, by) = (x.to_bits(), y.to_bits());
     let (ax, ay) = (bx & !(1u64 << 63), by & !(1u64 << 63));
     if ax < 0x7ff0_0000_0000_0000 && (0x0010_0000_0000_0000..0x7fe0_0000_0000_0000).contains(&ay) {
-        let a2 = ay + (1u64 << 52);
+        let a2 = ay + (1u64 << 52); // bits of 2|y|
         let r0 = if ax < a2 {
             Some(f64::from_bits(ax))
         } else {
@@ -233,7 +253,7 @@ pub extern "C" fn remainder(x: f64, y: f64) -> f64 {
                 if r + r >= yy {
                     r -= yy;
                 } else if r == 0.0 {
-                    r = 0.0;
+                    r = 0.0; // not -0
                 }
             }
             return if bx >> 63 != 0 { -r } else { r };
@@ -245,6 +265,9 @@ pub extern "C" fn remainder(x: f64, y: f64) -> f64 {
 pub extern "C" fn remainderf(x: f32, y: f32) -> f32 {
     remainder_g(x, y)
 }
+/// `drem`, the old BSD name of `remainder`. glibc keeps the old SVID wrapper for it: a domain
+/// error (y zero, or x infinite, without a NaN operand) returns the default NaN `0.0/0.0` and (shared build only: the static libm.a has `drem` as an alias of `remainder`)
+/// sets EDOM before the new `remainder` is even asked.
 fn drem_g<F: Fp>(x: F, y: F) -> F {
     if crate::SVID && ((y == F::ZERO && !x.is_nan_()) || (x.is_inf_() && !y.is_nan_())) {
         set_errno(EDOM);
@@ -261,6 +284,8 @@ pub extern "C" fn dremf(x: f32, y: f32) -> f32 {
     drem_g(x, y)
 }
 
+/// Rust form of `remquo`: the remainder and the signed low bits of the quotient (0 where C leaves
+/// `*quo` unwritten).
 pub fn remquo_pair(x: f64, y: f64) -> (f64, c_int) {
     let (r, q) = remquo_g(x, y);
     (r, q.unwrap_or(0))
@@ -270,18 +295,27 @@ pub fn remquof_pair(x: f32, y: f32) -> (f32, c_int) {
     (r, q.unwrap_or(0))
 }
 
+/// Remainder like `remainder`, and the low bits of the integral quotient (sign of `x/y`) in
+/// `*quo` (3 bits are guaranteed).
+///
+/// # Safety
+/// `quo` must be valid for a write.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn remquo(x: f64, y: f64, quo: *mut c_int) -> f64 {
     let (r, q) = remquo_g(x, y);
     if let Some(q) = q {
+        // SAFETY: the C contract: `quo` points to a writable int (written only when glibc writes it).
         unsafe { quo.write(q) };
     }
     r
 }
+/// # Safety
+/// `quo` must be valid for a write.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn remquof(x: f32, y: f32, quo: *mut c_int) -> f32 {
     let (r, q) = remquo_g(x, y);
     if let Some(q) = q {
+        // SAFETY: the C contract: `quo` points to a writable int (written only when glibc writes it).
         unsafe { quo.write(q) };
     }
     r

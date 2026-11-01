@@ -3,6 +3,11 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "aio.h",
     items: &[
+        Item::Comment(r#"/* aio.h for the Rust libc (crates/rusty-libc-ipc): POSIX asynchronous I/O. struct aiocb is 168 bytes (the
+   members after aio_sigevent are glibc's internal ones, kept so memory layouts agree). The prototypes
+   are generated (bits/rlibc-aio-calls.h, bits/rlibc-aio-64.h, bits/rlibc-aio-gnu.h). With
+   _FILE_OFFSET_BITS=64 the plain names are redirected to the 64 entry points with asm labels, as
+   glibc's header does (the two structures have the same layout on x86-64). */"#),
         Item::Guard { name: "_AIO_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),

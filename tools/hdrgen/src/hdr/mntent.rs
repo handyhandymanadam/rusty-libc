@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "mntent.h",
     items: &[
+        Item::Comment(r#"/* mntent.h for the Rust libc (crates/rusty-libc-extra/src/mntent.rs): the structure, the constants and the
+   prototypes (generated: bits/rlibc-mntentcalls.h, bits/rlibc-mntentcalls-misc.h). */"#),
         Item::Guard { name: "_RLIBC_MNTENT_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<bits/rlibc-features.h>"),

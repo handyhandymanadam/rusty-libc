@@ -21,7 +21,7 @@ pub static HDR: Header = Header {
    License along with the GNU C Library; if not, see
    <https://www.gnu.org/licenses/>.  */"#),
         Item::Blank,
-        Item::Guard { name: "_SYS_PLATFORM_X86_H", value: "", end: "", items: &[
+        Item::Guard { name: "_SYS_PLATFORM_X86_H", value: "", end: "  /* _SYS_PLATFORM_X86_H */", items: &[
             Item::Blank,
             Item::Include("<features.h>"),
             Item::Include("<stdbool.h>"),
@@ -30,6 +30,7 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::Decl("__BEGIN_DECLS"),
             Item::Blank,
+            Item::Comment("/* Get a pointer to the CPU feature structure.  */"),
             Item::Decl(r#"extern const struct cpuid_feature *__x86_get_cpuid_feature_leaf (unsigned int)
      __attribute__ ((pure));"#),
             Item::Blank,
@@ -62,7 +63,9 @@ x86_cpu_active (unsigned int __index)
   return __ptr->active_array[__reg] & (1 << __bit);
 }"#),
             Item::Blank,
+            Item::Comment("/* CPU_FEATURE_PRESENT evaluates to true if CPU supports the feature.  */"),
             Item::Raw(Reason::GlibcMacro, "#define CPU_FEATURE_PRESENT(name) x86_cpu_present (x86_cpu_##name)"),
+            Item::Comment("/* CPU_FEATURE_ACTIVE evaluates to true if the feature is active.  */"),
             Item::Raw(Reason::GlibcMacro, "#define CPU_FEATURE_ACTIVE(name) x86_cpu_active (x86_cpu_##name)"),
             Item::Blank,
             Item::Decl("__END_DECLS"),

@@ -1,3 +1,6 @@
+//! Error and signal message tables, copied from the messages glibc 2.43 prints (so output matches).
+
+/// `strerror` messages indexed by errno 0..=134 (entries glibc reports as unknown are empty).
 pub const ERRLIST: [&str; 135] = [
     "Success",
     "Operation not permitted",
@@ -136,6 +139,7 @@ pub const ERRLIST: [&str; 135] = [
     "Inappropriate file type or format",
 ]; 
 
+/// `strsignal` messages indexed by signal number 0..=64 (empty where glibc has no name).
 pub const SIGLIST: [&str; 65] = [
     "",
     "Hangup",
@@ -204,6 +208,7 @@ pub const SIGLIST: [&str; 65] = [
     "Real-time signal 30",
 ];
 
+/// `strerrorname_np` names (the macro names such as "ENOENT") indexed by errno 0..=134; empty where glibc has none.
 pub const ERRNAMES: [&str; 135] = [
     "0",
     "EPERM",
@@ -342,6 +347,10 @@ pub const ERRNAMES: [&str; 135] = [
     "EFTYPE",
 ];
 
+// ---- C strings and the lookup functions behind strerror and strsignal ----
+// (The run-time code tests the blobs, never the `&str` arrays: indexing one of those at run time puts a table of pointers in
+// libc.so.6 that the loader relocates at every start.)
+
 const fn blob_len(t: &[&str]) -> usize {
     let mut n = 0;
     let mut i = 0;
@@ -352,6 +361,7 @@ const fn blob_len(t: &[&str]) -> usize {
     n
 }
 
+/// All messages back to back, each followed by a NUL.
 const fn blob<const N: usize>(t: &[&str]) -> [u8; N] {
     let mut out = [0u8; N];
     let (mut k, mut i) = (0, 0);
@@ -363,12 +373,13 @@ const fn blob<const N: usize>(t: &[&str]) -> [u8; N] {
             k += 1;
             j += 1;
         }
-        k += 1;
+        k += 1; // the NUL
         i += 1;
     }
     out
 }
 
+/// Where each message starts in the blob.
 const fn offsets<const M: usize>(t: &[&str]) -> [u16; M] {
     let mut out = [0u16; M];
     let (mut k, mut i) = (0usize, 0);
@@ -390,8 +401,11 @@ const NAME_LEN: usize = blob_len(&ERRNAMES);
 static NAME_BLOB: [u8; NAME_LEN] = blob(&ERRNAMES);
 static NAME_OFF: [u16; 135] = offsets(&ERRNAMES);
 
+/// `struct { const char *list[135]; }` for the old `sys_errlist` data symbols: pointers to the
+/// messages (NULL for the numbers glibc does not know), usable in a static.
 #[repr(transparent)]
 pub struct ErrPtrs(pub [*const u8; 135]);
+// SAFETY: the pointers point into immutable static data.
 unsafe impl Sync for ErrPtrs {}
 
 pub const fn err_ptrs() -> ErrPtrs {
@@ -399,6 +413,7 @@ pub const fn err_ptrs() -> ErrPtrs {
     let mut i = 0;
     while i < 135 {
         if !ERRLIST[i].is_empty() {
+            // SAFETY: the offset is the start of string i inside the blob.
             out[i] = unsafe { ERR_BLOB.as_ptr().add(ERR_OFF[i] as usize) };
         }
         i += 1;
@@ -407,49 +422,67 @@ pub const fn err_ptrs() -> ErrPtrs {
 }
 
 
+/// The NUL-terminated message for a known errno, or None.
 #[inline(never)]
 pub fn error_message(code: i32) -> Option<&'static core::ffi::CStr> {
     if (0..ERRLIST.len() as i32).contains(&code) && ERR_BLOB[ERR_OFF[code as usize] as usize] != 0 {
         let at = ERR_OFF[code as usize] as usize;
+        // SAFETY: `at` is the offset of string `code` inside the blob (built by `offsets`).
         let p = unsafe { ERR_BLOB.as_ptr().add(at) };
+        // SAFETY: the blob holds NUL-terminated strings and `p` is the start of one; static, never changed.
         Some(unsafe { core::ffi::CStr::from_ptr(p.cast()) })
     } else {
         None
     }
 }
 
+/// The NUL-terminated macro name ("ENOENT") for a known errno, or None.
 #[inline(never)]
 pub fn error_name(code: i32) -> Option<&'static core::ffi::CStr> {
     if (0..ERRNAMES.len() as i32).contains(&code) && NAME_BLOB[NAME_OFF[code as usize] as usize] != 0 {
         let at = NAME_OFF[code as usize] as usize;
+        // SAFETY: `at` is the offset of name `code` inside the blob (built by `offsets`).
         let p = unsafe { NAME_BLOB.as_ptr().add(at) };
+        // SAFETY: as in `error_message`.
         Some(unsafe { core::ffi::CStr::from_ptr(p.cast()) })
     } else {
         None
     }
 }
 
+/// The NUL-terminated description of a known signal number, or None.
 #[inline(never)]
 pub fn signal_message(sig: i32) -> Option<&'static core::ffi::CStr> {
     if (0..SIGLIST.len() as i32).contains(&sig) && SIG_BLOB[SIG_OFF[sig as usize] as usize] != 0 {
         let at = SIG_OFF[sig as usize] as usize;
+        // SAFETY: `at` is the offset of description `sig` inside the blob (built by `offsets`).
         let p = unsafe { SIG_BLOB.as_ptr().add(at) };
+        // SAFETY: as in `error_message`.
         Some(unsafe { core::ffi::CStr::from_ptr(p.cast()) })
     } else {
         None
     }
 }
 
+/// This thread's buffer for the "Unknown error N" text of `strerror` and `strerror_l` (glibc keeps it in the thread's
+/// internal state, `strerror_l_buf`): malloc'd by the caller of this module, freed and replaced by the next unknown number.
 #[thread_local]
 static STRERROR_BUF: core::cell::Cell<*mut u8> = core::cell::Cell::new(core::ptr::null_mut());
 
+/// Address of this thread's `strerror_l_buf` (only this thread may use it; the slot is a `Cell`, so writes through the
+/// pointer are allowed).
 pub fn strerror_buf_slot() -> *mut *mut u8 {
     STRERROR_BUF.as_ptr()
 }
 
+/// Write `prefix` and the decimal number `n` (with a minus sign) into `buf` with a NUL; returns the
+/// length without the NUL. `buf` must hold prefix + 12 bytes.
+/// This thread's buffer for the "Unknown signal N" and "Real-time signal N" texts of `strsignal` (glibc's
+/// `strsignal_buf`), managed like [`strerror_buf_slot`].
 #[thread_local]
 static STRSIGNAL_BUF: core::cell::Cell<*mut u8> = core::cell::Cell::new(core::ptr::null_mut());
 
+/// Address of this thread's `strsignal_buf` (as [`strerror_buf_slot`]).
 pub fn strsignal_buf_slot() -> *mut *mut u8 {
     STRSIGNAL_BUF.as_ptr()
 }
@@ -478,11 +511,16 @@ pub fn write_unknown(buf: &mut [u8], prefix: &[u8], n: i32) -> usize {
     k
 }
 
+// ---- translated texts (glibc passes these through `_()`, see crate::i18n) ----
+
+/// The message of a known errno in the calling thread's LC_MESSAGES locale (glibc's `_(err)` in `__strerror_r`).
 #[inline]
 pub fn error_message_tr(code: i32) -> Option<&'static core::ffi::CStr> {
     error_message(code).map(crate::i18n::tr)
 }
 
+/// `snprintf(buf, buf.len(), "%s%d", prefix, n)`: the text cut to the buffer, always NUL-terminated (an empty
+/// buffer gets nothing); returns the length written without the NUL.
 pub fn write_prefixed_number(buf: &mut [u8], prefix: &[u8], n: i32) -> usize {
     if buf.is_empty() {
         return 0;
@@ -498,6 +536,8 @@ pub fn write_prefixed_number(buf: &mut [u8], prefix: &[u8], n: i32) -> usize {
     a + b
 }
 
+/// glibc's `__strerror_r(code, buf, buflen)` text: the (translated) message of a known number, else
+/// `_("Unknown error ")` and the number written into `buf` (cut to its size, NUL-terminated).
 pub fn strerror_r_text(code: i32, buf: &mut [u8]) -> &[u8] {
     if let Some(m) = error_message_tr(code) {
         return m.to_bytes();

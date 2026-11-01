@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "regex.h",
     items: &[
+        Item::Comment(r#"/* regex.h for the Rust libc (written by tools/gen_regex_h.py; constants are the system header's values,
+   structs and prototypes are written by hand). The GNU interface (re_*, RE_* bits) needs _GNU_SOURCE. */"#),
         Item::Guard { name: "_RLIBC_REGEX_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),
@@ -13,6 +15,7 @@ pub static HDR: Header = Header {
             Item::Typedef("int", "regoff_t"),
             Item::Typedef("unsigned long int", "reg_syntax_t"),
             Item::Blank,
+            Item::Comment("/* the error codes: REG_xxx above are macros for these enumerators (programs use both spellings) */"),
             Item::Block { head: r#"typedef enum
 "#, body: &["", "  _REG_ENOSYS = -1,", "  _REG_NOERROR = 0,", "  _REG_NOMATCH,", "  _REG_BADPAT,", "  _REG_ECOLLATE,", "  _REG_ECTYPE,", "  _REG_EESCAPE,", "  _REG_ESUBREG,", "  _REG_EBRACK,", "  _REG_EPAREN,", "  _REG_EBRACE,", "  _REG_BADBR,", "  _REG_ERANGE,", "  _REG_ESPACE,", "  _REG_BADRPT,", "  _REG_EEND,", "  _REG_ESIZE,", "  _REG_ERPAREN", ""], tail: " reg_errcode_t" },
             Item::Blank,

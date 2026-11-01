@@ -7,6 +7,12 @@ license.workspace = true
 [dependencies]
 rusty-libc-core = { path = "../rusty-libc-core" }
 
+[dev-dependencies]
+libc = "0.2"
+
 [features]
+# Export the C symbols (sin, cos, ...). Off for host tests so they never replace the host libm.
 export = []
+# The shared library's behaviour where glibc's dynamic libm still wraps functions in the old SVID code (positive NaN from
+# a domain error, divide-by-zero for y0l(0), ...): its static libm.a differs, so the static runtime leaves this off.
 svid = []

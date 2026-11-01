@@ -32,6 +32,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
     Item::Blank,
     Item::Block { head: "typedef struct ", body: &["", "  size_t gl_pathc;", "  char **gl_pathv;", "  size_t gl_offs;", "  int gl_flags;", "  void (*gl_closedir)(void *);", "  struct dirent64 *(*gl_readdir)(void *);", "  void *(*gl_opendir)(const char *);", "  int (*gl_lstat)(const char *__restrict, struct stat64 *__restrict);", "  int (*gl_stat)(const char *__restrict, struct stat64 *__restrict);", ""], tail: " glob64_t" },
     Item::Blank,
+    Item::Comment("/* x86-64 has one layout for both names; the 64 forms take the glob64_t spelling of the struct. */"),
     Item::Decl("int glob64(const char *__pattern, int __flags, int (*__errfunc)(const char *, int), glob64_t *__pglob);"),
     Item::Decl("void globfree64(glob64_t *__pglob);"),
 ];

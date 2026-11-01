@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("POLLIN", V::Txt("0x001")),
         ("POLLPRI", V::Txt("0x002")),
@@ -17,6 +18,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("POLLNVAL", V::Txt("0x020")),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Typedef("unsigned long", "nfds_t"),
 ];
 pub const AFTER_INCLUDES_CHOMP: bool = false;

@@ -10,13 +10,25 @@ rusty-libc-mem = { path = "../rusty-libc-mem" }
 rusty-libc-malloc = { path = "../rusty-libc-malloc" }
 rusty-libc-ctype = { path = "../rusty-libc-ctype" }
 rusty-libc-stdlib = { path = "../rusty-libc-stdlib" }
+# mntent and syslog use the FILE layer and the printf engine
 rusty-libc-stdio = { path = "../rusty-libc-stdio" }
+# utmp: fcntl lock timeouts use SIGALRM, login uses ttyname_r
 rusty-libc-signal = { path = "../rusty-libc-signal" }
 rusty-libc-sys = { path = "../rusty-libc-sys" }
+# syslog: local time of the time stamp
 rusty-libc-time = { path = "../rusty-libc-time" }
+# strfmon: the monetary conventions
 rusty-libc-locale = { path = "../rusty-libc-locale" }
+# dlfcn: the program headers (getauxval)
 rusty-libc-util = { path = "../rusty-libc-util" }
 
+[dev-dependencies]
+libc = "0.2"
+rusty-libc-malloc = { path = "../rusty-libc-malloc", features = ["no-brk"] }
+
 [features]
+# Export the C symbols. Off for host tests so they never replace the host libc.
 export = []
+# The shared libc.so.6 build: the dl* interface (dlfcn.rs) is not exported from here; the dynamic loader implements it
+# and rusty-libc-cabi (dl.rs) forwards to it.
 shared = []

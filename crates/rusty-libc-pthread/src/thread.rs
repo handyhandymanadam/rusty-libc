@@ -1,3 +1,21 @@
+//! Threads: the thread descriptor, pthread_create, join, detach, exit, self, stacks.
+//!
+//! A thread's memory is one mapping: `[guard | stack ... | TLS block | TCB + descriptor]`, the stack
+//! growing down towards the guard page, and the thread pointer (`%fs`) pointing at the TCB near the
+//! top. `pthread_t` is the address of the TCB, which is also the address of the `Thread`
+//! descriptor (the descriptor starts with the `Tcb` header). The kernel writes the thread id into
+//! the `tid` word at creation and clears it (and wakes the futex) when the thread has really ended
+//! (CLONE_PARENT_SETTID, CLONE_CHILD_CLEARTID). Joiners wait on that word.
+//!
+//! Releasing memory: a joined thread's mapping is put on a cache after the join (the joiner knows
+//! the thread is gone: tid is 0); a detached thread puts itself on the same list just before its
+//! last system call, and the list is only reused (or unmapped) for entries whose tid word is no
+//! longer positive, which means the kernel has finished the thread. No thread ever frees the stack
+//! it is running on.
+//!
+//! Unsafe left (U3): the clone entry assembly; the descriptor, which other threads and the kernel share, is reached through
+//! raw pointers field by field (`field_of!`, one operation per block: a new descriptor is a plain `&mut Thread` only until it
+//! is published); the stack mappings and their TLS blocks; the lists' links inside the descriptors (under LIST_LOCK).
 use crate::attr::*;
 use crate::cancel;
 use crate::key::KeyData;
@@ -19,11 +37,13 @@ pub const EXITED: u32 = 3;
 
 pub const FLAG_USER_STACK: u32 = 1;
 
-const CLONE_FLAGS: usize = 0x100  | 0x200  | 0x400  | 0x800  | 0x10000
-    | 0x40000  | 0x80000  | 0x100000  | 0x200000 ;
+const CLONE_FLAGS: usize = 0x100 /*VM*/ | 0x200 /*FS*/ | 0x400 /*FILES*/ | 0x800 /*SIGHAND*/ | 0x10000 /*THREAD*/
+    | 0x40000 /*SYSVSEM*/ | 0x80000 /*SETTLS*/ | 0x100000 /*PARENT_SETTID*/ | 0x200000 /*CHILD_CLEARTID*/;
 
+/// The robust futex list head (in the TCB header, at glibc's offset).
 pub use rusty_libc_core::tls::RobustHead;
 
+/// The thread descriptor. Starts with the TCB header; lives in the TCB area behind it.
 #[repr(C)]
 pub struct Thread {
     pub tcb: Tcb,
@@ -32,44 +52,71 @@ pub struct Thread {
     pub result: *mut c_void,
     pub start: Option<StartFn>,
     pub arg: *mut c_void,
+    /// Start of the mapping (the guard page), null for the main thread and for user stacks.
     pub mapping: *mut u8,
     pub mapping_size: usize,
     pub guard_size: usize,
+    /// Lowest usable stack address and the size from there to the top of the mapping.
     pub stack_lo: *mut u8,
     pub stack_size: usize,
+    /// Innermost `__pthread_unwind_buf_t` (the cancellation buffers of code built with glibc's
+    /// non-exception cleanup macros) and the value the thread is exiting with.
     pub unwind: *mut cancel::UnwindBuf,
     pub exit_value: *mut c_void,
+    /// The object a forced unwind is thrown with.
     pub exc: cancel::UnwindException,
+    /// 0 free-running, 1 waiting for the creator to finish setting up, 2 go, 3 abort.
     pub gate: AtomicU32,
     pub start_mask: u64,
     pub list_next: *mut Thread,
     pub list_prev: *mut Thread,
+    /// Start of the TLS block + TCB region (for zeroing when the memory is reused).
     pub block_base: *mut u8,
     pub block_size: usize,
+    /// The inheritsched bit of the creation attribute (pthread_getattr_np reports it back).
     pub attr_flags: i32,
+    /// Scheduling values as glibc keeps them in its descriptor: inherited at creation, updated by pthread_setschedparam,
+    /// pthread_setschedprio and pthread_getschedparam; pthread_getattr_np reports them without a system call (a seccomp
+    /// sandbox that allows only glibc's calls kills a process that asks the kernel there: glycin's image loaders).
+    /// Changed only with `lock` held (or before the thread is visible).
     pub sched: Sched,
+    /// The ceilings of the PTHREAD_PRIO_PROTECT mutexes this thread holds (glibc's `tpp`; see tpp.rs), null until first used.
     pub tpp: *mut crate::tpp::Tpp,
     pub specific_1st: [KeyData; 32],
+    /// Keys 32..1024, in a mapping of its own, allocated on first use.
     pub specific_2nd: *mut KeyData,
+    /// The start of the loader's heap block for this thread's dtv (the TCB points 16 bytes into it): with this pointer in the
+    /// thread's own mapping a leak checker (valgrind) sees the block as reachable while the thread lives and while its stack
+    /// waits in the cache for reuse (glibc keeps its TLS inside the stack mapping, so nothing of it is ever reported).
     pub dtv_block: usize,
+    /// glibc's `pd->lock`: held while the scheduling cache (`sched_*`) and the PRIO_PROTECT boost (`tpp`'s `priomax` with the
+    /// kernel priority) change or are read together: pthread_setschedparam, pthread_setschedprio, pthread_getschedparam,
+    /// pthread_getattr_np and the thread's own PP lock/unlock (tpp.rs), so a change from another thread cannot interleave.
     pub lock: RawMutex,
+    /// set*id broadcast state (setxid.rs): `XID_SET` while a set*id call waits for this thread, `XID_EXITING` once it exits.
     pub xid: AtomicU32,
+    /// glibc's `setxid_futex`: -1 until the thread runs, -2 while a set*id call waits for that, 0 or 1 afterwards.
     pub setxid_futex: AtomicU32,
 }
 
+/// The scheduling cache of a thread descriptor (see `Thread::sched`).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Sched {
     pub policy: i32,
     pub prio: i32,
+    /// ATTR_FLAG_SCHED_SET / ATTR_FLAG_POLICY_SET: which of the two values above are known.
     pub flags: i32,
 }
 
 impl Sched {
+    /// Ask the kernel for the values of thread `tid` that are not known yet (the priority first, as glibc); 0 or the errno of
+    /// the last failing call. A failed policy query leaves the policy -1.
     pub fn fill(&mut self, tid: i32) -> c_int {
         let mut result = 0;
         if self.flags & ATTR_FLAG_SCHED_SET == 0 {
             let mut sp = SchedParam::default();
+            // SAFETY: the kernel writes a struct sched_param into the borrowed local.
             let e = errno_of(unsafe { syscall2(SYS_SCHED_GETPARAM, tid as usize, &mut sp as *mut SchedParam as usize) });
             if e != 0 {
                 result = e;
@@ -93,9 +140,15 @@ impl Sched {
     }
 }
 
+/// Run `f` on thread `t`'s scheduling cache with `t`'s lock held (glibc's pd->lock).
+///
+/// # Safety
+/// `t` is a live thread descriptor of this process; `f` does not take `t`'s lock and does not reach `t`'s cache otherwise.
 pub unsafe fn with_sched_locked<R>(t: *mut Thread, f: impl FnOnce(&mut Sched) -> R) -> R {
+    // SAFETY: `t` is live (caller's contract); the lock is a RawMutex (an atomic word).
     let lock = unsafe { shared_field(field_of!(t, lock: RawMutex)) };
     lock.lock_always();
+    // SAFETY: the cache changes only with the lock held, which this thread now holds; `f` does not reach it otherwise.
     let r = f(unsafe { &mut *field_of!(t, sched: Sched) });
     lock.unlock_always();
     r
@@ -109,6 +162,8 @@ pub fn current_thread() -> *mut Thread {
     tls::current() as *mut Thread
 }
 
+/// The address of a field of the thread descriptor at `t`, typed: pointer arithmetic only, nothing is read (so it needs no
+/// unsafe; using the address does). `field_of!(t, tcb.tid: i32)`.
 macro_rules! field_of {
     ($t:expr, $($f:ident).+ : $ty:ty) => {
         ($t).cast::<u8>().wrapping_add(core::mem::offset_of!(crate::thread::Thread, $($f).+)).cast::<$ty>()
@@ -116,56 +171,86 @@ macro_rules! field_of {
 }
 pub(crate) use field_of;
 
+/// The kernel thread id word of thread `t` (CLONE_PARENT_SETTID / CLONE_CHILD_CLEARTID write it), as an atomic.
+///
+/// # Safety
+/// `t` is a thread descriptor of this process that stays mapped for `'a` (a pthread_t that was not reaped).
 #[inline(always)]
 pub unsafe fn tid_word<'a>(t: *mut Thread) -> &'a core::sync::atomic::AtomicI32 {
+    // SAFETY: forwarded contract; the word is an aligned i32 the kernel and other threads change, read here atomically.
     unsafe { &*field_of!(t, tcb.tid: core::sync::atomic::AtomicI32) }
 }
 
+/// An atomic field of thread `t` (joinstate, gate, xid, setxid_futex, lock, cancelhandling) as a shared reference.
+///
+/// # Safety
+/// `t` is a thread descriptor of this process that stays mapped for `'a`, and `p` is the address of one of its atomic
+/// (or otherwise interior-mutable) fields, from `field_of!`.
 #[inline(always)]
 pub unsafe fn shared_field<'a, T>(p: *mut T) -> &'a T {
+    // SAFETY: forwarded contract.
     unsafe { &*p }
 }
 
 static LIST_LOCK: RawMutex = RawMutex::new();
+/// The initial thread's descriptor (it is not on the list), recorded at the first pthread_create; null in a child that
+/// fork made from another thread (the initial thread does not exist there).
 static MAIN_TD: core::sync::atomic::AtomicPtr<Thread> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+/// Set in a child that fork made from a thread other than the initial one.
 static MAIN_GONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// The list of threads that are alive or not yet reaped (linked through `list_next` / `list_prev`) and the cache of
+/// finished threads whose memory can be reused (linked through `list_next`).
 struct Lists {
     all: *mut Thread,
     free: *mut Thread,
 }
 
+/// Touched only with LIST_LOCK held (`with_lists`), or by the only thread of a child after fork (`after_fork_child`).
 static LISTS: SyncCell<Lists> = SyncCell::new(Lists { all: core::ptr::null_mut(), free: core::ptr::null_mut() });
 
+/// Run `f` on the thread lists with LIST_LOCK held. `f` must not take LIST_LOCK.
 fn with_lists<R>(f: impl FnOnce(&mut Lists) -> R) -> R {
     LIST_LOCK.lock_always();
+    // SAFETY: LISTS is touched only with LIST_LOCK held, which this thread now holds, and `f` does not reach LISTS again.
     let r = unsafe { LISTS.with_unsync(f) };
     LIST_LOCK.unlock_always();
     r
 }
 
+/// Threads that are alive (the main thread counts).
+/// Exported as glibc's `__nptl_nthreads` (GLIBC_PRIVATE), which libthread_db's `td_ta_get_nthreads` reads.
 #[cfg_attr(feature = "export", unsafe(export_name = "__nptl_nthreads"))]
 static THREAD_COUNT: AtomicUsize = AtomicUsize::new(1);
+/// Entries kept for reuse when unused.
 const CACHE_MAX: usize = 32;
 
 static DEFAULT_LOCK: RawMutex = RawMutex::new();
+/// The default attribute (pthread_setattr_default_np); touched only with DEFAULT_LOCK held (`with_default`).
 static DEFAULT_ATTR: SyncCell<PthreadAttr> = SyncCell::new(PthreadAttr::new());
 
+/// Run `f` on the default attribute with DEFAULT_LOCK held. `f` must not take DEFAULT_LOCK.
 fn with_default<R>(f: impl FnOnce(&mut PthreadAttr) -> R) -> R {
     DEFAULT_LOCK.lock_always();
+    // SAFETY: DEFAULT_ATTR is touched only with DEFAULT_LOCK held, and `f` does not reach it again.
     let r = unsafe { DEFAULT_ATTR.with_unsync(f) };
     DEFAULT_LOCK.unlock_always();
     r
 }
 
+/// A field of thread `t` that is set before the thread is published and not changed after (mapping, sizes, flags ...).
+/// The caller's SAFETY comment states why `t` is live.
 macro_rules! fixed {
     ($t:expr, $($f:ident).+ : $ty:ty) => {{
+        // SAFETY: `t` is a live descriptor (see the caller); the field was written before the thread was published and is
+        // only read after that.
         unsafe { *field_of!($t, $($f).+ : $ty) }
     }};
 }
 
 fn rlimit_stack() -> usize {
     let mut lim = [0u64; 2];
+    // SAFETY: the kernel writes a struct rlimit (two u64) into the local array.
     let r = unsafe { syscall4(SYS_PRLIMIT64, 0, 3, 0, lim.as_mut_ptr() as usize) };
     let cur = if errno_of(r) == 0 { lim[0] } else { 8 << 20 };
     if cur == u64::MAX {
@@ -175,6 +260,7 @@ fn rlimit_stack() -> usize {
     }
 }
 
+/// The default stack size for new threads (RLIMIT_STACK at first use, 2 MiB when unlimited).
 pub fn default_stacksize() -> usize {
     with_default(|d| {
         if d.stacksize == 0 {
@@ -191,10 +277,12 @@ pub unsafe extern "C" fn pthread_getattr_default_np(attr: *mut PthreadAttr) -> c
         Ok(c) => (c, 0),
         Err((c, e)) => (c, e),
     });
+    // SAFETY: `attr` is writable memory for one attribute (C contract); its old contents are not read.
     unsafe { write_attr(attr, copy) };
     r
 }
 
+/// `pthread_setattr_default_np`: check `a` as glibc does and make a copy of it the default.
 pub fn setattr_default(a: &PthreadAttr) -> c_int {
     if !(SCHED_OTHER..=SCHED_RR).contains(&a.schedpolicy) {
         return EINVAL;
@@ -230,9 +318,12 @@ pub fn setattr_default(a: &PthreadAttr) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_setattr_default_np(attr: *const PthreadAttr) -> c_int {
+    // SAFETY: `attr` is an initialised attribute (C contract; read without a NULL check, as glibc).
     setattr_default(unsafe { arg(attr) })
 }
 
+// clone(flags, stack, ptid, ctid, tls) that runs `fn(arg)` on the new stack in the child.
+// C ABI arguments: rdi = flags, rsi = stack top, rdx = ptid, rcx = ctid, r8 = tls, r9 = fn, [rsp+8] = arg.
 global_asm!(
     ".text",
     ".globl rl_clone",
@@ -258,6 +349,9 @@ global_asm!(
     ".size rl_clone, . - rl_clone",
 );
 
+// clone3(args, size) that runs `fn(arg)` in the child, on the stack the arguments describe (the kernel starts the child with
+// its stack pointer at stack + stack_size; the child's registers are the parent's apart from rax, rcx, r11 and rsp, so the
+// function and its argument travel in r9 and r8). C ABI arguments: rdi = args, rsi = size, rdx = fn, rcx = arg.
 global_asm!(
     ".text",
     ".globl rl_clone3",
@@ -283,6 +377,7 @@ unsafe extern "C" {
     fn rl_clone3(args: *mut CloneArgs, size: usize, f: unsafe extern "C" fn(*mut Thread) -> !, arg: *mut Thread) -> isize;
 }
 
+/// The kernel's `struct clone_args` (version 2, 88 bytes), as glibc 2.43 passes it.
 #[repr(C)]
 struct CloneArgs {
     flags: u64,
@@ -298,8 +393,14 @@ struct CloneArgs {
     cgroup: u64,
 }
 
+/// 1 while clone3 may work, 0 once it said ENOSYS (an old kernel, or a seccomp filter that answers ENOSYS to make
+/// programs fall back, as Chromium's does): glibc's __clone_internal remembers the same.
 static CLONE3_OK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
 
+/// Start thread `t` as glibc's create_thread does: clone3 first, clone when clone3 is not available.
+///
+/// # Safety
+/// `t` is a descriptor set up by `create` (TLS block, stack bounds, start routine), not running yet.
 unsafe fn spawn_kernel_thread(t: *mut Thread) -> isize {
     let tidp = field_of!(t, tcb.tid: i32);
     let base = fixed!(t, block_base: *mut u8);
@@ -319,71 +420,116 @@ unsafe fn spawn_kernel_thread(t: *mut Thread) -> isize {
             set_tid_size: 0,
             cgroup: 0,
         };
+        // SAFETY: a thread on the stack `args` describes, with `t` as its TCB and argument (caller's contract).
         let r = unsafe { rl_clone3(&mut args, core::mem::size_of::<CloneArgs>(), thread_entry, t) };
         if r != -38 {
             return r;
         }
         CLONE3_OK.store(0, Ordering::Relaxed);
     }
+    // SAFETY: as above, with the stack top below the TLS block.
     unsafe { rl_clone(CLONE_FLAGS, base, tidp, tidp, t as *mut Tcb, thread_entry, t) }
 }
 
+/// Put `t` on the list of all threads (and on the list debuggers walk, libthread_db's).
+///
+/// # Safety
+/// `t` is a set-up descriptor that is on no list; `l` is LISTS under LIST_LOCK.
 unsafe fn list_insert_all(l: &mut Lists, t: *mut Thread) {
+    // SAFETY: forwarded contract.
     unsafe { list_insert_all_only(l, t) };
+    // SAFETY: `t` is a set-up TCB (forwarded contract).
     unsafe { rusty_libc_core::thread_db::add(t as *mut Tcb) };
 }
 
+/// On the list of all threads only (not on libthread_db's lists).
+///
+/// # Safety
+/// As `list_insert_all`.
 unsafe fn list_insert_all_only(l: &mut Lists, t: *mut Thread) {
+    // SAFETY: `t` is valid; its list links are changed only under LIST_LOCK (held: forwarded contract).
     unsafe { *field_of!(t, list_prev: *mut Thread) = core::ptr::null_mut() };
+    // SAFETY: as above.
     unsafe { *field_of!(t, list_next: *mut Thread) = l.all };
     if !l.all.is_null() {
+        // SAFETY: the old head is a thread on the list (links under LIST_LOCK).
         unsafe { *field_of!(l.all, list_prev: *mut Thread) = t };
     }
     l.all = t;
 }
 
+/// Take `t` off the list of all threads and libthread_db's lists.
+///
+/// # Safety
+/// `t` is on the list; `l` is LISTS under LIST_LOCK.
 unsafe fn list_remove_all(l: &mut Lists, t: *mut Thread) {
+    // SAFETY: `t` is on the list (forwarded contract); links change only under LIST_LOCK.
     let p = unsafe { *field_of!(t, list_prev: *mut Thread) };
+    // SAFETY: as above.
     let n = unsafe { *field_of!(t, list_next: *mut Thread) };
     if p.is_null() {
         if l.all == t {
             l.all = n;
         }
     } else {
+        // SAFETY: `p` is the previous thread on the list.
         unsafe { *field_of!(p, list_next: *mut Thread) = n };
     }
     if !n.is_null() {
+        // SAFETY: `n` is the next thread on the list.
         unsafe { *field_of!(n, list_prev: *mut Thread) = p };
     }
+    // SAFETY: as above.
     unsafe { *field_of!(t, list_next: *mut Thread) = core::ptr::null_mut() };
+    // SAFETY: as above.
     unsafe { *field_of!(t, list_prev: *mut Thread) = core::ptr::null_mut() };
+    // SAFETY: `t` is a TCB on libthread_db's lists.
     unsafe { rusty_libc_core::thread_db::remove(t as *mut Tcb) };
 }
 
+/// The next thread after `t` on the list it is linked on.
+///
+/// # Safety
+/// `t` is on one of the lists and LIST_LOCK is held (or the process has one thread).
 #[inline]
 unsafe fn next_of(t: *mut Thread) -> *mut Thread {
+    // SAFETY: forwarded contract.
     unsafe { *field_of!(t, list_next: *mut Thread) }
 }
 
+/// `__libc_walk_threads` (GLIBC_PRIVATE): call `cb(thread_pointer, arg)` for the main thread and every other thread that
+/// has been created and not yet reaped. The dynamic loader uses it to give each thread the initial image of a module
+/// with initial-exec TLS that was dlopen'd after the thread's block was made. Holds the thread list lock during the walk
+/// (`cb` may take the loader's TLS lock; the loader never takes the list lock while holding it). Each libc.so.6 copy lists the
+/// threads it created; only the base namespace's copy adds the main thread (in the copy of a dlmopen namespace `MAIN_TP` is the
+/// thread that ran its constructor, which another copy lists and which may have ended).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __libc_walk_threads(cb: unsafe extern "C" fn(usize, usize), arg: usize) {
     let main = if rusty_libc_core::lock::libc_initial() { tls::main_thread_pointer() } else { 0 };
     if main != 0 {
+        // SAFETY: the loader's callback with its own argument (C contract).
         unsafe { cb(main, arg) };
     }
     with_lists(|l| {
         let mut cur = l.all;
         while !cur.is_null() {
+            // SAFETY: a thread on the list (LIST_LOCK held).
             if unsafe { tid_of(cur) } > 0 && cur as usize != main {
+                // SAFETY: as above, for the loader's callback.
                 unsafe { cb(cur as usize, arg) };
             }
+            // SAFETY: as above.
             cur = unsafe { next_of(cur) };
         }
     })
 }
 
+/// What `with_thread_list` hands its function: call it with a closure that gets each thread.
 pub type Walker<'a> = &'a dyn Fn(&mut dyn FnMut(*mut Thread));
 
+/// Run `f` with the thread list lock held; `f` gets a walker that calls its argument for every thread of the process
+/// other than the caller that has been created and not yet reaped (the initial thread included), newest first. The threads
+/// it hands out stay mapped while `f` runs. `f` must not take the list lock (no pthread_create, join, detach).
 pub fn with_thread_list<R>(f: impl FnOnce(Walker<'_>) -> R) -> R {
     let me = current_thread();
     with_lists(|l| {
@@ -391,6 +537,7 @@ pub fn with_thread_list<R>(f: impl FnOnce(Walker<'_>) -> R) -> R {
         let walk = |g: &mut dyn FnMut(*mut Thread)| {
             let mut cur = all;
             while !cur.is_null() {
+                // SAFETY: a thread on the list; the list cannot change while LIST_LOCK is held.
                 let next = unsafe { next_of(cur) };
                 if cur != me {
                     g(cur);
@@ -406,39 +553,64 @@ pub fn with_thread_list<R>(f: impl FnOnce(Walker<'_>) -> R) -> R {
     })
 }
 
+/// Take a finished (or just finishing) thread off the live list and, if its memory is ours, onto the
+/// free list. Entries are only reused when their tid word says the kernel is done with them.
+///
+/// # Safety
+/// `t` is a thread of the list that has finished its work (joined, detached and exiting, or never started); nothing uses
+/// its descriptor after this but the free list.
 unsafe fn release(t: *mut Thread) {
+    // the PRIO_PROTECT table goes now, not at thread exit (glibc's __nptl_free_tcb)
+    // SAFETY: forwarded contract.
     unsafe { crate::tpp::free_table(t) };
     with_lists(|l| {
+        // SAFETY: forwarded contract; LIST_LOCK is held.
         unsafe { list_remove_all(l, t) };
         if fixed!(t, flags: u32) & FLAG_USER_STACK == 0 && !fixed!(t, mapping: *mut u8).is_null() {
+            // (a joined thread's tid is -1, our mark for "reaped"; the kernel had cleared it to 0, which is what glibc prints)
             if tls::debug_tls_on() {
+                // SAFETY: `t` is still mapped (forwarded contract).
                 let tid = unsafe { tid_of(t) };
                 tls::debug_tls(&[DebugArg::S(b"TCB deallocated into cache: TID="), DebugArg::D(tid.max(0) as i64), DebugArg::S(b", TCB="), DebugArg::X(t as usize)]);
             }
+            // SAFETY: as above.
             unsafe { *field_of!(t, list_next: *mut Thread) = l.free };
             l.free = t;
         }
     })
 }
 
+/// The kernel thread id word of `t`, read with acquire ordering.
+///
+/// # Safety
+/// `t` is a descriptor that stays mapped for the call: a thread on a list under LIST_LOCK, a handle of a thread that was
+/// not reaped, or the calling thread's own.
 #[inline]
 unsafe fn tid_of(t: *mut Thread) -> i32 {
+    // SAFETY: forwarded contract.
     unsafe { tid_word(t) }.load(Ordering::Acquire)
 }
 
+/// With the list lock held: unmap dead entries we will not keep, then return a reusable one of
+/// exactly this mapping size and guard size, if any.
 fn reap_and_find(l: &mut Lists, total: usize, guard: usize) -> *mut Thread {
     let mut cached = 0usize;
     let mut found: *mut Thread = core::ptr::null_mut();
     let mut prev: *mut Thread = core::ptr::null_mut();
     let mut cur = l.free;
     while !cur.is_null() {
+        // (every entry is a cached descriptor in its own mapping; LIST_LOCK is held)
+        // SAFETY: as above.
         let next = unsafe { next_of(cur) };
+        // SAFETY: as above.
         let tid = unsafe { tid_of(cur) };
         let dead = tid <= 0;
         let mut remove = false;
         if dead {
             let (msize, gsize) = (fixed!(cur, mapping_size: usize), fixed!(cur, guard_size: usize));
             if found.is_null() && msize == total && gsize == guard {
+                // the loader's per-thread TLS data (dtv, dynamically allocated blocks) of the dead thread
+                // SAFETY: the kernel is done with the thread (tid word not positive); its TLS data is no longer used.
                 unsafe { tls::release_block(cur as *mut Tcb) };
                 found = cur;
                 remove = true;
@@ -448,12 +620,16 @@ fn reap_and_find(l: &mut Lists, total: usize, guard: usize) -> *mut Thread {
                     tls::debug_tls(&[DebugArg::S(b"TCB cache full, deallocating: TID="), DebugArg::D(tid.max(0) as i64), DebugArg::S(b", TCB="), DebugArg::X(cur as usize)]);
                     tls::debug_tls(&[DebugArg::S(b"TCB deallocating: "), DebugArg::X(cur as usize), DebugArg::S(b" (dealloc_tcb=0)")]);
                 }
+                // unlink first: the node lives inside the mapping
+                // SAFETY: as above (dead thread).
                 unsafe { tls::release_block(cur as *mut Tcb) };
                 if prev.is_null() {
                     l.free = next;
                 } else {
+                    // SAFETY: `prev` is an entry of the free list.
                     unsafe { *field_of!(prev, list_next: *mut Thread) = next };
                 }
+                // SAFETY: the dead thread's own mapping, unlinked from every list: nothing uses it any more.
                 unsafe { munmap(m, msize) };
                 cur = next;
                 continue;
@@ -465,6 +641,7 @@ fn reap_and_find(l: &mut Lists, total: usize, guard: usize) -> *mut Thread {
             if prev.is_null() {
                 l.free = next;
             } else {
+                // SAFETY: `prev` is an entry of the free list.
                 unsafe { *field_of!(prev, list_next: *mut Thread) = next };
             }
         } else {
@@ -475,6 +652,7 @@ fn reap_and_find(l: &mut Lists, total: usize, guard: usize) -> *mut Thread {
     found
 }
 
+/// Everything a new thread needs, resolved from an attribute (or the default one).
 struct Params<'a> {
     stacksize: usize,
     guardsize: usize,
@@ -483,7 +661,9 @@ struct Params<'a> {
     explicit_sched: bool,
     policy: c_int,
     param: SchedParam,
+    /// The CPU set the attribute asks for (the default attribute's is not applied, as before).
     affinity: Option<&'a [u8]>,
+    /// The signal mask the attribute asks for (pthread_attr_setsigmask_np), from the default attribute when there is none.
     sigmask: Option<u64>,
     attr_flags: i32,
 }
@@ -495,6 +675,7 @@ fn resolve(attr: Option<&PthreadAttr>) -> Params<'_> {
     let a: &PthreadAttr = match attr {
         None => {
             copy = with_default(|d| {
+                // (the default's affinity is not applied; its signal mask is)
                 default_mask = d.sigmask();
                 PthreadAttr { extension: core::ptr::null_mut(), ..*d }
             });
@@ -516,26 +697,40 @@ fn resolve(attr: Option<&PthreadAttr>) -> Params<'_> {
     }
 }
 
+/// A field of the calling thread's own descriptor `t`.
 macro_rules! own {
     ($t:expr, $($f:ident).+ : $ty:ty) => {{
+        // SAFETY: `t` is the calling thread's own live descriptor; only it changes this field (others may read it).
         unsafe { *field_of!($t, $($f).+ : $ty) }
     }};
 }
 
+/// Entry point of every new thread (runs on its own stack, thread pointer already set).
 unsafe extern "C" fn thread_entry(t: *mut Thread) -> ! {
+    // set*id calls may mark this thread from now on (glibc's start_thread does this before restoring the mask)
+    // SAFETY: `t` is this thread's own descriptor, set up by its creator (rl_clone's argument).
     unsafe { crate::setxid::thread_started(t) };
+    // the kernel keeps a robust mutex list per thread: register this one's (glibc's start_thread does the same)
+    // SAFETY: as above; its robust list head lives in the TCB.
     unsafe { tls::robust_register(t as *mut Tcb) };
     sigprocmask_set(2, own!(t, start_mask: u64));
     if tls::debug_tls_on() {
         tls::debug_tls(&[DebugArg::S(b"Thread starting: TID="), DebugArg::D(raw_gettid() as i64), DebugArg::S(b", TCB="), DebugArg::X(t as usize)]);
     }
+    // static TLS modules that a dlopen added after this thread's block was made (initial-exec TLS images)
+    // SAFETY: as above.
     unsafe { tls::sync_new_thread(t as *mut Tcb) };
+    // gate: 0 free-running; 1 the creator is still applying scheduling and affinity; 2 go; 3 abort
+    // SAFETY: as above; `gate` is an atomic.
     let gate = unsafe { shared_field(field_of!(t, gate: AtomicU32)) };
     loop {
         let g = gate.load(Ordering::Acquire);
         if g != 1 {
             if g == 3 {
+                // creation was cancelled: end silently (the creator reclaims the memory), after answering a set*id call
+                // SAFETY: as above.
                 unsafe { crate::setxid::set_exiting(t) };
+                // SAFETY: as above.
                 unsafe { crate::setxid::exit_wait(t) };
                 exit_thread();
             }
@@ -544,25 +739,34 @@ unsafe extern "C" fn thread_entry(t: *mut Thread) -> ! {
         futex_wait(gate, 1, true);
     }
     let start = own!(t, start: Option<StartFn>);
+    // SAFETY: pthread_create always stores the start routine before the thread runs.
     let f = unsafe { start.unwrap_unchecked() };
     let a = own!(t, arg: *mut c_void);
+    // SAFETY: the program's start routine with its argument (pthread_create's C contract).
     let r = unsafe { f(a) };
     thread_exit(r)
 }
 
+/// pthread_create.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_create(newthread: *mut PthreadT, attr: *const PthreadAttr, start: unsafe extern "C" fn(*mut c_void) -> *mut c_void, arg: *mut c_void) -> c_int {
     crate::atfork::install_fork_hook();
     rusty_libc_core::lock::note_multithreaded();
     cancel::ensure_init();
     let me = current_thread();
+    // SAFETY: the calling thread's own descriptor.
     if MAIN_TD.load(Ordering::Relaxed).is_null() && unsafe { is_main_thread(me) } && !MAIN_GONE.load(Ordering::Relaxed) {
         MAIN_TD.store(me, Ordering::Relaxed);
     }
+    // set*id calls reach every thread from now on (glibc's late_init)
     crate::setxid::init();
+    // (this thread's id is current: every fork stores the child's through CLONE_CHILD_SETTID, as in glibc)
+    // SAFETY: `attr` is NULL or an initialised attribute that stays valid during the call (C contract).
     let p = resolve(unsafe { attr.as_ref() });
+    // SAFETY: a user stack in the attribute is the program's writable memory of the size it set (C contract).
     match unsafe { create(&p, start, arg) } {
         Ok(t) => {
+            // SAFETY: `newthread` is a writable pthread_t (C contract).
             unsafe { *newthread = t as PthreadT };
             0
         }
@@ -570,6 +774,10 @@ pub unsafe extern "C" fn pthread_create(newthread: *mut PthreadT, attr: *const P
     }
 }
 
+/// The body of pthread_create after the attribute was resolved: the new thread's descriptor, or the error.
+///
+/// # Safety
+/// A non-NULL `p.user_top` is the top of `p.stacksize` bytes of writable memory that the new thread may use as its stack.
 unsafe fn create(p: &Params<'_>, start: StartFn, arg: *mut c_void) -> Result<*mut Thread, c_int> {
     let me = current_thread();
     let tpl = tls::template();
@@ -578,13 +786,18 @@ unsafe fn create(p: &Params<'_>, start: StartFn, arg: *mut c_void) -> Result<*mu
     let (canary, pguard) = (own!(me, tcb.stack_guard: usize), own!(me, tcb.pointer_guard: usize));
     let (t, mapping);
     if !p.user_top.is_null() {
+        // glibc: the stack must hold the TLS block and MINIMAL_REST_STACK (2048) bytes of real stack
         if p.stacksize < block_size + 2048 {
             return Err(EINVAL);
         }
         let base = ((p.user_top as usize - block_size) & !(align - 1)) as *mut u8;
+        // SAFETY: the block lies inside the program's stack memory (caller's contract: stacksize >= block_size + 2048).
         unsafe { core::ptr::write_bytes(base, 0, block_size) };
+        // SAFETY: a zeroed block of the template's size and alignment for the new thread's TLS and descriptor.
         let tp = unsafe { tls::setup_block(base, &tpl, canary, pguard) } as *mut Thread;
+        // SAFETY: the new descriptor, set up above and not visible to any other thread yet.
         let td = unsafe { &mut *tp };
+        // SAFETY: as above.
         td.dtv_block = unsafe { tls::dtv_allocation(tp as *mut Tcb) };
         t = tp;
         mapping = core::ptr::null_mut();
@@ -604,10 +817,15 @@ unsafe fn create(p: &Params<'_>, start: StartFn, arg: *mut c_void) -> Result<*mu
         }
     } else {
         let guard = align_up(p.guardsize, PAGE);
+        // glibc: the stack size asked for must hold the guard, the TLS block and MINIMAL_REST_STACK (2048) bytes; the guard
+        // area is added below it (the usable stack is exactly the size asked for, which pthread_getattr_np reports)
         let size = align_up(p.stacksize, PAGE);
         if size < align_up(guard + block_size + 2048, PAGE) {
             return Err(EINVAL);
         }
+        // our thread descriptor block is larger than glibc's, so a minimal stack (PTHREAD_STACK_MIN) would leave less room
+        // for code than glibc's does (pthread_exit then overflows in the dynamic loader on the way to the unwinder):
+        // small stacks get one more page
         let extra = if size < 65536 { PAGE } else { 0 };
         let total = size + guard + extra;
         let reuse = with_lists(|l| reap_and_find(l, total, guard));
@@ -617,22 +835,29 @@ unsafe fn create(p: &Params<'_>, start: StartFn, arg: *mut c_void) -> Result<*mu
                 Ok(m) => m,
                 Err(_) => return Err(EAGAIN),
             };
+            // SAFETY: the guard pages are the bottom of the new mapping, which nothing uses yet.
             if guard != 0 && unsafe { mprotect(map, guard, 0) } != 0 {
+                // SAFETY: the new mapping, unused.
                 unsafe { munmap(map, total) };
                 return Err(EAGAIN);
             }
         } else {
+            // (taken off the free list above: ours alone now)
             map = fixed!(reuse, mapping: *mut u8);
         }
         mapping = map;
         let mapping_size = total;
         let base = (((map as usize + total) - block_size) & !(align - 1)) as *mut u8;
         if !reuse.is_null() {
+            // SAFETY: the TLS block area of a reused mapping that is ours alone (its thread has ended).
             unsafe { core::ptr::write_bytes(base, 0, block_size) };
         }
+        // SAFETY: a zeroed block (a fresh mapping or cleared above) for the new thread's TLS and descriptor.
         let tp = unsafe { tls::setup_block(base, &tpl, canary, pguard) } as *mut Thread;
         t = tp;
+        // SAFETY: the new descriptor, set up above and not visible to any other thread yet.
         let td = unsafe { &mut *tp };
+        // SAFETY: as above.
         td.dtv_block = unsafe { tls::dtv_allocation(tp as *mut Tcb) };
         if tls::debug_tls_on() {
             if reuse.is_null() {
@@ -651,9 +876,11 @@ unsafe fn create(p: &Params<'_>, start: StartFn, arg: *mut c_void) -> Result<*mu
     }
     let gated = p.explicit_sched || p.affinity.is_some();
     {
+        // SAFETY: the new descriptor, not visible to any other thread until it is put on the list below.
         let td = unsafe { &mut *t };
         td.block_size = block_size;
         td.attr_flags = p.attr_flags;
+        // (the creator's own cache: other threads change it only under its lock, as glibc reads it here without one)
         td.sched = own!(me, sched: Sched);
         td.tpp = core::ptr::null_mut();
         td.tcb.multiple_threads = 1;
@@ -662,29 +889,44 @@ unsafe fn create(p: &Params<'_>, start: StartFn, arg: *mut c_void) -> Result<*mu
         td.tcb.db_start = start as usize;
         td.arg = arg;
         td.joinstate.store(if p.detached { DETACHED } else { JOINABLE }, Ordering::Relaxed);
+        // no set*id marks until the thread runs (glibc's allocate_stack)
         td.xid.store(0, Ordering::Relaxed);
         td.setxid_futex.store(crate::setxid::FUTEX_NOT_STARTED, Ordering::Relaxed);
         td.gate.store(if gated { 1 } else { 0 }, Ordering::Relaxed);
     }
 
+    // from here on the creator is no longer alone: locks in other crates must really lock
+    // SAFETY: the calling thread's own TCB word (read by its own code only).
     unsafe { *field_of!(me, tcb.multiple_threads: i32) = 1 };
 
+    // on the list before the signals are blocked (as glibc's allocate_stack): a set*id call holds the list lock while it
+    // waits for every thread it signalled, so no thread may wait for that lock with SIGSETXID blocked
     THREAD_COUNT.fetch_add(1, Ordering::AcqRel);
+    // SAFETY: the set-up descriptor, on no list yet; LIST_LOCK is held inside with_lists.
     with_lists(|l| unsafe { list_insert_all(l, t) });
 
+    // all signals blocked while the new thread starts; it installs its own mask first thing
     let all = sigprocmask_set(2, u64::MAX);
+    // SAFETY: the thread is not running yet; `start_mask` is read by it only once it runs.
     unsafe { *field_of!(t, start_mask: u64) = p.sigmask.unwrap_or(all) };
 
+    // SAFETY: the descriptor is set up (TLS block, stack bounds, start routine) and not running.
     let r = unsafe { spawn_kernel_thread(t) };
     sigprocmask_set(2, all);
+    // SAFETY: `t` stays mapped until it is released below or reaped by a join or detach.
     let tid = unsafe { tid_word(t) };
     if r < 0 {
+        // it will never run: release a set*id call that waits for it (that call holds the list lock taken below)
+        // SAFETY: as above.
         unsafe { crate::setxid::thread_started(t) };
         THREAD_COUNT.fetch_sub(1, Ordering::AcqRel);
+        // SAFETY: `t` is on the list (inserted above); LIST_LOCK is held inside.
         with_lists(|l| unsafe { list_remove_all(l, t) });
         tid.store(-1, Ordering::Relaxed);
         if !mapping.is_null() {
+            // never ran: reusable at once
             with_lists(|l| {
+                // SAFETY: `t` is on no list now; its links change only under LIST_LOCK.
                 unsafe { *field_of!(t, list_next: *mut Thread) = l.free };
                 l.free = t;
             });
@@ -700,10 +942,13 @@ unsafe fn create(p: &Params<'_>, start: StartFn, arg: *mut c_void) -> Result<*mu
             if p.param.sched_priority >= 0 {
                 param = p.param;
             } else {
+                // SAFETY: the kernel writes a struct sched_param into the local.
                 unsafe { syscall2(SYS_SCHED_GETPARAM, 0, &mut param as *mut SchedParam as usize) };
             }
             err = sched_setscheduler(ktid, policy, &param);
             if err == 0 {
+                // (the new thread waits at its gate and no other thread has its handle yet)
+                // SAFETY: as above.
                 unsafe { *field_of!(t, sched: Sched) = Sched { policy, prio: param.sched_priority, flags: ATTR_FLAG_SCHED_SET | ATTR_FLAG_POLICY_SET } };
             }
         }
@@ -712,19 +957,24 @@ unsafe fn create(p: &Params<'_>, start: StartFn, arg: *mut c_void) -> Result<*mu
                 err = sched_setaffinity(ktid, set);
             }
         }
+        // SAFETY: as above; `gate` is an atomic.
         let gate = unsafe { shared_field(field_of!(t, gate: AtomicU32)) };
         if err != 0 {
             gate.store(3, Ordering::Release);
             futex_wake(gate, 1, true);
+            // wait for the thread to be gone, then take it back
             loop {
+                // SAFETY: `t` stays mapped until it is released below.
                 let v = unsafe { tid_of(t) };
                 if v == 0 {
                     break;
                 }
+                // SAFETY: the tid word as the futex the kernel wakes at the thread's end (CLONE_CHILD_CLEARTID).
                 futex_wait(unsafe { shared_field(field_of!(t, tcb.tid: AtomicU32)) }, v as u32, false);
             }
             THREAD_COUNT.fetch_sub(1, Ordering::AcqRel);
             tid.store(-1, Ordering::Relaxed);
+            // SAFETY: the thread has ended without running the program's code; nothing else uses it.
             unsafe { release(t) };
             return Err(err);
         }
@@ -735,33 +985,57 @@ unsafe fn create(p: &Params<'_>, start: StartFn, arg: *mut c_void) -> Result<*mu
 }
 
 fn syscall_getscheduler(tid: i32) -> c_int {
+    // SAFETY: plain-value system call.
     unsafe { rusty_libc_core::syscall::syscall1(SYS_SCHED_GETSCHEDULER, tid as usize) as c_int }
 }
 
+/// End the calling thread with `retval` (the common tail of pthread_exit, return from the start
+/// routine and cancellation): TSD destructors, bookkeeping, then the exit system call.
 pub fn thread_exit(retval: *mut c_void) -> ! {
     let t = current_thread();
+    // no further cancellation once we are on the way out
+    // SAFETY: the calling thread's own descriptor (all uses of `t` below).
     unsafe { cancel::word_of(t) }.fetch_or(cancel::EXITING_BIT | cancel::DISABLE_BIT, Ordering::AcqRel);
+    // SAFETY: see above; a joiner reads the result only after the thread has ended.
     unsafe { *field_of!(t, result: *mut c_void) = retval };
     rusty_libc_core::tls::run_thread_dtors();
+    // SAFETY: see above.
     unsafe { crate::key::run_destructors(t) };
+    // SAFETY: see above.
     unsafe { crate::key::free_second_level(t) };
+    // the thread's cached chunks back to their arenas, and its arena free for another thread (glibc does this last too)
+    // SAFETY: the exiting thread hands back its own malloc state, once, after its last allocation call (the destructors ran).
     unsafe { rusty_libc_malloc::thread_shutdown() };
+    // set*id calls leave the thread alone from here on (where glibc's start_thread sets EXITING_BITMASK; pthread_exit and
+    // cancellation set it earlier, as glibc's __do_cancel)
+    // SAFETY: see above.
     unsafe { crate::setxid::set_exiting(t) };
+    // SAFETY: see above.
     let is_main = unsafe { is_main_thread(t) };
     let left = THREAD_COUNT.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
+        // the last thread out ends the process the way exit(0) does
         rusty_libc_core::process::exit(0);
     }
     if is_main {
+        // SAFETY: see above.
         unsafe { crate::setxid::exit_wait(t) };
         exit_thread();
     }
+    // as glibc's start_thread: from here on (after the last-thread exit, whose atexit handlers must run with the program's
+    // mask) no signal reaches this thread except SIGSETXID, then the unused part of a stack the library allocated goes back
+    // to the kernel (it stays mapped for reuse)
     block_signals_for_exit();
     if fixed!(t, flags: u32) & FLAG_USER_STACK == 0 {
         let mapping = fixed!(t, mapping: *mut u8);
+        // SAFETY: the calling thread's own mapping.
         unsafe { advise_stack_range(mapping) };
     }
+    // a set*id call that counted on this thread gets its answer first
+    // SAFETY: see above.
     unsafe { crate::setxid::exit_wait(t) };
+    // joinable: tell joiners we are done; detached: hand the memory to the free list
+    // SAFETY: see above; `joinstate` is an atomic.
     let js = unsafe { shared_field(field_of!(t, joinstate: AtomicU32)) };
     loop {
         let s = js.load(Ordering::Acquire);
@@ -772,21 +1046,31 @@ pub fn thread_exit(retval: *mut c_void) -> ! {
                 }
             }
             DETACHED => {
+                // SAFETY: a detached thread at its end: nothing else uses its descriptor (the free list reuses it only
+                // after the kernel cleared the tid word).
                 unsafe { release(t) };
                 break;
             }
-            _ => break,
+            _ => break, // JOINING: the joiner releases it
         }
     }
     exit_thread();
 }
 
+/// rt_sigprocmask(SIG_BLOCK, all signals but SIGSETXID, NULL), glibc's last mask change of an exiting thread.
 #[inline]
 fn block_signals_for_exit() {
     let set: u64 = !(1u64 << (cancel::SIGSETXID - 1));
+    // SAFETY: the kernel reads the borrowed 8-byte mask; no old mask is asked for.
     unsafe { syscall4(rusty_libc_core::syscall::SYS_RT_SIGPROCMASK, 0, &set as *const u64 as usize, 0, 8) };
 }
 
+/// glibc's advise_stack_range (stack growing down): madvise(MADV_DONTNEED) from the start of the mapping (the guard
+/// included) up to PTHREAD_STACK_MIN below the page of the current stack pointer, if that leaves anything; the top of the
+/// stack in use, the TLS block and the descriptor stay.
+///
+/// # Safety
+/// `mem` is the start of the calling thread's own stack mapping.
 #[inline(never)]
 unsafe fn advise_stack_range(mem: *mut u8) {
     const SYS_MADVISE: usize = 28;
@@ -795,6 +1079,8 @@ unsafe fn advise_stack_range(mem: *mut u8) {
     let sp = core::hint::black_box(&raw const marker) as usize;
     let freesize = (sp - mem as usize) & !(PAGE - 1);
     if freesize > PTHREAD_STACK_MIN {
+        // SAFETY: the range is the part of this thread's own mapping below the frames in use (PTHREAD_STACK_MIN below the
+        // current page), which holds no live data any more; MADV_DONTNEED only drops its pages.
         unsafe { syscall3(SYS_MADVISE, mem as usize, freesize - PTHREAD_STACK_MIN, MADV_DONTNEED) };
     }
 }
@@ -803,11 +1089,15 @@ unsafe fn advise_stack_range(mem: *mut u8) {
 pub unsafe extern "C" fn pthread_exit(retval: *mut c_void) -> ! {
     cancel::ensure_init();
     let t = current_thread();
+    // SAFETY: the calling thread's own descriptor (all uses of `t` below).
     let w = unsafe { cancel::word_of(t) };
     w.fetch_or(cancel::EXITING_BIT | cancel::DISABLE_BIT, Ordering::AcqRel);
     w.fetch_and(!cancel::ASYNC_BIT, Ordering::AcqRel);
+    // SAFETY: see above.
     unsafe { crate::setxid::set_exiting(t) };
+    // SAFETY: see above.
     unsafe { *field_of!(t, exit_value: *mut c_void) = retval };
+    // SAFETY: the calling thread is ending with its exit value set.
     unsafe { cancel::unwind_continue() }
 }
 
@@ -816,8 +1106,11 @@ pub extern "C" fn pthread_self() -> PthreadT {
     current_thread() as PthreadT
 }
 
+/// `pthread_gettid_np (thread)`: the kernel thread id of a thread (glibc 2.42).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_gettid_np(th: PthreadT) -> c_int {
+    // the kernel clears the id when the thread has exited (and it is 0 before the thread is running): no thread, -1
+    // SAFETY: `th` is a thread handle that was not reaped (C contract).
     let tid = unsafe { tid_of(th as *mut Thread) };
     if tid > 0 { tid } else { -1 }
 }
@@ -828,17 +1121,25 @@ pub extern "C" fn pthread_equal(a: PthreadT, b: PthreadT) -> c_int {
 }
 
 unsafe extern "C" fn join_cleanup(arg: *mut c_void) {
+    // cancelled while joining: the thread stays joinable
+    // SAFETY: `arg` is the joined thread's descriptor, registered by join_common (still mapped: not reaped).
     unsafe { shared_field(field_of!(arg as *mut Thread, joinstate: AtomicU32)) }.store(JOINABLE, Ordering::Release);
 }
 
+/// The common join: `block` false is the try variant. The result goes to `retval` (None: not stored).
+///
+/// # Safety
+/// `th` is a thread handle of this process that was not reaped.
 pub unsafe fn join_common(th: PthreadT, retval: Option<&mut *mut c_void>, clock: c_int, abs: Option<&Timespec>, block: bool) -> c_int {
     let t = th as *mut Thread;
+    // SAFETY: `t` is a live handle (forwarded contract).
     if unsafe { tid_of(t) } < 0 {
         return ESRCH;
     }
     if t == current_thread() {
         return EDEADLK;
     }
+    // SAFETY: `t` is a live handle (forwarded contract); `joinstate` is an atomic.
     let js = unsafe { shared_field(field_of!(t, joinstate: AtomicU32)) };
     loop {
         let s = js.load(Ordering::Acquire);
@@ -850,11 +1151,15 @@ pub unsafe fn join_common(th: PthreadT, retval: Option<&mut *mut c_void>, clock:
         }
     }
     let mut result = 0;
+    // SAFETY: as above; the tid word is the futex the kernel wakes at the thread's end.
     let tid_futex = unsafe { shared_field(field_of!(t, tcb.tid: AtomicU32)) };
     let body = || loop {
         if block {
+            // a blocking join is a cancellation point even when the thread has already ended (glibc's tst-cancel34); the
+            // cleanup handler leaves the thread joinable
             cancel::testcancel();
         }
+        // SAFETY: `t` stays mapped while this thread joins it.
         let tid = unsafe { tid_of(t) };
         if tid == 0 {
             return true;
@@ -869,21 +1174,27 @@ pub unsafe fn join_common(th: PthreadT, retval: Option<&mut *mut c_void>, clock:
             return false;
         }
     };
+    // SAFETY: the handler gets `t`, which stays mapped while this thread joins it.
     let waited = unsafe { cancel::with_cleanup(join_cleanup, t as *mut c_void, body) };
     if !waited {
         js.store(JOINABLE, Ordering::Release);
         return result;
     }
     if let Some(r) = retval {
+        // SAFETY: the thread has ended (tid word 0): its result was written before and does not change.
         *r = unsafe { *field_of!(t, result: *mut c_void) };
     }
+    // SAFETY: the joined thread stays mapped until it is released just below.
     unsafe { tid_word(t) }.store(-1, Ordering::Relaxed);
+    // SAFETY: the joined thread has ended and this thread holds the only claim on it (JOINING).
     unsafe { release(t) };
     0
 }
 
+/// The join entry points: `retval` NULL or a writable pointer (C contract), a NULL timeout means none.
 macro_rules! retval {
     ($p:expr) => {{
+        // SAFETY: the C caller passes NULL or a writable `void *`.
         unsafe { $p.as_mut() }
     }};
 }
@@ -891,19 +1202,23 @@ macro_rules! retval {
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_join(th: PthreadT, retval: *mut *mut c_void) -> c_int {
     let retval = retval!(retval);
+    // SAFETY: `th` is a live thread handle (C contract).
     unsafe { join_common(th, retval, CLOCK_REALTIME, None, true) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_tryjoin_np(th: PthreadT, retval: *mut *mut c_void) -> c_int {
     let retval = retval!(retval);
+    // SAFETY: `th` is a live thread handle (C contract).
     unsafe { join_common(th, retval, CLOCK_REALTIME, None, false) }
 }
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_timedjoin_np(th: PthreadT, retval: *mut *mut c_void, abstime: *const Timespec) -> c_int {
+    // SAFETY: `abstime` is NULL or a valid struct timespec (C contract).
     let abs = unsafe { abstime.as_ref() };
     let retval = retval!(retval);
+    // SAFETY: `th` is a live thread handle (C contract).
     unsafe { join_common(th, retval, CLOCK_REALTIME, abs, true) }
 }
 
@@ -912,16 +1227,24 @@ pub unsafe extern "C" fn pthread_clockjoin_np(th: PthreadT, retval: *mut *mut c_
     if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
         return EINVAL;
     }
+    // SAFETY: `abstime` is NULL or a valid struct timespec (C contract).
     let abs = unsafe { abstime.as_ref() };
     let retval = retval!(retval);
+    // SAFETY: `th` is a live thread handle (C contract).
     unsafe { join_common(th, retval, clockid, abs, true) }
 }
 
+/// `pthread_detach`.
+///
+/// # Safety
+/// `th` is a thread handle of this process that was not reaped.
 pub unsafe fn detach(th: PthreadT) -> c_int {
     let t = th as *mut Thread;
+    // SAFETY: `t` is a live handle (forwarded contract).
     if unsafe { tid_of(t) } < 0 {
         return ESRCH;
     }
+    // SAFETY: `t` is a live handle (forwarded contract); `joinstate` is an atomic.
     let js = unsafe { shared_field(field_of!(t, joinstate: AtomicU32)) };
     loop {
         let s = js.load(Ordering::Acquire);
@@ -933,6 +1256,8 @@ pub unsafe fn detach(th: PthreadT) -> c_int {
             }
             EXITED => {
                 if js.compare_exchange(EXITED, DETACHED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    // it has finished its work: its memory goes to the free list now
+                    // SAFETY: the thread has finished (EXITED) and this thread holds the only claim on it.
                     unsafe { release(t) };
                     return 0;
                 }
@@ -944,58 +1269,93 @@ pub unsafe fn detach(th: PthreadT) -> c_int {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_detach(th: PthreadT) -> c_int {
+    // SAFETY: `th` is a live thread handle (C contract).
     unsafe { detach(th) }
 }
 
+/// Number of live threads (including the main thread).
 pub fn thread_count() -> usize {
     THREAD_COUNT.load(Ordering::Acquire)
 }
 
+/// True when `t` is the main thread (it was not made by pthread_create).
+///
+/// # Safety
+/// `t` is a live descriptor of this process (the calling thread's, a handle that was not reaped, or one of the list).
 pub unsafe fn is_main_thread(t: *mut Thread) -> bool {
     fixed!(t, mapping: *mut u8).is_null() && fixed!(t, flags: u32) & FLAG_USER_STACK == 0
 }
 
+/// In the child after fork: only the calling thread exists. Every other thread's memory is
+/// reclaimed, the lists are reset and the new process's thread id is recorded.
+///
+/// # Safety
+/// Called once in the child of fork, before any other thread can exist in it, with signals blocked.
 pub unsafe fn after_fork_child() {
     let me = current_thread();
+    // (the thread id: the fork's CLONE_CHILD_SETTID stored the child's in the TCB, as in glibc)
+    // kernel threads of the parent are gone; locks held by them can never be released
+    // SAFETY: the child has one thread (caller's contract), so nothing else uses the locks while they are reset; a RawMutex
+    // is a plain atomic word.
     unsafe { core::ptr::write(&raw const LIST_LOCK as *mut RawMutex, RawMutex::new()) };
+    // SAFETY: as above.
     unsafe { core::ptr::write(&raw const DEFAULT_LOCK as *mut RawMutex, RawMutex::new()) };
     let unmap_others = |l: &mut Lists| {
         let mut cur = l.all;
         while !cur.is_null() {
+            // SAFETY: the parent's list, intact in the child's copy of memory; no other thread runs.
             let next = unsafe { next_of(cur) };
             if cur != me && fixed!(cur, flags: u32) & FLAG_USER_STACK == 0 && !fixed!(cur, mapping: *mut u8).is_null() {
                 let (m, n) = (fixed!(cur, mapping: *mut u8), fixed!(cur, mapping_size: usize));
+                // SAFETY: the mapping of a thread that does not exist in the child; nothing uses it.
                 unsafe { munmap(m, n) };
             }
             cur = next;
         }
         let mut cur = l.free;
         while !cur.is_null() {
+            // SAFETY: as above, for the cache.
             let next = unsafe { next_of(cur) };
             let (m, n) = (fixed!(cur, mapping: *mut u8), fixed!(cur, mapping_size: usize));
+            // SAFETY: a cached mapping; nothing uses it.
             unsafe { munmap(m, n) };
             cur = next;
         }
         l.free = core::ptr::null_mut();
         l.all = core::ptr::null_mut();
     };
+    // SAFETY: the child has one thread (caller's contract): nothing else touches LISTS.
     unsafe { LISTS.with_unsync(unmap_others) };
+    // the initial thread exists in the child only if it is the one that forked
     if MAIN_TD.load(Ordering::Relaxed) != me {
         MAIN_TD.store(core::ptr::null_mut(), Ordering::Relaxed);
         MAIN_GONE.store(true, Ordering::Relaxed);
     }
+    // SAFETY: own descriptor; atomics.
     unsafe { shared_field(field_of!(me, xid: AtomicU32)) }.store(0, Ordering::Relaxed);
+    // SAFETY: as above.
     unsafe { shared_field(field_of!(me, setxid_futex: AtomicU32)) }.store(0, Ordering::Relaxed);
+    // SAFETY: own descriptor.
     if !unsafe { is_main_thread(me) } {
+        // (not through list_insert_all: libthread_db's lists still link the parent's other threads, whose stacks were just
+        // unmapped; thread_db::after_fork below starts them again with this thread alone)
         let insert = |l: &mut Lists| {
+            // SAFETY: own descriptor, on no list now; the only thread holds the lists.
             unsafe { list_insert_all_only(l, me) }
         };
+        // SAFETY: one thread (caller's contract): nothing else touches LISTS.
         unsafe { LISTS.with_unsync(insert) };
     }
+    // the debugger's lists hold only this thread now
+    // SAFETY: own TCB, the only thread.
     unsafe { rusty_libc_core::thread_db::after_fork(me as *mut Tcb) };
     THREAD_COUNT.store(1, Ordering::Release);
+    // (the robust list: rusty-libc-core's fork registered an empty one in the child, as glibc's _Fork does)
+    // SAFETY: own descriptor.
     unsafe { cancel::word_of(me) }.fetch_and(!cancel::CANCELED_BIT, Ordering::AcqRel);
 }
+
+// ---- pthread_getattr_np -------------------------------------------------------------------
 
 fn parse_hex(s: &[u8]) -> usize {
     let mut v = 0usize;
@@ -1010,7 +1370,11 @@ fn parse_hex(s: &[u8]) -> usize {
     v
 }
 
+/// Find the mapping that contains `addr` in /proc/self/maps: Ok((end of the previous mapping, end of this one)), or the
+/// error glibc's pthread_getattr_np reports: the open's errno (a chrooted sandbox such as Chromium's renderers has no
+/// /proc), ENOENT when no line contains the address.
 fn find_mapping(addr: usize) -> Result<(usize, usize), c_int> {
+    // SAFETY: the kernel reads the static NUL-terminated path.
     let fd = unsafe { rusty_libc_core::syscall::sys_open(c"/proc/self/maps".as_ptr() as usize, 0x80000, 0) };
     let e = errno_of(fd);
     if e != 0 {
@@ -1021,6 +1385,7 @@ fn find_mapping(addr: usize) -> Result<(usize, usize), c_int> {
     let mut result = Err(ENOENT);
     let mut last_to = 0usize;
     'outer: loop {
+        // SAFETY: the kernel writes at most `buf.len() - have` bytes into the free tail of the local buffer.
         let n = unsafe { syscall3(rusty_libc_core::syscall::SYS_READ, fd, buf[have..].as_mut_ptr() as usize, buf.len() - have) };
         if errno_of(n) != 0 || n == 0 {
             break;
@@ -1050,13 +1415,17 @@ fn find_mapping(addr: usize) -> Result<(usize, usize), c_int> {
     result
 }
 
+/// The initial thread's stack as glibc reports it: from the page above `__libc_stack_end` down by RLIMIT_STACK less the
+/// part of the stack mapping above that page, page-aligned and never past the mapping below.
 fn main_stack() -> Result<(usize, usize), c_int> {
     let mut end = tls::stack_end();
     if end == 0 {
+        // no startup record (host unit tests): somewhere in the current frame
         end = &raw const end as usize;
     }
     let (last_to, to) = find_mapping(end)?;
     let mut lim = [0u64; 2];
+    // SAFETY: the kernel writes a struct rlimit (two u64) into the local array.
     let r = unsafe { syscall4(SYS_PRLIMIT64, 0, 3, 0, lim.as_mut_ptr() as usize) };
     let e = errno_of(r);
     if e != 0 {
@@ -1072,12 +1441,18 @@ fn main_stack() -> Result<(usize, usize), c_int> {
 
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_getattr_np(th: PthreadT, attr: *mut PthreadAttr) -> c_int {
+    // SAFETY: `attr` is writable memory for one attribute (C contract); its old contents are not read.
     unsafe { write_attr(attr, PthreadAttr::new()) };
+    // SAFETY: as above, now initialised; no other thread uses it during the call.
     let a = unsafe { arg_mut(attr) };
     let t = th as *mut Thread;
+    // held until the end, as glibc (the sched cache must not change under us)
+    // SAFETY: `th` is a live thread handle (C contract); getattr_locked does not take its lock.
     let body = |sched: &mut Sched| {
+        // SAFETY: `th` is a live thread handle (C contract).
         unsafe { getattr_locked(t, a, *sched) }
     };
+    // SAFETY: as above; getattr_locked does not take the thread's lock.
     let r = unsafe { with_sched_locked(t, body) };
     if r != 0 {
         a.destroy();
@@ -1085,16 +1460,25 @@ pub unsafe extern "C" fn pthread_getattr_np(th: PthreadT, attr: *mut PthreadAttr
     r
 }
 
+/// pthread_getattr_np's work with `t`'s lock held (`sched` is its cache).
+///
+/// # Safety
+/// `t` is a live thread handle.
 unsafe fn getattr_locked(t: *mut Thread, a: &mut PthreadAttr, sched: Sched) -> c_int {
+    // SAFETY: `t` is a live handle (pthread_getattr_np's contract); `joinstate` is an atomic.
     if unsafe { shared_field(field_of!(t, joinstate: AtomicU32)) }.load(Ordering::Acquire) == DETACHED {
         a.flags |= ATTR_FLAG_DETACHSTATE;
     }
+    // (the descriptor's word, read plainly as glibc reads it)
+    // SAFETY: `t` is a live handle.
     let tid = if t == current_thread() { gettid() } else { unsafe { tid_word(t) }.load(Ordering::Relaxed) };
+    // scheduling values as the thread library knows them, like glibc (no system call)
     a.schedpolicy = sched.policy;
     a.schedparam = SchedParam { sched_priority: sched.prio };
     a.flags |= fixed!(t, attr_flags: i32) | sched.flags;
+    // SAFETY: `t` is a live handle.
     if unsafe { is_main_thread(t) } {
-        a.guardsize = 0;
+        a.guardsize = 0; // glibc reports no guard for the initial thread
         a.flags |= ATTR_FLAG_STACKADDR;
         match main_stack() {
             Ok((addr, size)) => {
@@ -1102,6 +1486,7 @@ unsafe fn getattr_locked(t: *mut Thread, a: &mut PthreadAttr, sched: Sched) -> c
                 a.stacksize = size;
             }
             Err(e) => {
+                // like glibc: no stack information is an error (callers such as V8 then use another way)
                 return e;
             }
         }
@@ -1120,6 +1505,7 @@ unsafe fn getattr_locked(t: *mut Thread, a: &mut PthreadAttr, sched: Sched) -> c
         }
         a.flags |= ATTR_FLAG_STACKADDR;
     }
+    // affinity
     let ks = kernel_cpumask_size();
     let Ok(e) = a.ext_alloc(ks) else { return ENOMEM };
     let r = sched_getaffinity(tid, e.room_mut(ks));

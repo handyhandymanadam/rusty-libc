@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""Generate crates/rusty-libc-iconv/src/composedata/<name>.rs for the 8-bit charsets that compose and
+decompose (CP1255, CP1258, TCVN5712-1): the byte table, the pairs (base, mark) -> composed
+character found by decoding two-byte (and for CP1255 three-byte) sequences, and the decompositions
+found by encoding every character. From the behaviour of the host's iconv (mbprobe decf / enc).
+Usage: gen_compose.py NAME... (writes ../src/composedata/NAME.rs)"""
 import os, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "..", "src", "composedata")
@@ -26,6 +31,7 @@ def build(name, iname):
     for k, v in pairs.items():
         if len(v) == 1:
             comp[(dec[k[0]], dec[k[1]])] = v[0]
+    # chained compositions: a composed character that is itself a base (CP1255)
     marks = sorted({m for (_, m) in comp})
     bases = sorted({b for (b, _) in comp})
     mark_bytes = [b for b in dec if dec[b] in marks]

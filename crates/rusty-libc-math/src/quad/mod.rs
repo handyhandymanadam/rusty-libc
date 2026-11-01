@@ -1,3 +1,13 @@
+//! `_Float128` (IEEE 754 binary128, the C type `_Float128`/`_Float128` of the `f128` names): the
+//! number type, exact conversions, correctly rounded arithmetic in software (integer operations
+//! only: no floating-point state is read except the rounding direction, and exceptions are raised
+//! explicitly), and the libm functions glibc exports for it (`sinf128`, `fmaf128`, ...).
+//!
+//! The values travel through the C ABI in an xmm register (the Rust type `f128`, used only to carry
+//! the bits); everything inside works on [`F128`], a wrapper of the 128 bits. Transcendental
+//! functions are computed in [`crate::longdouble::ext::Ext`] (128-bit significand, error about
+//! 2^-120 relative) and rounded once, so results are within a small fraction of an ulp of the true
+//! value (glibc documents errors of 1 to 4 ulp for its own).
 use crate::fenv::{self, FE_DIVBYZERO, FE_INVALID, RoundMode};
 use crate::longdouble::ext::{Class, Ext, Exact, Fmt, K, Wide, mul_wide, raise_flags};
 
@@ -9,9 +19,13 @@ pub mod expfn;
 pub mod special;
 pub mod trigfn;
 pub mod narrow;
-pub mod cplx;
-pub mod c23;
+pub mod cplx; // the complex.h functions for _Float128
+pub mod c23; // pown, powr, rootn, compoundn, rsqrt for float and double
 
+#[cfg(test)]
+mod tests;
+
+/// The binary128 format: 113 significant bits, exponents -16382 ..= 16383.
 pub const F128F: Fmt = Fmt { p: 113, emin: -16382, emax: 16383, bias: 16383 };
 
 pub const SIGN: u128 = 1 << 127;
@@ -19,6 +33,7 @@ pub const FRAC: u128 = (1 << 112) - 1;
 pub const EXPM: u128 = 0x7fff << 112;
 pub const QUIET: u128 = 1 << 111;
 
+/// A binary128 number, as its 128 bits.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[repr(transparent)]
 pub struct F128(pub u128);
@@ -30,7 +45,9 @@ impl F128 {
     pub const NEG_ONE: F128 = F128(SIGN | (0x3fff << 112));
     pub const INF: F128 = F128(EXPM);
     pub const NEG_INF: F128 = F128(SIGN | EXPM);
+    /// A positive quiet NaN.
     pub const NAN: F128 = F128(EXPM | QUIET);
+    /// The NaN that invalid operations produce on x86 (negative, quiet, empty payload).
     pub const DEFAULT_NAN: F128 = F128(SIGN | EXPM | QUIET);
     pub const MAX: F128 = F128((0x7ffe << 112) | FRAC);
     pub const MIN_POSITIVE: F128 = F128(1 << 112);
@@ -85,6 +102,7 @@ impl F128 {
         let e = self.exp_field();
         e != 0 && e != 0x7fff
     }
+    /// The same NaN, quiet.
     #[inline]
     pub const fn quieted(self) -> F128 {
         F128(self.0 | QUIET)
@@ -114,6 +132,7 @@ impl F128 {
         F128((0x3fff << 112) | if neg { SIGN } else { 0 })
     }
 
+    /// The exact value as an [`Ext`] (NaN carries no payload there).
     pub fn to_ext(self) -> Ext {
         let neg = self.is_neg();
         let ex = self.exp_field();
@@ -131,16 +150,19 @@ impl F128 {
         Ext { neg, k: K::Fin, e: ex as i64 - 16383, m: ((1u128 << 112) | fr) << 15 }
     }
 
+    /// The bits as the Rust type `f128`, which only carries them through the C ABI.
     #[inline]
     pub fn to_f128(self) -> f128 {
         f128::from_bits(self.0)
     }
 
+    /// From the Rust type `f128`.
     #[inline]
     pub fn from_f128(x: f128) -> F128 {
         F128(x.to_bits())
     }
 
+    /// Widen a `f64` exactly (a signaling NaN becomes quiet and raises invalid).
     pub fn from_f64(x: f64) -> F128 {
         let b = x.to_bits();
         let neg = b >> 63 != 0;
@@ -160,14 +182,16 @@ impl F128 {
             if fr == 0 {
                 return F128(s);
             }
-            let top = 127 - fr.leading_zeros() as i64;
-            let e = top - 1074;
+            // subnormal: normalize
+            let top = 127 - fr.leading_zeros() as i64; // bit position of the leading one
+            let e = top - 1074; // unbiased exponent of the value
             let sig = (fr << (112 - top)) & FRAC;
             return F128(s | (((e + 16383) as u128) << 112) | sig);
         }
         F128(s | (((ex - 1023 + 16383) as u128) << 112) | (fr << 60))
     }
 
+    /// Widen a `f32` exactly.
     pub fn from_f32(x: f32) -> F128 {
         let b = x.to_bits();
         let neg = b >> 31 != 0;
@@ -195,6 +219,7 @@ impl F128 {
         F128(s | (((ex - 127 + 16383) as u128) << 112) | (fr << 89))
     }
 
+    /// Widen an x87 `long double` exactly (a pseudo-denormal or unnormal is read as the hardware does).
     pub fn from_f80(x: crate::longdouble::common::F80) -> F128 {
         let e = Ext::from_f80(x);
         let b = x.0;
@@ -215,20 +240,31 @@ impl F128 {
     }
 }
 
+/// An exactly representable [`Ext`] (zero, infinity or a finite value with at most 113 significant
+/// bits in range) as bits; NaN becomes the default NaN.
 pub fn pack_exact(e: &Ext) -> F128 {
     finish_ext(e, Exact::Yes)
 }
 
+// ---------------------------------------------------------------------------------------------
+// rounding
+
+/// Result of rounding a [`Wide`] to a format with up to 128 significant bits.
 #[derive(Clone, Copy, Debug)]
 pub struct Rnd128 {
     pub class: Class,
     pub neg: bool,
+    /// The significand including the leading bit (finite results).
     pub q: u128,
+    /// Biased exponent field (0 for subnormal results).
     pub field: i64,
     pub flags: u32,
+    /// The overflow went to the largest finite number (directed rounding), not infinity.
     pub to_max: bool,
 }
 
+/// Round `w` (nonzero, normalized) to `fmt` (precision at most 113) in rounding direction `mode`,
+/// deciding the exception flags (inexact, underflow after rounding, overflow).
 pub fn round_wide128(w: &Wide, fmt: Fmt, mode: RoundMode) -> Rnd128 {
     use crate::fenv::{FE_INEXACT, FE_OVERFLOW, FE_UNDERFLOW};
     let p = fmt.p;
@@ -255,6 +291,7 @@ pub fn round_wide128(w: &Wide, fmt: Fmt, mode: RoundMode) -> Rnd128 {
     let mut q = q + up as u128;
     let mut u = if tiny { fmt.emin - p + 1 } else { e - p + 1 };
     let mut flags = 0u32;
+    // tininess after rounding to p bits with an unbounded exponent (as the long double code does)
     let mut tiny_flag = tiny;
     if tiny && e == fmt.emin - 1 {
         let qp = w.hi >> (128 - p);
@@ -305,6 +342,7 @@ pub fn round_wide128(w: &Wide, fmt: Fmt, mode: RoundMode) -> Rnd128 {
     Rnd128 { class: Class::Fin, neg: w.neg, q, field, flags, to_max: false }
 }
 
+/// The bits of a result rounded with [`round_wide128`] and [`F128F`].
 pub fn rnd_to_f128(r: &Rnd128) -> F128 {
     let s = if r.neg { SIGN } else { 0 };
     match r.class {
@@ -314,26 +352,32 @@ pub fn rnd_to_f128(r: &Rnd128) -> F128 {
     }
 }
 
+/// Raise the flags of a rounding (overflow, underflow, inexact).
 pub fn raise_rnd_flags(flags: u32) {
     if flags != 0 {
         raise_flags(flags);
     }
 }
 
+/// Round a wide result to binary128 in the current rounding direction and raise its flags.
 pub fn round_wide_f128(w: &Wide) -> F128 {
     round_wide_f128_flags(w).0
 }
 
+/// As [`round_wide_f128`], also returning the flags that were raised.
 pub fn round_wide_f128_flags(w: &Wide) -> (F128, u32) {
     let r = round_wide128(w, F128F, fenv::round_mode());
     raise_rnd_flags(r.flags);
     (rnd_to_f128(&r), r.flags)
 }
 
+/// Round an [`Ext`] result to binary128 and raise the flags it implies; `ex` says how sure the caller is
+/// that the true value differs from the computed one (see [`Exact`]). The default NaN stands for NaN.
 pub fn finish_ext(x: &Ext, ex: Exact) -> F128 {
     finish_ext_flags(x, ex).0
 }
 
+/// As [`finish_ext`], also returning the flags that the rounding raised.
 pub fn finish_ext_flags(x: &Ext, ex: Exact) -> (F128, u32) {
     match x.k {
         K::Zero => return (F128::zero(x.neg), 0),
@@ -349,6 +393,8 @@ pub fn finish_ext_flags(x: &Ext, ex: Exact) -> (F128, u32) {
             w = Wide { hi: x.m - 1, lo: u128::MAX, sticky: true, ..w }.normalize();
         }
         Exact::IfClose => {
+            // the computation is good to about 2^-120: within 2^-8 ulp of a representable number
+            // (the 15 bits below the 113-bit significand) the result is taken to be exact
             const TAIL: u128 = (1 << 15) - 1;
             let tail = x.m & TAIL;
             let close = !((1 << 8)..=TAIL - (1 << 8)).contains(&tail);
@@ -372,22 +418,29 @@ pub fn finish_ext_flags(x: &Ext, ex: Exact) -> (F128, u32) {
     round_wide_f128_flags(&w)
 }
 
+// ---------------------------------------------------------------------------------------------
+// helpers shared by the function modules (the same roles as `longdouble::common`)
+
 pub use crate::rounding::fp::{EDOM, ERANGE, set_errno};
 
+/// Raise "invalid" and return the default NaN.
 pub fn invalid() -> F128 {
     fenv::raise_exceptions(FE_INVALID as u32);
     F128::DEFAULT_NAN
 }
 
+/// Domain error: invalid, errno EDOM, and a NaN of the given sign.
 pub fn domain_nan(neg: bool) -> F128 {
     set_errno(EDOM);
     invalid().with_sign(neg)
 }
 
+/// Domain error with the default (negative) NaN.
 pub fn domain() -> F128 {
     domain_nan(true)
 }
 
+/// Pole error: infinity of the given sign, divide-by-zero raised, errno ERANGE.
 pub fn pole(neg: bool) -> F128 {
     set_errno(ERANGE);
     fenv::raise_exceptions(FE_DIVBYZERO as u32);
@@ -398,6 +451,7 @@ pub fn erange() {
     set_errno(ERANGE);
 }
 
+/// The quiet NaN carrying the payload of `x` (the result of `x + x`): invalid for a signaling NaN.
 pub fn nan1(x: F128) -> F128 {
     if x.is_snan() {
         fenv::raise_exceptions(FE_INVALID as u32);
@@ -405,6 +459,7 @@ pub fn nan1(x: F128) -> F128 {
     x.quieted()
 }
 
+/// The NaN `x + y` gives when one is a NaN: the first NaN operand, quieted (invalid if either is signaling).
 pub fn nan2(x: F128, y: F128) -> F128 {
     if x.is_snan() || y.is_snan() {
         fenv::raise_exceptions(FE_INVALID as u32);
@@ -412,6 +467,7 @@ pub fn nan2(x: F128, y: F128) -> F128 {
     if x.is_nan() { x.quieted() } else { y.quieted() }
 }
 
+/// Product of two normalized 128-bit significands: the exact 256-bit [`Wide`].
 pub(crate) fn mul_exact(neg: bool, ea: i64, ma: u128, eb: i64, mb: u128) -> Wide {
     let (hi, lo) = mul_wide(ma, mb);
     Wide { neg, e: ea + eb + 1, hi, lo, sticky: false }.normalize()

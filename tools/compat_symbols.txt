@@ -1,3 +1,5 @@
+# glibc 2.43 (libc.so.6 of this machine): symbols exported only with a non-default version (compat), from `objdump -T`: name version kind size
+# Used by hdrgen compat-symver and tests/gaps_symver.sh.
 _IO_vfscanf GLIBC_2.2.5 func 56
 __after_morecore_hook GLIBC_2.2.5 data 8
 __ctype32_b GLIBC_2.2.5 data 8

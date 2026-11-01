@@ -6,13 +6,24 @@ license.workspace = true
 
 [dependencies]
 rusty-libc-core = { path = "../rusty-libc-core" }
+# gethostid's rules, shared with the Rust face (no features: no libc services)
 rusty-libc-rs-core = { path = "../rusty-libc-rs-core" }
 rusty-libc-mem = { path = "../rusty-libc-mem" }
 rusty-libc-malloc = { path = "../rusty-libc-malloc" }
+# rcmd: the user database (getpwnam_r) and warn/warnx for .netrc
 rusty-libc-util = { path = "../rusty-libc-util" }
+# getaddrinfo_a: worker threads and the notification code of POSIX AIO
 rusty-libc-ipc = { path = "../rusty-libc-ipc" }
+# idna: mbrtowc for the Rust runtime (no C symbols)
 rusty-libc-wchar = { path = "../rusty-libc-wchar" }
 
+[dev-dependencies]
+libc = "0.2"
+rusty-libc-malloc = { path = "../rusty-libc-malloc", features = ["no-brk"] }
+
 [features]
+# Export the C symbols. Off for host tests so they never replace the host libc.
 export = ["start"]
+# Take the vDSO address from rusty-libc-core's startup code (programs started by its `_start`) instead of
+# reading /proc/self/auxv.
 start = ["rusty-libc-core/start"]

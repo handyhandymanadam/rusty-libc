@@ -1,11 +1,26 @@
+//! netdb.h netgroups: `setnetgrent`, `getnetgrent`, `getnetgrent_r`, `endnetgrent`, `innetgr`, on the `files`
+//! database `/etc/netgroup` (the service list comes from the `netgroup:` line of nsswitch.conf; only `files` is
+//! known, any other source is skipped like the other databases here).
+//!
+//! The file has lines `name (host,user,domain) (host,user,domain) othergroup ...`, long lines continued with a
+//! backslash at the end. `setnetgrent` finds the group and keeps its text; `getnetgrent` hands out the triples one
+//! by one, and when a group names other groups it goes through those too (each group at most once);
+//! `innetgr` searches a triple the same way. The algorithms (including their quirks) follow glibc 2.43
+//! nss/getnetgrent_r.c and nss/nss_files/files-netgrp.c, read as reference and written in Rust.
+//!
+//! U2: the state is an [`Ng`]: glibc's `struct __netgrent` (the layout the plug-in modules fill) plus, in Rust types, what
+//! only this file uses: the `files` text and its read position, and the lists of known and needed groups (the struct's own
+//! fields for them stay NULL). What stays unsafe: the module functions (one transmute each), the strings a source stored in
+//! the entry (read only after a successful get), the global state under its lock and the C arguments.
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
-use crate::nss;
+use crate::nss::{self, ZBuf};
 use crate::util::{HeapVec, eq_nocase, is_space};
 use core::ffi::{CStr, c_char, c_int};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
 use rusty_libc_core::errno;
 use rusty_libc_core::ffi;
+use rusty_libc_core::nscd;
 use rusty_libc_core::sync_cell::SyncCell;
 
 const ERANGE: i32 = 34;
@@ -21,6 +36,7 @@ enum St {
     Return,
 }
 
+/// A NUL-terminated copy of a group name (empty when out of memory).
 struct Name(HeapVec<u8>);
 
 impl Name {
@@ -33,6 +49,7 @@ impl Name {
     }
 }
 
+/// A list of group names (glibc's `struct name_list`): membership, push, and pop of the last pushed.
 struct Names {
     bytes: HeapVec<u8>,
     ranges: HeapVec<(usize, usize)>,
@@ -45,6 +62,7 @@ impl Names {
     fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
+    /// false when out of memory (the list is unchanged then).
     fn push(&mut self, name: &[u8]) -> bool {
         let s = self.bytes.len();
         self.bytes.extend_from(name) && self.ranges.push((s, s + name.len()))
@@ -52,9 +70,11 @@ impl Names {
     fn contains(&self, name: &[u8]) -> bool {
         self.ranges.iter().any(|&(s, e)| &self.bytes[s..e] == name)
     }
+    /// The last pushed name (a copy), taken off the list; None when empty or out of memory.
     fn pop(&mut self) -> Option<Name> {
         let &(s, e) = self.ranges.last()?;
         let n = Name::of(&self.bytes[s..e]);
+        // the ranges shrink by rebuilding (HeapVec cannot truncate); lists are short
         let mut r = HeapVec::new();
         let k = self.ranges.len() - 1;
         if !r.extend_from(&self.ranges[..k]) {
@@ -68,29 +88,46 @@ impl Names {
     }
 }
 
+/// glibc's `struct __netgrent`, with its layout: plug-in modules (`_nss_NAME_setnetgrent` and friends) fill it in.
 #[repr(C)]
 struct NetGrent {
+    /// 0: the last entry is a triple, 1: it is the name of another group (then `host` holds the name: glibc's union).
     typ: c_int,
     host: *const c_char,
     user: *const c_char,
     domain: *const c_char,
+    /// The text of the group's line and how far it has been read (the modules' own; `files` keeps its text in `Ng`).
     data: *mut u8,
     data_size: usize,
     cursor: *mut u8,
+    /// No entry returned yet from this text (an empty or bad text then means "not found").
     first: c_int,
+    /// glibc's lists of known and needed groups (always NULL here: see `Ng`).
     known: *mut u8,
     needed: *mut u8,
+    /// The source in use plus one (0: none); glibc keeps a pointer into the list of sources here.
     nip: usize,
 }
 
+/// The netgroup state: the C entry plus what only this file uses.
 struct Ng {
     d: NetGrent,
+    /// The `files` source's text of the group (NUL-terminated) and the read position in it (None: no text).
     text: HeapVec<u8>,
     cur: Option<usize>,
     known: Names,
     needed: Names,
+    /// The last get succeeded: the entry's strings were stored by the source and may be read.
     got: bool,
+    /// The entries the name service cache daemon sent (three NUL-terminated strings each), `daemon_len` bytes, and the read
+    /// position. Used while `d.nip` is [`DAEMON`].
+    daemon: ZBuf,
+    daemon_len: usize,
+    daemon_at: usize,
 }
+
+/// `d.nip` while the entries come from the name service cache daemon (glibc keeps -1 there).
+const DAEMON: usize = usize::MAX;
 
 impl Ng {
     const fn new() -> Ng {
@@ -101,12 +138,18 @@ impl Ng {
             known: Names::new(),
             needed: Names::new(),
             got: false,
+            daemon: ZBuf::new(),
+            daemon_len: 0,
+            daemon_at: 0,
         }
     }
+    /// The entry's strings after a successful get: host (or the group name), user, domain (None: NULL).
     fn strs(&self) -> [Option<&[u8]>; 3] {
         if !self.got {
             return [None; 3];
         }
+        // SAFETY: after a successful get the source stored NULL or C strings (in the caller's buffer, our text or the
+        // module's memory), which stay until the next get or end; `&self` keeps those from running meanwhile.
         [self.d.host, self.d.user, self.d.domain].map(|p| unsafe { ffi::cstr(p) }.map(CStr::to_bytes))
     }
 }
@@ -114,10 +157,12 @@ impl Ng {
 use rusty_libc_core::nssent::{self, EntOps, Fn3};
 use rusty_libc_core::nssmod;
 
+/// The sources of the `netgroup` database: the override of `__nss_configure_lookup`, else nsswitch.conf, else `files`.
 fn ng_order() -> nssmod::Order {
     nssmod::order(b"netgroup")
 }
 
+/// What the netgroup functions of a source are: `files` is built in, `dns` has none, the rest are module functions.
 struct NgOps;
 
 fn ng_fn_name(f: Fn3) -> &'static [u8] {
@@ -158,6 +203,7 @@ fn st_of(status: i32) -> St {
     }
 }
 
+/// `_nss_NAME_setnetgrent` of source `src` (files: built in).
 fn src_set(src: &nssmod::Source, group: &CStr, st: &mut Ng) -> St {
     st.got = false;
     if nssent::is_files(src) {
@@ -167,6 +213,8 @@ fn src_set(src: &nssmod::Source, group: &CStr, st: &mut Ng) -> St {
     if f == 0 {
         return St::Unavail;
     }
+    // SAFETY: `f` is the module's `_nss_NAME_setnetgrent`, whose C type this is (glibc's NSS module ABI); it is called
+    // once, below, with a C string and the valid entry.
     let f: extern "C" fn(*const c_char, *mut NetGrent) -> c_int = unsafe { core::mem::transmute(f) };
     st_of(f(group.as_ptr(), &mut st.d))
 }
@@ -180,6 +228,8 @@ fn src_get(src: &nssmod::Source, st: &mut Ng, buffer: &mut [u8]) -> St {
         if f == 0 {
             return St::Unavail;
         }
+        // SAFETY: `f` is the module's `_nss_NAME_getnetgrent_r`, whose C type this is; called once, below, with the valid
+        // entry, the buffer's writable bytes and the calling thread's errno pointer.
         let f: extern "C" fn(*mut NetGrent, *mut u8, usize, *mut c_int) -> c_int = unsafe { core::mem::transmute(f) };
         st_of(f(&mut st.d, buffer.as_mut_ptr(), buffer.len(), errno::location()))
     };
@@ -195,11 +245,13 @@ fn src_end(src: &nssmod::Source, st: &mut Ng) {
     }
     let f = ng_module_fn(src, Fn3::End);
     if f != 0 {
+        // SAFETY: `f` is the module's `_nss_NAME_endnetgrent`, whose C type this is; called once with the valid entry.
         let f: extern "C" fn(*mut NetGrent) -> c_int = unsafe { core::mem::transmute(f) };
         f(&mut st.d);
     }
 }
 
+/// glibc's `__nss_netgroup_lookup2`: the first source that has `setnetgrent`. 0 found.
 fn ng_lookup(ord: &nssmod::Order, nip: &mut usize, f: Fn3) -> i32 {
     nssent::lookup(ord, nip, f, &mut NgOps)
 }
@@ -215,6 +267,7 @@ fn ng_next2(ord: &nssmod::Order, nip: &mut usize, f: Fn3, status: St) -> i32 {
     nssent::next2(ord, nip, f, s, false, &mut NgOps)
 }
 
+/// `n` more zero bytes at the end of `v` (false when out of memory).
 fn grow_zeroed(v: &mut HeapVec<u8>, n: usize) -> bool {
     let zeros = [0u8; 512];
     let mut left = n;
@@ -228,8 +281,12 @@ fn grow_zeroed(v: &mut HeapVec<u8>, n: usize) -> bool {
     true
 }
 
+/// The whole of a file: (buffer, bytes read). The buffer starts at 4096 bytes and doubles when full, so the reads ask for
+/// the same sizes as before.
 fn read_file(path: &crate::util::Buf<320>) -> Result<(HeapVec<u8>, usize), i32> {
+    // etc_path always ends the path with a NUL (it is the last byte pushed); a path with none cannot be opened
     let Ok(path) = CStr::from_bytes_until_nul(&path.b) else { return Err(ENOMEM) };
+    // SAFETY: `path` is a C string.
     let fd = match unsafe { rusty_libc_core::unistd::open(path.as_ptr(), 0o2000000, 0) } {
         Ok(fd) => fd,
         Err(e) => return Err(e.0),
@@ -256,11 +313,13 @@ fn read_file(path: &crate::util::Buf<320>) -> Result<(HeapVec<u8>, usize), i32> 
     Ok((buf, len))
 }
 
+/// `_nss_files_endnetgrent`: drop the text.
 fn files_end(st: &mut Ng) {
     st.text = HeapVec::new();
     st.cur = None;
 }
 
+/// A text being built that can drop its last bytes (glibc's line buffer edits).
 struct Text {
     v: HeapVec<u8>,
     len: usize,
@@ -281,6 +340,7 @@ impl Text {
     }
 }
 
+/// `_nss_files_setnetgrent`: find `group` in the file and keep its text.
 fn files_set(group: &[u8], st: &mut Ng) -> St {
     if group.is_empty() {
         return St::Unavail;
@@ -291,6 +351,7 @@ fn files_set(group: &[u8], st: &mut Ng) -> St {
         Err(e) => return if e == EAGAIN { St::TryAgain } else { St::Unavail },
     };
     let bytes = &file[..flen];
+    // line k: bytes[s..e] with the newline at e (when e < flen); getline's length includes it
     let mut pos = 0usize;
     let next_line = |pos: &mut usize| -> Option<(usize, usize)> {
         if *pos >= flen {
@@ -312,11 +373,13 @@ fn files_set(group: &[u8], st: &mut Ng) -> St {
         let line = &bytes[s..end];
         let found = line.len() > group.len() && line[..group.len()] == *group && is_space(line[group.len()]);
         if found {
+            // the text after the name and the separator, newline included
             if !out.extend(&line[group.len() + 1..]) {
                 oom = true;
                 break;
             }
         }
+        // a backslash before the newline: the next line goes on
         let mut cur = (s, end);
         while cur.1 - cur.0 > 1 && bytes[cur.1 - 1] == b'\n' && bytes[cur.1 - 2] == b'\\' {
             if found {
@@ -326,6 +389,7 @@ fn files_set(group: &[u8], st: &mut Ng) -> St {
                 Some((s2, e2)) => {
                     cur = (s2, e2);
                     if found {
+                        // a separator where the backslash was, then the new line (its newline replaces the old one)
                         if !out.push(b' ') || !out.extend(&bytes[s2..e2]) {
                             oom = true;
                             break;
@@ -349,6 +413,7 @@ fn files_set(group: &[u8], st: &mut Ng) -> St {
         return St::Unavail;
     }
     if status == St::Success {
+        // NUL-terminate and keep
         if !out.push(0) {
             return St::Unavail;
         }
@@ -361,6 +426,7 @@ fn files_set(group: &[u8], st: &mut Ng) -> St {
     status
 }
 
+/// Strip white space round the field of `b` that starts at `start` and ends at a NUL; its start, or None when empty.
 fn strip_whitespace(b: &mut [u8], start: usize) -> Option<usize> {
     let mut c = start;
     while is_space(b[c]) {
@@ -374,9 +440,11 @@ fn strip_whitespace(b: &mut [u8], start: usize) -> Option<usize> {
     if b[s] == 0 { None } else { Some(s) }
 }
 
+/// `_nss_netgroup_parseline`: the next entry of the `files` text.
 fn parseline(st: &mut Ng, buffer: &mut [u8]) -> St {
     let Some(start) = st.cur else { return St::NotFound };
     let d = &mut st.d;
+    // the text from the read position to its NUL (the last byte)
     let t = &mut st.text[start..];
     let mut i = 0usize;
     while is_space(t[i]) {
@@ -384,6 +452,7 @@ fn parseline(st: &mut Ng, buffer: &mut [u8]) -> St {
     }
     let not_found = |first: bool| if first { St::NotFound } else { St::Return };
     if t[i] != b'(' {
+        // a list of other groups
         let name = i;
         while t[i] != 0 && !is_space(t[i]) {
             i += 1;
@@ -402,6 +471,7 @@ fn parseline(st: &mut Ng, buffer: &mut [u8]) -> St {
         }
         return not_found(d.first != 0);
     }
+    // up to the next `stop` (the NUL ends the text: a bad entry)
     let skip_to = |i: &mut usize, stop: u8| -> bool {
         while t[*i] != stop {
             if t[*i] == 0 {
@@ -425,6 +495,7 @@ fn parseline(st: &mut Ng, buffer: &mut [u8]) -> St {
     if !skip_to(&mut i, b')') {
         return not_found(d.first != 0);
     }
+    // before copying to the caller's buffer make sure it is big enough
     let n = i - host;
     if n > buffer.len() {
         errno::set(ERANGE);
@@ -449,8 +520,10 @@ fn parseline(st: &mut Ng, buffer: &mut [u8]) -> St {
     St::Success
 }
 
+/// `endnetgrent_hook`: close the service in use.
 fn end_hook(st: &mut Ng, ord: &nssmod::Order) {
-    if st.d.nip == 0 {
+    // (glibc's endnetgrent_hook leaves the daemon's entries alone: getnetgrent goes on with them after endnetgrent)
+    if st.d.nip == 0 || st.d.nip == DAEMON {
         return;
     }
     let src = ord.e[st.d.nip - 1];
@@ -460,7 +533,12 @@ fn end_hook(st: &mut Ng, ord: &nssmod::Order) {
     st.d.nip = 0;
 }
 
+/// `__internal_setnetgrent_reuse`: open the group through the sources; true when found.
 fn set_reuse(group: &CStr, st: &mut Ng, ord: &mut nssmod::Order) -> bool {
+    if st.d.nip == DAEMON {
+        st.daemon = ZBuf::new();
+        st.d.nip = 0;
+    }
     end_hook(st, ord);
     let mut status = St::Unavail;
     *ord = ng_order();
@@ -481,6 +559,7 @@ fn set_reuse(group: &CStr, st: &mut Ng, ord: &mut nssmod::Order) -> bool {
             }
         }
     }
+    // add the group to the known ones
     if !st.known.push(group.to_bytes()) {
         errno::set(ENOMEM);
         status = St::TryAgain;
@@ -500,15 +579,56 @@ fn internal_end(st: &mut Ng, ord: &nssmod::Order) {
     st.needed.free();
 }
 
+/// A triple: host, user, domain (each a C string or NULL for "any").
 pub(crate) type Triple = (*mut c_char, *mut c_char, *mut c_char);
 
+/// glibc's `nscd_getnetgrent`: the next entry of the daemon's answer; an empty string is NULL ("any").
+fn daemon_entry(st: &mut Ng) -> Option<Triple> {
+    let data = st.daemon.as_slice().get(..st.daemon_len)?;
+    let [host, user, domain] = nscd::reply::netgroup_entry(data, &mut st.daemon_at)?;
+    let base = data.as_ptr();
+    let at = |r: Option<core::ops::Range<usize>>| r.map_or(null_mut(), |r| base.wrapping_add(r.start).cast_mut().cast::<c_char>());
+    st.d.typ = 0;
+    st.got = false;
+    Some((at(host), at(user), at(domain)))
+}
+
+/// `nscd_setnetgrent` and `setnetgrent` of glibc: ask the daemon first; its answer, found or not, is final. None: use the
+/// sources (`__internal_setnetgrent`).
+fn daemon_set(group: &CStr, st: &mut Ng) -> Option<c_int> {
+    let mut sink = ZBuf::new();
+    match nscd::netgroup(group.to_bytes(), &mut sink) {
+        nscd::Netgroup::Fallback => None,
+        nscd::Netgroup::NotFound => {
+            errno::set(0);
+            Some(0)
+        }
+        nscd::Netgroup::Found { len } => {
+            st.known.free();
+            st.needed.free();
+            st.daemon = sink;
+            st.daemon_len = len;
+            st.daemon_at = 0;
+            st.d.nip = DAEMON;
+            st.d.first = 1;
+            Some(1)
+        }
+    }
+}
+
+/// `__internal_getnetgrent_r`: the next triple, or None.
 fn internal_get(st: &mut Ng, ord: &mut nssmod::Order, buffer: &mut [u8]) -> Option<Triple> {
+    if st.d.nip == DAEMON {
+        return daemon_entry(st);
+    }
     let mut status = St::NotFound;
     if st.d.nip != 0 && (nssent::is_files(&ord.e[st.d.nip - 1]) || ng_module_fn(&ord.e[st.d.nip - 1], Fn3::Get) != 0) {
         loop {
             let src = ord.e[st.d.nip - 1];
             status = src_get(&src, st, buffer);
             if status == St::Return || (status == St::NotFound && !st.needed.is_empty()) {
+                // the last one of this group: go to the next group if there is one (set_reuse adds the name to the known
+                // ones, as glibc's moving the list node there does)
                 let mut found = false;
                 while !found {
                     let Some(n) = st.needed.pop() else { break };
@@ -521,6 +641,7 @@ fn internal_get(st: &mut Ng, ord: &mut nssmod::Order, buffer: &mut [u8]) -> Opti
                     }
                 }
             } else if status == St::Success && st.d.typ == 1 {
+                // the name of another group
                 let [g, _, _] = st.strs();
                 let g = g.unwrap_or(b"");
                 if st.known.contains(g) || st.needed.contains(g) {
@@ -538,6 +659,8 @@ fn internal_get(st: &mut Ng, ord: &mut nssmod::Order, buffer: &mut [u8]) -> Opti
     if status == St::Success { Some((st.d.host as *mut c_char, st.d.user as *mut c_char, st.d.domain as *mut c_char)) } else { None }
 }
 
+/// glibc's `__internal_setnetgrent`, `__internal_getnetgrent_r` and `__internal_endnetgrent` on a state of their own (the
+/// compat source walks a netgroup without touching the one a program opened with `setnetgrent`).
 pub(crate) struct PrivNetgr {
     st: Ng,
     ord: nssmod::Order,
@@ -547,9 +670,11 @@ impl PrivNetgr {
     pub(crate) const fn new() -> PrivNetgr {
         PrivNetgr { st: Ng::new(), ord: nssmod::Order::EMPTY }
     }
+    /// Open `group`; true when some source knows it.
     pub(crate) fn set(&mut self, group: &CStr) -> bool {
         internal_set(group, &mut self.st, &mut self.ord)
     }
+    /// The next triple, or None; the strings are in `buffer` or in the state.
     pub(crate) fn get(&mut self, buffer: &mut [u8]) -> Option<Triple> {
         internal_get(&mut self.st, &mut self.ord, buffer)
     }
@@ -561,12 +686,15 @@ impl PrivNetgr {
 struct Lock(AtomicBool);
 static LOCK: Lock = Lock(AtomicBool::new(false));
 
+/// The state of `setnetgrent`/`getnetgrent`: the entry, the sources `d.nip` points into (glibc keeps pointers into the
+/// list itself) and `getnetgrent`'s static buffer.
 struct Global {
     st: Ng,
     ord: nssmod::Order,
     buffer: [u8; 1024],
 }
 
+/// Rule: touched only inside [`with_global`], under LOCK.
 static GLOBAL: SyncCell<Global> = SyncCell::new(Global { st: Ng::new(), ord: nssmod::Order::EMPTY, buffer: [0; 1024] });
 
 struct Guard;
@@ -586,25 +714,46 @@ impl Drop for Guard {
 
 fn with_global<R>(f: impl FnOnce(&mut Global) -> R) -> R {
     let _g = Guard::new();
+    // SAFETY: LOCK is held for the call, and GLOBAL is only reached here; `f` (this module's code and the NSS modules it
+    // calls) never re-enters the netgroup functions that take LOCK (a re-entry would spin forever, as before).
     unsafe { GLOBAL.with_unsync(f) }
 }
 
+/// `setnetgrent (netgroup)`: open a netgroup for `getnetgrent`; 1 if it exists, 0 if not.
+///
+/// # Safety
+/// `group` is a C string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn setnetgrent(group: *const c_char) -> c_int {
+    // SAFETY: `group` is a C string (the contract; glibc also faults on NULL).
     let group = unsafe { ffi::cstr_nonnull(group) };
-    with_global(|g| internal_set(group, &mut g.st, &mut g.ord)) as c_int
+    with_global(|g| match daemon_set(group, &mut g.st) {
+        Some(r) => r,
+        None => internal_set(group, &mut g.st, &mut g.ord) as c_int,
+    })
 }
 
+/// `endnetgrent ()`: close the netgroup and forget what was read.
+///
+/// # Safety
+/// Always safe to call.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn endnetgrent() {
     with_global(|g| internal_end(&mut g.st, &g.ord))
 }
 
+/// `getnetgrent_r (host, user, domain, buffer, buflen)`: the next triple of the open netgroup (the strings are
+/// in `buffer`; a NULL pointer means "any"); 1, or 0 at the end (and for ERANGE: the buffer is too small).
+///
+/// # Safety
+/// The pointers are valid.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getnetgrent_r(host: *mut *mut c_char, user: *mut *mut c_char, domain: *mut *mut c_char, buffer: *mut c_char, buflen: usize) -> c_int {
+    // SAFETY: `buffer` is writable for `buflen` bytes and used by nothing else during the call (the contract).
     let buffer = unsafe { ffi::bytes_mut(buffer.cast::<u8>(), buflen) };
     match with_global(|g| internal_get(&mut g.st, &mut g.ord, buffer)) {
         Some(t) => {
+            // SAFETY: the out-pointers are valid for writes (the contract; glibc does not check them either).
             let [h, u, d] = [host, user, domain].map(|p| unsafe { &mut *p });
             (*h, *u, *d) = t;
             1
@@ -613,10 +762,16 @@ pub unsafe extern "C" fn getnetgrent_r(host: *mut *mut c_char, user: *mut *mut c
     }
 }
 
+/// `getnetgrent (host, user, domain)`: `getnetgrent_r` with a static 1024 byte buffer.
+///
+/// # Safety
+/// The pointers are valid.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn getnetgrent(host: *mut *mut c_char, user: *mut *mut c_char, domain: *mut *mut c_char) -> c_int {
+    // the triple is stored under the lock, as before
     with_global(|g| match internal_get(&mut g.st, &mut g.ord, &mut g.buffer) {
         Some(t) => {
+            // SAFETY: the out-pointers are valid for writes (the contract).
             let [h, u, d] = [host, user, domain].map(|p| unsafe { &mut *p });
             (*h, *u, *d) = t;
             1
@@ -625,10 +780,22 @@ pub unsafe extern "C" fn getnetgrent(host: *mut *mut c_char, user: *mut *mut c_c
     })
 }
 
+/// `innetgr` on Rust values: is the triple in the netgroup (or in a group it names)? None matches anything.
 pub fn in_netgroup(netgroup: &CStr, host: Option<&[u8]>, user: Option<&[u8]>, domain: Option<&[u8]>) -> bool {
+    // the name service cache daemon first: its answer is final
+    match nscd::in_netgroup(netgroup.to_bytes(), host, user, domain) {
+        nscd::InNetgroup::Fallback => {}
+        nscd::InNetgroup::NotFound => {
+            errno::set(0);
+            return false;
+        }
+        nscd::InNetgroup::Result(r) => return r != 0,
+    }
     let mut entry = Ng::new();
     let mut result = 0;
     let ng = netgroup.to_bytes();
+    // the group being searched once it came off the needed list (glibc moves it to the known ones first; it is
+    // compared as one of them)
     let mut cur: Option<Name> = None;
     loop {
         let group: &CStr = match &cur {
@@ -647,6 +814,7 @@ pub fn in_netgroup(netgroup: &CStr, host: Option<&[u8]>, user: Option<&[u8]>, do
                 while src_get(&src, &mut entry, &mut buffer) == St::Success {
                     let [eh, eu, ed] = entry.strs();
                     if entry.d.typ == 1 {
+                        // not seen before and not the group being asked about
                         let g = eh.unwrap_or(b"");
                         let is_cur = cur.as_ref().is_some_and(|n| n.cstr().to_bytes() == g);
                         if !entry.known.contains(g) && !is_cur && !entry.needed.contains(g) && g != ng {
@@ -667,8 +835,10 @@ pub fn in_netgroup(netgroup: &CStr, host: Option<&[u8]>, user: Option<&[u8]>, do
                         }
                     }
                 }
+                // a source that knows the group ends the search
                 status = St::Return;
             }
+            // free all resources of the source
             if nssent::is_files(&src) || ng_module_fn(&src, Fn3::End) != 0 {
                 src_end(&src, &mut entry);
             }
@@ -697,9 +867,17 @@ pub fn in_netgroup(netgroup: &CStr, host: Option<&[u8]>, user: Option<&[u8]>, do
     result == 1
 }
 
+/// `innetgr (netgroup, host, user, domain)`: is the triple in the netgroup (or in a group it names)? A NULL
+/// part matches anything, as does an empty part of an entry; host and domain compare without regard to case.
+/// Like glibc it walks the sources (files and plug-in modules) and stops at the first one that knows the group.
+///
+/// # Safety
+/// `netgroup` is a C string; the others are C strings or NULL.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn innetgr(netgroup: *const c_char, host: *const c_char, user: *const c_char, domain: *const c_char) -> c_int {
+    // SAFETY: `netgroup` is a C string (the contract).
     let netgroup = unsafe { ffi::cstr_nonnull(netgroup) };
+    // SAFETY: C strings or NULL (the contract).
     let [host, user, domain] = [host, user, domain].map(|p| unsafe { ffi::cstr(p) }.map(CStr::to_bytes));
     in_netgroup(netgroup, host, user, domain) as c_int
 }

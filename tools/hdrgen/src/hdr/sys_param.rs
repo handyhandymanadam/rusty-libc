@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "sys/param.h",
     items: &[
+        Item::Comment("/* sys/param.h for the Rust libc: the BSD-style constants and helper macros programs still use. */"),
         Item::Guard { name: "_SYS_PARAM_H", value: "1", end: "", items: &[
             Item::Include("<features.h>"),
             Item::Include("<limits.h>"),

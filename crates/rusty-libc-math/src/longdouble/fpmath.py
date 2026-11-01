@@ -1,3 +1,6 @@
+"""Fixed-point big-integer arithmetic and Chebyshev fitting for the table generators of the long
+double fast paths (gen_special.py). Values are integers scaled by 2^P. Everything is computed here
+from the mathematics with exact integer arithmetic (nothing is copied from another library)."""
 from fractions import Fraction
 import math
 
@@ -59,6 +62,7 @@ LN2 = 2 * atanh_inv(3)
 
 
 def fexp(x):
+    """e^x for any fixed-point x (negative allowed), by halving the argument."""
     neg = x < 0
     if neg:
         x = -x
@@ -81,6 +85,7 @@ def fexp(x):
 
 
 def fsincos(x):
+    """sin and cos of a fixed-point x (|x| < 8) by the Taylor series."""
     x2 = fmul(x, x)
     s, c = x, ONE
     ts, tc = x, ONE
@@ -97,6 +102,7 @@ def fsincos(x):
 
 
 def dd(v):
+    """Fraction -> (hi, lo) doubles."""
     hi = float(v)
     return hi, float(v - Fraction(hi))
 
@@ -105,11 +111,15 @@ def fmt(x):
     return repr(float(x))
 
 
+# ---- Chebyshev interpolation ---------------------------------------------------------------------
+
 def cheb_nodes(n):
+    """Fixed-point approximations of cos(pi (j + 1/2) / n), j = 0..n-1."""
     out = []
     for j in range(n):
+        # cos(pi (2j+1) / (2n)): reduce to [0, pi/2] by symmetry
         num = 2 * j + 1
-        ang = (PI * num) // (2 * n)
+        ang = (PI * num) // (2 * n)  # in [0, pi)
         if ang > PI // 2:
             s, c = fsincos(PI - ang)
             out.append(-c)
@@ -120,6 +130,7 @@ def cheb_nodes(n):
 
 
 def cheb_poly_coeffs(n):
+    """Integer coefficients of T_0 .. T_{n-1} in powers of s."""
     T = [[1], [0, 1]]
     for k in range(2, n):
         a = [0] + [2 * c for c in T[k - 1]]
@@ -129,12 +140,15 @@ def cheb_poly_coeffs(n):
 
 
 def cheb_fit(f, c, h, n):
+    """Interpolate f (Fraction x -> fixed-point value) on [c - h, c + h] at n Chebyshev nodes.
+    Returns (monomial coefficients in s = (x - c)/h as fixed-point integers, chebyshev coefficients)."""
     nodes = cheb_nodes(n)
     cf, hf = Fraction(c), Fraction(h)
     vals = []
     for s in nodes:
         x = cf + hf * to_frac(s)
         vals.append(f(x))
+    # Chebyshev coefficients a_k = (2/n) sum f_j T_k(s_j) (a_0 halved)
     a = [0] * n
     Tprev = [ONE] * n
     Tcur = nodes[:]
@@ -157,6 +171,7 @@ def cheb_fit(f, c, h, n):
 
 
 def eval_poly_frac(coefs, s):
+    """Horner evaluation with exact Fractions: coefs are Fractions."""
     acc = Fraction(0)
     for ck in reversed(coefs):
         acc = acc * s + ck

@@ -3,6 +3,9 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "argp.h",
     items: &[
+        Item::Comment(r#"/* argp.h for the Rust libc (crates/rusty-libc-extra/src/argp.rs): hierarchical argument parsing layered over getopt.
+   The structures and constants are glibc's (struct argp_option 48 bytes, struct argp 56, struct argp_child 32,
+   struct argp_state 96). */"#),
         Item::Guard { name: "_RLIBC_ARGP_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<bits/rlibc-features.h>"),
@@ -23,14 +26,16 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
-            Item::Block { head: "struct argp_option ", body: &["", "  const char *name;", "  int key;", "  const char *arg;", "  int flags;", "  const char *doc;", "  int group;", ""], tail: "" },
+            Item::Comment(r#"/* A description of a particular option: one long option and/or one short option; more names for the same option
+   follow it with OPTION_ALIAS set. */"#),
+            Item::Block { head: "struct argp_option ", body: &["", "  const char *name;             /* the long option name */", "  int key;                      /* what key is returned; > 0 and printable: also a short option */", "  const char *arg;              /* the name of the argument, if any (required unless OPTION_ARG_OPTIONAL) */", "  int flags;                    /* OPTION_ flags */", "  const char *doc;              /* the doc string (with NAME and KEY both 0: a group header) */", "  int group;                    /* the group this option is in */", ""], tail: "" },
             Item::Blank,
             Item::Consts(&[
-                ("OPTION_ARG_OPTIONAL", V::Txt("0x1")),
-                ("OPTION_HIDDEN", V::Txt("0x2")),
-                ("OPTION_ALIAS", V::Txt("0x4")),
-                ("OPTION_DOC", V::Txt("0x8")),
-                ("OPTION_NO_USAGE", V::Txt("0x10")),
+                ("OPTION_ARG_OPTIONAL", V::Txt("0x1 /* the argument is optional */")),
+                ("OPTION_HIDDEN", V::Txt("0x2       /* not displayed in any help message */")),
+                ("OPTION_ALIAS", V::Txt("0x4        /* an alias for the closest previous non-alias option */")),
+                ("OPTION_DOC", V::Txt("0x8          /* documentation only: displayed like an option, not parsed */")),
+                ("OPTION_NO_USAGE", V::Txt("0x10    /* not included in `long' usage messages */")),
             ]),
             Item::Blank,
             Item::Decl("struct argp;"),
@@ -40,7 +45,7 @@ pub static HDR: Header = Header {
             Item::Decl("typedef error_t (*argp_parser_t) (int __key, char *__arg, struct argp_state *__state);"),
             Item::Blank,
             Item::Consts(&[
-                ("ARGP_ERR_UNKNOWN", V::Txt("E2BIG")),
+                ("ARGP_ERR_UNKNOWN", V::Txt("E2BIG  /* what to return for unrecognized keys */")),
             ]),
             Item::Blank,
             Item::Consts(&[
@@ -54,7 +59,7 @@ pub static HDR: Header = Header {
                 ("ARGP_KEY_ERROR", V::Hex(0x1000005)),
             ]),
             Item::Blank,
-            Item::Block { head: "struct argp ", body: &["", "  const struct argp_option *options;", "  argp_parser_t parser;", "  const char *args_doc;", r#"  const char *doc;"#, "  const struct argp_child *children;", "  char *(*help_filter) (int __key, const char *__text, void *__input);", "  const char *argp_domain;", ""], tail: "" },
+            Item::Block { head: "struct argp ", body: &["", "  const struct argp_option *options;    /* terminated by an entry with NAME and KEY 0 */", "  argp_parser_t parser;                 /* what to do with an option */", "  const char *args_doc;                 /* what other arguments are wanted (for the `Usage:' message) */", r#"  const char *doc;                      /* text before and after the options (separated by \v) */"#, "  const struct argp_child *children;    /* child argps, terminated by an entry with a NULL argp */", "  char *(*help_filter) (int __key, const char *__text, void *__input);", "  const char *argp_domain;              /* the message domain (unused: no catalogues) */", ""], tail: "" },
             Item::Blank,
             Item::Consts(&[
                 ("ARGP_KEY_HELP_PRE_DOC", V::Hex(0x2000001)),
@@ -65,9 +70,9 @@ pub static HDR: Header = Header {
                 ("ARGP_KEY_HELP_ARGS_DOC", V::Hex(0x2000006)),
             ]),
             Item::Blank,
-            Item::Block { head: "struct argp_child ", body: &["", "  const struct argp *argp;", "  int flags;", "  const char *header;", "  int group;", ""], tail: "" },
+            Item::Block { head: "struct argp_child ", body: &["", "  const struct argp *argp;      /* the child parser */", "  int flags;", "  const char *header;           /* an optional header printed before the child's options */", "  int group;                    /* where to group the child's options */", ""], tail: "" },
             Item::Blank,
-            Item::Block { head: "struct argp_state ", body: &["", "  const struct argp *root_argp;", "  int argc;", "  char **argv;", "  int next;", "  unsigned flags;", "  unsigned arg_num;", "  int quoted;", "  void *input;", "  void **child_inputs;", "  void *hook;", "  char *name;", "  FILE *err_stream;", "  FILE *out_stream;", "  void *pstate;", ""], tail: "" },
+            Item::Block { head: "struct argp_state ", body: &["", "  const struct argp *root_argp; /* the top level argp being parsed */", "  int argc;", "  char **argv;                  /* the argument vector being parsed (may be modified) */", "  int next;                     /* the index of the next argument to parse (may be modified) */", "  unsigned flags;               /* the flags given to argp_parse */", "  unsigned arg_num;             /* the number of the current non-option argument */", "  int quoted;                   /* the index of the first argument after `--' (0: not seen) */", "  void *input;                  /* the user's pointer */", "  void **child_inputs;          /* values for the child parsers */", "  void *hook;                   /* for the parser's use */", "  char *name;                   /* the program name used in messages */", "  FILE *err_stream;             /* for errors; stderr */", "  FILE *out_stream;             /* for information; stdout */", "  void *pstate;                 /* private */", ""], tail: "" },
             Item::Blank,
             Item::Consts(&[
                 ("ARGP_PARSE_ARGV0", V::Txt("0x01")),

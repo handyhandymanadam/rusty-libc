@@ -1,3 +1,7 @@
+//! The libresolv names that glibc 2.43 exports only as compatibility symbols (`_res_opcodes`, `__p_secstodate`, `_gethtent`,
+//! `res_gethostbyname`, `res_send_setqhook`, ...: GLIBC_2.2.5 in libresolv.so.2): each is a `jmp` to the implementation in
+//! rusty-libc-net (resdebug.rs, compathost.rs) under its old version name, as compat_symver.rs does for libc's own. The data
+//! object `_res_opcodes` (a table of 16 `const char *`, exported by accident in glibc) is built here.
 #![allow(missing_docs)]
 
 core::arch::global_asm!(

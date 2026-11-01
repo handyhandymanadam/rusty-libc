@@ -4,6 +4,8 @@ pub static HDR: Header = Header {
     path: "netinet/in.h",
     items: &[
         Item::Guard { name: "_NETINET_IN_H", value: "1", end: "", items: &[
+            Item::Comment(r#"/* Internet addresses. Types, constants and macros are written by hand (checked against glibc by
+   tests/c/net_consts.c and net_layout.c); prototypes come from bits/rlibc-net-in.h. */"#),
             Item::Include("<stdint.h>"),
             Item::Include("<sys/socket.h>"),
             Item::Blank,
@@ -306,6 +308,7 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::Include("<bits/rlibc-net-in.h>"),
             Item::Blank,
+            Item::Comment("/* byte order: functions above; macros when optimising (as glibc) */"),
             Item::Gate(&[
                 Branch { head: "ifdef __OPTIMIZE__", items: &[
                     Item::Raw(Reason::StdMacro, "# define ntohl(x) __builtin_bswap32 (x)"),

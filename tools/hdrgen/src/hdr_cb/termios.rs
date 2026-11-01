@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("NCCS", V::Dec(32)),
         ("VINTR", V::Dec(0)),
@@ -159,6 +160,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("BAUD_MAX", V::Txt("0xffffffffU")),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Typedef("unsigned char", "cc_t"),
     Item::Typedef("unsigned int", "speed_t"),
     Item::Typedef("unsigned int", "tcflag_t"),

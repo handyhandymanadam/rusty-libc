@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "sys/ucontext.h",
     items: &[
+        Item::Comment(r#"/* sys/ucontext.h for the Rust libc: ucontext_t, mcontext_t and the register indices, glibc's
+   x86-64 layout (968-byte ucontext_t). Written by hand. */"#),
         Item::Guard { name: "_RLIBC_SYS_UCONTEXT_H", value: "1", end: "", items: &[
             Item::Include("<bits/types/sigset_t.h>"),
             Item::Include("<bits/types/stack_t.h>"),

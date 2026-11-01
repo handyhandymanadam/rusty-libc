@@ -1,3 +1,13 @@
+//! Finding the data of one category for a locale name, the way glibc's `_nl_find_locale` does
+//! (locale/findlocale.c, intl/l10nflist.c, intl/explodename.c, intl/localealias.c; LGPL; the
+//! behaviour here was also checked against the host's glibc, see the tests).
+//!
+//! In order: an empty name means the environment (LC_ALL, LC_<category>, LANG); "C" and "POSIX"
+//! are built in; otherwise, without LOCPATH, the name is looked up in the locale archive (with the
+//! codeset part normalised: `en_US.UTF-8` is the archive's `en_US.utf8`), then as an alias from
+//! /usr/share/locale/locale.alias; then the per-locale directories are tried for the name and for
+//! progressively less specific forms (dropping codeset, territory, modifier), and a locale found
+//! that way must have the codeset the name asked for.
 use crate::archive;
 use crate::charsets::same_charset;
 use crate::data;
@@ -12,6 +22,7 @@ pub const CAT_NAMES: [&str; 13] = [
     "LC_MEASUREMENT", "LC_IDENTIFICATION",
 ];
 
+/// A locale name (at most 255 bytes, as glibc allows).
 #[derive(Clone, Copy)]
 pub struct NameBuf {
     b: [u8; 288],
@@ -30,15 +41,20 @@ impl NameBuf {
     }
 }
 
+/// Environment value `name`, if set and non-empty.
 pub fn env(name: &[u8]) -> Option<&'static [u8]> {
+    // SAFETY: the environment block is valid for the program's life.
     let p = unsafe { rusty_libc_core::env::getenv(name) };
     if p.is_null() {
         return None;
     }
+    // SAFETY: a non-NULL getenv result is a NUL-terminated value in the environment block, which is never freed (setenv
+    // keeps the strings it replaces).
     let v = unsafe { rusty_libc_core::ffi::cstr_bytes_scalar(p) };
     if v.is_empty() { None } else { Some(v) }
 }
 
+/// The name the environment selects for `cat`: LC_ALL, then LC_<cat>, then LANG, else "C".
 pub fn env_name(cat: usize) -> &'static [u8] {
     if let Some(v) = env(b"LC_ALL") {
         return v;
@@ -69,6 +85,8 @@ fn valid_name(name: &[u8]) -> bool {
     true
 }
 
+/// glibc's `_nl_normalize_codeset`: letters lower-cased, digits kept, everything else dropped; a
+/// name of digits only gets an "iso" prefix.
 pub fn normalize_codeset(cs: &[u8]) -> NameBuf {
     let only_digit = cs.iter().filter(|c| c.is_ascii_alphanumeric()).all(|c| c.is_ascii_digit());
     let mut out = NameBuf::new(b"");
@@ -105,6 +123,7 @@ struct Parts<'a> {
     mask: u32,
 }
 
+/// glibc's `_nl_explode_name`: language[_territory][.codeset][@modifier].
 fn explode(name: &[u8]) -> Parts<'_> {
     let mut p = Parts { language: name, territory: None, codeset: None, ncs: NameBuf::new(b""), modifier: None, mask: 0 };
     let lend = name.iter().position(|&c| matches!(c, b'_' | b'@' | b'.')).unwrap_or(name.len());
@@ -149,16 +168,23 @@ fn explode(name: &[u8]) -> Parts<'_> {
     p
 }
 
+// ---- locale.alias ----
+
 struct AliasTable {
     text: &'static [u8],
+    /// (alias start, alias length, value start, value length) into `text`, sorted by alias ignoring case
     ent: &'static [[usize; 4]],
 }
 
+/// The parsed locale.alias: null until first needed, then a table that is never freed or changed (NO_ALIASES when the
+/// file is missing). setlocale (under the locale lock) and gettext (under its own lock) both read it, so it is set once
+/// with a compare-exchange; a thread that loses the race drops its copy (leaked: a rare race, a few kilobytes).
 static ALIASES: AtomicPtr<AliasTable> = AtomicPtr::new(core::ptr::null_mut());
 static NO_ALIASES: AliasTable = AliasTable { text: &[], ent: &[] };
 
 fn load_aliases() -> &'static AliasTable {
     let p = ALIASES.load(Ordering::Acquire);
+    // SAFETY: ALIASES holds null or a pointer to NO_ALIASES or to a table leaked by `read_aliases`, never freed or changed.
     if let Some(t) = unsafe { p.as_ref() } {
         return t;
     }
@@ -168,6 +194,7 @@ fn load_aliases() -> &'static AliasTable {
     };
     match ALIASES.compare_exchange(core::ptr::null_mut(), new as *const AliasTable as *mut AliasTable, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => new,
+        // SAFETY: as above (another thread stored it).
         Err(other) => unsafe { &*other },
     }
 }
@@ -183,6 +210,7 @@ fn read_aliases() -> Option<&'static AliasTable> {
     while pos < len {
         let eol = text[pos..].iter().position(|&c| c == b'\n').map_or(len, |i| pos + i);
         let mut line = &text[pos..eol];
+        // glibc reads lines of at most 399 bytes and ignores the rest of a longer line
         if line.len() > 399 {
             line = &line[..399];
         }
@@ -213,6 +241,7 @@ fn read_aliases() -> Option<&'static AliasTable> {
         ent[n] = [base + a0, a1 - a0, base + v0, i - v0];
         n += 1;
     }
+    // sort by alias, ignoring case (insertion sort keeps equal keys in file order)
     let e = &mut ent[..n];
     for i in 1..n {
         let mut j = i;
@@ -240,6 +269,7 @@ fn cmp_nocase(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
     }
 }
 
+/// `_nl_expand_alias`: the value `name` stands for in locale.alias (case-insensitive), if any.
 pub fn expand_alias(name: &[u8]) -> Option<NameBuf> {
     let t = load_aliases();
     let (text, e) = (t.text, t.ent);
@@ -255,6 +285,9 @@ pub fn expand_alias(name: &[u8]) -> Option<NameBuf> {
     None
 }
 
+// ---- archive and directory lookup ----
+
+/// Look `name` up in the archive (codeset normalised first) and intern the category.
 fn from_archive(cat: usize, name: &[u8]) -> Option<&'static CatData> {
     let mut nb = NameBuf::new(name);
     if let Some(dot) = name.iter().position(|&c| c == b'.') {
@@ -287,6 +320,7 @@ fn from_dirs(cat: usize, work: &[u8], locpath: Option<&[u8]>) -> Result<&'static
     let mut nd = 0;
     if let Some(lp) = locpath {
         for d in lp.split(|&c| c == b':') {
+            // an empty entry is skipped (argz_create_sep drops empty fields)
             if !d.is_empty() && nd < 31 {
                 dirs[nd] = d;
                 nd += 1;
@@ -304,7 +338,7 @@ fn from_dirs(cat: usize, work: &[u8], locpath: Option<&[u8]>) -> Result<&'static
             continue;
         }
         if c & XPG_CODESET != 0 && c & XPG_NORM_CODESET != 0 {
-            continue;
+            continue; // glibc never loads this pseudo entry
         }
         for d in &dirs[..nd] {
             let mut path = [0u8; 700];
@@ -337,6 +371,7 @@ fn from_dirs(cat: usize, work: &[u8], locpath: Option<&[u8]>) -> Result<&'static
             path[n] = 0;
             let Some(img) = archive::map_file_cached(&path[..=n], Some(catname)) else { continue };
             let Some(d) = data::intern(cat, img) else { continue };
+            // a name that spells a codeset must get a locale with that codeset
             if let Some(cs) = p.codeset {
                 let have = d.bytes(data::CODESET_IDX[cat]);
                 if !same_charset(cs, have) {
@@ -349,6 +384,10 @@ fn from_dirs(cat: usize, work: &[u8], locpath: Option<&[u8]>) -> Result<&'static
     Err(errno::ENOENT)
 }
 
+/// The names glibc's `_nl_make_l10nflist` tries for the locale name `work` (language[_territory]
+/// [.codeset][@modifier]) below `dir`: `dir/<name>/<tail>` for the full name first, then for the
+/// forms with less information (dropping modifier, territory, codeset in glibc's order). `f`
+/// gets each path (NUL-terminated) and stops the walk by returning true.
 pub fn for_each_candidate(work: &[u8], dir: &[u8], tail: &[u8], mut f: impl FnMut(&[u8]) -> bool) {
     let p = explode(work);
     let mut cnt = p.mask as i32;
@@ -395,11 +434,15 @@ pub fn for_each_candidate(work: &[u8], dir: &[u8], tail: &[u8], mut f: impl FnMu
     }
 }
 
+/// What a name resolves to.
 pub struct Found {
     pub data: &'static CatData,
+    /// The name to report: the one given (or the environment's), "C" for C and POSIX.
     pub name: NameBuf,
 }
 
+/// `_nl_find_locale` for one category; `name` empty means "from the environment". Errors are errno
+/// values (EINVAL for a bad name, ENOENT when nothing matches). Callers hold the locale lock.
 pub fn find_locale(cat: usize, name: &[u8], locpath: Option<&[u8]>) -> Result<Found, c_int> {
     let cloc: &[u8] = if name.is_empty() { env_name(cat) } else { name };
     if cloc == b"C" || cloc == b"POSIX" {

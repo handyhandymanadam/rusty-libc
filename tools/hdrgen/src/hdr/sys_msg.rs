@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "sys/msg.h",
     items: &[
+        Item::Comment(r#"/* sys/msg.h for the Rust libc (crates/rusty-libc-ipc): System V message queues. struct msqid_ds is 120
+   bytes, as in glibc on x86-64. The prototypes are generated (bits/rlibc-ipc-msg.h). */"#),
         Item::Guard { name: "_SYS_MSG_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),

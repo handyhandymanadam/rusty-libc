@@ -1,7 +1,10 @@
+//! Small text helpers (no regex needed): word-boundary search and replace.
+
 fn is_word(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
+/// Byte offsets of every whole-word occurrence of `w` (like `\bw\b`).
 pub fn word_positions(s: &str, w: &str) -> Vec<usize> {
     let b = s.as_bytes();
     let mut out = Vec::new();
@@ -25,6 +28,7 @@ pub fn contains_word(s: &str, w: &str) -> bool {
     !word_positions(s, w).is_empty()
 }
 
+/// `re.sub(r"\bw\b", r, s)`; with `not_before_paren` the `(?!\()` lookahead is applied.
 pub fn replace_word(s: &str, w: &str, r: &str, not_before_paren: bool) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last = 0;

@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "utmpx.h",
     items: &[
+        Item::Comment(r#"/* utmpx.h for the Rust libc (crates/rusty-libc-extra/src/utmp.rs): the record (the same 384 bytes as struct
+   utmp), the constants and the prototypes (generated: bits/rlibc-utmpxcalls.h and -misc). */"#),
         Item::Guard { name: "_RLIBC_UTMPX_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<bits/rlibc-features.h>"),

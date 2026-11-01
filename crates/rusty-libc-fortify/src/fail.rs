@@ -1,5 +1,8 @@
+//! The failure path: write "*** <what> ***: terminated" to standard error and abort, like glibc's
+//! `__fortify_fail` over `__libc_message`.
 use core::ffi::c_char;
 
+/// Write the pieces to descriptor 2 in one buffer (resuming after a short write), then abort.
 #[cold]
 #[inline(never)]
 pub fn message_abort(parts: &[&[u8]]) -> ! {
@@ -21,21 +24,26 @@ pub fn message_abort(parts: &[&[u8]]) -> ! {
     rusty_libc_core::process::abort()
 }
 
+/// "*** <msg> ***: terminated\n" then abort.
 #[cold]
 #[inline(never)]
 pub fn fortify_fail(msg: &[u8]) -> ! {
     message_abort(&[b"*** ", msg, b" ***: terminated\n"])
 }
 
+/// A fortified call would overflow its destination.
 #[cold]
 #[inline(never)]
 pub fn chk_fail() -> ! {
     fortify_fail(b"buffer overflow detected")
 }
 
+/// # Safety
+/// `msg` must be a NUL-terminated string.
 #[cold]
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn __fortify_fail(msg: *const c_char) -> ! {
+    // SAFETY: `msg` is a NUL-terminated string (the caller's contract) that lives until the abort.
     fortify_fail(unsafe { rusty_libc_core::ffi::cstr_bytes(msg) })
 }
 

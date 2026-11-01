@@ -1,3 +1,5 @@
+//! regex.h constants: syntax bits, cflags/eflags, error codes and glibc's error texts.
+
 pub type RegSyntax = u64;
 
 pub const RE_BACKSLASH_ESCAPE_IN_LISTS: RegSyntax = 1;
@@ -103,6 +105,7 @@ pub const REGS_REALLOCATE: u32 = 1;
 pub const REGS_FIXED: u32 = 2;
 pub const RE_NREGS: usize = 30;
 
+/// glibc's texts, indexed by error code (NUL-terminated).
 pub static ERROR_MSGS: [&core::ffi::CStr; 17] = [
     c"Success",
     c"No match",
@@ -123,6 +126,7 @@ pub static ERROR_MSGS: [&core::ffi::CStr; 17] = [
     c"Unmatched ) or \\)",
 ];
 
+/// The message for `code` without its NUL, or None when the code is out of range.
 pub fn error_message(code: i32) -> Option<&'static [u8]> {
     if code < 0 || code as usize >= ERROR_MSGS.len() {
         return None;

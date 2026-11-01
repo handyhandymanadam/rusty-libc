@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("TTYDEF_IFLAG", V::Hex(0x2d22)),
         ("TTYDEF_OFLAG", V::Hex(0x1805)),
@@ -30,6 +31,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("CFLUSH", V::Dec(15)),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Raw(Reason::GlibcMacro, "#define CTRL(x) ((x) & 037)"),
     Item::Consts(&[
         ("CEOF", V::Txt("CTRL('d')")),

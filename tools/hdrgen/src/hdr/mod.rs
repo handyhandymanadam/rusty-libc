@@ -76,6 +76,7 @@ mod bits_floatn_common;
 mod bits_floatn;
 mod bits_getopt_posix;
 mod bits_hwcap;
+mod bits_libc_header_start;
 mod bits_pthreadtypes;
 mod bits_rlibc_cdefs;
 mod bits_rlibc_features;
@@ -278,6 +279,7 @@ pub static ALL: &[&Header] = &[
     &bits_floatn::HDR,
     &bits_getopt_posix::HDR,
     &bits_hwcap::HDR,
+    &bits_libc_header_start::HDR,
     &bits_pthreadtypes::HDR,
     &bits_rlibc_cdefs::HDR,
     &bits_rlibc_features::HDR,

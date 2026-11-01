@@ -32,7 +32,9 @@ pub static HDR: Header = Header {
  *   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */"#),
-        Item::Guard { name: "_RPC_CLNT_H", value: "1", end: "", items: &[
+        Item::Comment(r#"/* Structure layouts and constants follow Sun's RPC headers (as in glibc's sunrpc/rpc/);
+   the function prototypes are generated from the Rust sources (bits/rlibc-rpc-*.h). */"#),
+        Item::Guard { name: "_RPC_CLNT_H", value: "1", end: " /* rpc/clnt.h */", items: &[
             Item::Blank,
             Item::Include("<sys/types.h>"),
             Item::Include("<rpc/types.h>"),
@@ -40,10 +42,10 @@ pub static HDR: Header = Header {
             Item::Include("<rpc/auth.h>"),
             Item::Include("<sys/un.h>"),
             Item::Blank,
-            Item::Block { head: "struct rpc_err ", body: &["", "  enum clnt_stat re_status;", "  union {", r#"    int RE_errno;"#, r#"    enum auth_stat RE_why;"#, "    struct {", r#"      u_long low;"#, r#"      u_long high;"#, "    } RE_vers;", r#"    struct {"#, "      long s1;", "      long s2;", r#"    } RE_lb;"#, "  } ru;", r#"#define	re_errno	ru.RE_errno"#, r#"#define	re_why		ru.RE_why"#, r#"#define	re_vers		ru.RE_vers"#, r#"#define	re_lb		ru.RE_lb"#, ""], tail: "" },
+            Item::Block { head: "struct rpc_err ", body: &["", "  enum clnt_stat re_status;", "  union {", r#"    int RE_errno;		/* related system error */"#, r#"    enum auth_stat RE_why;	/* why the auth error occurred */"#, "    struct {", r#"      u_long low;		/* lowest version supported */"#, r#"      u_long high;		/* highest version supported */"#, "    } RE_vers;", r#"    struct {			/* maybe meaningful if RPC_FAILED */"#, "      long s1;", "      long s2;", r#"    } RE_lb;			/* life boot & debugging only */"#, "  } ru;", r#"#define	re_errno	ru.RE_errno"#, r#"#define	re_why		ru.RE_why"#, r#"#define	re_vers		ru.RE_vers"#, r#"#define	re_lb		ru.RE_lb"#, ""], tail: "" },
             Item::Blank,
             Item::Typedef("struct CLIENT", "CLIENT"),
-            Item::Block { head: "struct CLIENT ", body: &["", r#"  AUTH	*cl_auth;"#, "  struct clnt_ops {", "    enum clnt_stat (*cl_call) (CLIENT *, u_long, xdrproc_t, caddr_t, xdrproc_t,", r#"			       caddr_t, struct timeval);"#, "    void (*cl_abort) (void);", "    void (*cl_geterr) (CLIENT *, struct rpc_err *);", "    bool_t (*cl_freeres) (CLIENT *, xdrproc_t, caddr_t);", "    void (*cl_destroy) (CLIENT *);", "    bool_t (*cl_control) (CLIENT *, int, char *);", "  } *cl_ops;", r#"  caddr_t cl_private;"#, ""], tail: "" },
+            Item::Block { head: "struct CLIENT ", body: &["", r#"  AUTH	*cl_auth;		 /* authenticator */"#, "  struct clnt_ops {", "    enum clnt_stat (*cl_call) (CLIENT *, u_long, xdrproc_t, caddr_t, xdrproc_t,", r#"			       caddr_t, struct timeval);"#, "    void (*cl_abort) (void);", "    void (*cl_geterr) (CLIENT *, struct rpc_err *);", "    bool_t (*cl_freeres) (CLIENT *, xdrproc_t, caddr_t);", "    void (*cl_destroy) (CLIENT *);", "    bool_t (*cl_control) (CLIENT *, int, char *);", "  } *cl_ops;", r#"  caddr_t cl_private;		/* private stuff */"#, ""], tail: "" },
             Item::Blank,
             Item::Raw(Reason::GlibcMacro, r#"#define	CLNT_CALL(rh, proc, xargs, argsp, xres, resp, secs)	\
 	((*(rh)->cl_ops->cl_call)(rh, proc, xargs, argsp, xres, resp, secs))"#),
@@ -93,11 +95,11 @@ pub static HDR: Header = Header {
                 ("NULLPROC", V::Txt("((u_long)0)")),
             ]),
             Item::Blank,
-            Item::Block { head: "struct rpc_createerr ", body: &["", r#"	enum clnt_stat cf_stat;"#, r#"	struct rpc_err cf_error;"#, ""], tail: "" },
+            Item::Block { head: "struct rpc_createerr ", body: &["", r#"	enum clnt_stat cf_stat;"#, r#"	struct rpc_err cf_error; /* useful when cf_stat == RPC_PMAPFAILURE */"#, ""], tail: "" },
             Item::Blank,
             Item::Consts(&[
-                ("UDPMSGSIZE", V::Sp(r#"	8800"#)),
-                ("RPCSMALLMSGSIZE", V::Sp(r#"	400"#)),
+                ("UDPMSGSIZE", V::Sp(r#"	8800	/* rpc imposed limit on udp msg size */"#)),
+                ("RPCSMALLMSGSIZE", V::Sp(r#"	400	/* a more reasonable packet size */"#)),
             ]),
             Item::Blank,
             Item::Include("<bits/rlibc-rpc-clnt.h>"),

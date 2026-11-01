@@ -1,9 +1,22 @@
 use crate::model::*;
 
+// Derived from glibc 2.43 math/tgmath.h (LGPL-2.1+): the selection machinery and the macro list, comments dropped, glibc's
+// feature tests mapped to the math.h tiers (IEC_60559_TYPES_EXT -> __RLIBC_MATH_FLOATN; IEC_60559_FUNCS_EXT_C23, BFP_EXT_C23
+// and BFP_EXT -> __RLIBC_MATH_EXT), so that the macros only name functions math.h declares. tools/hdrgen does not read glibc
+// at build time; this file holds the text (regenerate by hand from the glibc source if glibc's tgmath.h changes).
 pub static HDR: Header = Header {
     path: "tgmath.h",
     items: &[
-        Item::Guard { name: "_TGMATH_H", value: "1", end: "", items: &[
+        Item::Comment(r#"/* tgmath.h for the Rust libc: the type-generic math macros of C99/C23 and the IEC 60559 additions, as glibc 2.43's
+   <tgmath.h>, with both of its implementations:
+     - GCC 8 or later: __builtin_tgmath (every argument evaluated once; GCC 13 or later for the C23 rules of integer
+       arguments with _FloatNx and of the _Float32x narrowing macros);
+     - other compilers that say they are GCC 2.7 or later, clang among them (clang says GCC 4.2): glibc's macros built on
+       __typeof__, __builtin_classify_type, __builtin_types_compatible_p and _Generic, choosing the float, double, long double
+       or _Float128 function (and the complex one for complex arguments) from the size and type of the arguments.
+   With _GNU_SOURCE (or __STDC_WANT_IEC_60559_TYPES_EXT__) the _Float32/_Float64/_Float128/_Float32x/_Float64x functions and
+   the f32add .. f64xfma narrowing macros take part, as in glibc. _Float16 has no functions here (as in glibc on x86-64). */"#),
+        Item::Guard { name: "_TGMATH_H", value: "1", end: " /* tgmath.h */", items: &[
             Item::Blank,
             Item::Include("<features.h>"),
             Item::Include("<bits/floatn.h>"),
@@ -18,6 +31,7 @@ pub static HDR: Header = Header {
                 ] },
             ], ""),
             Item::Blank,
+            Item::Comment("/* the selection machinery (glibc's two implementations, chosen by __GNUC_PREREQ) */"),
             Item::Raw(Reason::StdMacro, r#"#if __GNUC_PREREQ (2, 7)
 # if __HAVE_FLOAT128X
 # error "Unsupported _Float128x type for <tgmath.h>."
@@ -252,6 +266,7 @@ pub static HDR: Header = Header {
 # error "Unsupported compiler; you cannot use <tgmath.h>"
 #endif"#),
             Item::Blank,
+            Item::Comment("/* the type-generic macros */"),
             Item::Raw(Reason::StdMacro, r#"#define acos(Val) __TGMATH_UNARY_REAL_IMAG (Val, acos, cacos)
 #define asin(Val) __TGMATH_UNARY_REAL_IMAG (Val, asin, casin)
 #define atan(Val) __TGMATH_UNARY_REAL_IMAG (Val, atan, catan)

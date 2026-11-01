@@ -1,7 +1,13 @@
+//! Unicode charsets: UTF-8, UCS-4 (BE and LE), UCS-2 (host order and reversed), UTF-16, UTF-32,
+//! UNICODE (UCS-2 with byte order mark), and ASCII. Each function mirrors the loop of the glibc
+//! module of the same charset (the checks are in the same order, so the status that wins when
+//! several things are wrong at once is the same).
 use crate::engine::*;
 
+/// Byte order variants of UTF-16 and UTF-32.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Var {
+    /// "UTF-16": byte order mark on output, accepted on input, host order (little endian) without.
     Plain,
     Le,
     Be,
@@ -17,8 +23,13 @@ fn get32(b: &[u8]) -> u32 {
 }
 
 
+// ---------------------------------------------------------------- fast paths
+// Runs of ordinary characters, converted without the per-character checks of the loops. Each one
+// stops at the first character that needs the full body (or where the buffers end).
+
 const HI_BYTES: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
 
+/// ASCII bytes to characters.
 #[inline(always)]
 fn ascii_run_dec(s: &[u8], o: &mut [u32]) -> (usize, usize) {
     if s[0] >= 0x80 {
@@ -45,6 +56,7 @@ fn ascii_run_dec(s: &[u8], o: &mut [u32]) -> (usize, usize) {
     (k, k)
 }
 
+/// Characters below `limit` to one byte each.
 #[inline(always)]
 fn byte_run_enc(s: &[u32], o: &mut [u8], limit: u32) -> (usize, usize) {
     if s[0] >= limit {
@@ -74,6 +86,7 @@ fn byte_run_enc(s: &[u32], o: &mut [u8], limit: u32) -> (usize, usize) {
     (k, k)
 }
 
+/// UTF-16 units that are not surrogates to characters.
 #[inline(always)]
 fn u16_run_dec(s: &[u8], o: &mut [u32], swap: bool) -> (usize, usize) {
     let n = (s.len() / 2).min(o.len());
@@ -92,6 +105,7 @@ fn u16_run_dec(s: &[u8], o: &mut [u32], swap: bool) -> (usize, usize) {
     (2 * k, k)
 }
 
+/// Characters of the BMP (not surrogates) to UTF-16 units.
 #[inline(always)]
 fn u16_run_enc(s: &[u32], o: &mut [u8], swap: bool) -> (usize, usize) {
     let n = s.len().min(o.len() / 2);
@@ -111,6 +125,7 @@ fn u16_run_enc(s: &[u32], o: &mut [u8], swap: bool) -> (usize, usize) {
 }
 
 
+/// Complete, valid UTF-8 sequences (up to U+10FFFF) to characters.
 #[inline(always)]
 fn utf8_run_dec(s: &[u8], o: &mut [u32]) -> (usize, usize) {
     if s[0] < 0x80 {
@@ -157,6 +172,7 @@ fn utf8_run_dec(s: &[u8], o: &mut [u32]) -> (usize, usize) {
     (k, c)
 }
 
+/// Characters to UTF-8 (surrogates and values above U+10FFFF are left to the body).
 #[inline(always)]
 fn utf8_run_enc(s: &[u32], o: &mut [u8]) -> (usize, usize) {
     if s[0] < 0x80 {
@@ -203,6 +219,8 @@ fn utf8_run_enc(s: &[u32], o: &mut [u8]) -> (usize, usize) {
     }
     (k, w)
 }
+
+// ---------------------------------------------------------------- UTF-8
 
 pub fn utf8_dec(flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u32], op: &mut usize, irr: &mut usize) -> St {
     dec_loop(flags, inp, ip, out, op, irr, 1, utf8_run_dec, |s| {
@@ -292,6 +310,9 @@ pub fn utf8_enc(flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u8], op: &mu
     })
 }
 
+// ---------------------------------------------------------------- UCS-4
+
+/// UCS-4 big endian to internal (glibc's "ISO-10646/UCS4/"); `le` selects UCS-4LE.
 pub fn ucs4_dec(le: bool, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u32], op: &mut usize, irr: &mut usize) -> St {
     let mut i = *ip;
     let mut o = *op;
@@ -343,6 +364,9 @@ pub fn ucs4_enc(le: bool, inp: &[u32], ip: &mut usize, out: &mut [u8], op: &mut 
     if *ip == inp.len() { St::Empty } else { St::Full }
 }
 
+// ---------------------------------------------------------------- UCS-2
+
+/// UCS-2 to internal. `swap` reverses the byte order (host order is little endian).
 pub fn ucs2_dec(swap: bool, quiet: bool, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u32], op: &mut usize, irr: &mut usize) -> St {
     dec_loop(flags, inp, ip, out, op, irr, 2, |s: &[u8], o: &mut [u32]| u16_run_dec(s, o, swap), |s| {
         let mut u = get16(s);
@@ -371,6 +395,8 @@ pub fn ucs2_enc(swap: bool, quiet: bool, flags: u32, inp: &[u32], ip: &mut usize
     })
 }
 
+// ---------------------------------------------------------------- UNICODE (UCS-2 with BOM)
+
 pub fn unicode_dec_prepare(ctx: &mut Ctx, inp: &[u8], ip: &mut usize) -> Option<St> {
     if ctx.inv == 0 {
         if *ip + 2 > inp.len() {
@@ -398,6 +424,8 @@ pub fn unicode_enc_prepare(ctx: &mut Ctx, out: &mut [u8], op: &mut usize) -> Opt
     }
     None
 }
+
+// ---------------------------------------------------------------- UTF-16
 
 pub fn utf16_dec_prepare(var: Var, ctx: &mut Ctx, inp: &[u8], ip: &mut usize) -> Option<St> {
     if ctx.inv == 0 {
@@ -493,6 +521,8 @@ pub fn utf16_enc(flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u8], op: &m
     })
 }
 
+// ---------------------------------------------------------------- UTF-32
+
 pub fn utf32_dec_prepare(var: Var, ctx: &mut Ctx, inp: &[u8], ip: &mut usize) -> Option<St> {
     if var == Var::Plain {
         if ctx.inv == 0 {
@@ -558,6 +588,8 @@ pub fn utf32_enc(flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u8], op: &m
     })
 }
 
+// ---------------------------------------------------------------- ASCII
+
 pub fn ascii_dec(flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u32], op: &mut usize, irr: &mut usize) -> St {
     dec_loop(flags, inp, ip, out, op, irr, 1, ascii_run_dec, |s| if s[0] > 0x7f { Body::Illegal(1) } else { Body::Char(s[0] as u32, 1) })
 }
@@ -573,6 +605,15 @@ pub fn ascii_enc(flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u8], op: &m
     })
 }
 
+// ---------------------------------------------------------------- single-byte tables
+
+/// A single-byte charset: `dec[b]` is the character of byte b (0xffff = invalid byte); for the other
+/// direction `hi[c >> 8]` selects a block of 256 bytes in `blocks` (0 = none), where a byte of 0 means
+/// "no code" and the characters whose code is 0 are in `zero`; characters below `ident` are written
+/// as the same byte value, bytes below `dec_ident` decode to themselves.
+///
+/// Holds no pointers (a static with pointers costs a load-time relocation each, and the pages they sit on are copied at
+/// the start of every program): the tables are fields of `charsets_gen::SB_BLOB`, found by byte offset.
 pub struct Sb {
     name_off: u32,
     name_len: u16,
@@ -587,37 +628,50 @@ pub struct Sb {
 }
 
 impl Sb {
+    /// Only the generated table (`charsets_gen::SBS`) builds these, with offsets from `offset_of!` on `SB_BLOB` and the
+    /// lengths of those fields: the accessors below rely on that, so the constructor is private to the crate.
     #[allow(clippy::too_many_arguments)]
     pub(crate) const fn new(name_off: u32, name_len: u16, dec_off: u32, hi_off: u32, blocks_off: u32, nblocks: u16, zero_off: u32, nzero: u16, ident: u16, dec_ident: u16) -> Sb {
         Sb { name_off, name_len, dec_off, hi_off, blocks_off, nblocks, zero_off, nzero, ident, dec_ident }
     }
 
+    /// The address `off` bytes into `SB_BLOB`; `off` is one of an `Sb`'s field offsets.
     #[inline(always)]
     fn at(off: u32) -> *const u8 {
+        // SAFETY: every `Sb` is built by the generated table with `offset_of!` offsets of SB_BLOB's fields (`new` is
+        // crate-private), so `off` is inside the static; the blob is a plain repr(C) struct of arrays.
         unsafe { (&raw const crate::charsets_gen::SB_BLOB as *const u8).add(off as usize) }
     }
 
+    /// The canonical name of the charset.
     pub fn name(&self) -> &'static str {
         let b = &crate::charsets_gen::SB_NAMES[self.name_off as usize..self.name_off as usize + self.name_len as usize];
+        // SAFETY: SB_NAMES holds only ASCII charset names (generated) and `name_off`/`name_len` cut out whole names.
         unsafe { core::str::from_utf8_unchecked(b) }
     }
     #[inline(always)]
     pub fn dec(&self) -> &'static [u16; 256] {
+        // SAFETY: `dec_off` is the offset of a `[u16; 256]` field of the immutable static SB_BLOB (see `at`), so the
+        // reference is aligned, in bounds and valid forever.
         unsafe { &*(Self::at(self.dec_off) as *const [u16; 256]) }
     }
     #[inline(always)]
     pub fn hi(&self) -> &'static [u8; 256] {
+        // SAFETY: `hi_off` is the offset of a `[u8; 256]` field of SB_BLOB (as `dec`).
         unsafe { &*(Self::at(self.hi_off) as *const [u8; 256]) }
     }
     #[inline(always)]
     pub fn blocks(&self) -> &'static [[u8; 256]] {
+        // SAFETY: `blocks_off` is the offset of a `[[u8; 256]; nblocks]` field of SB_BLOB (generated together; as `dec`).
         unsafe { core::slice::from_raw_parts(Self::at(self.blocks_off) as *const [u8; 256], self.nblocks as usize) }
     }
     #[inline(always)]
     pub fn zero(&self) -> &'static [u16] {
+        // SAFETY: `zero_off` is the offset of a `[u16; nzero]` field of SB_BLOB (generated together; as `dec`).
         unsafe { core::slice::from_raw_parts(Self::at(self.zero_off) as *const u16, self.nzero as usize) }
     }
 
+    /// The byte for a character.
     #[inline(always)]
     pub fn lookup(&self, ch: u32) -> Option<u8> {
         if ch >= 0x10000 {
@@ -634,10 +688,12 @@ impl Sb {
     }
 }
 
+/// The charset name table: entries are (offset, length, code) into `charsets_gen::ALIAS_NAMES`, sorted by name; no pointers
+/// (see `Sb`). `code` is a `Cs` code: below 0x8000 an index of `SBS`, else 0x8000 + a special charset.
 pub struct AliasTable<const N: usize>(pub [(u32, u8, u16); N]);
 
 impl<const N: usize> AliasTable<N> {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used by the unit tests only
     pub fn len(&self) -> usize {
         N
     }
@@ -645,14 +701,18 @@ impl<const N: usize> AliasTable<N> {
     pub fn is_empty(&self) -> bool {
         N == 0
     }
+    /// The name of entry `i`.
     pub fn name(&self, i: usize) -> &'static str {
         let (off, len, _) = self.0[i];
         let b = &crate::charsets_gen::ALIAS_NAMES[off as usize..off as usize + len as usize];
+        // SAFETY: ALIAS_NAMES holds only ASCII names (generated), so any cut of it is UTF-8.
         unsafe { core::str::from_utf8_unchecked(b) }
     }
+    /// The code of entry `i`.
     pub fn code(&self, i: usize) -> u16 {
         self.0[i].2
     }
+    /// Binary search by name (the table is sorted): the index of the entry whose name equals `key`.
     pub fn find(&self, key: &[u8]) -> Option<usize> {
         let (mut lo, mut hi) = (0usize, N);
         while lo < hi {
@@ -671,6 +731,7 @@ impl<const N: usize> AliasTable<N> {
 }
 
 pub fn sb_dec(t: &Sb, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u32], op: &mut usize, irr: &mut usize) -> St {
+    // bytes that decode to themselves can be copied in runs
     let lim = t.dec_ident as usize;
     let dec = t.dec();
     dec_loop(
@@ -704,6 +765,8 @@ pub fn sb_dec(t: &Sb, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u32], o
     )
 }
 
+/// The charsets of glibc's ISO646 module (the national variants of ISO 646): it marks every character it cannot write as
+/// "illegal input seen" before it tries transliteration.
 fn is_iso646_module(name: &str) -> bool {
     matches!(
         name,

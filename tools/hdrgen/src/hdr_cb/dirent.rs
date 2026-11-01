@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("_DIRENT_MATCHES_DIRENT64", V::Dec(1)),
         ("DT_UNKNOWN", V::Dec(0)),
@@ -16,10 +17,11 @@ pub static AFTER_INCLUDES: &[Item] = &[
     ]),
     Item::Gate(&[
         Branch { head: "ifdef __USE_MISC", items: &[
-            Item::Include("<limits.h>"),
+            Item::Include("<limits.h>   /* glibc's dirent.h pulls in NAME_MAX, PATH_MAX, ... */"),
         ] },
     ], ""),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Typedef("struct __dirstream", "DIR"),
     Item::Block { head: "struct dirent64 ", body: &["", "  uint64_t d_ino;", "  int64_t d_off;", "  unsigned short d_reclen;", "  unsigned char d_type;", "  char d_name[256];", ""], tail: "" },
     Item::Consts(&[

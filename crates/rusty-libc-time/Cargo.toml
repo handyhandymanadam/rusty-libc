@@ -10,8 +10,16 @@ rusty-libc-mem = { path = "../rusty-libc-mem" }
 rusty-libc-malloc = { path = "../rusty-libc-malloc" }
 rusty-libc-ctype = { path = "../rusty-libc-ctype" }
 rusty-libc-stdlib = { path = "../rusty-libc-stdlib" }
+# SIGEV_THREAD timers start threads: the helper-thread seam of mq_notify and AIO
 rusty-libc-ipc = { path = "../rusty-libc-ipc" }
 
+[dev-dependencies]
+libc = "0.2"
+rusty-libc-malloc = { path = "../rusty-libc-malloc", features = ["no-brk"] }
+
 [features]
+# Export the C symbols. Off for host tests so they never replace the host libc.
 export = ["start"]
+# Take the vDSO address from rusty-libc-core's startup code (programs started by its `_start`) instead of
+# reading /proc/self/auxv.
 start = ["rusty-libc-core/start"]

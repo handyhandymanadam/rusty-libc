@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+"""Generate crates/rusty-libc-iconv/src/tsciidata.rs: the TSCII byte <-> Tamil character tables, read from the
+behaviour of the host's iconv (no glibc source is copied).
+
+* TO_UCS4[b - 0x80] = [first, second] character of the byte b (0 = none). The bytes whose meaning
+  needs state (0x82 0x87 0x8a 0x8b 0x8c: several characters, 0xa6-0xa8: a vowel sign placed before
+  its consonant) are marked [0, 0] and handled by the code in src/tscii.rs.
+* UCS4_TO_TSCII[c - 0xb80] = the byte of the Tamil character c when it is a single byte (the
+  consonants 0xb8-0xc9 and 0x83-0x86 are held back by the encoder: the code knows them by value).
+* CONSONANT_WITH_U / _UU / _VIRAMA: the byte of each of the 18 consonants 0xb8..0xc9 followed by
+  U+0BC1, U+0BC2, U+0BCD.
+Run: python3 gen_tscii.py > ../src/tsciidata.rs
+"""
 import ctypes, struct, sys
 
 libc = ctypes.CDLL(None, use_errno=True)
@@ -73,6 +85,8 @@ def comb(sign):
 
 
 cu, cuu, cv = comb(0xBC1), comb(0xBC2), comb(0xBCD)
+# the other single-byte consonant: 0xb8 (U+0B95 KA) with virama is held back (0xec); check the
+# table has no further surprises by decoding what we generate
 for i, b in enumerate(range(0x80, 0x100)):
     if to_ucs4[i][0] and to_ucs4[i][1] == 0 and to_ucs4[i][0] >= 0xB80 and b not in cons:
         pass

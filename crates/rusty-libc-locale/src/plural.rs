@@ -1,3 +1,11 @@
+//! The `plural=` expression of a message catalog's header, e.g. `(n != 1)` or
+//! `n%10==1 && n%100!=11 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2`.
+//!
+//! Same language as glibc's intl/plural.y (C operators on unsigned long values: `?:`, `||`, `&&`,
+//! `== !=`, `< > <= >=`, `+ -`, `* / %`, `!`, the variable `n`, decimal numbers, parentheses; no unary
+//! minus), same lexer rules (blanks and tabs skipped, `;`, newline or the end ends the expression).
+//! The expression is parsed into a small arena (no allocation), evaluated with unsigned arithmetic.
+
 #[derive(Clone, Copy)]
 enum Node {
     Var,
@@ -26,6 +34,7 @@ enum Op {
 
 const MAX_NODES: usize = 96;
 
+/// A parsed plural expression.
 #[derive(Clone, Copy)]
 pub struct Plural {
     nodes: [Node; MAX_NODES],
@@ -190,6 +199,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Precedence climbing: binary operators from `Or` (lowest) to `Mul`.
     fn binary(&mut self, level: u8) -> Option<u8> {
         if level > 5 {
             return self.primary();
@@ -235,6 +245,7 @@ impl<'a> Parser<'a> {
 }
 
 impl Plural {
+    /// The Germanic rule `n != 1`, used when a catalog says nothing usable.
     pub fn germanic() -> Plural {
         let mut p = Plural { nodes: [Node::Var; MAX_NODES], root: 2, n: 3 };
         p.nodes[0] = Node::Var;
@@ -243,6 +254,7 @@ impl Plural {
         p
     }
 
+    /// Parse the expression at the start of `text`; None if it is not valid.
     pub fn parse(text: &[u8]) -> Option<Plural> {
         let mut ps = Parser { s: text, i: 0, tok: Tok::End, p: Plural { nodes: [Node::Var; MAX_NODES], root: 0, n: 0 } };
         ps.lex();
@@ -292,11 +304,14 @@ impl Plural {
         }
     }
 
+    /// The plural form index for `n`.
     pub fn eval(&self, n: u64) -> u64 {
         self.eval_node(self.root, n)
     }
 }
 
+/// glibc's EXTRACT_PLURAL_EXPRESSION: `nplurals=` and `plural=` from a catalog header entry.
+/// Without both (or with a bad expression) the Germanic rule with 2 forms applies.
 pub fn extract(header: &[u8]) -> (Plural, u64) {
     let find = |pat: &[u8]| header.windows(pat.len()).position(|w| w == pat);
     if let (Some(pl), Some(npl)) = (find(b"plural="), find(b"nplurals=")) {

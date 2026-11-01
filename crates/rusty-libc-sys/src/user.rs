@@ -1,5 +1,11 @@
+//! `sys/user.h` and `sys/procfs.h` for x86_64: the register sets and process images that `ptrace` and core files carry
+//! (`user_regs_struct`, `user_fpregs_struct`, `struct user`, `elf_prstatus`, `elf_prpsinfo`). Plain data; the C
+//! headers are include-static/sys/user.h and procfs.h, and tests/c/user_procfs.c checks that both give glibc's layouts.
+//! The sizes and offsets below are glibc 2.43's (read from its headers with the C test); compile-time assertions keep
+//! the Rust definitions equal to them.
 use core::mem::{offset_of, size_of};
 
+/// `struct user_regs_struct`: the general registers in `ptrace(PTRACE_GETREGS)` order.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UserRegsStruct {
@@ -32,6 +38,7 @@ pub struct UserRegsStruct {
     pub gs: u64,
 }
 
+/// `struct user_fpregs_struct`: the x87 and SSE state (the `fxsave` image).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserFpregsStruct {
@@ -54,6 +61,7 @@ impl Default for UserFpregsStruct {
     }
 }
 
+/// `struct user`: the image of a process as old core files and `PTRACE_PEEKUSER` see it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct User {
@@ -67,13 +75,16 @@ pub struct User {
     pub start_stack: u64,
     pub signal: i64,
     pub reserved: i32,
+    /// `u_ar0` (a pointer in C, kept as its 64-bit value).
     pub u_ar0: u64,
+    /// `u_fpstate` (a pointer in C, kept as its 64-bit value).
     pub u_fpstate: u64,
     pub magic: u64,
     pub u_comm: [u8; 32],
     pub u_debugreg: [u64; 8],
 }
 
+/// `struct timeval` as the core file structures hold it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Timeval {
@@ -81,6 +92,7 @@ pub struct Timeval {
     pub tv_usec: i64,
 }
 
+/// `struct elf_siginfo`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ElfSiginfo {
@@ -89,9 +101,12 @@ pub struct ElfSiginfo {
     pub si_errno: i32,
 }
 
+/// `ELF_NGREG`: the number of registers in an `elf_gregset_t`.
 pub const ELF_NGREG: usize = size_of::<UserRegsStruct>() / size_of::<u64>();
+/// `elf_gregset_t`.
 pub type ElfGregset = [u64; ELF_NGREG];
 
+/// `struct elf_prstatus`: the NT_PRSTATUS note of a core file.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ElfPrstatus {
@@ -111,8 +126,10 @@ pub struct ElfPrstatus {
     pub pr_fpvalid: i32,
 }
 
+/// `ELF_PRARGSZ`.
 pub const ELF_PRARGSZ: usize = 80;
 
+/// `struct elf_prpsinfo`: the NT_PRPSINFO note of a core file.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ElfPrpsinfo {
@@ -137,6 +154,7 @@ impl Default for ElfPrpsinfo {
     }
 }
 
+// glibc 2.43 (x86_64), as printed by tests/c/user_procfs.c
 const _: () = {
     assert!(size_of::<UserRegsStruct>() == 216);
     assert!(offset_of!(UserRegsStruct, rip) == 128);
@@ -165,3 +183,19 @@ const _: () = {
     assert!(offset_of!(ElfPrpsinfo, pr_psargs) == 56);
 };
 
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
+    use super::*;
+
+    #[test]
+    fn layouts_are_the_ones_of_glibc() {
+        // the assertions above hold at compile time; this checks a built value through bytes
+        let r = UserRegsStruct { rip: 0x1122_3344_5566_7788, ..Default::default() };
+        let bytes: [u8; 216] = unsafe { core::mem::transmute(r) };
+        assert_eq!(&bytes[128..136], &0x1122_3344_5566_7788u64.to_ne_bytes());
+        let mut p = ElfPrstatus::default();
+        p.pr_reg[16] = 7;
+        assert_eq!(unsafe { *(((&p as *const ElfPrstatus).cast::<u8>()).add(112 + 16 * 8) as *const u64) }, 7);
+    }
+}

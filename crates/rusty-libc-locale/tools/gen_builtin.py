@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
+"""Write ../src/builtin_tables.rs: the data of the built-in locales "C" and "C.UTF-8" in the layout
+of glibc's locale files (magic, nstrings, strindex[], data), one blob per category, plus the list of
+item indices whose value is a 32-bit word. Facts come from the host: the item list and value types
+from glibc's locale/categories.def (read-only reference source), the values from the host glibc's
+nl_langinfo (a small C program). Big tables (ctype classes, collation tables, transliteration) are
+left empty: they are not nl_langinfo text and the runtime keeps its own copies.
+Usage: crates/rusty-libc-locale/tools/gen_builtin.py [glibc-source-dir]"""
 import os, re, struct, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GLIBC = sys.argv[1]
+GLIBC = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/Claude/libc-upstream/glibc-2.43")
 defs = open(os.path.join(GLIBC, "locale/categories.def")).read()
 
 CATS = ["LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE", "LC_MONETARY", "LC_MESSAGES", "LC_ALL", "LC_PAPER", "LC_NAME", "LC_ADDRESS", "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION"]
-elements = {}
+# categories.def: DEFINE_CATEGORY ( LC_X, "LC_X", ( DEFINE_ELEMENT (NAME, "n", std, type ...) ...
+elements = {}  # cat -> [(name, type)]
 for m in re.finditer(r"DEFINE_CATEGORY\s*\(\s*(LC_\w+)\s*,(.*?)\)\s*,\s*\w+\)", defs, re.S):
     cat, body = m.group(1), m.group(2)
     elements[cat] = re.findall(r"DEFINE_ELEMENT\s*\(\s*(\w+)\s*,\s*\"[^\"]*\"\s*,\s*\w+\s*,\s*(\w+)", body)
 assert len(elements) == 12, len(elements)
 
+# item indices from the host's langinfo.h
 allnames = sorted({n for es in elements.values() for n, _ in es})
 nums = ["_NL_NUM_" + c for c in CATS if c != "LC_ALL"]
 hdr = open("/usr/include/langinfo.h").read()
-def cname(n):
+def cname(n):  # the host header spells some enumerators with a leading "__"
     return n if re.search(r"^\s*%s\b" % re.escape(n), hdr, re.M) else "__" + n
 src = ["#define _GNU_SOURCE 1", "#include <langinfo.h>", "#include <stdio.h>", "int main(void) {"]
 for n in allnames + nums:
@@ -38,6 +47,7 @@ idxtype = {c: {} for c in nstrings}
 for c, es in elements.items():
     for n, t in es:
         idxtype[c][item[n] & 0xFFFF] = t
+# arrays: an element of stringarray/stringlist type covers the following indices up to the next element
 for c in nstrings:
     last = None
     for i in range(nstrings[c]):
@@ -58,11 +68,13 @@ for c, es in elements.items():
     for n, t in es:
         if n in skipnames:
             skip_idx[c].add(item[n] & 0xFFFF)
+# gaps are filler
 for c in nstrings:
     for i in range(nstrings[c]):
         if i not in idxtype[c] or True:
             pass
 
+# value probe: one program, prints "cat idx kind hex" for every non-skipped item
 kind = {}
 for c in nstrings:
     for i in range(nstrings[c]):

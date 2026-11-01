@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "semaphore.h",
     items: &[
+        Item::Comment(r#"/* semaphore.h for the Rust libc. The declarations are generated (bits/rlibc-semcalls.h, from
+   crates/rusty-libc-pthread/src/sem.rs). */"#),
         Item::Guard { name: "_RLIBC_SEMAPHORE_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),

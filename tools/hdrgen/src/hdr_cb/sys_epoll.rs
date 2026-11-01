@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("EPOLL_CLOEXEC", V::Hex(0x80000)),
         ("EPOLLIN", V::Txt("1U")),
@@ -26,9 +27,10 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("EPIOCGPARAMS", V::Txt("0x80088a02UL")),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Block { head: "typedef union epoll_data ", body: &["", "  void *ptr;", "  int fd;", "  uint32_t u32;", "  uint64_t u64;", ""], tail: " epoll_data_t" },
     Item::Block { head: "struct epoll_event ", body: &["", "  uint32_t events;", "  epoll_data_t data;", ""], tail: " __attribute__((__packed__))" },
-    Item::Block { head: "struct epoll_params ", body: &["", "  uint32_t busy_poll_usecs;", "  uint16_t busy_poll_budget;", "  uint8_t prefer_busy_poll;", "  uint8_t __pad;", ""], tail: "" },
+    Item::Block { head: "struct epoll_params ", body: &["", "  uint32_t busy_poll_usecs;", "  uint16_t busy_poll_budget;", "  uint8_t prefer_busy_poll;", "  uint8_t __pad;   /* pad the struct to a multiple of 64 bits */", ""], tail: "" },
 ];
 pub const AFTER_INCLUDES_CHOMP: bool = false;
 

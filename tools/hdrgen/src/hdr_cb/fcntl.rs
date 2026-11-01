@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* glibc's fcntl.h also provides off_t, off64_t, mode_t and pid_t */"),
     Item::Include("<sys/types.h>"),
     Item::Gate(&[
         Branch { head: "ifdef __USE_LARGEFILE64", items: &[
@@ -14,6 +15,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
             ], ""),
         ] },
     ], ""),
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("F_GETLK64", V::Dec(5)),
         ("F_SETLK64", V::Dec(6)),
@@ -198,6 +200,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("F_TEST", V::Dec(3)),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Block { head: "struct f_owner_ex ", body: &["", "  int type;", "  pid_t pid;", ""], tail: "" },
     Item::Block { head: "struct flock64 ", body: &["", "  short l_type;", "  short l_whence;", "  long l_start;", "  long l_len;", "  pid_t l_pid;", ""], tail: "" },
     Item::Block { head: "struct file_handle ", body: &["", "  unsigned int handle_bytes;", "  int handle_type;", "  unsigned char f_handle[];", ""], tail: "" },
@@ -208,6 +211,7 @@ pub const AFTER_INCLUDES_CHOMP: bool = false;
 pub static TRAILER: &[Item] = &[
     Item::Gate(&[
         Branch { head: "if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function", items: &[
+            Item::Comment("/* the wrappers' test for open's mode argument: x86-64 O_CREAT, and __O_TMPFILE (O_TMPFILE is only visible with _GNU_SOURCE) */"),
             Item::Raw(Reason::GlibcMacro, "# define __OPEN_NEEDS_MODE(oflag) (((oflag) & 0100) != 0 || ((oflag) & 0x410000) == 0x410000)"),
             Item::Include("<bits/fcntl-linux-fortify.h>"),
             Item::Include("<bits/fcntl2.h>"),

@@ -1,9 +1,19 @@
+//! 8-bit charsets with combining characters: CP1255 (Hebrew points), CP1258 and TCVN5712-1
+//! (Vietnamese tone marks). The decoder holds back a character that a combining mark may follow
+//! (the pending character is released by the next character or by a flush) and combines the pair
+//! when the table has it; the encoder writes a character that has no code of its own as a base
+//! letter followed by marks.
 use crate::engine::*;
 
+/// The generated tables of one charset.
 pub struct Comp {
+    /// The character of each byte (0xffff = invalid byte).
     pub dec: &'static [u16; 256],
+    /// `character << 8 | byte` for the characters with a code of their own, sorted.
     pub enc1: &'static [u32],
+    /// (mark, base, composed), sorted by mark then base.
     pub comp: &'static [(u16, u16, u16)],
+    /// (character, number of bytes, bytes), sorted by character.
     pub decomp: &'static [(u16, u8, [u8; 3])],
 }
 
@@ -25,6 +35,7 @@ pub fn tables(k: Kind) -> &'static Comp {
     }
 }
 
+/// The decoder holds this much of the state: the pending character shifted left by 3 bits.
 pub type DecState = u32;
 
 fn params(k: Kind) -> (u32, u32, u32, u32, &'static [u32]) {
@@ -63,6 +74,7 @@ pub fn dec(k: Kind, st: &mut DecState, flags: u32, inp: &[u8], ip: &mut usize, o
                     return Body::Char(composed, 1);
                 }
             }
+            // not combining: release the pending character
             *st = 0;
             if must_buffer {
                 *st = ch << 3;

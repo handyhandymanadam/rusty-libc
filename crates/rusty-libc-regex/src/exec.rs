@@ -1,3 +1,25 @@
+//! The matcher. Same results as glibc's regexec.c, different machinery:
+//!
+//! 1. Where the match is: glibc runs a DFA whose states are sets of NFA nodes; here a Thompson/Pike
+//!    simulation over the same node sets finds the leftmost start and the longest end in
+//!    O(length x nodes). Threads carry their start; a node reached by two starts keeps the earlier
+//!    one. The rules that make glibc's DFA unusual are kept: a character consumed by a transition
+//!    gives the next state the context "word" or "newline" of that character (newline even without
+//!    REG_NEWLINE), a node with a "next" constraint (copy made for `$`, `\>` ...) only consumes
+//!    characters of the right kind, and halting is checked against the real context.
+//! 2. Which submatches are reported: glibc re-runs the match from its start keeping the node set of
+//!    every position (state log), throws away the nodes that cannot reach the final end node
+//!    ("sifting", `prune_impossible_nodes`), and walks one path from the start node, taking at
+//!    each choice the first successor in the sifted set, recording group boundaries
+//!    (`update_regs`, with its rule for empty iterations of optional groups). `fwd_rows`, `sift` and
+//!    `walk_regs` do the same.
+//! 3. Patterns with back-references: a backtracking search over all paths in glibc's priority
+//!    order, remembering visited (branch node, position, referenced groups) states so repetition does
+//!    not blow up; the longest end wins, and among paths with that end the first in priority order.
+//!    glibc itself is unreliable on such patterns (see the tests), this is the sensible reading.
+//!
+//! Text is read through `Env::tb`, one byte per character (C locale); the context functions are the
+//! only places that know what a word or a line boundary is.
 use crate::charset::{self, Mb};
 use crate::consts::*;
 use crate::dfa::Loc;
@@ -15,40 +37,92 @@ pub struct Reg {
 
 pub const UNSET: Reg = Reg { so: -1, eo: -1 };
 
+/// The table of character starts of a text (`Env::starts`), one bit per byte and one more: in the struct itself for a text of up to
+/// `INLINE_WORDS * 64 - 1` bytes, so a short search makes no allocation.
+pub struct Starts {
+    inline: [u64; INLINE_WORDS],
+    big: V<u64>,
+    /// Bits in use: `text.len() + 1`, or 0 for "every byte starts a character".
+    n: usize,
+}
+
+const INLINE_WORDS: usize = 3;
+
+impl Starts {
+    /// The bits.
+    pub(crate) fn words(&self) -> &[u64] {
+        if self.big.is_empty() { &self.inline[..self.n.div_ceil(64)] } else { &self.big[..self.n.div_ceil(64)] }
+    }
+
+    /// Bits in use (0: every byte starts a character).
+    pub(crate) fn len(&self) -> usize {
+        self.n
+    }
+}
+
 pub struct Env<'a> {
     pub nfa: &'a Nfa,
     pub text: &'a [u8],
     pub xlat: &'a [u8; 256],
+    /// `xlat` is the compiled pattern's own table (it cannot change between searches).
     pub xlat_fixed: bool,
+    /// glibc's fastmap (when it is in use for this search) and the pattern buffer's translate
+    /// table (the fastmap is indexed by translated bytes then).
     pub fastmap: Option<&'a [u8; 256]>,
     pub fm_trans: Option<&'a [u8; 256]>,
     pub stop: usize,
     pub not_bol: bool,
     pub not_eol: bool,
     pub newline_anchor: bool,
-    pub starts: V<u8>,
+    /// In a multibyte charset that is not UTF-8: 1 at every byte that starts a character, 0 inside one (one entry
+    /// more than the text has bytes). Empty when every byte starts one (ASCII text, and the other kinds of locale). Made by
+    /// the first search that needs it (`starts()`).
+    starts: core::cell::OnceCell<Starts>,
 }
 
 impl<'a> Env<'a> {
-    pub fn char_starts(nfa: &Nfa, text: &[u8]) -> V<u8> {
-        let mut v: V<u8> = V::new();
-        if nfa.mb != Mb::Other {
-            return v;
-        }
-        v.resize(text.len() + 1, 0);
-        let mut i = 0;
-        while i < text.len() {
-            v[i] = 1;
-            let n = match charset::decode(Mb::Other, &text[i..text.len().min(i + 6)]) {
-                Some((_, n)) => n,
-                None => 1,
-            };
-            i += n.max(1);
-        }
-        v[text.len()] = 1;
-        v
+    /// The environment of one search (see the fields).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(nfa: &'a Nfa, text: &'a [u8], xlat: &'a [u8; 256], xlat_fixed: bool, fastmap: Option<&'a [u8; 256]>, fm_trans: Option<&'a [u8; 256]>, stop: usize, not_bol: bool, not_eol: bool, newline_anchor: bool) -> Env<'a> {
+        Env { nfa, text, xlat, xlat_fixed, fastmap, fm_trans, stop, not_bol, not_eol, newline_anchor, starts: core::cell::OnceCell::new() }
     }
 
+    /// The table of character starts (see the field), made on first use.
+    pub(crate) fn starts(&self) -> &Starts {
+        self.starts.get_or_init(|| Env::char_starts(self.nfa, self.text))
+    }
+
+    /// Does a character start at byte `i` (`i` up to the text's length), for a non-UTF-8 multibyte charset?
+    #[inline]
+    fn start_at(&self, i: usize) -> bool {
+        let st = self.starts();
+        st.n == 0 || st.words()[i >> 6] >> (i & 63) & 1 != 0
+    }
+
+    /// The table `starts` needs for `text` (glibc builds the same from `mbrtowc`: a valid character is one
+    /// unit, an invalid byte a character of its own).
+    fn char_starts(nfa: &Nfa, text: &[u8]) -> Starts {
+        let mut st = Starts { inline: [0; INLINE_WORDS], big: V::new(), n: 0 };
+        if nfa.mb != Mb::Other || text.is_ascii() {
+            return st;
+        }
+        let n = text.len() + 1;
+        if n <= INLINE_WORDS * 64 {
+            crate::starts::fill(text, &mut st.inline);
+        } else {
+            st.big = V::from_elem(0, n.div_ceil(64));
+            if st.big.oom {
+                st.big = V::new();
+                return st;
+            }
+            crate::starts::fill(text, &mut st.big[..]);
+        }
+        st.n = n;
+        st
+    }
+
+    /// Multibyte: the character that contains byte `i` (`i < len`): where it starts, its value (the byte itself when
+    /// the bytes there are not a valid character) and its length.
     fn char_info(&self, i: usize) -> (usize, u32, usize) {
         let text = self.text;
         let b = text[i];
@@ -61,6 +135,7 @@ impl<'a> Env<'a> {
             loop {
                 let c = text[j];
                 if !(0x80..0xc0).contains(&c) {
+                    // a possible first byte: does a valid character that starts here reach byte i?
                     if let Some((wc, n)) = charset::decode(Mb::Utf8, &text[j..text.len().min(j + 4)])
                         && j + n > i
                     {
@@ -75,8 +150,9 @@ impl<'a> Env<'a> {
             }
             return (i, b as u32, 1);
         }
+        // another multibyte charset: the table says where characters start
         let mut j = i;
-        while j > 0 && self.starts[j] == 0 {
+        while j > 0 && !self.start_at(j) {
             j -= 1;
         }
         match charset::decode(Mb::Other, &text[j..text.len().min(j + 6)]) {
@@ -85,6 +161,7 @@ impl<'a> Env<'a> {
         }
     }
 
+    /// Multibyte: does a character start at byte `i`?
     #[inline]
     pub(crate) fn is_first(&self, i: usize) -> bool {
         if i >= self.text.len() {
@@ -94,10 +171,18 @@ impl<'a> Env<'a> {
             let b = self.text[i];
             return b < 0x80 || self.char_info(i).0 == i;
         }
-        self.starts[i] != 0
+        if self.text[i] < 0x80 && self.nfa.ascii_starts {
+            return true;
+        }
+        self.start_at(i)
     }
 
+    /// Context of the character that contains byte `i`, in a multibyte locale.
     fn mb_ctx(&self, i: usize) -> u8 {
+        if !self.nfa.word_ctx {
+            // (no node asks whether a character is a word character: only a newline matters, and it is a character of its own)
+            return if self.text[i] == b'\n' && self.newline_anchor { CTX_NEWLINE } else { 0 };
+        }
         let (_, wc, _) = self.char_info(i);
         if charset::is_word_wc(wc) {
             CTX_WORD
@@ -113,6 +198,8 @@ impl<'a> Env<'a> {
         self.xlat[self.text[i] as usize]
     }
 
+    /// Context of position `i` as glibc's re_string_context_at gives it (real, honours
+    /// REG_NEWLINE / REG_NOTEOL).
     fn ctx_at(&self, i: usize) -> u8 {
         if i >= self.text.len() {
             return CTX_ENDBUF | if self.not_eol { 0 } else { CTX_NEWLINE };
@@ -130,14 +217,22 @@ impl<'a> Env<'a> {
         }
     }
 
+    /// Context of the character before position `p` when a match starts at `p` (glibc's tip
+    /// context).
     pub(crate) fn tip_ctx(&self, p: usize) -> u8 {
         if p == 0 { CTX_BEGBUF | if self.not_bol { 0 } else { CTX_NEWLINE } } else { self.ctx_at(p - 1) }
     }
 
+    /// Context a DFA state gets from the character consumed to reach it: a newline always counts
+    /// as a line start, whatever REG_NEWLINE says.
+    /// Same for the byte at `p` of the text (multibyte: the context of the character the byte ends, if it ends one).
     #[inline]
     fn trans_ctx_at(&self, p: usize, b: u8) -> u8 {
         if self.nfa.mb == Mb::None || (self.nfa.mb == Mb::Utf8 && b < 0x80) {
             return Self::trans_ctx(b);
+        }
+        if !self.nfa.word_ctx {
+            return if b == b'\n' { CTX_NEWLINE } else { 0 };
         }
         let (s, wc, n) = self.char_info(p);
         if s + n != p + 1 {
@@ -152,8 +247,13 @@ impl<'a> Env<'a> {
         }
     }
 
+    /// `consume_dfa` for the byte at `p`: in a multibyte locale a "next is a word character" constraint looks at the
+    /// whole character that starts there.
     #[inline]
     pub(crate) fn consume_at(&self, nd: &NNode, b: u8, p: usize) -> bool {
+        if nd.kind == K_U8 && self.nfa.u8refs()[nd.arg as usize].depth != 0 {
+            return self.u8_step(nd, b, p).is_some();
+        }
         if self.nfa.mb != Mb::None && nd.constraint & (NEXT_WORD | NEXT_NOTWORD) != 0 {
             if !self.accept_base(nd, b) {
                 return false;
@@ -191,12 +291,19 @@ impl<'a> Env<'a> {
             K_CHAR => nd.c == b,
             K_SET => set_has(&self.nfa.sets[nd.arg as usize], b),
             K_ANY => !(b == b'\n' && self.nfa.syntax & RE_DOT_NEWLINE == 0) && !(b == 0 && self.nfa.syntax & RE_DOT_NOT_NULL != 0),
+            K_MB => self.nfa.mb_accepts(nd, b),
+            K_U8 => self.nfa.u8_accepts(nd, b),
             _ => false,
         }
     }
 
+    /// May `nd` consume byte `b` in a DFA transition (glibc's group_nodes_into_DFAstates)?
     #[inline]
     pub(crate) fn consume_dfa(&self, nd: &NNode, b: u8) -> bool {
+        // (the DFA reads text of single-byte characters only: the inner nodes of a UTF-8 set are never in its states)
+        if nd.kind == K_U8 && self.nfa.u8refs()[nd.arg as usize].depth != 0 {
+            return false;
+        }
         if !self.accept_base(nd, b) {
             return false;
         }
@@ -218,11 +325,46 @@ impl<'a> Env<'a> {
         true
     }
 
+    /// A `K_U8` node of depth 1 to 3 and the byte `b` at `p` (the bytes before it, back to the character's first, are in
+    /// the text): `None` when it does not take the byte, else whether the byte completes the character.
+    fn u8_step(&self, nd: &NNode, b: u8, p: usize) -> Option<bool> {
+        let r = &self.nfa.u8refs()[nd.arg as usize];
+        let d = r.depth as usize;
+        if d == 0 || p < d {
+            return None;
+        }
+        let mut bytes = [0u8; 3];
+        for (k, x) in bytes.iter_mut().enumerate().take(d) {
+            *x = self.tb(p - d + k);
+        }
+        self.nfa.u8specs()[r.spec as usize].step(&bytes[..d], b)
+    }
+
+    /// The node a consumer goes to after consuming byte `b` at `p` (which it accepts).
+    #[inline]
+    pub(crate) fn next_at(&self, nd: &NNode, b: u8, p: usize) -> u32 {
+        if nd.kind == K_U8 {
+            let r = &self.nfa.u8refs()[nd.arg as usize];
+            if r.depth != 0 {
+                return match self.u8_step(nd, b, p) {
+                    Some(true) => nd.next,
+                    Some(false) => r.base + r.depth,
+                    None => NONE,
+                };
+            }
+        }
+        self.nfa.next_of(nd, b)
+    }
+
+    /// glibc's check_node_accept: does `nd` accept the character at `idx` in the real context?
     fn accept_real(&self, nd: &NNode, idx: usize) -> bool {
         if idx >= self.stop.min(self.text.len()) {
             return false;
         }
         if !self.accept_base(nd, self.tb(idx)) {
+            return false;
+        }
+        if nd.kind == K_U8 && self.nfa.u8refs()[nd.arg as usize].depth != 0 && self.u8_step(nd, self.tb(idx), idx).is_none() {
             return false;
         }
         if nd.constraint != 0 && next_bad(nd.constraint, self.ctx_at(idx)) {
@@ -235,22 +377,21 @@ impl<'a> Env<'a> {
         nd.constraint == 0 || !next_bad(nd.constraint, self.ctx_at(p))
     }
 
+    /// Can a match start at `q`, according to the fastmap in use?
     #[inline]
     pub(crate) fn start_ok(&self, q: usize) -> bool {
-        if self.nfa.mb != Mb::None && !self.is_first(q) {
-            return false;
-        }
-        match self.fastmap {
-            None => true,
-            Some(fm) => {
-                let ch = if q < self.text.len() { self.text[q] } else { 0 };
-                let i = match self.fm_trans {
-                    Some(t) => t[ch as usize],
-                    None => ch,
-                };
-                fm[i as usize] != 0
+        // (the fastmap first: it is a table lookup)
+        if let Some(fm) = self.fastmap {
+            let ch = if q < self.text.len() { self.text[q] } else { 0 };
+            let i = match self.fm_trans {
+                Some(t) => t[ch as usize],
+                None => ch,
+            };
+            if fm[i as usize] == 0 {
+                return false;
             }
         }
+        self.nfa.mb == Mb::None || self.is_first(q)
     }
 }
 
@@ -264,12 +405,16 @@ pub struct Scratch {
 
 impl Scratch {
     pub fn new(nodes: usize) -> Scratch {
+        // the mark array is made when the matcher first needs it (the DFA often answers alone)
         Scratch { nodes, mark: V::new(), generation: 0, cur: V::new(), next: V::new() }
     }
 }
 
 type Best = Option<(u32, usize)>;
 
+/// Adds the nodes of `nodes` (an epsilon closure) at position `p` to `list` as threads of `start`,
+/// dropping those whose "previous" constraint fails under `prevctx`, and records a match when an
+/// end node whose "next" constraint holds is among them.
 #[allow(clippy::too_many_arguments)]
 fn fwd_add(env: &Env, mark: &mut V<u32>, generation: u32, list: &mut V<(u32, u32)>, nodes: &[u32], start: u32, p: usize, prevctx: u8, best: &mut Best) {
     for &n in nodes {
@@ -282,7 +427,7 @@ fn fwd_add(env: &Env, mark: &mut V<u32>, generation: u32, list: &mut V<(u32, u32
         }
         mark[n as usize] = generation;
         match nd.kind {
-            K_CHAR | K_SET | K_ANY => list.push((n, start)),
+            K_CHAR | K_SET | K_ANY | K_MB | K_U8 => list.push((n, start)),
             K_END if env.halt_ok(nd, p) => {
                 let better = match *best {
                     None => true,
@@ -297,10 +442,12 @@ fn fwd_add(env: &Env, mark: &mut V<u32>, generation: u32, list: &mut V<(u32, u32
     }
 }
 
+/// Leftmost start in `start0..=last_start`, and the longest end for it. Without back-references.
 fn search_forward(env: &Env, start0: usize, last_start: usize, need_longest: bool, sc: &mut Scratch) -> Result<Option<(usize, usize)>, i32> {
     let nfa = env.nfa;
     let stop = env.stop;
     let mut start0 = start0;
+    // a full scan of a longer text: the DFA finds the match, or where the matcher has to start
     if last_start == env.text.len() {
         match nfa.dfa.locate(env, start0, need_longest) {
             Loc::NoMatch => return Ok(None),
@@ -332,6 +479,7 @@ fn search_forward(env: &Env, start0: usize, last_start: usize, need_longest: boo
                 break;
             }
             sc.cur.clear();
+            // skip to the next position where a match may start
             let mut q = p + 1;
             while q < last_start && !env.start_ok(q) {
                 q += 1;
@@ -353,7 +501,7 @@ fn search_forward(env: &Env, start0: usize, last_start: usize, need_longest: boo
             }
             let nd = &nfa.nodes[n as usize];
             if env.consume_at(nd, b, p) {
-                fwd_add(env, &mut sc.mark, sc.generation, &mut sc.next, nfa.eclosure(nd.next), s, p + 1, pc, &mut best);
+                fwd_add(env, &mut sc.mark, sc.generation, &mut sc.next, nfa.eclosure(env.next_at(nd, b, p)), s, p + 1, pc, &mut best);
             }
         }
         core::mem::swap(&mut sc.cur, &mut sc.next);
@@ -375,6 +523,8 @@ fn setbit(rows: &mut [u64], w: usize, r: usize, n: usize) {
     rows[r * w + n / 64] |= 1 << (n % 64);
 }
 
+/// glibc's state log for the match `s..=e`: the node set of every position, running the DFA from
+/// the start `s` alone. Row `p - s` is the set at position `p`.
 fn fwd_rows(env: &Env, s: usize, e: usize) -> Result<V<u64>, i32> {
     let nfa = env.nfa;
     let m = nfa.nodes.len();
@@ -403,8 +553,8 @@ fn fwd_rows(env: &Env, s: usize, e: usize) -> Result<V<u64>, i32> {
                 word &= word - 1;
                 let n = wi * 64 + bi;
                 let nd = &nfa.nodes[n];
-                if matches!(nd.kind, K_CHAR | K_SET | K_ANY) && env.consume_at(nd, b, p) {
-                    for &x in nfa.eclosure(nd.next) {
+                if matches!(nd.kind, K_CHAR | K_SET | K_ANY | K_MB | K_U8) && env.consume_at(nd, b, p) {
+                    for &x in nfa.eclosure(env.next_at(nd, b, p)) {
                         let c = nfa.nodes[x as usize].constraint;
                         if c != 0 && prev_bad(c, pc) {
                             continue;
@@ -418,6 +568,9 @@ fn fwd_rows(env: &Env, s: usize, e: usize) -> Result<V<u64>, i32> {
     Ok(bits)
 }
 
+/// glibc's prune_impossible_nodes / sift_states_backward: keep, at every position, the nodes whose
+/// epsilon closure reaches a node that accepts the next character into the kept set of the next
+/// position (at the end: the last node). Returns None when nothing is left at the start.
 fn sift(env: &Env, rows: &V<u64>, s: usize, e: usize, last_node: u32) -> Result<Option<V<u64>>, i32> {
     let nfa = env.nfa;
     let m = nfa.nodes.len();
@@ -444,7 +597,7 @@ fn sift(env: &Env, rows: &V<u64>, s: usize, e: usize, last_node: u32) -> Result<
                     word &= word - 1;
                     let n = wi * 64 + bi;
                     let nd = &nfa.nodes[n];
-                    if matches!(nd.kind, K_CHAR | K_SET | K_ANY) && env.accept_real(nd, idx) && bit(&out, w, r + 1, nd.next as usize) {
+                    if matches!(nd.kind, K_CHAR | K_SET | K_ANY | K_MB | K_U8) && env.accept_real(nd, idx) && bit(&out, w, r + 1, env.next_at(nd, env.tb(idx), idx) as usize) {
                         dest.push(n as u32);
                     }
                 }
@@ -479,6 +632,7 @@ fn sift(env: &Env, rows: &V<u64>, s: usize, e: usize, last_node: u32) -> Result<
     Ok(if any { Some(out) } else { None })
 }
 
+/// glibc's update_regs.
 fn update_regs(nd: &NNode, regs: &mut [Reg], prev: &mut [Reg], idx: i32) {
     let nmatch = regs.len();
     if nd.kind == K_OPEN {
@@ -502,6 +656,8 @@ fn update_regs(nd: &NNode, regs: &mut [Reg], prev: &mut [Reg], idx: i32) {
     }
 }
 
+/// glibc's set_regs without a fail stack: one walk from the start node, taking at each choice the
+/// first successor that is in the node set of the position.
 fn walk_regs(env: &Env, s: usize, e: usize, rows: &V<u64>, last_node: u32, regs: &mut [Reg]) -> bool {
     let nfa = env.nfa;
     let m = nfa.nodes.len();
@@ -545,8 +701,8 @@ fn walk_regs(env: &Env, s: usize, e: usize, rows: &V<u64>, last_node: u32, regs:
                 return false;
             }
             cur = dest;
-        } else if matches!(nd.kind, K_CHAR | K_SET | K_ANY) && env.accept_real(nd, idx) {
-            cur = nd.next;
+        } else if matches!(nd.kind, K_CHAR | K_SET | K_ANY | K_MB | K_U8) && env.accept_real(nd, idx) {
+            cur = env.next_at(nd, env.tb(idx), idx);
             idx += 1;
             egen += 1;
         } else {
@@ -555,6 +711,7 @@ fn walk_regs(env: &Env, s: usize, e: usize, rows: &V<u64>, last_node: u32, regs:
     }
 }
 
+/// Steps one search with back-references may take before it gives up with REG_ESPACE.
 pub const BK_BUDGET: u64 = 8_000_000;
 
 struct Frame {
@@ -581,6 +738,7 @@ impl Memo {
     fn new() -> Memo {
         Memo { tab: V::from_elem(0, 1024), n: 0 }
     }
+    /// True when `key` was not present (and is now).
     fn insert(&mut self, key: u64) -> bool {
         let key = key | 1;
         if self.n >= (1 << 22) || self.tab.oom || self.tab.len() < 2 {
@@ -620,12 +778,15 @@ impl Memo {
     }
 }
 
+/// Does the text at `idx` go on as the longer collating element a guard stands for?
 fn guard_hit(env: &Env, g: usize, idx: usize) -> bool {
     let (rest, n) = env.nfa.guards[g];
     let n = n as usize;
     idx + n <= env.stop && (0..n).all(|k| env.tb(idx + k) == rest[k])
 }
 
+/// Patterns with back-references: all paths from `s` in glibc's priority order; the longest end
+/// wins, the first path to reach it gives the groups.
 fn bk_at(env: &Env, s: usize, budget: &mut u64) -> Result<Option<(usize, V<Reg>)>, i32> {
     let nfa = env.nfa;
     let nreg = nfa.nsub as usize + 1;
@@ -693,6 +854,8 @@ fn bk_at(env: &Env, s: usize, budget: &mut u64) -> Result<Option<(usize, V<Reg>)
                 }
             } else if nd.kind == K_BACKREF {
                 let g = nd.arg as usize + 1;
+                // glibc (transit_state_bkref) checks a back-reference's "next" constraint (`$`, `\>` ... before it) against the
+                // real context at the position where the referenced text would start, whatever the group holds
                 if nd.constraint != 0 && next_bad(nd.constraint, env.ctx_at(idx)) {
                 } else if g < nreg && regs[g].so != -1 && regs[g].eo != -1 {
                     let len = (regs[g].eo - regs[g].so) as usize;
@@ -715,10 +878,10 @@ fn bk_at(env: &Env, s: usize, budget: &mut u64) -> Result<Option<(usize, V<Reg>)
                         }
                     }
                 }
-            } else if matches!(nd.kind, K_CHAR | K_SET | K_ANY) && env.accept_real(nd, idx) {
+            } else if matches!(nd.kind, K_CHAR | K_SET | K_ANY | K_MB | K_U8) && env.accept_real(nd, idx) {
+                nxt = env.next_at(nd, env.tb(idx), idx);
                 idx += 1;
                 eps.clear();
-                nxt = nd.next;
             }
         }
         if stack.oom || regs.oom || eps.oom {
@@ -746,6 +909,12 @@ fn has_constraint(nfa: &Nfa, set: &[u32]) -> bool {
     set.iter().any(|&n| nfa.nodes[n as usize].constraint != 0)
 }
 
+/// glibc quirk. check_matching remembers how many characters the DFA spent in its initial state
+/// (`next_start_idx`) so that a failed attempt can skip those start positions, and it adds that
+/// number to `match_first` at the end unless a later state halted. When the initial state itself
+/// halts (the match is empty) and the DFA then only loops in the initial state without halting
+/// again, the empty match is reported that many characters too late. This returns that number for
+/// the attempt starting at `s`, by following the DFA state identity (node set and context).
 fn init_bump(env: &Env, s: usize) -> usize {
     let nfa = env.nfa;
     let mut entr: V<u32> = V::new();
@@ -762,9 +931,9 @@ fn init_bump(env: &Env, s: usize) -> usize {
         let mut un: V<u32> = V::new();
         for &n in st.iter() {
             let nd = &nfa.nodes[n as usize];
-            if matches!(nd.kind, K_CHAR | K_SET | K_ANY) && env.consume_at(nd, b, p) {
+            if matches!(nd.kind, K_CHAR | K_SET | K_ANY | K_MB | K_U8) && env.consume_at(nd, b, p) {
                 let mut tmp: V<u32> = V::new();
-                tmp.extend_from_slice(nfa.eclosure(nd.next));
+                tmp.extend_from_slice(nfa.eclosure(env.next_at(nd, b, p)));
                 merge_sorted_pub(&mut un, &tmp);
             }
         }
@@ -793,6 +962,9 @@ fn init_bump(env: &Env, s: usize) -> usize {
     k
 }
 
+/// glibc's re_search_internal. `start`/`last_start` are as in re_search (last_start may be below
+/// start: the search then runs backwards). `nmatch_in` is the number of entries of `pmatch` the
+/// caller wants (0 for "match or not only"). Returns REG_NOERROR, REG_NOMATCH or REG_ESPACE.
 pub fn search_internal(env: &Env, start: isize, last_start: isize, nmatch_in: usize, pmatch: &mut [Reg]) -> i32 {
     let nfa = env.nfa;
     let nsub = nfa.nsub as usize;
@@ -812,6 +984,7 @@ pub fn search_internal(env: &Env, start: isize, last_start: isize, nmatch_in: us
     let mut budget: u64 = BK_BUDGET;
     let mut cur_start = start;
     loop {
+        // find the match: (start, end, groups when back-references gave them)
         let found: Option<(usize, usize, Option<V<Reg>>)> = if nfa.nbackref > 0 {
             let mut f = None;
             let mut s = cur_start;
@@ -871,6 +1044,8 @@ pub fn search_internal(env: &Env, start: isize, last_start: isize, nmatch_in: us
         };
         let bump = if bk_regs.is_none() && forward && need_longest && e == s && nfa.nbackref == 0 { init_bump(env, s) } else { 0 };
         if nmatch > 0 {
+            // results go to a scratch array first: nothing is written to the caller's array unless
+            // the whole search succeeds, like glibc
             let mut tmp: V<Reg> = V::from_elem(UNSET, nmatch);
             if tmp.oom {
                 return REG_ESPACE;
@@ -887,6 +1062,7 @@ pub fn search_internal(env: &Env, start: isize, last_start: isize, nmatch_in: us
                         Err(c) => return c,
                     };
                     let w = nfa.nodes.len().div_ceil(64);
+                    // the halt node: first end node of the final state that fits the context
                     let mut last_node = NONE;
                     for n in 0..nfa.nodes.len() {
                         if bit(&rows, w, e - s, n) {
@@ -905,6 +1081,7 @@ pub fn search_internal(env: &Env, start: isize, last_start: isize, nmatch_in: us
                         match sift(env, &rows, s, e, last_node) {
                             Err(c) => return c,
                             Ok(None) => {
+                                // nothing survives from this start: try the next one
                                 if forward {
                                     if s >= last_start {
                                         return REG_NOMATCH;
@@ -927,6 +1104,7 @@ pub fn search_internal(env: &Env, start: isize, last_start: isize, nmatch_in: us
                         &rows
                     };
                     if !walk_regs(env, s, e, use_rows, last_node, &mut tmp) {
+                        // glibc has written its registers by then, still relative to the start
                         for (d, r) in pmatch[..nmatch].iter_mut().zip(tmp.iter()) {
                             d.so = if r.so == -1 { -1 } else { r.so - s as i32 };
                             d.eo = if r.eo == -1 { -1 } else { r.eo - s as i32 };

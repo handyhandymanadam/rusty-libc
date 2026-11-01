@@ -3,6 +3,10 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "mqueue.h",
     items: &[
+        Item::Comment(r#"/* mqueue.h for the Rust libc (crates/rusty-libc-ipc): POSIX message queues. struct mq_attr is 64 bytes, as in
+   glibc on x86-64. The prototypes are generated (bits/rlibc-mq-calls.h, bits/rlibc-mq-timed.h). Unlike
+   glibc's header this one has no _FORTIFY_SOURCE wrapper for mq_open (nothing in this libc's headers
+   does); __mq_open_2, the function that wrapper calls, is exported and declared. */"#),
         Item::Guard { name: "_MQUEUE_H", value: "1", end: "", items: &[
             Item::Blank,
             Item::Include("<stddef.h>"),

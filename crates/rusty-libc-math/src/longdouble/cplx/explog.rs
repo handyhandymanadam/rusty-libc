@@ -1,11 +1,19 @@
+//! cexp, clog, clog10, cpow.
+//!
+//! Derived from glibc 2.43 `math/s_cexp_template.c`, `s_clog_template.c`, `s_clog10_template.c`,
+//! `s_cpow_template.c` (LGPL-2.1-or-later): the case structure (which gives the special values,
+//! flags and errno of glibc) and the scaling thresholds; arithmetic goes through the
+//! sibling libm functions of this crate.
 use super::cfp::*;
 
 type P<F> = (W<F>, W<F>);
 
+/// `(int) ((M_MAX_EXP - 1) * M_LN2)`: 709 for double, 88 for float.
 pub(super) fn tmax<F: CF>() -> i32 {
     ((F::MAX_EXP - 1) as f64 * core::f64::consts::LN_2) as i32
 }
 
+/// `(sin x, cos x)`, or `(x, 1)` when |x| <= MIN (as glibc does, avoiding a needless call).
 pub(super) fn sincos_small<F: CF>(x: W<F>) -> P<F> {
     if x.abs() > W(F::MIN) { x.sincos() } else { (x, W::k(1.0)) }
 }
@@ -74,14 +82,17 @@ pub fn cexp<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
     }
 }
 
+/// clog (`base10` false) and clog10 (true); they differ only in the scale factors.
 fn clog_gen<F: CF>(xr: W<F>, xi: W<F>, base10: bool) -> P<F> {
     let rcls = xr.cls();
     let icls = xi.cls();
     let half_l10e = W(F::LOG10E) / 2.0;
+    // (log1p(d) / 2) or (log1p(d) * (log10(e) / 2))
     let l1p = |d: W<F>| -> W<F> { if base10 { d.log1p() * half_l10e } else { d.log1p() / 2.0 } };
     if rcls == FP_ZERO && icls == FP_ZERO {
         let pi = if base10 { W(F::PI_LOG10E) } else { W(F::PI) };
         let im = (if xr.signbit() { pi } else { W::k(0.0) }).copysign(xi);
+        // "Yes, the following line raises an exception."
         let re = W::<F>::k(-1.0) / xr.abs();
         (re, im)
     } else if rcls != FP_NAN && icls != FP_NAN {
@@ -139,6 +150,7 @@ pub fn clog10<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
     clog_gen(xr, xi, true)
 }
 
+/// cpow (x ^ c) = cexp (c * clog (x)), with the C99 Annex G product.
 pub fn cpow<F: CF>(xr: W<F>, xi: W<F>, cr: W<F>, ci: W<F>) -> P<F> {
     let (lr, li) = clog(xr, xi);
     let (pr, pi) = cmul(cr, ci, lr, li);

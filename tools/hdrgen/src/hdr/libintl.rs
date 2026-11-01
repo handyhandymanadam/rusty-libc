@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "libintl.h",
     items: &[
+        Item::Comment("/* libintl.h for the Rust libc (gettext family, crates/rusty-libc-locale/src/gettext.rs). */"),
         Item::Guard { name: "_RLIBC_LIBINTL_H", value: "1", end: "", items: &[
             Item::Include("<locale.h>"),
             Item::ExternBegin,

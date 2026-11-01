@@ -1,3 +1,12 @@
+//! The long double complex functions of complex.h: cabsl, cargl, creall, cimagl, conjl, cprojl, cexpl,
+//! clogl, clog10l, cpowl, csqrtl, csinl, ccosl, ctanl, casinl, cacosl, catanl, csinhl, ccoshl, ctanhl,
+//! casinhl, cacoshl, catanhl and the _Float64x names.
+//!
+//! The case structure, special values and evaluation regions are glibc 2.43's complex templates
+//! (LGPL-2.1-or-later), the same ones the double and float versions use: `cplx/*.rs` are those
+//! templates written generically over `cfp::CF` with `L80` (an x87 value, arithmetic by single x87
+//! instructions) as the type. ABI: a `long double _Complex` argument is 32 bytes in memory on the
+//! stack (class COMPLEX_X87) and the result comes back in st(0) (real) and st(1) (imaginary).
 pub(crate) mod cfp;
 pub(crate) mod explog;
 pub(crate) mod inverse;
@@ -28,6 +37,8 @@ cfunc_l!(ccoshl, ccoshl_impl, trighyp::ccosh);
 cfunc_l!(ctanhl, ctanhl_impl, trighyp::ctanh);
 cfunc_l!(casinl, casinl_impl, inverse::casin);
 cfunc_l!(cacosl, cacosl_impl, inverse::cacos);
+// glibc's catan classifies the imaginary part only when the real part is not infinite (the compiler
+// moves the classification into the branch), so a signaling NaN there raises no "invalid"
 pub fn catanl_impl(re: F80, im: F80) -> (F80, F80) {
     let inf_re = re.sign_exp_() & 0x7fff == 0x7fff && re.mant_() << 1 == 0;
     let snan_im = im.is_nan_() && im.mant_() & (1 << 62) == 0;
@@ -43,12 +54,16 @@ cfunc_l!(casinhl, casinhl_impl, inverse::casinh);
 cfunc_l!(cacoshl, cacoshl_impl, inverse::cacosh);
 cfunc_l!(catanhl, catanhl_impl, inverse::catanh);
 
+/// Negate the imaginary part (a sign flip; NaN payloads untouched).
 pub fn conjl_impl(re: F80, im: F80) -> (F80, F80) {
     (re, f80_from_bits(im.mant_(), im.sign_exp_() ^ 0x8000))
 }
 c_to_c!(conjl, super::conjl_impl);
 
+/// The projection onto the Riemann sphere: any infinite part gives (inf, copysign(0, im)).
 pub fn cprojl_impl(re: F80, im: F80) -> (F80, F80) {
+    // isinf on an x87 value is a comparison: a signaling NaN raises "invalid" (the second test is
+    // not evaluated when the first one succeeds)
     let is_inf = |x: F80| {
         if x.is_nan_() && x.mant_() & (1 << 62) == 0 {
             crate::fenv::raise_exceptions(crate::fenv::FE_INVALID as u32);
@@ -63,6 +78,7 @@ pub fn cprojl_impl(re: F80, im: F80) -> (F80, F80) {
 }
 c_to_c!(cprojl, super::cprojl_impl);
 
+/// x ^ c = cexp (c * clog (x)).
 pub fn cpowl_impl(xr: F80, xi: F80, cr: F80, ci: F80) -> (F80, F80) {
     let (r, i) = explog::cpow::<L80>(W(L80(xr)), W(L80(xi)), W(L80(cr)), W(L80(ci)));
     (r.0.0, i.0.0)

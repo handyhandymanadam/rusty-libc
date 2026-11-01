@@ -1,3 +1,6 @@
+//! crti.o: the start of the `_init` and `_fini` functions in the `.init` and `.fini` sections. crtn.o closes them; the
+//! linker puts everything other crt objects add to those sections (gcc's crtbegin does) in between. Same layout
+//! as glibc's crti.S on x86-64 (the stack is realigned for the calls between them).
 #![no_std]
 #![allow(missing_docs)]
 

@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "bits/byteswap.h",
     items: &[
+        Item::Comment("/* bits/byteswap.h for the Rust libc */"),
         Item::Guard { name: "_BITS_BYTESWAP_H", value: "1", end: "", items: &[
             Item::Include("<stdint.h>"),
             Item::Raw(Reason::GlibcMacro, "#define __bswap_constant_16(x) ((uint16_t) ((((x) >> 8) & 0xff) | (((x) & 0xff) << 8)))"),

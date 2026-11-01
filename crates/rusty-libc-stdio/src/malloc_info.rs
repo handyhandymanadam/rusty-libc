@@ -1,3 +1,4 @@
+//! malloc.h: `malloc_info`, the allocator's state as XML on a stream (glibc's format).
 use crate::file::{self, File as FILE};
 use crate::fmt::Sink;
 use crate::rust_api::{Arg, format_to};
@@ -7,10 +8,16 @@ struct Out(*mut FILE);
 
 impl Sink for Out {
     fn put(&mut self, bytes: &[u8]) -> bool {
+        // SAFETY: made by `malloc_info` from the caller's open stream (its contract), used for this call only.
         file::write_bytes(unsafe { file::stream(self.0) }, bytes) == bytes.len()
     }
 }
 
+/// Write the allocator's state to `f` as XML, one `<heap>` per arena then the totals (glibc's format; the free chunks of
+/// this allocator are not listed by size, so `<sizes>` stays empty). `options` must be 0, else the result is EINVAL (22).
+///
+/// # Safety
+/// `f` must be an open stream.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn malloc_info(options: c_int, f: *mut FILE) -> c_int {
     {
@@ -20,9 +27,10 @@ pub unsafe extern "C" fn malloc_info(options: c_int, f: *mut FILE) -> c_int {
         let mut o = Out(f);
         let n = |v: usize| Arg::Uint(v as u64);
         let mut bad = format_to(&mut o, c"<malloc version=\"1\">\n", &[]) < 0;
+        // the figures are gathered first (each arena under its lock), printed after: printing may allocate
         let mut list = [[0usize; 8]; 256];
         let mut count = 0usize;
-        let mut t = [0usize; 6];
+        let mut t = [0usize; 6]; // blocks, avail, system, max system, aspace, aspace mprotect
         rusty_libc_malloc::arena_infos(|a| {
             if count < list.len() {
                 list[count] = [a.main as usize, a.nblocks, a.avail, a.system, a.max_system, a.aspace, a.aspace_mprotect, a.subheaps];

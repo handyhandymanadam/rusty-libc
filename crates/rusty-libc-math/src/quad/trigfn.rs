@@ -1,3 +1,6 @@
+//! `_Float128` sin, cos, tan, sincos, asin, acos, atan, atan2, sinh, cosh, tanh, asinh, acosh, atanh and the pi
+//! forms sinpi, cospi, tanpi, asinpi, acospi, atanpi, atan2pi. Computed in `Ext` and rounded once; the
+//! argument reduction handles all 113 significant bits of the argument (Payne-Hanek with the bits of 2/pi).
 use super::*;
 use super::arith;
 use crate::longdouble::consts::*;
@@ -12,6 +15,9 @@ fn fin(x: &Ext, ex: Exact) -> F128 {
     r
 }
 
+// ---- argument reduction for sin, cos and tan ----
+
+/// shift a little-endian 8-limb number right by `n` bits (bits shifted past the end are zero).
 fn shr8(p: &[u64; 8], n: u32) -> [u64; 8] {
     let (w, b) = ((n / 64) as usize, n % 64);
     let mut out = [0u64; 8];
@@ -23,10 +29,14 @@ fn shr8(p: &[u64; 8], n: u32) -> [u64; 8] {
     out
 }
 
+/// Quadrant (n mod 4) and reduced argument r with x = n * pi/2 + r, |r| <= pi/4 (a little more), for a finite
+/// x >= pi/4 - epsilon with up to 113 significant bits.
 fn reduce_pio2(x: Ext) -> (u32, Ext) {
+    // x = M * 2^q with M the 128-bit significand
     let q = x.e - 127;
-    let i0 = if q - 1 > 1 { q - 1 } else { 1 };
+    let i0 = if q - 1 > 1 { q - 1 } else { 1 }; // first bit of 2/pi that matters (1 = first after the point)
     const L: i64 = 384;
+    // window: bits i0 .. i0 + L - 1 of 2/pi (1-indexed), big endian, in six limbs
     let b0 = (i0 - 1) as usize;
     let (wi, off) = (b0 / 64, (b0 % 64) as u32);
     let mut wbe = [0u64; 6];
@@ -35,7 +45,8 @@ fn reduce_pio2(x: Ext) -> (u32, Ext) {
         let b = TWO_OVER_PI[wi + k + 1];
         *w = if off == 0 { a } else { (a << off) | (b >> (64 - off)) };
     }
-    let w = [wbe[5], wbe[4], wbe[3], wbe[2], wbe[1], wbe[0]];
+    let w = [wbe[5], wbe[4], wbe[3], wbe[2], wbe[1], wbe[0]]; // little endian
+    // P = M * W (eight limbs)
     let m = [x.m as u64, (x.m >> 64) as u64];
     let mut p = [0u64; 8];
     for (i, &mi) in m.iter().enumerate() {
@@ -47,6 +58,7 @@ fn reduce_pio2(x: Ext) -> (u32, Ext) {
         }
         p[i + 6] = p[i + 6].wrapping_add(carry as u64);
     }
+    // value = P / 2^S
     let s = (i0 + L - 1 - q) as u32;
     let int_part = shr8(&p, s)[0] & 3;
     let fr = if s >= 256 { shr8(&p, s - 256) } else { [0; 8] };
@@ -55,6 +67,7 @@ fn reduce_pio2(x: Ext) -> (u32, Ext) {
     let mut n = int_part as u32;
     let mut neg = false;
     if hi >> 127 != 0 {
+        // fraction >= 1/2: use the next integer and a negative remainder
         n = (n + 1) & 3;
         neg = true;
         let (l2, b) = 0u128.overflowing_sub(lo);
@@ -65,15 +78,18 @@ fn reduce_pio2(x: Ext) -> (u32, Ext) {
     (n, f.mul(PIO2))
 }
 
+/// sin and cos of a finite x (any sign, up to 113 significant bits).
 pub(crate) fn sincos_q(x: Ext) -> (Ext, Ext) {
     if x.is_zero() {
         return (x, Ext::ONE);
     }
     if x.cmp_abs(&PIO4) != Ordering::Greater {
+        // |x| <= pi/4: the series are accurate directly (sincos_ext does that without reduction)
         return sincos_ext(x);
     }
     let (n, r) = reduce_pio2(x.abs());
     let (n, r) = if x.neg { ((4 - n) & 3, r.negate()) } else { (n, r) };
+    // sin and cos of the reduced argument |r| <= 0.8 (sincos_ext handles it without another reduction)
     let (s, c) = sincos_ext(r);
     match n {
         0 => (s, c),
@@ -83,6 +99,7 @@ pub(crate) fn sincos_q(x: Ext) -> (Ext, Ext) {
     }
 }
 
+/// Is x (finite) an integer or half-integer, and which: `Some(n mod 4)` for x = n/2.
 fn half_integer_q(x: Ext) -> Option<u32> {
     if x.is_zero() {
         return Some(0);
@@ -94,11 +111,13 @@ fn half_integer_q(x: Ext) -> Option<u32> {
     if y.is_integer() { Some((y.round_i128() & 3) as u32) } else { None }
 }
 
+/// For a tiny x the result of an odd function is x itself: inexact (and underflow for a subnormal x).
 fn tiny_odd(x: F128) -> F128 {
     raise_rnd_flags(if x.is_subnormal() { (fenv::FE_UNDERFLOW | fenv::FE_INEXACT) as u32 } else { fenv::FE_INEXACT as u32 });
     x
 }
 
+/// Is |x| below 2^-58 (so that x - x^3/6 and x + x^3/3 round to x)?
 fn is_tiny(x: F128) -> bool {
     x.is_finite() && !x.is_zero() && x.to_ext().e < -58
 }
@@ -171,6 +190,7 @@ pub fn atan(x: F128) -> F128 {
         return x;
     }
     if x.is_inf() || x.to_ext().e >= 115 {
+        // pi/2 rounded to the format, no flags
         return F128::from_bits(0x3fff921fb54442d18469898cc51701b8).with_sign(x.is_neg());
     }
     if is_tiny(x) {
@@ -207,9 +227,11 @@ pub fn acos(x: F128) -> F128 {
     finish_ext(&acos_ext(e), Exact::Never)
 }
 
+/// atan2 special cases (C Annex F), None for the regular case. `pi_form`: the angle in units of pi.
 fn atan2_special(y: F128, x: F128, pi_form: bool) -> Option<F128> {
     if x.is_nan() || y.is_nan() {
         if !pi_form {
+            // glibc's atan2 returns x + y here: the soft-float sum picks the NaN (the larger fraction, on a tie x)
             return super::narrow::pick_nan(super::narrow::Rule::SoftFp, &[y, x]);
         }
         return Some(nan2(y, x));
@@ -248,6 +270,9 @@ pub fn atan2(y: F128, x: F128) -> F128 {
     }
     let (ey, ex) = (y.to_ext(), x.to_ext());
     if !x.is_neg() && ey.e - ex.e < -300 {
+        // atan(r) = r - r^3/3 with r^3/3 below 2^-600 of r: the result is r correctly rounded, which the 128-bit
+        // quotient of atan2_ext cannot give when r lies within 2^-15 ulp of a rounding boundary. An exact r is a
+        // hair above the true value.
         let mut w = arith::div_exact(y.is_neg(), &ey, &ex);
         if !w.sticky {
             w = Wide { hi: w.hi - 1, lo: u128::MAX, sticky: true, ..w }.normalize();
@@ -314,6 +339,8 @@ pub fn acospi(x: F128) -> F128 {
     }
     fin(&acos_ext(e).mul(INV_PI), Exact::Never)
 }
+
+// ---- hyperbolic ----
 
 pub fn sinh(x: F128) -> F128 {
     if x.is_nan() {
@@ -403,11 +430,16 @@ pub fn atanh(x: F128) -> F128 {
     finish_ext(&atanh_ext(e), Exact::Never)
 }
 
+// ---- pi forms of sin, cos, tan ----
+
+/// An exactly representable result that glibc reports as inexact (the pi forms at their special points).
 fn inexact_const(v: F128) -> F128 {
     raise_rnd_flags(fenv::FE_INEXACT as u32);
     v
 }
 
+/// sinpi and tanpi of a tiny x: x times pi, with the flags of that product (underflow and inexact for a subnormal
+/// result).
 fn pi_product(x: F128) -> F128 {
     let r = arith::mul(x, F128::from_bits(0x4000921fb54442d18469898cc51701b8));
     if r.is_subnormal() {
@@ -440,6 +472,7 @@ pub fn sinpi(x: F128) -> F128 {
 
 pub fn cospi(x: F128) -> F128 {
     if x.is_nan() {
+        // glibc computes -cos(pi * (1 - |x - 2 round(x/2)|)): a negative quiet NaN with x's payload
         return nan1(x).with_sign(true);
     }
     if x.is_inf() {
@@ -471,6 +504,7 @@ pub fn tanpi(x: F128) -> F128 {
     if let Some(n) = half_integer_q(e) {
         return match n {
             0 => F128::zero(x.is_neg()),
+            // odd integers: -0 for positive x and +0 for negative x (glibc's convention)
             2 => F128::zero(!x.is_neg()),
             _ => pole(n == 3),
         };
@@ -503,9 +537,13 @@ q_un!(acospif128, acospi);
 q_un!(atanpif128, atanpi);
 q_bin!(atan2pif128, atan2pi);
 
+/// # Safety
+/// `sp` and `cp` are valid.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn sincosf128(x: f128, sp: *mut f128, cp: *mut f128) {
     let (s, c) = sincos(F128(x.to_bits()));
+    // SAFETY: the C contract: `sp` points to a writable _Float128.
     unsafe { sp.write(s.to_f128()) };
+    // SAFETY: the C contract: `cp` points to a writable _Float128.
     unsafe { cp.write(c.to_f128()) };
 }

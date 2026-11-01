@@ -2,10 +2,16 @@ language = "C"
 include_guard = "_RLIBC_MATH_CALLS_H"
 no_includes = true
 sys_includes = ["stdint.h"]
+# Included by tools/hdrgen/src/hdr/math.h, which defines the feature macros named here. The functions
+# that glibc hides behind a feature macro carry a #[cfg(feature = ...)] in the temporary copy
+# gen_headers.py gives cbindgen (the table is in tools/math_headers.py).
 [defines]
 "feature = misc" = "__RLIBC_MATH_MISC"
 "feature = gnu" = "__RLIBC_MATH_GNU"
 "feature = ext" = "__RLIBC_MATH_EXT"
 "feature = floatn" = "__RLIBC_MATH_FLOATN"
 [export]
+# errno values belong to errno.h; the long double stand-in is only for the Rust signature of
+# nexttoward (its prototype is written by tools/math_headers.py); sincosf32/f32x/f64 take _Float32/_Float32x/_Float64
+# pointers, which cbindgen would write as float/double (the prototypes come from hdrgen's math.rs)
 exclude = ["EDOM", "ERANGE", "F80Arg", "nexttoward", "nexttowardf", "sincosf32", "sincosf32x", "sincosf64"]

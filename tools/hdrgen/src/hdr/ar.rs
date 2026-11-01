@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "ar.h",
     items: &[
+        Item::Comment("/* ar.h for the Rust libc: the UNIX archive (ar) file format, same layout as glibc's header. */"),
         Item::Guard { name: "_AR_H", value: "1", end: "", items: &[
             Item::Include("<sys/types.h>"),
             Item::Consts(&[

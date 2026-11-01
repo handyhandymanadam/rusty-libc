@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("MAXQUOTAS", V::Dec(3)),
         ("USRQUOTA", V::Dec(0)),
@@ -59,7 +60,9 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("NR_DQUOTS", V::Dec(256)),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Raw(Reason::GlibcMacro, "#define QCMD(cmd, type) (((cmd) << SUBCMDSHIFT) | ((type) & SUBCMDMASK))"),
+    Item::Comment("/* the kernel's structures (linux/quota.h), with glibc's old names */"),
     Item::Block { head: "struct if_dqblk ", body: &["", "  uint64_t dqb_bhardlimit;", "  uint64_t dqb_bsoftlimit;", "  uint64_t dqb_curspace;", "  uint64_t dqb_ihardlimit;", "  uint64_t dqb_isoftlimit;", "  uint64_t dqb_curinodes;", "  uint64_t dqb_btime;", "  uint64_t dqb_itime;", "  uint32_t dqb_valid;", ""], tail: "" },
     Item::Block { head: "struct dqblk ", body: &["", "  uint64_t dqb_bhardlimit;", "  uint64_t dqb_bsoftlimit;", "  uint64_t dqb_curspace;", "  uint64_t dqb_ihardlimit;", "  uint64_t dqb_isoftlimit;", "  uint64_t dqb_curinodes;", "  uint64_t dqb_btime;", "  uint64_t dqb_itime;", "  uint32_t dqb_valid;", ""], tail: "" },
     Item::Block { head: "struct if_nextdqblk ", body: &["", "  uint64_t dqb_bhardlimit;", "  uint64_t dqb_bsoftlimit;", "  uint64_t dqb_curspace;", "  uint64_t dqb_ihardlimit;", "  uint64_t dqb_isoftlimit;", "  uint64_t dqb_curinodes;", "  uint64_t dqb_btime;", "  uint64_t dqb_itime;", "  uint32_t dqb_valid;", "  uint32_t dqb_id;", ""], tail: "" },

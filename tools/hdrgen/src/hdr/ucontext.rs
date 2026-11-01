@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "ucontext.h",
     items: &[
+        Item::Comment("/* ucontext.h for the Rust libc: user-space context switching (crates/rusty-libc-signal/src/context.rs). */"),
         Item::Guard { name: "_RLIBC_UCONTEXT_H", value: "1", end: "", items: &[
             Item::Include("<sys/ucontext.h>"),
             Item::Blank,

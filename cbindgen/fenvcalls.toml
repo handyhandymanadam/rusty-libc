@@ -1,6 +1,9 @@
 language = "C"
 include_guard = "_RLIBC_FENV_CALLS_H"
 no_includes = true
+# Included by tools/hdrgen/src/hdr/fenv.h after it has defined fexcept_t, fenv_t, femode_t and the
+# FE_* constants (by hand, in glibc's layout; the test tests/c/math_diff.c checks them against
+# the Rust constants and glibc's header).
 [defines]
 "feature = gnu" = "__RLIBC_MATH_GNU"
 "feature = ext" = "__RLIBC_MATH_EXT"

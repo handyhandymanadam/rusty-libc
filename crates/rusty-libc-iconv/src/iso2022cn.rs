@@ -1,3 +1,6 @@
+//! ISO-2022-CN (RFC 1922): ASCII, GB 2312 and CNS 11643 plane 1 selected with SO (which of the two
+//! was announced last), and CNS plane 2 for single characters after `ESC N` (SS2). The announcements
+//! `ESC $ ) A`, `ESC $ ) G` and `ESC $ * H` are written once per line before the first use.
 use crate::engine::*;
 use crate::iso2022jp::{GB2312, SetRes, dec_set, gb2312};
 use crate::mbdata::euc_tw;
@@ -16,8 +19,10 @@ const CNS1_ANN: u32 = 64;
 const CNS2_ANN: u32 = 128;
 const ANN_MASK: u32 = 224;
 
+/// Glibc's state word: selected set bits and announcement bits.
 pub type CnState = u32;
 
+/// CNS 11643 plane 1 as a 94x94 set (bytes 0x21..0x7e), glibc's helper's checks and order.
 pub(crate) fn dec_cns(plane2: bool, s: &[u8]) -> SetRes {
     let b1 = s[0];
     if b1 <= 0x20 || b1 > 0x7d {
@@ -30,9 +35,9 @@ pub(crate) fn dec_cns(plane2: bool, s: &[u8]) -> SetRes {
     if b2 <= 0x20 || b2 >= 0x7f {
         return SetRes::Unknown;
     }
-    let m = &euc_tw::MB;
+    let m = euc_tw::mb();
     let r = if plane2 {
-        match m.sets.iter().position(|st| st.prefix == [0x8e, 0xa2]) {
+        match m.sets.iter().position(|st| st.prefix() == [0x8e, 0xa2]) {
             Some(si) => m.dec2(si, b1 | 0x80, b2 | 0x80),
             None => None,
         }
@@ -76,6 +81,7 @@ pub fn dec(st: &mut CnState, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [
             return Body::Skip(1);
         }
         if ch == ESC && s[1] == 0x4e {
+            // a character of CNS plane 2: the two bytes after ESC N
             return match dec_cns(true, &s[2..]) {
                 SetRes::Char(c) => Body::Char(c, 4),
                 _ => Body::Illegal(2),
@@ -94,7 +100,7 @@ pub fn dec(st: &mut CnState, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [
 }
 
 pub(crate) fn cns1(c: u32) -> Option<[u8; 2]> {
-    let x = euc_tw::MB.enc(c)?;
+    let x = euc_tw::mb().enc(c)?;
     if x.len == 2 && x.bytes[0] >= 0xa1 && x.bytes[1] >= 0xa1 {
         Some([x.bytes[0] - 0x80, x.bytes[1] - 0x80])
     } else {
@@ -103,17 +109,19 @@ pub(crate) fn cns1(c: u32) -> Option<[u8; 2]> {
 }
 
 pub(crate) fn cns2(c: u32) -> Option<[u8; 2]> {
-    if let Some(x) = euc_tw::MB.enc(c) {
+    if let Some(x) = euc_tw::mb().enc(c) {
         if x.len == 4 && x.bytes[0] == 0x8e && x.bytes[1] == 0xa2 {
             return Some([x.bytes[2] - 0x80, x.bytes[3] - 0x80]);
         }
     }
-    let m = &euc_tw::MB;
-    let s = &m.sets[m.sets.iter().position(|st| st.prefix == [0x8e, 0xa2])?];
+    // shadowed by plane 1 in EUC-TW: look in the plane's own table
+    let m = euc_tw::mb();
+    let s = &m.sets[m.sets.iter().position(|st| st.prefix() == [0x8e, 0xa2])?];
     let cols = (s.trail_hi - s.trail_lo) as usize + 1;
     if c > 0xffff {
+        // characters above U+FFFF are listed in `wide` by position
         for (pos, cp) in m.wide {
-            if *cp == c && *pos >= s.base && ((*pos - s.base) as usize) < s.data.len() {
+            if *cp == c && *pos >= s.base && ((*pos - s.base) as usize) < s.len as usize {
                 let i = (*pos - s.base) as usize;
                 return Some([(s.lead_lo as usize + i / cols) as u8 - 0x80, (s.trail_lo as usize + i % cols) as u8 - 0x80]);
             }
@@ -121,7 +129,7 @@ pub(crate) fn cns2(c: u32) -> Option<[u8; 2]> {
         return None;
     }
     let want = if c == 0 { 0xfffe } else { c as u16 };
-    s.data.iter().position(|&v| v == want).map(|i| [(s.lead_lo as usize + i / cols) as u8 - 0x80, (s.trail_lo as usize + i % cols) as u8 - 0x80])
+    m.set_data(s).iter().position(|&v| v == want).map(|i| [(s.lead_lo as usize + i / cols) as u8 - 0x80, (s.trail_lo as usize + i % cols) as u8 - 0x80])
 }
 
 pub fn enc(st: &mut CnState, flags: u32, inp: &[u32], ip: &mut usize, out: &mut [u8], op: &mut usize, irr: Option<&mut usize>) -> St {

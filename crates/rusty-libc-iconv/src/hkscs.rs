@@ -1,7 +1,13 @@
+//! BIG5-HKSCS: Big5 with the Hong Kong supplement. Four codes (8862, 8864, 88a3, 88a5) are
+//! combinations of two characters; the decoder queues the second one when the output has no room for
+//! it, the encoder holds back U+00CA and U+00EA (and their codes 8866 and 88a7) in case a combining
+//! mark follows.
 use crate::engine::*;
-use crate::mbdata::big5hkscs::MB;
+use crate::mbdata::big5hkscs::mb;
 
+/// Decoder state: the queued character (glibc keeps it shifted left by 3 bits).
 pub type DecState = u32;
+/// Encoder state: the two bytes held back.
 pub type EncState = u32;
 
 pub fn dec(st: &mut DecState, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u32], op: &mut usize, irr: &mut usize) -> St {
@@ -22,7 +28,7 @@ pub fn dec(st: &mut DecState, flags: u32, inp: &[u8], ip: &mut usize, out: &mut 
                     break;
                 }
                 let b2 = inp[i + 1];
-                let found = if ch >= 0x87 && b2 >= 0x40 && b2 <= 0xfe { MB.dec2(1, ch as u8, b2) } else { None };
+                let found = if ch >= 0x87 && b2 >= 0x40 && b2 <= 0xfe { mb().dec2(1, ch as u8, b2) } else { None };
                 match found {
                     Some(c) => {
                         ch = c;
@@ -121,7 +127,7 @@ pub fn enc(st: &mut EncState, flags: u32, inp: &[u32], ip: &mut usize, out: &mut
             o[0] = ch as u8;
             return EBody::Ok(1, 1);
         }
-        let Some(code) = MB.enc(ch) else {
+        let Some(code) = mb().enc(ch) else {
             return EBody::Illegal;
         };
         if ch == 0xca || ch == 0xea {
@@ -139,6 +145,7 @@ pub fn enc(st: &mut EncState, flags: u32, inp: &[u32], ip: &mut usize, out: &mut
     })
 }
 
+/// Encoder flush: the two bytes held back.
 pub fn enc_emit_reset(st: &mut EncState, out: &mut [u8], op: &mut usize) -> St {
     if (*st >> 3) != 0 {
         if *op + 2 > out.len() {

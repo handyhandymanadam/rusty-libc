@@ -81,6 +81,7 @@ dependencies = [
 name = "rusty-libc-ctype"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
 ]
 
@@ -88,6 +89,7 @@ dependencies = [
 name = "rusty-libc-extra"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-ctype",
  "rusty-libc-locale",
@@ -105,6 +107,7 @@ dependencies = [
 name = "rusty-libc-fortify"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-ctype",
  "rusty-libc-extra",
@@ -122,6 +125,7 @@ dependencies = [
 name = "rusty-libc-iconv"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-malloc",
  "rusty-libc-mem",
@@ -131,6 +135,7 @@ dependencies = [
 name = "rusty-libc-ipc"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-malloc",
  "rusty-libc-mem",
@@ -141,12 +146,15 @@ dependencies = [
 name = "rusty-libc-locale"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-ctype",
  "rusty-libc-iconv",
  "rusty-libc-malloc",
  "rusty-libc-mem",
  "rusty-libc-stdio",
+ "rusty-libc-stdlib",
+ "rusty-libc-time",
  "rusty-libc-wchar",
 ]
 
@@ -154,6 +162,7 @@ dependencies = [
 name = "rusty-libc-malloc"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-mem",
  "rusty-libc-rs-core",
@@ -163,17 +172,22 @@ dependencies = [
 name = "rusty-libc-math"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
 ]
 
 [[package]]
 name = "rusty-libc-mem"
 version = "0.0.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "rusty-libc-net"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-ipc",
  "rusty-libc-malloc",
@@ -187,6 +201,7 @@ dependencies = [
 name = "rusty-libc-pthread"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-malloc",
  "rusty-libc-mem",
@@ -196,6 +211,7 @@ dependencies = [
 name = "rusty-libc-regex"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-ctype",
  "rusty-libc-locale",
@@ -209,6 +225,7 @@ dependencies = [
 name = "rusty-libc-rpc"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-malloc",
  "rusty-libc-mem",
@@ -223,6 +240,7 @@ dependencies = [
 name = "rusty-libc-rs"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rustix",
  "rusty-libc-rs-core",
 ]
@@ -235,6 +253,7 @@ version = "0.1.0"
 name = "rusty-libc-signal"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
 ]
 
@@ -242,6 +261,7 @@ dependencies = [
 name = "rusty-libc-stdio"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-iconv",
  "rusty-libc-malloc",
@@ -253,6 +273,7 @@ dependencies = [
 name = "rusty-libc-stdlib"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-ctype",
  "rusty-libc-malloc",
@@ -263,6 +284,7 @@ dependencies = [
 name = "rusty-libc-sys"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-ctype",
  "rusty-libc-malloc",
@@ -275,6 +297,7 @@ dependencies = [
 name = "rusty-libc-time"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-ctype",
  "rusty-libc-ipc",
@@ -287,6 +310,7 @@ dependencies = [
 name = "rusty-libc-util"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-ctype",
  "rusty-libc-locale",
@@ -301,6 +325,7 @@ dependencies = [
 name = "rusty-libc-wchar"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rusty-libc-core",
  "rusty-libc-ctype",
  "rusty-libc-malloc",

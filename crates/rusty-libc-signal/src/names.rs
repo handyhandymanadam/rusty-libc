@@ -1,30 +1,41 @@
+//! Signal names and messages: sigabbrev_np, sigdescr_np, psignal, psiginfo. `strsignal` is in
+//! rusty-libc-cabi (it shares the message table in rusty-libc-core::messages with `strerror`).
+//!
+//! The psiginfo code-description strings are glibc's own text (stdio-common/psiginfo-data.h, LGPL),
+//! typos included ("Floating-poing inexact result"); only the data is taken, not the code.
 use crate::consts::*;
 use crate::types::Siginfo;
 use core::ffi::{CStr, c_char, c_int};
 use rusty_libc_core::{ffi, i18n, messages};
 use rusty_libc_core::unistd::write_nocancel;
 
+/// The names without the SIG prefix, signals 1..=31 (index 0 unused).
 const ABBREV: [&CStr; 32] = [
     c"", c"HUP", c"INT", c"QUIT", c"ILL", c"TRAP", c"ABRT", c"BUS", c"FPE", c"KILL", c"USR1", c"SEGV", c"USR2", c"PIPE", c"ALRM",
     c"TERM", c"STKFLT", c"CHLD", c"CONT", c"STOP", c"TSTP", c"TTIN", c"TTOU", c"URG", c"XCPU", c"XFSZ", c"VTALRM", c"PROF",
     c"WINCH", c"POLL", c"PWR", c"SYS",
 ];
 
+/// `sigabbrev_np` (GNU): "INT" for SIGINT; NULL for 0, the real-time signals and bad numbers.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sigabbrev_np(sig: c_int) -> *const c_char {
     if (1..=31).contains(&sig) { ABBREV[sig as usize].as_ptr() } else { core::ptr::null() }
 }
 
+/// The English description of signals 1..=31 (glibc's `__sys_siglist`; None for 0, the real-time signals and bad numbers).
 #[inline]
 pub fn sigdescr_text(sig: c_int) -> Option<&'static CStr> {
     if (1..=31).contains(&sig) { messages::signal_message(sig) } else { None }
 }
 
+/// `sigdescr_np` (GNU): the description ("Interrupt"); NULL for 0, the real-time signals and bad
+/// numbers (`strsignal` gives text for those).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub extern "C" fn sigdescr_np(sig: c_int) -> *const c_char {
     if (1..=31).contains(&sig) { messages::signal_message(sig).map_or(core::ptr::null(), CStr::as_ptr) } else { core::ptr::null() }
 }
 
+/// A fixed-size text buffer that cuts what does not fit (what `fmemopen` of 512 bytes does in glibc).
 struct Buf {
     b: [u8; 1100],
     n: usize,
@@ -57,6 +68,7 @@ impl Buf {
         }
         self.bytes(&tmp[i..]);
     }
+    /// `%p`: "(nil)" or 0x and lower-case hex.
     fn ptr(&mut self, p: usize) {
         if p == 0 {
             self.bytes(b"(nil)");
@@ -78,16 +90,25 @@ impl Buf {
     }
 }
 
+/// One write(2) to standard error (not a cancellation point); the result is ignored, as glibc's unbuffered stderr does.
 fn write_stderr(s: &[u8]) {
     let _ = write_nocancel(2, s);
 }
 
+/// `psignal`: print "s: description\n" (or just the description when `s` is NULL or empty) on
+/// standard error, in one write. Real-time and unknown numbers print "Unknown signal N" (the
+/// `sys_siglist` table glibc consults has no entries for them, unlike `strsignal`).
+///
+/// # Safety
+/// `s` must be null or a NUL-terminated string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn psignal(sig: c_int, s: *const c_char) {
+    // SAFETY: `s` is NULL or a NUL-terminated string that lives for the call (the caller's contract).
     let s = unsafe { ffi::cstr(s) };
     psignal_rs(sig, s);
 }
 
+/// Rust form of `psignal`: `s` None or empty prints just the description.
 #[inline]
 pub fn psignal_rs(sig: c_int, s: Option<&CStr>) {
     let (s, colon): (&CStr, &CStr) = match s {
@@ -97,6 +118,7 @@ pub fn psignal_rs(sig: c_int, s: Option<&CStr>) {
     let prefix = s.to_bytes();
     let desc = sigdescr_text(sig).map(i18n::tr);
     if desc.is_none() && i18n::active() {
+        // glibc: asprintf(_("%s%sUnknown signal %d\n"), s, colon, sig), written at once
         let mut buf = Buf::new(1024);
         let done = i18n::tr_format(c"%s%sUnknown signal %d\n", &[s.as_ptr() as u64, colon.as_ptr() as u64, sig as u32 as u64], &mut |b: &[u8]| {
             let mut b = b;
@@ -118,6 +140,8 @@ pub fn psignal_rs(sig: c_int, s: Option<&CStr>) {
     let colon = colon.to_bytes();
     let mut buf = Buf::new(1024);
     if prefix.len() + colon.len() + 40 + desc.map_or(0, |d| d.to_bytes().len()) > buf.cap {
+        // too long for one buffer: three writes (glibc would also need more than one for an
+        // unbuffered stream beyond 8 KiB)
         write_stderr(prefix);
         write_stderr(colon);
         let mut tail = Buf::new(100);
@@ -179,6 +203,7 @@ const CLD_TEXT: [&CStr; 6] = [
 const POLL_TEXT: [&CStr; 6] =
     [c"Data input available", c"Output buffers available", c"Input message available", c"I/O error", c"High priority input available", c"Device disconnected"];
 
+/// The per-signal list of `si_code` descriptions (code 1 first), if the signal has one.
 fn code_table(sig: i32) -> Option<&'static [&'static CStr]> {
     match sig {
         SIGILL => Some(&ILL_TEXT),
@@ -207,13 +232,22 @@ fn generic_code_text(code: i32) -> Option<&'static CStr> {
     })
 }
 
+/// `psiginfo`: print "s: Description (code text details)\n" on standard error, in one write of at
+/// most 511 bytes. The details are the fault address for SIGILL, SIGFPE, SIGSEGV and SIGBUS,
+/// "pid status uid" for SIGCHLD, the band for SIGPOLL, and "pid uid" for the rest.
+///
+/// # Safety
+/// `pinfo` must be valid for reads; `s` null or a NUL-terminated string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn psiginfo(pinfo: *const Siginfo, s: *const c_char) {
+    // SAFETY: `pinfo` is valid for reads (the caller's contract; NULL faults, as in glibc).
     let info = unsafe { &*pinfo };
+    // SAFETY: `s` is NULL or a NUL-terminated string that lives for the call (the caller's contract).
     let s = unsafe { ffi::cstr(s) };
     psiginfo_rs(info, s);
 }
 
+/// Rust form of `psiginfo`: `s` None or empty prints no prefix.
 #[inline]
 pub fn psiginfo_rs(info: &Siginfo, s: Option<&CStr>) {
     {

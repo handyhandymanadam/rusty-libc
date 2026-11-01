@@ -11,5 +11,10 @@ rusty-libc-malloc = { path = "../rusty-libc-malloc" }
 rusty-libc-wchar = { path = "../rusty-libc-wchar" }
 rusty-libc-iconv = { path = "../rusty-libc-iconv" }
 
+[dev-dependencies]
+libc = "0.2"
+rusty-libc-malloc = { path = "../rusty-libc-malloc", features = ["no-brk"] }
+
 [features]
+# Export the C symbols (printf, fopen, ...). Off for host tests so they never replace the host libc.
 export = []

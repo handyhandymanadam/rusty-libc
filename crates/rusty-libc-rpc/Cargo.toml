@@ -8,11 +8,21 @@ license.workspace = true
 rusty-libc-core = { path = "../rusty-libc-core" }
 rusty-libc-mem = { path = "../rusty-libc-mem" }
 rusty-libc-malloc = { path = "../rusty-libc-malloc" }
+# sockets, getifaddrs, gethostbyname2_r, getprotobyname_r, bindresvport
 rusty-libc-net = { path = "../rusty-libc-net" }
+# poll, read, write, close, ids, host name
 rusty-libc-sys = { path = "../rusty-libc-sys" }
+# clock_gettime, nanosleep
 rusty-libc-time = { path = "../rusty-libc-time" }
+# xdrstdio uses the FILE layer; error messages go to stderr through it
 rusty-libc-stdio = { path = "../rusty-libc-stdio" }
+# the drand48 generator of the transaction ids
 rusty-libc-stdlib = { path = "../rusty-libc-stdlib" }
 
+[dev-dependencies]
+libc = "0.2"
+rusty-libc-malloc = { path = "../rusty-libc-malloc", features = ["no-brk"] }
+
 [features]
+# Export the C symbols. Off for host tests so they never replace the host libc.
 export = []

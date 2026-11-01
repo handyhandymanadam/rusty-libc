@@ -1,7 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
-    Item::Block { head: "struct option ", body: &["", "  const char *name;", "", "  int has_arg;", "  int *flag;", "  int val;", ""], tail: "" },
+    Item::Block { head: "struct option ", body: &["", "  const char *name;", "  /* no_argument, required_argument or optional_argument */", "  int has_arg;", "  int *flag;", "  int val;", ""], tail: "" },
     Item::Blank,
     Item::Consts(&[
         ("no_argument", V::Dec(0)),

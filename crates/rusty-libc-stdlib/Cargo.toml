@@ -10,5 +10,10 @@ rusty-libc-mem = { path = "../rusty-libc-mem" }
 rusty-libc-malloc = { path = "../rusty-libc-malloc" }
 rusty-libc-ctype = { path = "../rusty-libc-ctype" }
 
+[dev-dependencies]
+libc = "0.2"
+rusty-libc-malloc = { path = "../rusty-libc-malloc", features = ["no-brk"] }
+
 [features]
+# Export the C symbols (qsort, rand, getenv, ...). Off for host tests so they never replace the host libc.
 export = []

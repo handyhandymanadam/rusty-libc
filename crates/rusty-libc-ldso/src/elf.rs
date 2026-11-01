@@ -1,3 +1,5 @@
+//! ELF64 structures and constants (System V gABI, x86-64 psABI).
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Ehdr {
@@ -114,6 +116,7 @@ pub const PF_R: u32 = 4;
 
 pub const DT_NULL: i64 = 0;
 pub const DT_NEEDED: i64 = 1;
+/// Auxiliary filter (the object's own definition is the fallback) and standard filter (only the filtee defines the symbol).
 pub const DT_AUXILIARY: i64 = 0x7fff_fffd;
 pub const DT_FILTER: i64 = 0x7fff_ffff;
 pub const DT_PLTRELSZ: i64 = 2;
@@ -215,6 +218,7 @@ pub const AT_RANDOM: usize = 25;
 pub const AT_EXECFN: usize = 31;
 pub const AT_SYSINFO_EHDR: usize = 33;
 
+/// The ELF hash function (DT_HASH, and the hashes of version names).
 pub fn elf_hash(name: &[u8]) -> u32 {
     let mut h: u32 = 0;
     for &c in name {
@@ -228,6 +232,7 @@ pub fn elf_hash(name: &[u8]) -> u32 {
     h
 }
 
+/// The GNU hash function (DT_GNU_HASH).
 pub fn gnu_hash(name: &[u8]) -> u32 {
     let mut h: u32 = 5381;
     for &c in name {

@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("FAN_ACCESS", V::Txt("0x00000001")),
         ("FAN_MODIFY", V::Txt("0x00000002")),
@@ -91,6 +92,7 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("FAN_EVENT_METADATA_LEN", V::Txt("24UL")),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Block { head: "struct fanotify_event_metadata ", body: &["", "  uint32_t event_len;", "  uint8_t vers;", "  uint8_t reserved;", "  uint16_t metadata_len;", "  uint64_t mask;", "  int32_t fd;", "  int32_t pid;", ""], tail: "" },
     Item::Raw(Reason::GlibcMacro, r#"#define FAN_EVENT_OK(meta, len) \
   ((long)(len) >= (long)FAN_EVENT_METADATA_LEN && (long)(meta)->event_len >= (long)FAN_EVENT_METADATA_LEN && \

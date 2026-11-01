@@ -1,3 +1,8 @@
+//! The three conversions glibc runs in one step, without going through UCS-4: GBK <-> EUC-CN,
+//! EUC-CN <-> BIG5 (through a table) and IBM1008 <-> IBM420. They differ from the two-step route in
+//! the handling of invalid input and of a full output buffer (several of the quirks of the
+//! originals are kept: for instance EUC-CN to GBK reports a two-byte character that ends the input
+//! as incomplete and has already stepped over its first byte).
 use crate::directdata::{BIG5_TO_GB, GB_TO_BIG5, IBM420_TO_1008, IBM1008_TO_420};
 use crate::engine::{IGNORE, St};
 
@@ -68,6 +73,7 @@ pub fn run(k: Kind, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u8], op: 
                 }
             }
             Kind::GbToGbk => {
+                // the first byte is consumed before anything is checked
                 let ch = inp[i];
                 i += 1;
                 if ch > 0x7f {
@@ -131,6 +137,7 @@ pub fn run(k: Kind, flags: u32, inp: &[u8], ip: &mut usize, out: &mut [u8], op: 
                     let tab: &[u16] = if k == Kind::GbToBig5 { &GB_TO_BIG5 } else { &BIG5_TO_GB };
                     let v = tab.get(idx).copied().unwrap_or(0);
                     if v == 0 {
+                        // no mapping: with //IGNORE write the box character of the target set
                         result = St::Illegal;
                         if !ignore {
                             break;

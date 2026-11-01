@@ -1,3 +1,4 @@
+//! crtn.o: the end of `_init` and `_fini` (see crti.rs).
 #![no_std]
 #![allow(missing_docs)]
 

@@ -4,6 +4,8 @@ include_guard = "_RLIBC_ARGZCALLS_H"
 usize_is_size_t = true
 no_includes = true
 documentation = false
+# Included by a hand-written header in tools/hdrgen/src/hdr/ (types, constants, macros there); only the
+# function declarations are generated here.
 [export]
 item_types = ["functions"]
 [export.rename]

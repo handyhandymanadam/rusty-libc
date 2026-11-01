@@ -3,6 +3,8 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "bits/floatn-common.h",
     items: &[
+        Item::Comment(r#"/* bits/floatn-common.h: the x86-64 values of the __HAVE_FLOATN macros and the __fN literal / __CFLOATN type macros for the
+   types shared by every architecture (glibc's header of the same name; GCC 7 or later, and clang). */"#),
         Item::Guard { name: "_BITS_FLOATN_COMMON_H", value: "1", end: "", items: &[
             Item::Include("<features.h>"),
             Item::Consts(&[
@@ -33,6 +35,8 @@ pub static HDR: Header = Header {
             ], ""),
             Item::Gate(&[
                 Branch { head: "ifndef __ASSEMBLER__", items: &[
+                    // clang (C) has none of these types as keywords: glibc's header makes them typedefs of float, double and
+                    // long double there, with the plain literal suffixes and the built-ins of the standard types
                     Item::Gate(&[
                         Branch { head: "if defined __clang__", items: &[
                             Item::Raw(Reason::GlibcMacro, "#  define __f32(x) x##f"),

@@ -1,15 +1,24 @@
+//! Charset names: glibc's normalisation (upper case, only letters, digits and `_-.,:` kept, exactly
+//! two slashes), the `//TRANSLIT` and `//IGNORE` suffixes, and the alias table.
 use crate::charsets_gen::{ALIASES, SBS, SPECIAL_CODES, SPECIAL_STRS};
+#[cfg(test)]
+use crate::charsets_gen::SPECIAL_NAMES;
 use crate::unicode::Sb;
 
+/// A charset the converter knows.
 #[derive(Clone, Copy)]
 pub enum Cs {
+    /// A hand-written charset (index into `SPECIAL_NAMES`).
     Special(u8),
+    /// A single-byte table charset.
     Sb(&'static Sb),
 }
 
 pub const SP_INTERNAL: u8 = 15;
 
+/// A parsed `iconv_open` argument.
 pub struct Parsed {
+    /// Normalised name with two slashes, e.g. `UTF-8//` (NUL-padded buffer and length).
     pub buf: [u8; 128],
     pub len: usize,
     pub translit: bool,
@@ -46,6 +55,8 @@ fn eq_nocase(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
+/// glibc's `__gconv_create_spec` for one name: strip the suffixes (recording TRANSLIT and IGNORE),
+/// then normalise. `None` when the name is too long to be any charset.
 pub fn parse(name: &[u8]) -> Option<Parsed> {
     if name.len() > 120 {
         return None;
@@ -75,6 +86,7 @@ pub fn parse(name: &[u8]) -> Option<Parsed> {
             }
         }
     }
+    // strip: keep alphanumerics and _-.,: (upper-cased), at most two slashes, pad to two
     let mut buf = [0u8; 128];
     let mut n = 0;
     let mut slashes = 0;
@@ -99,6 +111,12 @@ pub fn parse(name: &[u8]) -> Option<Parsed> {
     Some(Parsed { buf, len: n, translit, ignore })
 }
 
+/// The alias-table key of a `fopen (..., ",ccs=NAME")` charset, as glibc 2.43's `_IO_new_file_fopen` (libio/fileops.c) forms
+/// it: `strip` (iconv/gconv_charset.h) of NAME, used as it is: alphanumerics and `_-.,:` kept upper-cased, everything else
+/// dropped, the scan stopping at a third slash, then slashes added up to two. No `//TRANSLIT`-style suffix is taken off
+/// (`UTF-8//TRANSLIT` stays that key, which no charset has) and an empty result does not mean the locale's charset (glibc
+/// then looks up the upper-cased raw text, which never names a charset either). None when the key cannot be a charset name
+/// (empty, or longer than any name).
 pub fn ccs_key(name: &[u8]) -> Option<Parsed> {
     let mut buf = [0u8; 128];
     let mut n = 0;
@@ -115,6 +133,7 @@ pub fn ccs_key(name: &[u8]) -> Option<Parsed> {
         } else {
             continue;
         };
+        // (two bytes stay free for the padding slashes)
         if n + 2 >= buf.len() {
             return None;
         }
@@ -132,6 +151,7 @@ pub fn ccs_key(name: &[u8]) -> Option<Parsed> {
     Some(Parsed { buf, len: n, translit: false, ignore: false })
 }
 
+/// Look a normalised name up in the alias table.
 pub fn lookup_key(key: &[u8]) -> Option<Cs> {
     let i = ALIASES.find(key)?;
     Some(code_cs(ALIASES.code(i)))
@@ -141,6 +161,7 @@ fn code_cs(code: u16) -> Cs {
     if code >= 0x8000 { Cs::Special((code - 0x8000) as u8) } else { Cs::Sb(&SBS[code as usize]) }
 }
 
+/// The name of a charset as the module list gives it (without the trailing slashes).
 pub fn cs_name(cs: Cs) -> &'static str {
     match cs {
         Cs::Special(k) => SPECIAL_CODES.iter().position(|&c| c == k).map_or("?", |i| SPECIAL_STRS.get(i)),
@@ -148,13 +169,23 @@ pub fn cs_name(cs: Cs) -> &'static str {
     }
 }
 
+/// The canonical name of any charset name glibc knows, or `None`: `canonical_name("latin1")` is
+/// `Some("ISO-8859-1")`. Suffixes are ignored. An empty name means the locale charset (always the
+/// C locale's `ANSI_X3.4-1968` here).
 pub fn canonical_name(name: &str) -> Option<&'static str> {
     let p = parse(name.as_bytes())?;
     let cs = if p.key() == b"//" { lookup_key(b"ANSI_X3.4-1968//")? } else { lookup_key(p.key())? };
     Some(cs_name(cs))
 }
 
+/// Every name `iconv -l` would print (aliases included, with the trailing `//`), sorted.
 pub fn all_names() -> impl Iterator<Item = &'static str> {
+    // (INTERNAL opens, but glibc keeps it out of the list)
     ALIASES.names().filter(|n| !n.starts_with("INTERNAL"))
 }
 
+/// The canonical names of every charset this library implements (for tests and listings).
+#[cfg(test)]
+pub fn implemented() -> impl Iterator<Item = &'static str> {
+    SBS.iter().map(|t| t.name()).chain(SPECIAL_NAMES.iter().filter(|e| e.0 != SP_INTERNAL).map(|e| e.1))
+}

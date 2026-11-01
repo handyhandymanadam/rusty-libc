@@ -1,12 +1,13 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
     Item::Gate(&[
         Branch { head: "ifndef __fsword_t_defined", items: &[
             Item::ConstsFlat(&[
                 ("__fsword_t_defined", V::Dec(1)),
             ]),
-            Item::Decl("typedef long __fsword_t;"),
+            Item::Decl("typedef long __fsword_t; /* the type of the f_type and f_bsize fields (glibc's bits/types.h) */"),
         ] },
     ], ""),
     Item::Gate(&[

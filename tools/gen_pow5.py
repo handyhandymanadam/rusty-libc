@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""Generates crates/rusty-libc-core/src/pow5.rs: 128-bit approximations of 5^q for q in -342..=308, the table
+the Eisel-Lemire decimal-to-binary algorithm multiplies a 64-bit decimal significand with (Lemire,
+"Number Parsing at a Gigabyte per Second", 2021).
+
+Each entry is (hi, lo) of a 128-bit integer whose top bit is set:
+  q >= 0: the top 128 bits of 5^q, truncated (exact while 5^q < 2^128, i.e. q <= 55);
+  q <  0: floor(2^b / 5^-q) + 1 with b = z + 127 for q >= -27 and b = 2z + 128 otherwise, z = ceil(log2(5^-q)),
+          halved until it fits 128 bits (rounded up: the error bounds of the algorithm assume this).
+Pure integer arithmetic; nothing is copied from any library."""
 import os
 
 LO, HI = -342, 308
@@ -11,7 +20,7 @@ def entry(q):
         v = p >> (bl - 128) if bl > 128 else p << (128 - bl)
     else:
         n = 5 ** (-q)
-        z = (n - 1).bit_length()
+        z = (n - 1).bit_length()  # smallest z with 2^z >= n
         if q >= -27:
             v = (1 << (z + 127)) // n + 1
         else:

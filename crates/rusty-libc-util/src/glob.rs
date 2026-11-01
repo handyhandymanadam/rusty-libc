@@ -1,3 +1,19 @@
+//! glob.h: `glob`, `glob64`, `globfree`, `globfree64`, `glob_pattern_p`.
+//!
+//! Follows glibc 2.43: the pattern is split at its last slash; a directory part with wildcards is
+//! globbed recursively (with GLOB_ONLYDIR), the file part is matched with `fnmatch` over the
+//! entries of each directory (read with `getdents64`; this module has its own small directory
+//! reader), results of each call are sorted (`strcoll` of the locale in force, with qsort's merge sort) unless
+//! GLOB_NOSORT (then in glibc's block order, see `block_order`), braces expand left to right with the results of each alternative sorted on its own,
+//! and `gl_flags` ends up with GLOB_MAGCHAR set when a directory was actually read. The tilde forms
+//! use `$HOME`, else the login name's passwd entry (files backend), else `~user`'s home.
+//! GLOB_ALTDIRFUNC works with the `gl_opendir` family of function pointers.
+//! Memory for the result vector comes from this library's `malloc`; `globfree` frees it.
+//!
+//! Unsafe code (BRIEF-UNSAFE U2): the pattern and the names are byte slices and owned heap strings ([`CBuf`]); what
+//! stays unsafe is the result vector, which belongs to the caller's `glob_t` (the small [`PathV`] type, under the
+//! glob_t contract), the caller's functions (errfunc and the GLOB_ALTDIRFUNC family), the directory and stat system
+//! calls, and reading `$HOME` and a passwd entry's home directory.
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 use crate::cmem::CVec;
 use crate::fnmatch::{FNM_NOESCAPE, FNM_PERIOD, fnmatch_bytes};
@@ -25,6 +41,7 @@ pub const GLOB_NOSPACE: c_int = 1;
 pub const GLOB_ABORTED: c_int = 2;
 pub const GLOB_NOMATCH: c_int = 3;
 
+/// Flags `glob` accepts (everything but the output-only GLOB_MAGCHAR).
 const ALL_FLAGS: c_int = GLOB_ERR | GLOB_MARK | GLOB_NOSORT | GLOB_DOOFFS | GLOB_NOESCAPE | GLOB_NOCHECK | GLOB_APPEND | GLOB_PERIOD | GLOB_ALTDIRFUNC | GLOB_BRACE | GLOB_NOMAGIC | GLOB_TILDE | GLOB_ONLYDIR | GLOB_TILDE_CHECK;
 
 const ENOMEM: i32 = 12;
@@ -37,6 +54,7 @@ const DT_UNKNOWN: u8 = 0;
 const DT_DIR: u8 = 4;
 const DT_LNK: u8 = 10;
 
+/// `struct dirent` / `struct dirent64` on x86-64 Linux (they are the same).
 #[repr(C)]
 pub struct Dirent {
     pub d_ino: u64,
@@ -48,6 +66,7 @@ pub struct Dirent {
 
 pub type ErrFn = unsafe extern "C" fn(*const c_char, c_int) -> c_int;
 
+/// `glob_t` (and `glob64_t`: the same on x86-64).
 #[repr(C)]
 pub struct Glob {
     pub gl_pathc: usize,
@@ -62,13 +81,20 @@ pub struct Glob {
 }
 
 impl Glob {
+    /// An empty `glob_t` ready for the first call.
     pub const fn new() -> Glob {
         Glob { gl_pathc: 0, gl_pathv: null_mut(), gl_offs: 0, gl_flags: 0, gl_closedir: None, gl_readdir: None, gl_opendir: None, gl_lstat: None, gl_stat: None }
     }
 
+    /// The matched paths (without the `gl_offs` leading NULL slots).
+    ///
+    /// # Safety
+    /// `self` must hold the result of a successful `glob` call that is not freed yet.
     pub unsafe fn paths(&self) -> impl Iterator<Item = &core::ffi::CStr> + '_ {
         (0..self.gl_pathc).map(move |i| {
+            // SAFETY: the vector has `gl_offs + gl_pathc + 1` entries (caller's contract).
             let p = unsafe { *self.gl_pathv.wrapping_add(self.gl_offs + i) };
+            // SAFETY: entries `gl_offs..gl_offs + gl_pathc` are C strings (caller's contract).
             unsafe { core::ffi::CStr::from_ptr(p) }
         })
     }
@@ -80,13 +106,20 @@ impl Default for Glob {
     }
 }
 
+// ------------------------------------------------------------------------------ small helpers
+
+/// `strlen` of the bytes in `s` (up to the first NUL, or all of it).
+// (the dispatched memchr, as the strlen of the code before the safe rewrite: a byte loop cost more per directory entry)
 fn clen(s: &[u8]) -> usize {
     rusty_libc_core::string::memchr(s, 0).unwrap_or(s.len())
 }
 
+/// A heap C string owned by this value (from this library's malloc, so it can go into the result vector). Its C
+/// string is the bytes up to the first NUL (a NUL written into it cuts it, as glibc does to its copies).
 struct CBuf(CVec<u8>);
 
 impl CBuf {
+    /// The concatenation of `parts` and a NUL; None when memory ran out.
     fn of(parts: &[&[u8]]) -> Option<CBuf> {
         let mut v = CVec::new();
         let n: usize = parts.iter().map(|p| p.len()).sum();
@@ -100,10 +133,12 @@ impl CBuf {
         }
         v.push(0).then_some(CBuf(v))
     }
+    /// The C string without its NUL.
     fn bytes(&self) -> &[u8] {
         let s = self.0.as_slice();
         &s[..clen(s)]
     }
+    /// The C string with its NUL.
     fn cstr(&self) -> &[u8] {
         let s = self.0.as_slice();
         &s[..=clen(s).min(s.len() - 1)]
@@ -111,19 +146,24 @@ impl CBuf {
     fn as_mut(&mut self) -> &mut [u8] {
         self.0.as_mut_slice()
     }
+    /// The string for the result vector (freed by `globfree`).
     fn into_raw(self) -> *mut c_char {
         self.0.into_raw().0.cast()
     }
 }
 
+/// The names one directory read found: malloc'd C strings owned by the list (freed when it drops) until they are moved
+/// into the result vector.
 struct Names(CVec<*mut c_char>);
 
 impl Names {
+    /// Add `s`; false (and `s` freed) when memory ran out.
     fn push(&mut self, s: CBuf) -> bool {
         let raw = s.into_raw();
         if self.0.push(raw) {
             return true;
         }
+        // SAFETY: the string just made from `s`, not in the list and not used again.
         unsafe { crate::cmem::free(raw) };
         false
     }
@@ -135,11 +175,13 @@ impl Names {
 impl Drop for Names {
     fn drop(&mut self) {
         for &p in self.0.as_slice() {
+            // SAFETY: each is a string the list owns (from `CBuf::into_raw`), freed once as the list goes.
             unsafe { crate::cmem::free(p) };
         }
     }
 }
 
+/// `__glob_pattern_type`: 0 none, 1 special, 2 backslash, 4 bracket (bit flags).
 const PAT_NONE: i32 = 0;
 const PAT_SPECIAL: i32 = 1;
 const PAT_BACKSLASH: i32 = 2;
@@ -167,18 +209,29 @@ fn pattern_type(pattern: &[u8], quote: bool) -> i32 {
     ret
 }
 
+/// # Safety
+/// `pattern` is a C string.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn glob_pattern_p(pattern: *const c_char, quote: c_int) -> c_int {
+    // SAFETY: a C string (caller's contract).
     let p = unsafe { ffi::cstr_bytes(pattern) };
     (pattern_type(p, quote != 0) == PAT_SPECIAL) as c_int
 }
 
+// ---- the result vector
+
+/// The caller's `glob_t` while one call works on it: its vector is NULL or a malloc'd array of at least `cap`
+/// entries, `gl_offs` NULLs, `gl_pathc` malloc'd C strings and a NULL (what glob leaves and the glob_t contract makes
+/// the caller hand back), and its functions are the caller's.
 struct PathV<'a> {
     g: &'a mut Glob,
     cap: usize,
 }
 
 impl<'a> PathV<'a> {
+    /// # Safety
+    /// `g` is zeroed, or as glob left it (the vector NULL or as described above); its function pointers are NULL or
+    /// valid for the GLOB_ALTDIRFUNC interface.
     unsafe fn new(g: &'a mut Glob) -> PathV<'a> {
         let cap = if g.gl_pathv.is_null() { 0 } else { g.gl_offs.wrapping_add(g.gl_pathc).wrapping_add(1) };
         PathV { g, cap }
@@ -186,7 +239,9 @@ impl<'a> PathV<'a> {
     fn count(&self) -> usize {
         self.g.gl_offs + self.g.gl_pathc
     }
+    /// Make the vector exactly `n` entries long (realloc); false (the vector unchanged) when memory ran out.
     fn resize(&mut self, n: usize) -> bool {
+        // SAFETY: NULL or our malloc'd array; on success the old pointer is not used again.
         let nv = unsafe { crate::cmem::realloc(self.g.gl_pathv, n * core::mem::size_of::<*mut c_char>()) };
         if nv.is_null() {
             return false;
@@ -195,6 +250,7 @@ impl<'a> PathV<'a> {
         self.cap = n;
         true
     }
+    /// A fresh vector of `n` NULL entries (GLOB_DOOFFS); false when memory ran out.
     fn fresh(&mut self, n: usize) -> bool {
         let v = crate::cmem::malloc(n * core::mem::size_of::<*mut c_char>()).cast::<*mut c_char>();
         if v.is_null() {
@@ -209,73 +265,104 @@ impl<'a> PathV<'a> {
     }
     fn set(&mut self, i: usize, p: *mut c_char) {
         assert!(i < self.cap);
+        // SAFETY: an entry of our array (checked above).
         unsafe { *self.g.gl_pathv.wrapping_add(i) = p };
     }
     fn get(&self, i: usize) -> *mut c_char {
         assert!(i < self.cap);
+        // SAFETY: an entry of our array (checked above), written before.
         unsafe { *self.g.gl_pathv.wrapping_add(i) }
     }
+    /// The C string of path entry `i` (with its NUL).
     fn path(&self, i: usize) -> &[u8] {
         let p = self.get(i);
+        // SAFETY: entries `gl_offs..count()` are C strings (the type's invariant), unchanged while borrowed.
         unsafe { ffi::cstr_nonnull(p) }.to_bytes_with_nul()
     }
+    /// Replace path entry `i` by `s` (the old string is freed).
     fn replace(&mut self, i: usize, s: *mut c_char) {
         let old = self.get(i);
+        // SAFETY: a path entry is a malloc'd string owned by the vector, replaced right after.
         unsafe { crate::cmem::free(old) };
         self.set(i, s);
     }
+    /// Sort the entries `from..count()` as glibc does: `qsort` with `collated_compare`, that is `strcoll` in the locale in
+    /// force (byte order in the C locale), with qsort's merge sort, so entries that collate equal keep glibc's order.
     fn sort(&mut self, from: usize) {
         let to = self.count();
         if from >= to {
             return;
         }
+        // SAFETY: entries `from..to` are inside our array and borrowed exclusively here.
         let s = unsafe { ffi::slice_mut(self.g.gl_pathv.wrapping_add(from), to - from) };
-        s.sort_unstable_by(|a, b| unsafe { rusty_libc_mem::strcmp(*a, *b) }.cmp(&0));
+        // (glibc's comparator also orders equal and null pointers; the entries are distinct non-null strings)
+        // SAFETY: path entries are C strings (the type's invariant).
+        rusty_libc_stdlib::sort::sort_by(s, |a, b| unsafe { rusty_libc_mem::strcoll(*a, *b) }.cmp(&0));
     }
+    /// `globfree`: free the paths and the vector.
     fn free(&mut self) {
         if !self.g.gl_pathv.is_null() {
             for i in 0..self.g.gl_pathc {
                 let p = self.get(self.g.gl_offs + i);
+                // SAFETY: a path entry is a malloc'd string owned by the vector, which goes away now.
                 unsafe { crate::cmem::free(p) };
             }
+            // SAFETY: our malloc'd array, cleared right after.
             unsafe { crate::cmem::free(self.g.gl_pathv) };
             self.g.gl_pathv = null_mut();
             self.cap = 0;
         }
     }
+    /// The caller's `gl_opendir(dir)` (NULL when it is not set).
     fn opendir(&self, dir: &[u8]) -> *mut c_void {
+        // SAFETY: `dir` ends with its NUL; the function is the caller's GLOB_ALTDIRFUNC opendir (the type's invariant).
         self.g.gl_opendir.map_or(null_mut(), |f| unsafe { f(dir.as_ptr().cast()) })
     }
+    /// The caller's `gl_readdir(stream)`: the entry's name (with its NUL) and type, None at the end.
     fn readdir<'s>(&self, stream: *mut c_void) -> Option<(&'s [u8], u8)> {
+        // SAFETY: `stream` came from the caller's opendir; the function is its readdir (the type's invariant).
         let d = self.g.gl_readdir.map_or(null_mut(), |f| unsafe { f(stream) });
         if d.is_null() {
             return None;
         }
+        // SAFETY: a `struct dirent` the caller's readdir returned, valid until the next call on the stream.
         let d = unsafe { &*d };
+        // SAFETY: `d_name` holds a C string (the dirent contract).
         Some((unsafe { ffi::cstr_nonnull(d.d_name.as_ptr()) }.to_bytes_with_nul(), d.d_type))
     }
+    /// The caller's `gl_closedir(stream)`.
     fn closedir(&self, stream: *mut c_void) {
         if let Some(f) = self.g.gl_closedir {
+            // SAFETY: `stream` came from the caller's opendir; the function is its closedir.
             unsafe { f(stream) };
         }
     }
+    /// The caller's `gl_stat` or `gl_lstat` on `path` (with its NUL): 0 or -1 as the function returns it.
     fn alt_stat(&self, lstat: bool, path: &[u8], st: &mut StatBuf) -> c_int {
         let f = if lstat { self.g.gl_lstat } else { self.g.gl_stat };
+        // SAFETY: `path` ends with its NUL and `st` has room for a `struct stat`; the function is the caller's.
         f.map_or(-1, |f| unsafe { f(path.as_ptr().cast(), st.as_mut_ptr().cast()) })
     }
 }
 
+/// The caller's error function (`errfunc(path, errno)`).
 #[derive(Clone, Copy)]
 struct ErrCb(Option<ErrFn>);
 
 impl ErrCb {
+    /// # Safety
+    /// `f` is NULL or a function of glob's errfunc type.
     unsafe fn new(f: Option<ErrFn>) -> ErrCb {
         ErrCb(f)
     }
+    /// Does the caller want to stop at this error? (`path` with its NUL)
     fn stop(self, path: &[u8], e: i32) -> bool {
+        // SAFETY: `path` ends with its NUL; the function is the caller's errfunc (`new`'s contract).
         self.0.is_some_and(|f| unsafe { f(path.as_ptr().cast(), e) } != 0)
     }
 }
+
+// ---- file system access
 
 const AT_FDCWD: usize = (-100isize) as usize;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
@@ -284,14 +371,17 @@ const SYS_GETDENTS64: usize = 217;
 const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
 
+/// `struct stat` for x86-64: 144 bytes; `st_mode` is the u32 at offset 24.
 type StatBuf = [u64; 18];
 
 fn stat_mode(st: &StatBuf) -> u32 {
     (st[3] & 0xffff_ffff) as u32
 }
 
+/// fstatat(dirfd, path, flags) with `path` ending in its NUL; Ok(()) with the buffer filled, or Err(errno).
 fn fstatat(dirfd: usize, path: &[u8], st: &mut StatBuf, flags: usize) -> Result<(), i32> {
     debug_assert!(path.last() == Some(&0));
+    // SAFETY: `path` is a C string and `st` has room for the kernel's `struct stat`.
     let r = unsafe { syscall::syscall4(SYS_NEWFSTATAT, dirfd, path.as_ptr() as usize, st.as_mut_ptr() as usize, flags) };
     match syscall::check(r) {
         Ok(_) => Ok(()),
@@ -301,6 +391,7 @@ fn fstatat(dirfd: usize, path: &[u8], st: &mut StatBuf, flags: usize) -> Result<
 
 fn glob_lstat(pglob: &PathV, flags: c_int, fullname: &[u8]) -> Result<(), i32> {
     let mut st: StatBuf = [0; 18];
+    // glob@GLIBC_2.2.5 (before 2.27) called `gl_stat` where the current one calls `gl_lstat` (with GLOB_ALTDIRFUNC)
     let compat = STAT_FOR_LSTAT.get();
     if flags & GLOB_ALTDIRFUNC != 0 {
         let r = pglob.alt_stat(!compat, fullname, &mut st);
@@ -310,16 +401,24 @@ fn glob_lstat(pglob: &PathV, flags: c_int, fullname: &[u8]) -> Result<(), i32> {
     }
 }
 
+/// Set while `glob_compat` runs (this thread): with GLOB_ALTDIRFUNC the existence test calls `gl_stat`, not `gl_lstat`.
 #[thread_local]
 static STAT_FOR_LSTAT: core::cell::Cell<bool> = core::cell::Cell::new(false);
 
+/// `glob@GLIBC_2.2.5` / `glob64@GLIBC_2.2.5`: `glob` that calls `gl_stat` where the current one calls `gl_lstat`
+/// (GLOB_ALTDIRFUNC only; the plain file system is always asked with lstat). rusty-libc-cabi exports it under the old version name.
+///
+/// # Safety
+/// As `glob`.
 pub unsafe fn glob_compat(pattern: *const c_char, flags: c_int, errfunc: Option<ErrFn>, pglob: *mut Glob) -> c_int {
     let saved = STAT_FOR_LSTAT.replace(true);
+    // SAFETY: forwarded contract.
     let r = unsafe { glob(pattern, flags, errfunc, pglob) };
     STAT_FOR_LSTAT.set(saved);
     r
 }
 
+/// True if `filename` (with its NUL) is a directory or a symbolic link to one.
 fn is_dir(filename: &[u8], flags: c_int, pglob: &PathV) -> bool {
     let mut st: StatBuf = [0; 18];
     if flags & GLOB_ALTDIRFUNC != 0 {
@@ -329,17 +428,21 @@ fn is_dir(filename: &[u8], flags: c_int, pglob: &PathV) -> bool {
     }
 }
 
+/// A directory opened with `open` and read with `getdents64`.
 struct Dir {
     fd: c_int,
+    /// `DIR_BUF` bytes from malloc, filled by the kernel: glibc's readdir reads 32 KiB at a time too (fewer getdents calls
+    /// than a small buffer)
     buf: CVec<u8>,
     pos: usize,
 }
 
 const DIR_BUF: usize = 32768;
 
-const O_RDONLY_DIR_CLOEXEC: i32 = 0o2000000 | 0o200000 | 0o4000;
+const O_RDONLY_DIR_CLOEXEC: i32 = 0o2000000 | 0o200000 | 0o4000; // O_CLOEXEC | O_DIRECTORY | O_NONBLOCK
 
 impl Dir {
+    /// Open `path` (with its NUL).
     fn open(path: &[u8]) -> Result<Dir, i32> {
         debug_assert!(path.last() == Some(&0));
             let Ok(cpath) = CStr::from_bytes_with_nul(path) else { return Err(EINVAL) };
@@ -355,12 +458,14 @@ impl Dir {
             Err(e) => Err(e.0),
         }
     }
+    /// The next entry: (name with its NUL, d_type); None at the end or on error.
     fn next(&mut self) -> Option<(&[u8], u8)> {
         loop {
             if self.pos >= self.buf.len() {
                 let fd = self.fd as usize;
                 let mut err = 0;
                 let getdents = |p: *mut u8, cap: usize| {
+                    // SAFETY: the kernel writes at most `cap` bytes of directory records at `p` (the block fill_raw gives).
                     match syscall::check(unsafe { syscall::syscall3(SYS_GETDENTS64, fd, p as usize, cap) }) {
                         Ok(n) => n,
                         Err(e) => {
@@ -369,6 +474,7 @@ impl Dir {
                         }
                     }
                 };
+                // SAFETY: `getdents` writes the first `n <= cap` bytes and returns `n`.
                 let n = unsafe { self.buf.fill_raw(DIR_BUF, getdents) };
                 if n == 0 {
                     if err != 0 {
@@ -379,6 +485,7 @@ impl Dir {
                 self.pos = 0;
             }
             let b = self.buf.as_slice();
+            // the record header (d_ino, d_off, d_reclen, d_type) with one bounds check
             let h: &[u8; 19] = b[self.pos..].first_chunk().unwrap_or_else(|| panic!("short directory record"));
             let ino = u64::from_le_bytes(*h.first_chunk().unwrap_or(&[0; 8]));
             let reclen = u16::from_le_bytes([h[16], h[17]]) as usize;
@@ -387,11 +494,15 @@ impl Dir {
             let end = (self.pos + reclen).min(b.len()).max(start);
             self.pos += reclen.max(1);
             if ino == 0 {
-                continue;
+                continue; // deleted entry
             }
+            // The kernel pads each record to 8 bytes (reclen = align8(19 + name length + 1), fs/readdir.c), so the name's
+            // NUL is in the record's last 8 bytes: look there, not along the whole name. The full search stays as the
+            // fallback for a record that does not follow that layout.
             let area = &b[start..end];
             let in_tail = match area.last_chunk::<8>() {
                 Some(t) => {
+                    // the lowest zero byte of the word (exact: the trick's false hits are only above a real zero)
                     let w = u64::from_le_bytes(*t);
                     let z = w.wrapping_sub(0x0101_0101_0101_0101) & !w & 0x8080_8080_8080_8080;
                     (z != 0).then(|| area.len() - 8 + (z.trailing_zeros() / 8) as usize)
@@ -418,6 +529,9 @@ impl Drop for Dir {
     }
 }
 
+// ------------------------------------------------------------------------------ the glob proper
+
+/// Find the end of a sub-pattern in a brace expression (positions in `s`, which ends with its NUL).
 fn next_brace_sub(s: &[u8], mut cp: usize, flags: c_int) -> Option<usize> {
     let at = |i: usize| s.get(i).copied().unwrap_or(0);
     let mut depth = 0usize;
@@ -445,6 +559,8 @@ fn next_brace_sub(s: &[u8], mut cp: usize, flags: c_int) -> Option<usize> {
     if at(cp) != 0 { Some(cp) } else { None }
 }
 
+/// Prepend `dirname` + '/' to the `n` paths from entry `from` of the vector (replacing them); true when memory ran out
+/// (the entries done so far are freed and cleared, as glibc frees them).
 fn prefix_array(dirname: &[u8], pv: &mut PathV, from: usize, n: usize) -> bool {
     let mut dirlen = clen(dirname);
     if dirlen == 1 && dirname[0] == b'/' {
@@ -464,7 +580,11 @@ fn prefix_array(dirname: &[u8], pv: &mut PathV, from: usize, n: usize) -> bool {
     false
 }
 
+/// The order glibc 2.43's glob_in_dir hands its names over in, as (start, end) ranges of the names in reading order:
+/// it collects them in blocks of 64, 128, 256, ... names (each block twice the one before) chained newest first, so the
+/// last block comes first and each block keeps reading order. Only visible with GLOB_NOSORT (and above 64 names).
 fn block_order(n: usize) -> impl Iterator<Item = (usize, usize)> {
+    // number of blocks: the smallest k with 64 * (2^k - 1) >= n
     let mut k = 0u32;
     while k < usize::BITS - 7 && 64usize.saturating_mul((1usize << k) - 1) < n {
         k += 1;
@@ -475,6 +595,8 @@ fn block_order(n: usize) -> impl Iterator<Item = (usize, usize)> {
     })
 }
 
+/// Like `glob`, but `pattern` (with its NUL) is a final path component matched inside `directory` (with its NUL);
+/// always appends, never sorts.
 fn glob_in_dir(pattern: &[u8], directory: &[u8], mut flags: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c_int {
     let dirlen = directory.len() - 1;
     let mut names = Names(CVec::new());
@@ -484,6 +606,7 @@ fn glob_in_dir(pattern: &[u8], directory: &[u8], mut flags: c_int, errfunc: ErrC
     let mut own_dir: Option<Dir> = None;
     let mut opened = false;
     if meta == PAT_NONE && flags & (GLOB_NOCHECK | GLOB_NOMAGIC) != 0 {
+        // no wildcard and a single name is wanted whatever the file system says
         flags |= GLOB_NOCHECK;
     } else if meta == PAT_NONE {
         let Some(fullname) = CBuf::of(&[&directory[..dirlen], b"/", pattern]) else { return GLOB_NOSPACE };
@@ -535,12 +658,14 @@ fn glob_in_dir(pattern: &[u8], directory: &[u8], mut flags: c_int, errfunc: ErrC
                     match d_type {
                         DT_DIR => {}
                         DT_LNK | DT_UNKNOWN => {
+                            // the file system gave no hint: ask
                             if let (false, Some(dfd)) = (alt, dfd) {
                                 let mut st: StatBuf = [0; 18];
                                 if !(fstatat(dfd, name, &mut st, 0).is_ok() && stat_mode(&st) & S_IFMT == S_IFDIR) {
                                     continue;
                                 }
                             } else {
+                                // a directory that already ends in '/' gets no second slash
                                 let sep: &[u8] = if dirlen > 0 && directory[dirlen - 1] == b'/' { b"" } else { b"/" };
                                 let Some(s) = CBuf::of(&[&directory[..dirlen], sep, name]) else { return GLOB_NOSPACE };
                                 if !is_dir(s.cstr(), flags, pglob) {
@@ -576,6 +701,7 @@ fn glob_in_dir(pattern: &[u8], directory: &[u8], mut flags: c_int, errfunc: ErrC
             drop(names);
             result = GLOB_NOSPACE;
         } else {
+            // the vector owns the names from here on, in glibc's order (see `block_order`)
             let all = names.0.as_slice();
             for (start, end) in block_order(all.len()) {
                 for &s in &all[start..end] {
@@ -596,10 +722,12 @@ fn glob_in_dir(pattern: &[u8], directory: &[u8], mut flags: c_int, errfunc: ErrC
         pglob.closedir(alt_stream);
         errno::set(save);
     }
+    // `own_dir` closes itself (keeping errno) when it goes out of scope
     drop(own_dir);
     result
 }
 
+/// The directory part as glob works on it: a literal, the whole pattern ("~name"), or our own copy.
 enum DirName<'p> {
     Lit(&'static [u8]),
     Pat(&'p [u8]),
@@ -607,15 +735,18 @@ enum DirName<'p> {
 }
 
 impl DirName<'_> {
+    /// The C string with its NUL.
     fn cstr(&self) -> &[u8] {
         match self {
             DirName::Lit(s) | DirName::Pat(s) => s,
             DirName::Own(b) => b.cstr(),
         }
     }
+    /// Byte `i` of the C string, 0 past its end.
     fn at(&self, i: usize) -> u8 {
         self.cstr().get(i).copied().unwrap_or(0)
     }
+    /// Our own copy, made now if needed (glibc writes into it).
     fn own(&mut self) -> Option<&mut CBuf> {
         if !matches!(self, DirName::Own(_)) {
             let c = CBuf::of(&[&self.cstr()[..self.cstr().len() - 1]])?;
@@ -628,18 +759,22 @@ impl DirName<'_> {
     }
 }
 
+/// The home directory for "~": `$HOME`, else the login name's passwd entry; None when neither gives one (an empty
+/// value counts as none); Err(()) when memory ran out.
 fn home_dir() -> Result<Option<CBuf>, ()> {
     if let Some(h) = crate::cmem::getenv(b"HOME")
         && !h.is_empty()
     {
         return CBuf::of(&[h]).map(Some).ok_or(());
     }
+    // login name -> passwd entry
     let mut name = [0u8; 4096];
     let mut pwbuf = [0u8; 4096];
     if crate::pwd::getlogin_into(&mut name) == 0 {
         let mut pw = crate::pwd::Passwd { pw_name: null_mut(), pw_passwd: null_mut(), pw_uid: 0, pw_gid: 0, pw_gecos: null_mut(), pw_dir: null_mut(), pw_shell: null_mut() };
         let Ok(n) = CStr::from_bytes_until_nul(&name) else { return Ok(None) };
         if crate::pwd::pwnam_into(n, &mut pw, &mut pwbuf) == Ok(true) {
+            // SAFETY: the entry's home directory is NULL or a C string in `pwbuf` (not written any more) or a module's memory.
             let d = unsafe { ffi::cstr(pw.pw_dir) }.map_or(&b""[..], CStr::to_bytes);
             let c = CBuf::of(&[d]).ok_or(())?;
             return Ok(if c.bytes().is_empty() { None } else { Some(c) });
@@ -648,6 +783,8 @@ fn home_dir() -> Result<Option<CBuf>, ()> {
     Ok(None)
 }
 
+/// The home directory of `user` (with its NUL) from the passwd database: Ok(None) when there is no such user,
+/// Err(()) when memory ran out.
 fn user_home(user: &[u8]) -> Result<Option<CBuf>, ()> {
     let Ok(u) = CStr::from_bytes_until_nul(user) else { return Ok(None) };
     let mut pw = crate::pwd::Passwd { pw_name: null_mut(), pw_passwd: null_mut(), pw_uid: 0, pw_gid: 0, pw_gecos: null_mut(), pw_dir: null_mut(), pw_shell: null_mut() };
@@ -663,10 +800,12 @@ fn user_home(user: &[u8]) -> Result<Option<CBuf>, ()> {
             _ => return Ok(None),
         }
     }
+    // SAFETY: the entry's home directory is NULL or a C string in `buf` (not written any more) or a module's memory.
     let d = unsafe { ffi::cstr(pw.pw_dir) }.map_or(&b""[..], CStr::to_bytes);
     CBuf::of(&[d]).map(Some).ok_or(())
 }
 
+/// glibc's `__glob` on a pattern (with its NUL).
 fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c_int {
     let mut flags = flags_in;
     if flags & !ALL_FLAGS != 0 {
@@ -675,6 +814,7 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
     }
     let patlen = pat.len() - 1;
     let at = |i: usize| pat.get(i).copied().unwrap_or(0);
+    // POSIX: a trailing slash means only directories match
     if patlen > 0 && pat[patlen - 1] == b'/' {
         flags |= GLOB_ONLYDIR;
     }
@@ -758,17 +898,20 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
                         return GLOB_NOMATCH;
                     }
                 }
+                // not a well-formed brace expression: treat the braces as ordinary characters
                 _ => flags &= !GLOB_BRACE,
             }
         }
     }
 
+    // ---- no_brace:
     let mut oldcount = pglob.count();
     let mut dirs = Glob::new();
     let mut retval = 0;
     let mut dirname: DirName;
     let mut dirlen: usize;
     let mut dirname_modified = false;
+    // the file part: a suffix of the pattern (with its NUL)
     let filename: Option<&[u8]>;
 
     let slash = pat[..patlen].iter().rposition(|&c| c == b'/');
@@ -777,6 +920,7 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
             'nm: {
                 match slash {
                     None => {
+                        // a simple name or "~name"
                         if flags & (GLOB_TILDE | GLOB_TILDE_CHECK) != 0 && at(0) == b'~' {
                             dirname = DirName::Pat(pat);
                             dirlen = patlen;
@@ -791,6 +935,7 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
                         }
                     }
                     Some(s) if s == 0 || (s == 1 && at(0) == b'\\' && flags & GLOB_NOESCAPE == 0) => {
+                        // "/pattern" or "\\/pattern"
                         dirname = DirName::Lit(b"/\0");
                         dirlen = 1;
                         filename = Some(&pat[s + 1..]);
@@ -802,10 +947,12 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
                         let fname = &pat[s + 1..];
                         filename = Some(fname);
                         if fname[0] == 0 && dirlen > 1 {
+                            // "pattern/": expand "pattern" with slashes appended
                             let orig_flags = flags;
                             let DirName::Own(dn) = &mut dirname else { unreachable!() };
                             let dnb = dn.as_mut();
                             if flags & GLOB_NOESCAPE == 0 && dnb[dirlen - 1] == b'\\' {
+                                // "pattern\\/": drop the final backslash if it is not itself escaped
                                 let mut p = dirlen - 1;
                                 while p > 0 && dnb[p - 1] == b'\\' {
                                     p -= 1;
@@ -816,6 +963,7 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
                                     flags &= !(GLOB_NOCHECK | GLOB_NOMAGIC);
                                 }
                             }
+                            // many trailing slashes: collapse them
                             let mut p = dirlen - 1;
                             while p > 0 && dnb[p] == b'/' && dnb[p - 1] == b'/' {
                                 dnb[p] = 0;
@@ -836,8 +984,10 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
                     }
                 }
 
+                // ---- tilde
                 if flags & (GLOB_TILDE | GLOB_TILDE_CHECK) != 0 && dirname.at(0) == b'~' {
                     if dirname.at(1) == 0 || dirname.at(1) == b'/' || (flags & GLOB_NOESCAPE == 0 && dirname.at(1) == b'\\' && (dirname.at(2) == 0 || dirname.at(2) == b'/')) {
+                        // "~" or "~/...": the home directory
                         let home = match home_dir() {
                             Ok(h) => h,
                             Err(()) => {
@@ -860,6 +1010,7 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
                             }
                         };
                         if dirname.at(1) == 0 {
+                            // just "~"
                             dirlen = home.bytes().len();
                             dirname = DirName::Own(home);
                         } else {
@@ -873,6 +1024,7 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
                         }
                         dirname_modified = true;
                     } else {
+                        // "~user": that user's home directory
                         let d = dirname.cstr();
                         let dl = d.len() - 1;
                         let mut end_name = d[..dl].iter().position(|&c| c == b'/');
@@ -897,6 +1049,7 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
                                     while ok && q != end {
                                         if d[q] == b'\\' {
                                             if q + 1 == end {
+                                                // "~fo\\o\\" gives user name "foo\\", "~fo\\o\\/" gives "foo"
                                                 if filename.is_none() {
                                                     ok = v.push(b'\\');
                                                 }
@@ -944,6 +1097,7 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
                     }
                 }
 
+                // "~" or "~name" alone: the answer is the (expanded) directory itself
                 let Some(filename) = filename else {
                     let newcount = pglob.count();
                     if !pglob.resize(newcount + 2) {
@@ -969,7 +1123,9 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
 
                 let meta = pattern_type(dirname.cstr(), flags & GLOB_NOESCAPE == 0);
                 if meta & (PAT_SPECIAL | PAT_BRACKET) != 0 {
+                    // wildcards in the directory part: glob for the directories first
                     if flags & GLOB_NOESCAPE == 0 && dirlen > 0 && dirname.at(dirlen - 1) == b'\\' {
+                        // "foo\\/bar": drop the final backslash if it is not itself escaped
                         let Some(dn) = dirname.own() else {
                             retval = GLOB_NOSPACE;
                             break 'out;
@@ -991,6 +1147,7 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
                         dirs.gl_stat = pglob.g.gl_stat;
                         dirs.gl_lstat = pglob.g.gl_lstat;
                     }
+                    // SAFETY: our own zeroed glob_t, with the caller's functions copied in.
                     let mut dv = unsafe { PathV::new(&mut dirs) };
                     let status = glob_run(dirname.cstr(), (flags & (GLOB_ERR | GLOB_NOESCAPE | GLOB_ALTDIRFUNC)) | GLOB_NOSORT | GLOB_ONLYDIR, errfunc, &mut dv);
                     if status != 0 {
@@ -1025,6 +1182,8 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
                         }
                     }
                     flags |= GLOB_MAGCHAR;
+                    // GLOB_NOCHECK was ignored in the glob_in_dir calls: with nothing found
+                    // the pattern itself is the answer
                     if pglob.count() == oldcount {
                         break 'nm;
                     }
@@ -1034,6 +1193,7 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
                     let old_pathc = pglob.g.gl_pathc;
                     let orig_flags = flags;
                     if meta & PAT_BACKSLASH != 0 {
+                        // unescape the directory name in place (in our own copy)
                         let Some(dn) = dirname.own() else {
                             retval = GLOB_NOSPACE;
                             break 'out;
@@ -1085,6 +1245,8 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
                     break 'to_d;
                 }
             }
+            // ---- no_matches:
+            // SAFETY: our own glob_t (zeroed, or filled by the directory glob above).
             let mut dv = unsafe { PathV::new(&mut dirs) };
             if flags & GLOB_NOCHECK != 0 {
                 let newcount = pglob.count();
@@ -1111,6 +1273,7 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
             }
             dv.free();
         }
+        // ---- D: mark directories, sort
         if flags & GLOB_MARK != 0 {
             for i in oldcount..pglob.count() {
                 if is_dir(pglob.path(i), flags, pglob) {
@@ -1131,9 +1294,14 @@ fn glob_run(pat: &[u8], flags_in: c_int, errfunc: ErrCb, pglob: &mut PathV) -> c
     retval
 }
 
+/// # Safety
+/// `pattern` is a C string; `pglob` points to a `glob_t` (zeroed, or from a previous call with
+/// GLOB_APPEND); `errfunc` may be NULL.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn glob(pattern: *const c_char, flags: c_int, errfunc: Option<ErrFn>, pglob: *mut Glob) -> c_int {
+    // SAFETY: `pattern` is NULL or a C string (caller's contract).
     let p = unsafe { ffi::cstr(pattern) };
+    // SAFETY: `pglob` is NULL or a valid glob_t, ours for the call (caller's contract).
     let g = unsafe { ffi::out(pglob) };
     let (Some(p), Some(g)) = (p, g) else {
         errno::set(EINVAL);
@@ -1143,23 +1311,37 @@ pub unsafe extern "C" fn glob(pattern: *const c_char, flags: c_int, errfunc: Opt
         errno::set(EINVAL);
         return -1;
     }
+    // SAFETY: as glob left it or zeroed, with the caller's functions (caller's contract).
     let mut pv = unsafe { PathV::new(g) };
+    // SAFETY: `errfunc` is NULL or of the errfunc type (caller's contract).
     let cb = unsafe { ErrCb::new(errfunc) };
     glob_run(p.to_bytes_with_nul(), flags, cb, &mut pv)
 }
 
+/// The 64-bit-file-offset name of `glob` (same layout on x86-64).
+///
+/// # Safety
+/// As `glob`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn glob64(pattern: *const c_char, flags: c_int, errfunc: Option<ErrFn>, pglob: *mut Glob) -> c_int {
+    // SAFETY: forwarded contract.
     unsafe { glob(pattern, flags, errfunc, pglob) }
 }
 
+/// # Safety
+/// `pglob` was filled by `glob` (or is zeroed).
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn globfree(pglob: *mut Glob) {
+    // SAFETY: a glob_t as glob left it, or zeroed (caller's contract; NULL faults as in glibc).
     let g = unsafe { &mut *pglob };
+    // SAFETY: as above.
     unsafe { PathV::new(g) }.free();
 }
 
+/// # Safety
+/// As `globfree`.
 #[cfg_attr(feature = "export", unsafe(no_mangle))]
 pub unsafe extern "C" fn globfree64(pglob: *mut Glob) {
+    // SAFETY: forwarded contract.
     unsafe { globfree(pglob) }
 }

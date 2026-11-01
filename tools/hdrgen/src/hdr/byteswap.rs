@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "byteswap.h",
     items: &[
+        Item::Comment("/* byteswap.h for the Rust libc: the compiler builtins under glibc's names. */"),
         Item::Guard { name: "_BYTESWAP_H", value: "1", end: "", items: &[
             Item::Include("<features.h>"),
             Item::Include("<bits/byteswap.h>"),

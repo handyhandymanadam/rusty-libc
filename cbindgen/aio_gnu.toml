@@ -4,6 +4,8 @@ include_guard = "_RLIBC_AIO_GNU_DECLS_H"
 usize_is_size_t = true
 no_includes = true
 sys_includes = ["stddef.h"]
+# Included by tools/hdrgen/src/hdr/aio.h, which has the types and constants by hand; only the function
+# declarations are generated here.
 [export]
 item_types = ["functions"]
 [export.rename]

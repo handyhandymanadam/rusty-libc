@@ -3,6 +3,10 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "bits/types/siginfo_t.h",
     items: &[
+        Item::Comment(r#"/* siginfo_t, glibc's x86-64 layout (128 bytes) and the si_* accessor macros. One definition for
+   signal.h and the sys headers: __siginfo_t_defined is set here and by the generated headers'
+   shared-type block (tools/sys_types.py), which includes this file; _RLIBC_SIGINFO_T_H keeps the
+   body from being read twice. */"#),
         Item::Guard { name: "_RLIBC_SIGINFO_T_H", value: "1", end: "", items: &[
             Item::Gate(&[
                 Branch { head: "ifndef __siginfo_t_defined", items: &[

@@ -1,3 +1,7 @@
+//! `Errno`: a Linux error number, what every fallible call of this crate returns. With the `std` feature it converts into
+//! `std::io::Error` (`raw_os_error` gives the number back).
+
+/// A Linux error number (positive, 1..=4095).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Errno(pub i32);
@@ -20,12 +24,14 @@ impl Errno {
     pub const ETIMEDOUT: Errno = Errno(110);
     pub const ESTALE: Errno = Errno(116);
 
+    /// The error of a raw kernel return value, if it is one (-4095..=-1).
     #[inline(always)]
     pub const fn of(r: isize) -> Option<Errno> {
         if crate::syscall::is_err(r) { Some(Errno(-(r as i32))) } else { None }
     }
 }
 
+/// A raw kernel return value as a `Result`.
 #[inline(always)]
 pub(crate) const fn cvt(r: isize) -> Result<usize, Errno> {
     match Errno::of(r) {

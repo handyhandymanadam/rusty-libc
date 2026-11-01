@@ -3,6 +3,7 @@ use crate::model::*;
 pub static HDR: Header = Header {
     path: "fpu_control.h",
     items: &[
+        Item::Comment("/* fpu_control.h for the Rust libc: x86 FPU control word bits and the macros to read and write it. */"),
         Item::Guard { name: "_FPU_CONTROL_H", value: "1", end: "", items: &[
             Item::Consts(&[
                 ("_FPU_RESERVED", V::Txt("0xF0C0")),

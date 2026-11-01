@@ -1,7 +1,24 @@
-#![no_std]
+//! pthread.h, semaphore.h, threads.h (C11): thread creation (clone), join/detach, mutexes, condition
+//! variables, rwlocks, once, barriers, spin locks, semaphores, thread-specific data, attributes,
+//! cancellation, atfork. Written function by function; behaviour oracle is glibc 2.43.
+//!
+//! Struct layouts and sizes equal glibc's x86-64 ones, so memory that C code initialises with the
+//! PTHREAD_*_INITIALIZER macros works unchanged. See the module docs for each part.
+//!
+//! Unsafe areas (what stays unsafe, and where): the clone entry, the cancellable system call stub, the signal restorer
+//! and the cancellation buffer jump (assembly: thread.rs, cancel.rs); the thread descriptor and TCB, shared with other
+//! threads and the kernel, reached field by field through raw pointers (thread.rs `field_of!`, `tid_word`,
+//! `shared_field`); thread stacks and TLS blocks (thread.rs); the per-thread key slots (key.rs); the cleanup records and
+//! glibc-style cancellation buffers on thread stacks (cancel.rs, unwind.rs); the mutex lock paths and the robust list the
+//! kernel walks (mutex.rs); the C boundary conversions of every exported function (`sys::arg` / `arg_mut`, core's `ffi`);
+//! system calls with pointer arguments; calls of the program's functions (start routines, destructors, handlers).
+#![cfg_attr(not(test), no_std)]
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
+// style lints that fight the shape of the ported algorithms and the raw-pointer statics
 #![allow(clippy::collapsible_if, clippy::collapsible_match, clippy::needless_range_loop, clippy::doc_lazy_continuation, clippy::let_and_return, clippy::arc_with_non_send_sync)]
+// Thin unsafe shell, safe core (BRIEF-UNSAFE.md U2): every unsafe block holds one unsafe operation and says why it is sound.
+// The mutex lock paths (mutex.rs) keep their one-block bodies (allowed per function there).
 #![deny(clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block, unsafe_op_in_unsafe_fn)]
 
 #[cfg(feature = "alloc")]
@@ -24,6 +41,7 @@ pub mod thread;
 pub mod tpp;
 #[cfg(feature = "unwind")]
 pub mod unwind;
+/// The Rust API: Thread, JoinHandle, Mutex, Condvar, RwLock, Once, thread-local keys.
 pub mod api;
 
 pub use atfork::*;

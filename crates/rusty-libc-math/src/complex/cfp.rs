@@ -1,7 +1,13 @@
+//! Floating-point plumbing for the complex functions: one trait `CF` for binary32 and binary64
+//! (the algorithms are written once, as glibc writes them once as templates) and the wrapper
+//! `W<F>` whose operators are single SSE instructions (inline assembly, from `rounding::fp`), so
+//! the optimizer can neither fold, hoist nor drop an operation whose only effect is a floating
+//! point exception flag.
 use crate::rounding::fp::Fp;
 use core::hint::black_box;
 use core::ops::{Add, Div, Mul, Neg, Sub};
 
+/// `fpclassify` values of glibc.
 pub const FP_NAN: i32 = 0;
 pub const FP_INFINITE: i32 = 1;
 pub const FP_ZERO: i32 = 2;
@@ -9,11 +15,16 @@ pub const FP_SUBNORMAL: i32 = 3;
 pub const FP_NORMAL: i32 = 4;
 
 pub trait CF: Fp {
+    /// Smallest normal (`FLT_MIN`, `DBL_MIN`).
     const MIN: Self;
     const MAX: Self;
+    /// `FLT_EPSILON`, `DBL_EPSILON`.
     const EPS: Self;
     const MANT_DIG: i32;
+    /// Veltkamp splitting constant 2^ceil(p/2) + 1.
     const SPLIT: Self;
+    /// Constants the algorithms derive from the above (all exact: powers of two times MAX or MIN): the
+    /// operators of `W` are inline assembly, so an expression like `eps / 8.0` would be a divide per call.
     const INV_EPS: Self;
     const HALF_LOG10E: Self;
     const EPS_8: Self;
@@ -31,7 +42,9 @@ pub trait CF: Fp {
     const LOG10E: Self;
     const LOG10_2: Self;
     const PI_LOG10E: Self;
+    /// glibc's internal atan2 sets errno itself (ERANGE on a subnormal result): float only.
     const ATAN2_ERRNO: bool;
+    /// A value exactly representable in both formats (powers of two, small integers).
     fn lit(v: f64) -> Self;
     fn c_exp(x: Self) -> Self;
     fn c_log(x: Self) -> Self;
@@ -42,6 +55,7 @@ pub trait CF: Fp {
     fn c_cosh(x: Self) -> Self;
     fn c_atan2(y: Self, x: Self) -> Self;
     fn c_hypot(x: Self, y: Self) -> Self;
+    /// `c_hypot` with errno put back as it was (glibc's templates call the internal `__ieee754_hypot`).
     #[inline]
     fn c_hypot_q(x: Self, y: Self) -> Self {
         quiet(|| Self::c_hypot(x, y))
@@ -104,6 +118,7 @@ impl CF for f64 {
     fn c_hypot(x: f64, y: f64) -> f64 {
         crate::rounding::hypot(x, y)
     }
+    /// The common case inline (it never sets errno); only the out-of-line rest needs errno saved.
     #[inline(always)]
     fn c_hypot_q(x: f64, y: f64) -> f64 {
         match crate::rounding::hypot_fast(x, y) {
@@ -176,9 +191,12 @@ impl CF for f32 {
     }
 }
 
+/// A float whose arithmetic operators are one instruction each.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct W<F: CF>(pub F);
 
+// The four comparisons are written out: the defaults go through `partial_cmp` and its `Option<Ordering>`, which
+// compiles to a chain of set/move instructions instead of one `ucomisd` and a branch.
 impl<F: CF> PartialOrd for W<F> {
     #[inline(always)]
     fn partial_cmp(&self, o: &W<F>) -> Option<core::cmp::Ordering> {
@@ -236,9 +254,11 @@ impl<F: CF> W<F> {
     pub fn is_finite(self) -> bool {
         self.0.is_finite_()
     }
+    /// `fpclassify`.
     #[inline]
     pub fn cls(self) -> i32 {
         let b = self.0.bits() & !F::SIGN;
+        // the normal numbers first (one range test): the common case
         if b.wrapping_sub(1u64 << F::MANT) < F::EXP_MASK - (1u64 << F::MANT) {
             FP_NORMAL
         } else if b > F::EXP_MASK {
@@ -269,6 +289,8 @@ impl<F: CF> W<F> {
         let (s, c) = F::c_sincos(self.0);
         (W(s), W(c))
     }
+    // sinh, cosh, atan2, hypot and scalbn: glibc's templates call the internal `__ieee754_*`
+    // forms, which leave errno alone (the public wrappers set it); errno is restored here.
     pub fn sinh(self) -> W<F> {
         quiet(|| W(F::c_sinh(self.0)))
     }
@@ -284,12 +306,16 @@ impl<F: CF> W<F> {
     pub fn scalbn(self, n: i32) -> W<F> {
         quiet(|| W(F::c_scalbn(self.0, n)))
     }
+    /// glibc `math_check_force_underflow`: raise "underflow" when `self` is a nonzero value
+    /// below the smallest normal. The test is inline (a call per result cost 10% of casin); the
+    /// product that raises the flag is out of line and rare.
     #[inline(always)]
     pub fn force_underflow(self) {
         if self.abs() < W(F::MIN) {
             self.raise_underflow();
         }
     }
+    /// `math_check_force_underflow_nonneg`.
     #[inline(always)]
     pub fn force_underflow_nonneg(self) {
         if self < W(F::MIN) {
@@ -370,11 +396,13 @@ impl<F: CF> PartialOrd<f64> for W<F> {
     }
 }
 
+/// Raise the "invalid" exception.
 #[inline(never)]
 pub fn raise_invalid() {
     crate::fenv::feraiseexcept(crate::fenv::FE_INVALID);
 }
 
+/// The quiet NaN `NAN` of C.
 #[inline(always)]
 pub fn nan<F: CF>() -> W<F> {
     W(F::from_bits(F::EXP_MASK | (1u64 << (F::MANT - 1))))
@@ -385,6 +413,8 @@ pub fn inf<F: CF>() -> W<F> {
     W(F::from_bits(F::EXP_MASK))
 }
 
+/// Dekker/Veltkamp exact product: `(hi, lo)` with `hi + lo == x * y` (no overflow or underflow
+/// assumed).
 pub fn mul_split<F: CF>(x: W<F>, y: W<F>) -> (W<F>, W<F>) {
     let hi = x * y;
     let split = |a: W<F>| {
@@ -398,7 +428,11 @@ pub fn mul_split<F: CF>(x: W<F>, y: W<F>) -> (W<F>, W<F>) {
     (hi, lo)
 }
 
+/// `x^2 + y^2 - 1` without large cancellation error, for 1 > x >= y >= epsilon/2 and
+/// x^2 + y^2 >= 0.5 (glibc `__x2y2m1`: exact squares, then a compensated sum in order of
+/// increasing magnitude), computed in round to nearest whatever the current mode.
 pub fn x2y2m1<F: CF>(x: W<F>, y: W<F>) -> W<F> {
+    // glibc: SET_RESTORE_ROUND (FE_TONEAREST); the exact splitting needs round to nearest
     crate::fenv::with_round_mode(crate::fenv::RoundMode::Nearest, || x2y2m1_nearest(x, y))
 }
 
@@ -433,6 +467,8 @@ fn sort_abs<F: CF>(v: &mut [W<F>]) {
     }
 }
 
+/// C99 Annex G complex multiplication as libgcc's `__muldc3` does it (recovers infinities
+/// from NaN results).
 pub fn cmul<F: CF>(a: W<F>, b: W<F>, c: W<F>, d: W<F>) -> (W<F>, W<F>) {
     let (mut a, mut b, mut c, mut d) = (a, b, c, d);
     let ac = a * c;
@@ -489,6 +525,7 @@ pub fn cmul<F: CF>(a: W<F>, b: W<F>, c: W<F>, d: W<F>) -> (W<F>, W<F>) {
     (x, y)
 }
 
+/// Run `f` and put errno back as it was.
 #[inline]
 pub fn quiet<R>(f: impl FnOnce() -> R) -> R {
     let saved = Errno::save();
@@ -497,7 +534,9 @@ pub fn quiet<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+#[cfg(not(test))]
 struct Errno(i32);
+#[cfg(not(test))]
 impl Errno {
     #[inline(always)]
     fn save() -> Errno {
@@ -509,3 +548,29 @@ impl Errno {
     }
 }
 
+/// Test builds keep two errnos: the host's (what exp, log, trig set) and the per-thread one of
+/// the rounding functions.
+#[cfg(test)]
+struct Errno(i32, i32);
+#[cfg(test)]
+impl Errno {
+    fn save() -> Errno {
+        unsafe extern "C" {
+            fn __errno_location() -> *mut i32;
+        }
+        // SAFETY: the host glibc's __errno_location takes no arguments.
+        let p = unsafe { __errno_location() };
+        // SAFETY: it points to this thread's errno.
+        Errno(unsafe { *p }, crate::rounding::fp::test_errno())
+    }
+    fn restore(self) {
+        unsafe extern "C" {
+            fn __errno_location() -> *mut i32;
+        }
+        // SAFETY: the host glibc's __errno_location takes no arguments.
+        let p = unsafe { __errno_location() };
+        // SAFETY: it points to this thread's errno, valid for writes.
+        unsafe { *p = self.0 };
+        crate::rounding::fp::set_errno(self.1);
+    }
+}

@@ -1,12 +1,14 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* glibc: sys/types.h also brings fd_set, FD_SET, select and pselect in the default and GNU modes */"),
     Item::Gate(&[
         Branch { head: "ifdef __USE_MISC", items: &[
-            Item::Include("<endian.h>"),
+            Item::Include("<endian.h>   /* glibc: BYTE_ORDER, htobe32, ... */"),
             Item::Include("<sys/select.h>"),
         ] },
     ], ""),
+    Item::Comment("/* the BSD names glibc's sys/types.h gives (bash, gnulib and old code use them) */"),
     Item::Gate(&[
         Branch { head: "ifdef __USE_MISC", items: &[
             Item::Gate(&[

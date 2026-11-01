@@ -1,3 +1,10 @@
+//! csqrt, casinh, casin, cacos, cacosh, catan, catanh (and the kernel shared by the casinh family).
+//!
+//! Derived from glibc 2.43 `math/s_csqrt_template.c`, `k_casinh_template.c`,
+//! `s_casinh_template.c`, `s_casin_template.c`, `s_cacos_template.c`, `s_cacosh_template.c`,
+//! `s_catan_template.c`, `s_catanh_template.c` (LGPL-2.1-or-later): case structure, special
+//! values, the reduction to the first quadrant and the series-free evaluation regions of the
+//! kernel. The kernel and csqrt call this crate's hypot, log1p, atan2 and so on.
 use super::cfp::*;
 use super::explog::clog_finite;
 
@@ -31,11 +38,14 @@ pub fn csqrt<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
     }
 }
 
+/// `csqrt` of a finite `xr` and a finite nonzero `xi` (the casinh kernel's arguments): the same result without the
+/// classification of both.
 fn csqrt_finite<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
     debug_assert!(xr.is_finite() && xi.is_finite() && xi != 0.0);
     csqrt_finite_body(xr, xi)
 }
 
+/// The finite part of `csqrt` (inline into `csqrt` and `csqrt_finite`).
 #[inline(always)]
 fn csqrt_finite_body<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
     let half = 0.5;
@@ -64,6 +74,7 @@ fn csqrt_finite_body<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
         }
         let d = xr.hypot(xi);
         let (mut r, mut s);
+        // 2 Re(res) Im(res) = Im(x): avoids cancellation in d +- Re(x)
         if xr > 0.0 {
             r = (half * (d + xr)).sqrt();
             if scale == 1 && xi.abs() < 1.0 {
@@ -93,6 +104,8 @@ fn csqrt_finite_body<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
     }
 }
 
+/// Complex inverse hyperbolic sine of finite nonzero `x`; with `adj` the imaginary part of the
+/// result is subtracted from pi/2.
 pub fn kernel_casinh<F: CF>(xr: W<F>, xi: W<F>, adj: bool) -> P<F> {
     let rx = xr.abs();
     let ix = xi.abs();
@@ -100,6 +113,7 @@ pub fn kernel_casinh<F: CF>(xr: W<F>, xi: W<F>, adj: bool) -> P<F> {
     let ln2 = W(F::LN2);
     let (mut re, mut im);
     if rx >= W(F::INV_EPS) || ix >= W(F::INV_EPS) {
+        // x + csqrt(1 + x*x) is close to 2x; avoid overflow from the squaring
         let (mut yr, mut yi) = (rx, ix);
         if adj {
             let t = yr;
@@ -185,6 +199,7 @@ pub fn kernel_casinh<F: CF>(xr: W<F>, xi: W<F>, adj: bool) -> P<F> {
         re = lr;
         im = li;
     }
+    // give the results the correct sign for the original argument
     re = re.copysign(xr);
     im = im.copysign(if adj { W::k(1.0) } else { xi });
     (re, im)
@@ -284,6 +299,8 @@ pub fn cacosh<F: CF>(xr: W<F>, xi: W<F>) -> P<F> {
     }
 }
 
+/// `0.5 * atan2 (2 * a, den)` denominators of catan and catanh share this: 1 - |z|^2 computed
+/// without cancellation, `absx >= absy >= 0`.
 fn one_minus_abs2<F: CF>(absx: W<F>, absy: W<F>) -> W<F> {
     if absy < W(F::EPS_2) {
         let d = (1.0 - absx) * (1.0 + absx);

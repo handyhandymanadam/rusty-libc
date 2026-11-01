@@ -6,6 +6,10 @@ license.workspace = true
 
 [lib]
 crate-type = ["staticlib", "rlib"]
+# No unit-test harness: exported C symbols (write, exit) would replace the host libc inside it.
+# This crate is tested by the C and Rust programs in tests/.
+test = false
+doctest = false
 
 [dependencies]
 rusty-libc-core = { path = "../rusty-libc-core" }
@@ -30,6 +34,10 @@ rusty-libc-ipc = { path = "../rusty-libc-ipc" }
 rusty-libc-rpc = { path = "../rusty-libc-rpc" }
 
 [features]
+# The real C runtime build: adds the program entry (_start) and the C memory symbols.
+# every crate's exported C symbols (no program entry)
 exports = ["rusty-libc-core/export-mem", "rusty-libc-core/export-errno", "rusty-libc-malloc/export", "rusty-libc-stdio/export", "rusty-libc-ctype/export", "rusty-libc-stdlib/export", "rusty-libc-sys/export", "rusty-libc-util/export", "rusty-libc-time/export", "rusty-libc-wchar/export", "rusty-libc-math/export", "rusty-libc-regex/export", "rusty-libc-pthread/export", "rusty-libc-signal/export", "rusty-libc-net/export", "rusty-libc-iconv/export", "rusty-libc-fortify/export", "rusty-libc-locale/export", "rusty-libc-extra/export", "rusty-libc-ipc/export", "rusty-libc-rpc/export"]
 runtime = ["exports", "rusty-libc-core/start", "rusty-libc-pthread/unwind"]
-shared = ["exports", "rusty-libc-core/start", "rusty-libc-core/shared", "rusty-libc-sys/shared", "rusty-libc-extra/shared", "rusty-libc-regex/shared", "rusty-libc-math/svid", "rusty-libc-pthread/unwind-dl"]
+# The shared libc.so.6 build: the same exports, no _start; the dynamic loader starts the program and
+# rusty-libc-core's `shared` module does the initialisation (tools/build-shared.sh).
+shared = ["exports", "rusty-libc-iconv/shared", "rusty-libc-core/start", "rusty-libc-core/shared", "rusty-libc-sys/shared", "rusty-libc-extra/shared", "rusty-libc-regex/shared", "rusty-libc-math/svid", "rusty-libc-pthread/unwind-dl"]

@@ -1,8 +1,13 @@
+//! Argument reduction for sin, cos, tan: x = n * pi/2 + y with |y| <= pi/4 (a little more), y a
+//! double-double. Three ranges: none (|x| < pi/4); Cody-Waite with a four-piece pi/2 (|x| below
+//! 1.5e6, so n < 2^20 and n times a 33-bit piece is exact); Payne-Hanek with the bits of 2/pi
+//! (everything above, up to the largest double).
 use super::dd::{self, D};
 use super::tables::*;
 
-const SHIFT: f64 = 6755399441055744.0;
+const SHIFT: f64 = 6755399441055744.0; // 1.5 * 2^52
 
+/// Returns `(n mod 4, y)`.
 #[inline(always)]
 pub fn rem_pio2<const F: bool>(x: f64) -> (u32, D) {
     let ax = f64::from_bits(x.to_bits() & 0x7fff_ffff_ffff_ffff);
@@ -15,12 +20,13 @@ pub fn rem_pio2<const F: bool>(x: f64) -> (u32, D) {
 
 #[inline(always)]
 fn medium(ax: f64) -> (u32, D) {
+    // n = round(ax * 2/pi) by the shift trick (round to nearest is in force); no float-to-int cast
     let kd = ax * TWO_OVER_PI + SHIFT;
     let n = kd.to_bits() as u32;
     let nf = kd - SHIFT;
-    let r = ax - nf * PIO2_1;
-    let t1 = nf * PIO2_2;
-    let t2 = nf * PIO2_3;
+    let r = ax - nf * PIO2_1; // exact
+    let t1 = nf * PIO2_2; // exact
+    let t2 = nf * PIO2_3; // exact
     let t3 = nf * PIO2_4;
     let (h, l1) = dd::two_sum(r, -t1);
     let (h2, l2) = dd::two_sum(h, -t2);
@@ -28,16 +34,20 @@ fn medium(ax: f64) -> (u32, D) {
     (n & 3, dd::two_sum(h2, l))
 }
 
+/// Bits `k+1 ..= k+64` of 2/pi (k = number of bits skipped after the binary point).
 #[inline(always)]
 fn word_at(k: usize) -> u64 {
     let (i, r) = (k / 64, (k % 64) as u32);
+    // i + 1 <= 21 for every k used (k <= 1225); `get` keeps a panic path out of the library
     let w = |j: usize| TWO_OVER_PI_WORDS.get(j).copied().unwrap_or(0);
     if r == 0 { w(i) } else { (w(i) << r) | (w(i + 1) >> (64 - r)) }
 }
 
+/// Bits `[lo, lo + 64)` of a little-endian multi-word number (bits below 0 read as zero).
 #[inline(always)]
 fn get64(v: &[u64; 6], lo: i32) -> u64 {
     let mut out = 0u64;
+    // gather bit by word: result bit j is bit lo+j of v
     let (w, r) = (lo.div_euclid(64), lo.rem_euclid(64) as u32);
     let limb = |i: i32| -> u64 { if (0..6).contains(&i) { v[i as usize] } else { 0 } };
     out |= limb(w) >> r;
@@ -52,7 +62,9 @@ fn large<const F: bool>(ax: f64) -> (u32, D) {
     let bits = ax.to_bits();
     let e = ((bits >> 52) & 0x7ff) as i32 - 1075;
     let m = (bits & ((1u64 << 52) - 1)) | (1u64 << 52);
+    // Bits j <= e - 2 of 2/pi only add multiples of 4 to x * 2/pi: skip them.
     let s = if e > 2 { (e - 2) as usize } else { 0 };
+    // 320-bit window W = bits s+1 ..= s+320; x * 2/pi = m * W * 2^(e - s - 320) mod 4.
     let mut prod = [0u64; 6];
     let mut carry = 0u128;
     for (j, out) in prod.iter_mut().take(5).enumerate() {
@@ -62,9 +74,10 @@ fn large<const F: bool>(ax: f64) -> (u32, D) {
         carry = p >> 64;
     }
     prod[5] = carry as u64;
-    let t = (320 - e + s as i32) as u32;
+    let t = (320 - e + s as i32) as u32; // value = prod * 2^-t
     let bit = |i: u32| -> u64 { (prod.get((i / 64) as usize).copied().unwrap_or(0) >> (i % 64)) & 1 };
     let mut n = (bit(t) | (bit(t + 1) << 1)) as u32;
+    // fraction = low t bits
     let mut fr = prod;
     for (i, limb) in fr.iter_mut().enumerate() {
         let lo = (i * 64) as u32;
@@ -76,6 +89,7 @@ fn large<const F: bool>(ax: f64) -> (u32, D) {
     }
     let mut neg = false;
     if bit(t - 1) == 1 {
+        // fraction >= 1/2: take n + 1 and the negative remainder 2^t - fraction
         n = (n + 1) & 3;
         neg = true;
         let mut c = 1u128;
@@ -91,6 +105,7 @@ fn large<const F: bool>(ax: f64) -> (u32, D) {
             }
         }
     }
+    // highest set bit of the fraction
     let mut p: i32 = -1;
     for i in (0..6).rev() {
         if fr[i] != 0 {
@@ -103,8 +118,9 @@ fn large<const F: bool>(ax: f64) -> (u32, D) {
     }
     let top = get64(&fr, p - 63);
     let next = get64(&fr, p - 127);
-    let a = ((top >> 11) as f64) * 2048.0;
-    let lo = ((top & 0x7ff) as f64) + (next as f64) * 5.421010862427522e-20;
+    // (top + next * 2^-64) * 2^(p - 63 - t) as a double-double
+    let a = ((top >> 11) as f64) * 2048.0; // exact: the top 53 bits
+    let lo = ((top & 0x7ff) as f64) + (next as f64) * 5.421010862427522e-20; // + next * 2^-64
     let sc = dd::pow2(p - 63 - t as i32);
     let v = (a * sc, lo * sc);
     let y = dd::mul::<F>(PIO2, v);

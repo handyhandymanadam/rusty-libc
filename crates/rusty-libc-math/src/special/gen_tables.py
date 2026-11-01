@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""Generates the constant tables of rusty-libc-math's special functions (erf, erfc, lgamma, tgamma).
+Every number is computed here by hand-written code from the defining formulas or from MPFR
+(libmpfr.so.6 through mp.py) at 600 bits; nothing is copied from another libm.
+
+    python3 gen_tables.py base     -> tab_base.rs   (exp2 table, ln 2, pi, series coefficients, factorials)
+    python3 gen_tables.py erf      -> tab_erf.rs    (erf/erfc nodes and the erfc tail)
+    python3 gen_tables.py gamma    -> tab_gamma.rs  (lgamma nodes and the negative-side root windows)
+
+A table entry is a double-double (hi, lo): hi = round(v), lo = round(v - hi). Polynomials are
+Chebyshev interpolants (cheb.py), converted to monomials in h = x - x0 with exact fractions.
+"""
 import sys
 import os
 from fractions import Fraction
@@ -58,6 +69,7 @@ def array(name, rows, doc, ty="[f64; 2]"):
 
 
 def bernoulli(n):
+    """B_0..B_n as Fractions."""
     from math import comb
     b = [Fraction(0)] * (n + 1)
     b[0] = Fraction(1)
@@ -70,12 +82,14 @@ def gen_base():
     out = header("base", "Base constants of the special functions")
     pi = const_pi()
     ln2 = const_ln2()
+    # 2^(j/64)
     rows = []
     for j in range(64):
         rows.append(dd(mp.fn("exp2", Fraction(j, 64))))
     out += array("EXP2_TAB", rows, "2^(j/64), j = 0..63, as double-double.")
+    # ln2/64 in three pieces: c1 has 36 significant bits so k*c1 is exact for |k| < 2^17
     v = ln2 / 64
-    c1 = Fraction(round(v * 2**(36 + 6 + 1)), 2**(36 + 6 + 1))
+    c1 = Fraction(round(v * 2**(36 + 6 + 1)), 2**(36 + 6 + 1))  # ln2/64 ~ 2^-6.5: 36 bits after 2^-7
     r = v - c1
     c2 = Fraction(float(r))
     c3 = float(r - c2)
@@ -90,19 +104,23 @@ def gen_base():
     sq = mp.fn("sqrt", pi)
     out += "pub(super) const TWO_OVER_SQRT_PI_DD: [f64; 2] = %s;\n" % dd(2 / sq)
     out += "pub(super) const EULER_DD: [f64; 2] = %s;\n\n" % dd(const_euler())
+    # 1/n!, n = 0..13
     f = [1]
     for n in range(1, 60):
         f.append(f[-1] * n)
     out += array("INV_FACT", [dd(Fraction(1, f[n])) for n in range(14)], "1/n!, n = 0..13.")
+    # sin(pi t)/(pi t) = sum (-1)^k (pi t)^(2k) / (2k+1)!  in u = t^2: coefficients (-1)^k pi^(2k)/(2k+1)!
     rows = []
     for k in range(0, 24):
         rows.append(dd(Fraction((-1) ** k) * pi ** (2 * k) / f[2 * k + 1]))
     out += array("SINPI_C", rows, "Coefficients of sin(pi t)/(pi t) as a series in t^2: (-1)^k pi^(2k)/(2k+1)!.")
+    # Stirling: lgamma(x) = (x-1/2) ln x - x + ln(sqrt(2 pi)) + sum_{k>=1} B_2k / (2k (2k-1) x^(2k-1))
     B = bernoulli(60)
     rows = []
     for k in range(1, 25):
         rows.append(dd(B[2 * k] / (2 * k * (2 * k - 1))))
     out += array("STIRLING_C", rows, "B_2k / (2k (2k-1)), k = 1..24.")
+    # factorials 0!..170! as double-double
     fa = [1]
     for n in range(1, 171):
         fa.append(fa[-1] * n)
@@ -117,14 +135,16 @@ def sqrtpi():
 def gen_erf():
     out = header("erf", "erf / erfc node tables")
     sp = sqrtpi()
-    W = Fraction(1, 32)
+    # nodes x0 = k/16, k = 0..96 (x up to 6), w = 1/32; g(h) = (erf(x0+h) - erf(x0)) / h
+    # then (FIXLIST #155) the finer nodes x0 = j/32, j = 64..192 (x from 2 to 6), w = 1/64, as nodes 97..225: erfc there
+    # needs the plain-double part of its evaluation at |h| <= 1/64 to stay below the 2^-60 of its rounding test
+    nodes = [(Fraction(k, 16), Fraction(1, 32)) for k in range(0, 97)] + [(Fraction(j, 32), Fraction(1, 64)) for j in range(64, 193)]
     rows_c = []
     off = [0]
     e0s = []
     ec0s = []
     degs = []
-    for k in range(0, 97):
-        x0 = Fraction(k, 16)
+    for k, (x0, W) in enumerate(nodes):
         e0 = mp.fn("erf", x0)
         ec0 = mp.fn("erfc", x0)
         d0 = 2 * mp.fn("exp", -x0 * x0) / sp
@@ -155,11 +175,13 @@ def gen_erf():
         e0s.append(dd(e0))
         ec0s.append(dd(ec0))
         print("erf node", k, "degree", len(best) - 1, file=sys.stderr)
-    out += "/// Nodes: x0 = k/16 for k = 0..96; erf(x0 + h) = E0 + h q(h), erfc = EC0 - h q(h), |h| <= 1/32.\n"
-    out += array("ERF_E0", e0s, "erf(k/16).")
-    out += array("ERF_EC0", ec0s, "erfc(k/16).")
+    out += "/// Nodes: x0 = k/16 for k = 0..96 (|h| <= 1/32) and x0 = (k - 33)/32 for k = 97..225 (|h| <= 1/64);\n"
+    out += "/// erf(x0 + h) = E0 + h q(h), erfc = EC0 - h q(h).\n"
+    out += array("ERF_E0", e0s, "erf(x0) of the nodes.")
+    out += array("ERF_EC0", ec0s, "erfc(x0) of the nodes.")
     out += array("ERF_Q", rows_c, "Coefficients q_0..q_n of node k at ERF_OFF[k]..ERF_OFF[k+1].")
     out += "pub(super) static ERF_OFF: [u16; %d] = %s;\n\n" % (len(off), "[" + ", ".join(map(str, off)) + "]")
+    # tail: R(x) = erfc(x) exp(x^2) on nodes x0 = 6 + j/2 (j = 0..43), |h| <= 1/4
     W2 = Fraction(1, 4)
     rows_c = []
     off = [0]
@@ -196,6 +218,7 @@ def lgam(x):
 
 
 def fit_poly(g, x0, w, nmin, nmax=60, pts=33):
+    """Smallest-degree Chebyshev fit of g on [x0-w, x0+w] with relative error below TOL."""
     for n in range(nmin, nmax):
         c = cheb.cheb_fit(g, x0, w, n)
         worst = Fraction(0)
@@ -211,6 +234,7 @@ def fit_poly(g, x0, w, nmin, nmax=60, pts=33):
 
 def gen_gamma():
     out = header("gamma", "lgamma node tables and negative-side root windows")
+    # nodes c = k/8, k = 4..128, w = 1/16: lgamma(c + h) = F0 + h q(h)
     W = Fraction(1, 16)
     f0s = []
     rows = []
@@ -235,13 +259,14 @@ def gen_gamma():
     out += array("LG_F0", f0s, "lgamma(k/8), k = 4..128.")
     out += array("LG_Q", rows, "Coefficients q_0..q_n of node k (index k-4) at LG_OFF[k-4]..LG_OFF[k-3]: lgamma(k/8 + h) = F0 + h q(h), |h| <= 1/16.")
     out += "pub(super) static LG_OFF: [u16; %d] = %s;\n\n" % (len(off), "[" + ", ".join(map(str, off)) + "]")
+    # roots of lgamma below -2: x = -n - u (n >= 2) and x = -n + u (n >= 3), u in (0, 1/2)
     roots = []
     for n in range(2, 21):
         for side in (-1, +1):
             if side == +1 and n < 3:
                 continue
-            lo = Fraction(1, 2**200)
-            hi = Fraction(1, 2)
+            lo = Fraction(1, 2**200)   # lgamma > 0 here (near the pole)
+            hi = Fraction(1, 2)        # lgamma < 0 here
             def val(u):
                 return lgam(-n + side * (-u) if False else (-n - u if side < 0 else -n + u))
             assert val(lo) > 0 and val(hi) < 0, (n, side)
@@ -261,6 +286,7 @@ def gen_gamma():
     off = [0]
     for (r, u0) in roots:
         Wd = min(Fraction(1, 2**14), u0 / 512)
+        # window radius as a power of two below the bound (so it prints exactly)
         e = 0
         while Fraction(1, 2**(e + 1)) > Wd:
             e += 1

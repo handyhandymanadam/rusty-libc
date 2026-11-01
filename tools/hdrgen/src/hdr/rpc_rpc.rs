@@ -32,22 +32,29 @@ pub static HDR: Header = Header {
  *   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */"#),
-        Item::Guard { name: "_RPC_RPC_H", value: "1", end: "", items: &[
+        Item::Comment(r#"/* Structure layouts and constants follow Sun's RPC headers (as in glibc's sunrpc/rpc/);
+   the function prototypes are generated from the Rust sources (bits/rlibc-rpc-*.h). */"#),
+        Item::Guard { name: "_RPC_RPC_H", value: "1", end: " /* rpc/rpc.h */", items: &[
             Item::Blank,
-            Item::Include(r#"<rpc/types.h>"#),
+            Item::Include(r#"<rpc/types.h>		/* some typedefs */"#),
             Item::Include("<netinet/in.h>"),
             Item::Blank,
-            Item::Include(r#"<rpc/xdr.h>"#),
-            Item::Include(r#"<rpc/auth.h>"#),
-            Item::Include(r#"<rpc/clnt.h>"#),
-            Item::Include(r#"<rpc/rpc_msg.h>"#),
-            Item::Include(r#"<rpc/auth_unix.h>"#),
-            Item::Include(r#"<rpc/auth_des.h>"#),
-            Item::Include(r#"<rpc/svc.h>"#),
-            Item::Include(r#"<rpc/svc_auth.h>"#),
+            Item::Include(r#"<rpc/xdr.h>		/* generic (de)serializer */"#),
+            Item::Include(r#"<rpc/auth.h>		/* generic authenticator (client side) */"#),
+            Item::Include(r#"<rpc/clnt.h>		/* generic rpc stube (client side) */"#),
+            Item::Include(r#"<rpc/rpc_msg.h>	/* protocol for rpc messages */"#),
+            Item::Include(r#"<rpc/auth_unix.h>	/* protocol for unix style cred */"#),
+            Item::Include(r#"<rpc/auth_des.h>	/* protocol for des style cred */"#),
+            Item::Include(r#"<rpc/svc.h>		/* service manager and multiplexer */"#),
+            Item::Include(r#"<rpc/svc_auth.h>	/* service side authenticator */"#),
             Item::Blank,
+            Item::Comment(r#"/* COMMENT OUT THE NEXT INCLUDE IF RUNNING ON SUN OS OR ON A VERSION
+   OF UNIX BASED ON NFSSRC.  These systems will already have the
+   structures defined by <rpc/netdb.h> included in <netdb.h>.  */"#),
             Item::Include("<rpc/netdb.h>"),
             Item::Blank,
+            Item::Comment(r#"/* The data of the RPC layer is per thread (as in glibc): these accessor functions
+   are what `svc_fdset', `get_rpc_createerr ()' and `svc_pollfd' go through.  */"#),
             Item::Decl("extern fd_set *__rpc_thread_svc_fdset (void) __attribute__ ((__const__));"),
             Item::Consts(&[
                 ("svc_fdset", V::Txt("(*__rpc_thread_svc_fdset ())")),
@@ -59,6 +66,8 @@ pub static HDR: Header = Header {
             Item::Blank,
             Item::Gate(&[
                 Branch { head: "ifdef _RPC_MT_VARS", items: &[
+                    Item::Comment(r#"/* The glibc 2.0 spelling.  Not on by default: it would stop programs from
+   defining their own objects of type `struct rpc_createerr'.  */"#),
                     Item::Consts(&[
                         ("rpc_createerr", V::Txt("(*__rpc_thread_createerr ())")),
                     ]),

@@ -1,6 +1,7 @@
 use crate::model::*;
 
 pub static AFTER_INCLUDES: &[Item] = &[
+    Item::Comment("/* constants (values checked against glibc by tests/c/sys_consts.c) */"),
     Item::Consts(&[
         ("PT_TRACE_ME", V::Dec(0)),
         ("PT_READ_I", V::Dec(1)),
@@ -47,6 +48,8 @@ pub static AFTER_INCLUDES: &[Item] = &[
         ("PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG", V::Hex(0x4211)),
     ]),
     Item::Blank,
+    Item::Comment("/* written by hand: types, unions, macros with arguments */"),
+    Item::Comment("/* glibc's enum __ptrace_request, as plain constants (the ones glibc also defines as macros are above) */"),
     Item::Consts(&[
         ("PTRACE_TRACEME", V::Dec(0)),
         ("PTRACE_PEEKTEXT", V::Dec(1)),

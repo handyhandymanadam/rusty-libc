@@ -1,3 +1,12 @@
+//! A small growable array on this library's `malloc` (the runtime is built with `core` only, so
+//! there is no `alloc::vec::Vec`). Allocation failure is sticky: `push` and friends then do nothing
+//! and `oom` stays true; callers check it at the end of a phase and report REG_ESPACE.
+//!
+//! Invariant (what every unsafe block below relies on): `ptr` is NULL with `cap == 0`, or a block from this library's
+//! `malloc`/`realloc` with room for `cap` elements of `T`, owned by this `V` alone; the first `len <= cap` elements are
+//! initialised. Only the code of this module touches the three fields (Rust for Rustaceans p.233: soundness is checked at
+//! the privacy boundary). The design is the Rustonomicon's Vec (p.173 ff.), without the zero-sized-type cases (no `V` of a
+//! zero-sized type is made).
 use core::ops::{Deref, DerefMut};
 use core::ptr::null_mut;
 
@@ -52,6 +61,8 @@ impl<T> V<T> {
                 return;
             }
         };
+        // SAFETY: `ptr` is NULL or this `V`'s own block from malloc/realloc (the invariant); on success the old block is
+        // gone and only the new pointer is kept, on failure the old block stays ours.
         let p = unsafe { rusty_libc_malloc::realloc(self.ptr.cast(), bytes) } as *mut T;
         if p.is_null() {
             self.oom = true;
@@ -68,7 +79,9 @@ impl<T> V<T> {
                 return;
             }
         }
+        // SAFETY: len < cap (checked or just reserved): slot `len` is inside the block.
         let slot = unsafe { self.ptr.add(self.len) };
+        // SAFETY: an aligned slot of our block that is not initialised yet (nothing to drop).
         unsafe { slot.write(v) };
         self.len += 1;
     }
@@ -78,7 +91,9 @@ impl<T> V<T> {
             None
         } else {
             self.len -= 1;
+            // SAFETY: slot `len` (the old last one) is inside the block.
             let slot = unsafe { self.ptr.add(self.len) };
+            // SAFETY: it is initialised; lowering `len` first hands its value out exactly once.
             Some(unsafe { slot.read() })
         }
     }
@@ -86,7 +101,9 @@ impl<T> V<T> {
     pub fn truncate(&mut self, n: usize) {
         while self.len > n {
             self.len -= 1;
+            // SAFETY: slot `len` (the old last one) is inside the block.
             let slot = unsafe { self.ptr.add(self.len) };
+            // SAFETY: it is initialised and no longer counted, so it is dropped exactly once.
             unsafe { core::ptr::drop_in_place(slot) };
         }
     }
@@ -104,7 +121,9 @@ impl<T: Copy> V<T> {
                 return;
             }
             while self.len < n {
+                // SAFETY: len < n <= cap (reserved above): slot `len` is inside the block.
                 let slot = unsafe { self.ptr.add(self.len) };
+                // SAFETY: an aligned slot that is not initialised yet.
                 unsafe { slot.write(v) };
                 self.len += 1;
             }
@@ -124,7 +143,10 @@ impl<T: Copy> V<T> {
         if self.oom {
             return;
         }
+        // SAFETY: `len <= cap`: one past the initialised part is inside (or at the end of) our block.
         let dst = unsafe { self.ptr.add(self.len) };
+        // SAFETY: `len + s.len() <= cap` (reserved above), so the destination is inside our block, after the initialised
+        // part; `s` is a borrowed slice, so it cannot overlap the block this `V` owns exclusively (we hold `&mut self`).
         unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len()) };
         self.len += s.len();
     }
@@ -140,12 +162,14 @@ impl<T: Copy> V<T> {
 impl<T> Deref for V<T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
+        // SAFETY: the first `len` elements are initialised and owned by `self`, borrowed here for as long as `&self`.
         if self.len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(self.ptr, self.len) } }
     }
 }
 
 impl<T> DerefMut for V<T> {
     fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: as in `deref`, borrowed exclusively for as long as `&mut self`.
         if self.len == 0 { &mut [] } else { unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) } }
     }
 }
@@ -154,6 +178,7 @@ impl<T> Drop for V<T> {
     fn drop(&mut self) {
         self.truncate(0);
         if !self.ptr.is_null() {
+            // SAFETY: our own block (the invariant), freed once: the `V` is being dropped.
             unsafe { rusty_libc_malloc::free(self.ptr.cast()) };
         }
     }
@@ -165,26 +190,40 @@ impl<T> Default for V<T> {
     }
 }
 
+// (after the other impls: the symbol names of those, which the start-up ordering file lists, keep their impl numbers)
+// SAFETY: a `V<T>` owns its elements as `Vec<T>` does (the pointer is never shared with another `V`), so moving it to
+// another thread moves the `T`s: sound when `T: Send`.
 unsafe impl<T: Send> Send for V<T> {}
+// SAFETY: `&V<T>` gives only `&[T]` (and `len`/`oom`), so sharing it shares `&T`: sound when `T: Sync`.
 unsafe impl<T: Sync> Sync for V<T> {}
 
+/// A copy of `v` in a block of its own that is never freed (tables kept for the life of the program: the caches of
+/// `mbset`, which hand out `&'static` slices). `None` when there is no memory. One `malloc` of exactly `v`'s size, as
+/// the caches did before.
 pub fn leak_copy<T: Copy>(v: &[T]) -> Option<&'static [T]> {
     leak_with(v.len(), |i| v[i])
 }
 
+/// A slice of `n` elements, element `i` being `f(i)`, in a block of its own that is never freed. `None` when there is no
+/// memory (`n == 0` gives an empty slice without allocating).
 pub fn leak_with<T: Copy>(n: usize, mut f: impl FnMut(usize) -> T) -> Option<&'static [T]> {
     if n == 0 {
         return Some(&[]);
     }
     let bytes = n.checked_mul(core::mem::size_of::<T>())?;
+    // SAFETY: a plain allocation; nothing else knows the block.
     let p = unsafe { rusty_libc_malloc::malloc(bytes) } as *mut T;
     if p.is_null() {
         return None;
     }
     for i in 0..n {
         let v = f(i);
+        // SAFETY: i < n, so slot `i` is inside the block of `n` elements.
         let slot = unsafe { p.add(i) };
+        // SAFETY: an uninitialised slot of our fresh block (malloc aligns for every type).
         unsafe { slot.write(v) };
     }
+    // SAFETY: all `n` elements were written above; the block is never freed or written again, so a shared `'static`
+    // borrow is sound.
     Some(unsafe { core::slice::from_raw_parts(p, n) })
 }

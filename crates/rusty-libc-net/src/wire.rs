@@ -1,3 +1,6 @@
+//! DNS wire format (RFC 1035): headers, domain names (text <-> wire, compression), questions and
+//! resource records. Plain slices, no allocation; the C-ABI wrappers (`ns_name_*`, `dn_*`) are in
+//! [`crate::resolv`].
 use crate::util::Buf;
 
 pub const T_A: u16 = 1;
@@ -24,6 +27,7 @@ pub const HFIXEDSZ: usize = 12;
 pub const QFIXEDSZ: usize = 4;
 pub const RRFIXEDSZ: usize = 10;
 
+/// The twelve-byte message header.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Header {
     pub id: u16,
@@ -82,12 +86,15 @@ pub fn put16(m: &mut [u8], off: usize, v: u16) {
     m[off + 1] = v as u8;
 }
 
+/// Text to wire (RFC 1035 labels, no compression). Returns (bytes written, fully qualified), or None
+/// (label too long, name too long, bad escape, empty label, no room). Same rules as `ns_name_pton`.
 pub fn name_pton(src: &[u8], dst: &mut [u8]) -> Option<(usize, bool)> {
     let mut bp = 1usize;
     let mut label = 0usize;
     let mut escaped = false;
     let mut i = 0usize;
     let at = |i: usize| src.get(i).copied().unwrap_or(0);
+    // NUL in `src` ends the text like a C string
     while i < src.len() && src[i] != 0 {
         let mut c = src[i];
         i += 1;
@@ -172,6 +179,8 @@ fn special(c: u8) -> bool {
     matches!(c, b'"' | b'.' | b';' | b'\\' | b'(' | b')' | b'@' | b'$')
 }
 
+/// Uncompressed wire name to text (root is "."); like `ns_name_ntop` but into a Buf. None if it does
+/// not fit or a compression pointer is present.
 pub fn name_ntop<const N: usize>(src: &[u8]) -> Option<Buf<N>> {
     let mut o = Buf::<N>::new();
     let mut i = 0usize;
@@ -209,6 +218,8 @@ pub fn name_ntop<const N: usize>(src: &[u8]) -> Option<Buf<N>> {
     Some(o)
 }
 
+/// Expand a possibly compressed name at `src` (an offset into `msg`) to uncompressed wire form in `dst`.
+/// Returns the number of bytes the name occupies at `src`.
 pub fn name_unpack(msg: &[u8], src: usize, dst: &mut [u8]) -> Option<usize> {
     let mut len: Option<usize> = None;
     let mut checked = 0usize;
@@ -262,6 +273,7 @@ pub fn name_unpack(msg: &[u8], src: usize, dst: &mut [u8]) -> Option<usize> {
     Some(len.unwrap_or_else(|| sp - src))
 }
 
+/// Skip over the (possibly compressed) name at `off`; returns the offset after it.
 pub fn name_skip(msg: &[u8], off: usize) -> Option<usize> {
     let mut cp = off;
     while cp < msg.len() {
@@ -289,30 +301,39 @@ pub fn name_skip(msg: &[u8], off: usize) -> Option<usize> {
     None
 }
 
+/// Expand the name at `off` straight to text. Returns (text, bytes used at `off`).
 pub fn name_expand<const N: usize>(msg: &[u8], off: usize) -> Option<(Buf<N>, usize)> {
     let mut tmp = [0u8; MAXCDNAME + 1];
     let used = name_unpack(msg, off, &mut tmp)?;
     Some((name_ntop::<N>(&tmp)?, used))
 }
 
+/// Case-insensitive comparison of two text names, ignoring one trailing dot.
 pub fn same_name(a: &[u8], b: &[u8]) -> bool {
     let a = a.strip_suffix(b".").unwrap_or(a);
     let b = b.strip_suffix(b".").unwrap_or(b);
     crate::util::eq_nocase(a, b)
 }
 
+/// The EDNS0 UDP payload size the name service lookups advertise (glibc: RESOLV_EDNS_BUFFER_SIZE).
 pub const RESOLV_EDNS_BUFFER_SIZE: usize = 1200;
 
+/// The size to advertise in an OPT record for an answer buffer of `anslen` bytes: the length, but at least 512 and at
+/// most [`RESOLV_EDNS_BUFFER_SIZE`] (a bigger advertised size could mean a reply that has to be fragmented).
 pub fn edns_payload(anslen: usize) -> u16 {
     anslen.clamp(512, RESOLV_EDNS_BUFFER_SIZE) as u16
 }
 
+/// An OPT pseudo-record for a query: the UDP payload size the sender accepts, and the DO ("DNSSEC OK") bit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Opt {
     pub payload: u16,
     pub dnssec_ok: bool,
 }
 
+/// Build a query message into `out`: header (id, RD per `rd`), one question, and with `opt` an OPT
+/// record (root name, type OPT, payload size in the class field, extended rcode 0, version 0, the DO bit in the flags,
+/// no data). Returns the length.
 pub fn build_query(id: u16, name: &[u8], qtype: u16, qclass: u16, rd: bool, opt: Option<Opt>, out: &mut [u8]) -> Option<usize> {
     if out.len() < HFIXEDSZ + MAXCDNAME + QFIXEDSZ + 11 {
         return None;
@@ -325,18 +346,19 @@ pub fn build_query(id: u16, name: &[u8], qtype: u16, qclass: u16, rd: bool, opt:
     put16(out, p + 2, qclass);
     p += 4;
     if let Some(opt) = opt {
-        out[p] = 0;
+        out[p] = 0; // root name
         put16(out, p + 1, T_OPT);
-        put16(out, p + 3, opt.payload);
-        out[p + 5] = 0;
-        out[p + 6] = 0;
-        put16(out, p + 7, if opt.dnssec_ok { 0x8000 } else { 0 });
-        put16(out, p + 9, 0);
+        put16(out, p + 3, opt.payload); // class field = UDP payload size
+        out[p + 5] = 0; // extended rcode
+        out[p + 6] = 0; // version
+        put16(out, p + 7, if opt.dnssec_ok { 0x8000 } else { 0 }); // flags: DO
+        put16(out, p + 9, 0); // no rdata
         p += 11;
     }
     Some(p)
 }
 
+/// One resource record seen in a message.
 #[derive(Clone, Copy, Debug)]
 pub struct Rr {
     pub name_off: usize,
@@ -347,6 +369,7 @@ pub struct Rr {
     pub rdlen: usize,
 }
 
+/// Cursor over the records of a message (after the question section).
 pub struct Cursor<'a> {
     pub msg: &'a [u8],
     pub pos: usize,
@@ -354,6 +377,7 @@ pub struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
+    /// Cursor at the first answer record; `h` is the parsed header. Fails on a malformed question section.
     pub fn answers(msg: &'a [u8]) -> Option<(Header, Cursor<'a>)> {
         let h = Header::parse(msg)?;
         let mut pos = HFIXEDSZ;
@@ -371,6 +395,7 @@ impl<'a> Cursor<'a> {
 
 impl Iterator for Cursor<'_> {
     type Item = Option<Rr>;
+    /// Next record, or `Some(None)` once if the message is malformed.
     fn next(&mut self) -> Option<Option<Rr>> {
         if self.left == 0 {
             return None;
@@ -403,6 +428,7 @@ impl Iterator for Cursor<'_> {
     }
 }
 
+/// The first question of a message: (name text, type, class).
 pub fn first_question<const N: usize>(msg: &[u8]) -> Option<(Buf<N>, u16, u16)> {
     let h = Header::parse(msg)?;
     if h.qdcount < 1 {

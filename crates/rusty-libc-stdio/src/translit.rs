@@ -1,3 +1,11 @@
+//! The C locale's write-side transliteration for wide streams: a wide character above 0x7f that
+//! cannot be written is replaced by this text (or by `?` when it has no entry), as glibc 2.43's
+//! stdio does. Data measured from the host glibc (every code point 0x80..0x10ffff written with
+//! `fputwc` in the C locale; the `translit_matches_host` test repeats the measurement and compares).
+//! The table is facts about glibc's output (glibc's own source is locale/C-translit.h.in, LGPL):
+//! derived data, logged for LICENSES.md.
+
+/// (code point, offset into `POOL`, length), sorted by code point.
 pub static ENTRIES: [(u32, u16, u8); 1784] = [
     (0xa0, 0, 1), (0xa9, 1, 3), (0xab, 4, 2), (0xad, 6, 1), (0xae, 7, 3), (0xb5, 10, 1),
     (0xb8, 11, 1), (0xbb, 12, 2), (0xbc, 14, 5), (0xbd, 19, 5), (0xbe, 24, 5), (0xc6, 29, 2),
@@ -398,6 +406,7 @@ pub static ENTRIES: [(u32, u16, u8); 1784] = [
     (0xe007f, 2566, 0),
 ];
 
+/// The replacement texts, back to back.
 pub static POOL: [u8; 2566] = [
     32, 40, 67, 41, 60, 60, 45, 40, 82, 41, 117, 44, 62, 62, 32, 49, 47, 52, 32, 32, 49, 47, 50, 32,
     32, 51, 47, 52, 32, 65, 69, 120, 115, 115, 97, 101, 73, 74, 105, 106, 39, 110, 79, 69, 111, 101,
@@ -517,6 +526,7 @@ pub static POOL: [u8; 2566] = [
     51, 52, 53, 54, 55, 56, 57,
 ];
 
+/// The replacement for `wc` in the C locale: its entry, or `?`.
 pub fn lookup(wc: u32) -> &'static [u8] {
     match ENTRIES.binary_search_by_key(&wc, |e| e.0) {
         Ok(i) => {

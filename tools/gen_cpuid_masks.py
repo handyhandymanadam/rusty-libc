@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Print the per-leaf, per-register bit masks crates/rusty-libc-extra/src/cpuid.rs uses for the "active" arrays of
+__x86_get_cpuid_feature_leaf: which CPUID feature bits glibc marks usable (a) always, (b) when the OS saves
+the AVX state, (c) when it saves the AVX-512 state, (d) the AMX state, (e) when XSAVE is usable.
+
+The names come from glibc's <bits/platform/x86.h> (x86_cpu_<NAME> = index base + bit); the groups are the
+ones glibc's `update_active` (sysdeps/x86/cpu-features.c) uses. Usage: gen_cpuid_masks.py [path-to-x86.h]
+(default /usr/include/bits/platform/x86.h, the installed glibc development header)."""
 import re, sys
 
 path = sys.argv[1] if len(sys.argv) > 1 else "/usr/include/bits/platform/x86.h"
@@ -8,6 +15,7 @@ regs = {"eax": 0, "ebx": 1, "ecx": 2, "edx": 3}
 bases = {}
 for m in re.finditer(r"x86_cpu_index_(\w+?)_(eax|ebx|ecx|edx)\s*=\s*\(?\s*\(?CPUID_INDEX_(\w+)\s*\*", text):
     pass
+# base names: x86_cpu_index_<leaf>_<reg>
 for m in re.finditer(r"x86_cpu_index_(\w+?)_(eax|ebx|ecx|edx)\s*\n?\s*=\s*\(\(?CPUID_INDEX_(\w+)", text):
     bases["x86_cpu_index_%s_%s" % (m.group(1), m.group(2))] = (m.group(3), m.group(2))
 feat = {}

@@ -27,6 +27,7 @@ pub static HDR: Header = Header {
             ] },
         ], ""),
         Item::Blank,
+        Item::Comment("/* Bits in the feature_1 field in TCB.  */"),
         Item::Blank,
         Item::Block { head: r#"enum
 "#, body: &["", r#"  x86_feature_1_ibt		= 1U << 0,"#, r#"  x86_feature_1_shstk		= 1U << 1"#, ""], tail: "" },

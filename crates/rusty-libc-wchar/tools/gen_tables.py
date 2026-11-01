@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""Generate crates/rusty-libc-wchar/src/tables.rs from the behaviour of the host's glibc.
+
+The tables describe what glibc 2.43 answers in the "C.UTF-8" locale (the same answers as
+en_US.UTF-8 and ja_JP.UTF-8 on the reference machine; tr_TR.UTF-8 differs in the i/I mapping
+and is not covered) for every code point 0..=0x10FFFF:
+  - the twelve wctype classes of iswalnum..iswxdigit and the two extra classes "combining" and
+    "combining_level3" that the UTF-8 locales define,
+  - wcwidth (0, 1, 2 or -1),
+  - towupper, towlower and the "totitle" wctrans mapping (stored as deltas).
+No glibc source text is used: the data is the observed behaviour, compressed into two-stage
+tables (a block index plus unique blocks). Run: python3 tools/gen_tables.py > src/tables.rs
+(needs gcc and a glibc with the C.UTF-8 locale).
+"""
 import os
 import struct
 import subprocess
@@ -54,6 +67,7 @@ def host_data():
 
 
 def two_stage(values, elem_bytes):
+    """Pick the block size (a power of two) that gives the smallest tables."""
     best = None
     for shift in range(4, 10):
         size = 1 << shift

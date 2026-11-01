@@ -1,12 +1,20 @@
+//! Pattern parser: the same token rules, grammar and tree shapes as glibc's regcomp.c (the parse
+//! functions follow its structure on purpose: the order of alternatives, the way `{n,m}` is
+//! expanded into copies and where subexpressions are marked optional decide which submatch glibc
+//! reports). C locale only: one byte is one character.
 use crate::charset::{self, Mb};
 use crate::consts::*;
-use crate::mbset::{self, Canon, Seq, Trie};
+use crate::mbset::{self, Frag, Seq, Trie};
 use crate::vec::V;
 
 pub const NONE: u32 = u32::MAX;
+/// Largest tree the parser builds before giving up with REG_ESPACE.
 pub const MAX_NODES: usize = 3_000_000;
+/// Deepest nesting of parentheses.
 pub const MAX_NEST: u32 = 3000;
 
+/// Context constraints (glibc's PREV_*/NEXT_* bits) carried by anchor nodes.
+/// Bytes and their count: the text a `Guard` forbids, or a collating element.
 pub type Rest = ([u8; 6], u8);
 
 pub mod ctxbits {
@@ -45,7 +53,12 @@ pub enum NK {
     End,
     Open,
     Close,
+    /// Zero width check that the text after a collating element does not go on as a longer element (see `units_tree`).
     Guard,
+    /// A set of multibyte characters as an automaton over bytes (`idx`: index into `Parsed::frags`; see `nfa::K_MB`).
+    Mb,
+    /// A bracket set of a UTF-8 locale matched from its description (`idx`: index into `Parsed::u8specs`; see `u8set`).
+    U8,
 }
 
 #[derive(Clone, Copy)]
@@ -55,9 +68,11 @@ pub struct TNode {
     pub right: u32,
     pub parent: u32,
     pub c: u8,
+    /// Subexpression number (Subexp, Open, Close), group number - 1 (BackRef) or set index (Set).
     pub idx: u32,
     pub ctx: u16,
     pub opt: bool,
+    /// Copy made by `{n,m}` expansion (glibc's token.duplicated).
     pub dup: bool,
     pub first: u32,
     pub next: u32,
@@ -99,11 +114,13 @@ struct Tok {
     c: u8,
     idx: u32,
     ctx: u16,
+    /// A multibyte character: its length in bytes (0 for an ordinary token) and its value.
     mb: u8,
     wc: u32,
 }
 
 type Res = Result<u32, i32>;
+/// Inclusive code point ranges.
 type Ranges = [(u32, u32)];
 pub type Set = [u64; 4];
 
@@ -113,13 +130,20 @@ pub struct Parsed {
     pub sets: V<Set>,
     pub nsub: u32,
     pub nbackref: u32,
+    /// The texts a `Guard` node forbids after it: (bytes, length), indexed by the node's `idx`.
     pub guards: V<Rest>,
+    /// The multibyte kind of the locale the pattern was compiled in.
     pub mb: Mb,
+    /// The automata of the `Mb` nodes.
+    pub frags: V<Frag>,
+    /// The sets of the `U8` nodes.
+    pub u8specs: V<crate::u8set::U8Spec>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ET {
     SbChar,
+    /// A multibyte character (more than one byte).
     MbChar,
     CollSym,
     EquivClass,
@@ -146,7 +170,9 @@ impl Elem {
 }
 
 struct Parser<'a> {
+    /// The pattern after translation and (for REG_ICASE) conversion to upper case.
     up: &'a [u8],
+    /// The pattern as given.
     raw: &'a [u8],
     idx: usize,
     syntax: u64,
@@ -157,12 +183,19 @@ struct Parser<'a> {
     completed: u32,
     nbackref: u32,
     guards: V<Rest>,
+    /// Multibyte locale (the pattern is then handled character by character).
     mb: Mb,
+    /// The bytes that are complete characters on their own (`sb_char`).
     sbc: Set,
     icase: bool,
+    /// Per upper case form: the sequences of the characters that have it (REG_ICASE in a multibyte locale).
     ucache: V<(u32, V<Seq>)>,
+    /// The characters the upper case mapping changes (see `cased`): the table kept for the locale, or this pattern's own
+    /// copy when it could not be kept.
     cased: Option<mbset::Cased>,
     cased_own: Option<(V<(u32, u32)>, mbset::Ranges)>,
+    frags: V<Frag>,
+    u8specs: V<crate::u8set::U8Spec>,
 }
 
 fn set_bit(s: &mut Set, c: u8) {
@@ -234,6 +267,7 @@ impl<'a> Parser<'a> {
         self.idx >= self.up.len()
     }
 
+    /// The multibyte character (more than one byte) that starts at `raw[i]`, if the bytes there form one.
     fn char_at(&self, i: usize) -> Option<(u32, usize)> {
         match charset::decode(self.mb, &self.raw[i..]) {
             Some((wc, n)) if n > 1 => Some((wc, n)),
@@ -247,6 +281,7 @@ impl<'a> Parser<'a> {
         t
     }
 
+    /// glibc's peek_token: the token at the current position and its length in bytes.
     fn peek_at(&self, i: usize, syntax: u64) -> (Tok, usize) {
         let mut t = Tok { ty: T::Character, c: 0, idx: 0, ctx: 0, mb: 0, wc: 0 };
         if self.eoi() {
@@ -259,6 +294,7 @@ impl<'a> Parser<'a> {
             && c >= 0x80
             && let Some((wc, n)) = self.char_at(i)
         {
+            // a multibyte character is one token
             t.ty = T::Character;
             t.mb = n as u8;
             t.wc = wc;
@@ -386,6 +422,8 @@ impl<'a> Parser<'a> {
         self.peek_at(self.idx, syntax)
     }
 
+    /// glibc's peek_token_bracket. Note: for a backslash escape inside a list it advances the
+    /// input by one byte itself (as glibc does) and returns length 1.
     fn peek_token_bracket(&mut self) -> (Tok, usize) {
         let syntax = self.syntax;
         let mut t = Tok { ty: T::Character, c: 0, idx: 0, ctx: 0, mb: 0, wc: 0 };
@@ -509,6 +547,7 @@ impl<'a> Parser<'a> {
                 } else {
                     self.mk_tok(tok)?
                 };
+                // Anchors cannot be followed by repetition operators: "^*" is ANCHOR, CHAR(*).
                 *tok = self.fetch_token(syntax);
                 return Ok(t);
             }
@@ -727,10 +766,14 @@ impl<'a> Parser<'a> {
         Ok(new_root)
     }
 
+    // ---- characters, `.` and bracket expressions ----
+
+    /// A literal character (glibc's CHARACTER token, with the bytes of a multibyte character joined).
     fn mk_character(&mut self, tok: &Tok) -> Res {
         if self.mb == Mb::None {
             return self.mk_tok(tok);
         }
+        // the character, when the token is one (an invalid byte stands for itself)
         let wc = if tok.mb > 1 {
             tok.wc
         } else if tok.c < 0x80 {
@@ -752,7 +795,9 @@ impl<'a> Parser<'a> {
             }
             return self.mk_tok(tok);
         }
+        // REG_ICASE: glibc compares upper case forms, so every character with the same upper case form matches
         if wc < 0x80 && !rusty_libc_wchar::wctype::is_alpha(wc) {
+            // no other character has an ASCII non-letter as its upper case form
             return self.mk_tok(tok);
         }
         let want = charset::upper_wc(wc);
@@ -770,6 +815,7 @@ impl<'a> Parser<'a> {
             }
         }
         if seqs.len() <= 1 {
+            // only the character itself (one byte, or the bytes in a row)
             return match mbset::seq_of(self.mb, wc) {
                 Some(seq) if seq.n > 1 => self.tree_of_seq(&seq),
                 _ => self.mk_tok(tok),
@@ -778,6 +824,8 @@ impl<'a> Parser<'a> {
         self.tree_of_seqs(&seqs)
     }
 
+    /// The characters the upper case mapping changes, with their upper case forms, and every other code point as ranges
+    /// (the table is read once per locale, not per pattern).
     fn cased(&mut self) -> (&Ranges, &Ranges) {
         if self.cased.is_none() && self.cased_own.is_none() {
             self.cased = mbset::cased_cached();
@@ -794,9 +842,11 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The sequences of all characters whose upper case form is `want`.
     fn same_upper(&mut self, want: u32, out: &mut V<Seq>) {
         let mb = self.mb;
         if mb == Mb::Utf8 {
+            // the characters the mapping changes, plus `want` itself when it has no other form
             if charset::upper_wc(want) == want
                 && let Some(s) = mbset::seq_of(mb, want)
             {
@@ -812,7 +862,31 @@ impl<'a> Parser<'a> {
             return;
         }
         if mb != Mb::Utf8 {
-            mbset::collect_folded(mb, &mut |_, up, _| up == want, out);
+            let runs = mbset::other_runs();
+            if runs.is_empty() {
+                if !mbset::same_upper_listed(mb, want, out) {
+                    mbset::collect_folded(mb, &mut |_, up, _| up == want, out);
+                }
+                return;
+            }
+            if !mbset::same_upper_listed(mb, want, out) {
+                mbset::collect_folded_listed(mb, &mut |_, up, _| up == want, out);
+            }
+            // GB18030's four-byte codes: `want` itself when it has no other form, and the characters the mapping changes to it
+            let mut set: mbset::Ranges = V::new();
+            if charset::upper_wc(want) == want {
+                set.push((want, want));
+            }
+            for &(t, u) in self.cased().0 {
+                if u == want {
+                    set.push((t, t));
+                }
+            }
+            mbset::normalize(&mut set);
+            mbset::runs_in(runs, &set, out);
+            if set.oom {
+                out.oom = true;
+            }
             return;
         }
         let mut pred = |c: u32, _n: usize| charset::upper_wc(c) == want;
@@ -838,12 +912,20 @@ impl<'a> Parser<'a> {
         Ok(tree)
     }
 
+    /// An alternation over the sequences (NONE when there are none).
+    /// The tree of the sequences `build` makes, from the cache of canonical forms when `key` (which must describe the
+    /// set, the syntax-independent part of it and the locale) is there.
     fn cached_tree(&mut self, key: &[u8], build: &mut dyn FnMut(&mut V<Seq>)) -> Res {
-        if let Some(r) = mbset::canon_with(key, |c| if c.root == u32::MAX { Ok(NONE) } else { self.emit_canon(c, c.root) }) {
+        if let Some(r) = mbset::canon_with(key, |f| self.emit_frag(f)) {
             return r;
         }
         let mut seqs: V<Seq> = V::new();
         build(&mut seqs);
+        self.tree_put(key, &seqs)
+    }
+
+    /// The tree of the sequences `seqs`, whose canonical form is kept in the cache under `key` (see `cached_tree`).
+    fn tree_put(&mut self, key: &[u8], seqs: &V<Seq>) -> Res {
         if seqs.oom {
             return Err(REG_ESPACE);
         }
@@ -855,16 +937,40 @@ impl<'a> Parser<'a> {
             return Err(REG_ESPACE);
         }
         if trie.is_empty() {
-            mbset::canon_put(key, Canon::none());
+            mbset::canon_put(key, Frag::empty());
             return Ok(NONE);
         }
         let canon = trie.canon();
+        self.canon_put_tree(key, canon)
+    }
+
+    /// The tree of the canonical automaton `canon`, kept in the cache under `key` (see `tree_put`).
+    fn canon_put_tree(&mut self, key: &[u8], canon: mbset::Canon) -> Res {
         if canon.oom {
             return Err(REG_ESPACE);
         }
-        let r = self.emit_canon(&canon, canon.root)?;
-        mbset::canon_put(key, canon);
+        let frag = Frag::from_canon(&canon);
+        drop(canon);
+        if frag.nodes() == 0 {
+            mbset::canon_put(key, Frag::empty());
+            return Ok(NONE);
+        }
+        let r = self.emit_frag(&frag)?;
+        mbset::canon_put(key, frag);
         Ok(r)
+    }
+
+    /// The tree of the multibyte characters of a charset with rows (not GB18030, which has four-byte codes) whose value is in
+    /// `ranges` (all of them for `None`), from the cache under `key` or made from the rows (FIXLIST #148); `None` when the
+    /// charset has no rows.
+    fn rows_tree(&mut self, key: &[u8], ranges: Option<&[(u32, u32)]>) -> Result<Option<u32>, i32> {
+        if let Some(r) = mbset::canon_with(key, |f| self.emit_frag(f)) {
+            return r.map(Some);
+        }
+        match if mbset::other_runs().is_empty() { mbset::rows_canon(ranges) } else { mbset::rows_gb_canon(ranges) } {
+            Some(canon) => self.canon_put_tree(key, canon).map(Some),
+            None => Ok(None),
+        }
     }
 
     fn tree_of_seqs(&mut self, seqs: &V<Seq>) -> Res {
@@ -882,20 +988,51 @@ impl<'a> Parser<'a> {
         if canon.oom {
             return Err(REG_ESPACE);
         }
-        self.emit_canon(&canon, canon.root)
+        let frag = Frag::from_canon(&canon);
+        drop(canon);
+        self.emit_frag(&frag)
     }
 
-    fn emit_canon(&mut self, c: &Canon, id: u32) -> Res {
-        let mut groups: V<(u32, Set)> = V::new();
-        groups.extend_from_slice(c.groups(id));
+    /// The tree of an automaton (`NONE` for the empty set): one `Mb` node that holds it, or, when a byte may have two
+    /// successors in it, the tree of alternatives (`emit_tree`).
+    fn emit_frag(&mut self, f: &Frag) -> Res {
+        if f.oom {
+            return Err(REG_ESPACE);
+        }
+        match f.nodes() {
+            0 => Ok(NONE),
+            // one node: a set of single bytes (the same tree as before)
+            1 if f.det => self.emit_tree(f, 0),
+            _ if f.det => {
+                let copy = f.duplicate();
+                if copy.oom {
+                    return Err(REG_ESPACE);
+                }
+                let id = self.mk_raw(NK::Mb, NONE, NONE)?;
+                self.nodes[id as usize].idx = self.frags.len() as u32;
+                self.frags.push(copy);
+                if self.frags.oom {
+                    return Err(REG_ESPACE);
+                }
+                Ok(id)
+            }
+            _ => self.emit_tree(f, 0),
+        }
+    }
+
+    /// The tree of node `d` of an automaton: per group, its set of bytes followed by the tree of its target, joined by
+    /// alternation (a state reached by several paths is copied for each of them).
+    fn emit_tree(&mut self, f: &Frag, d: u32) -> Res {
+        let mut groups: V<(Set, u32)> = V::new();
+        groups.extend_from_slice(f.groups(d));
         if groups.oom {
             return Err(REG_ESPACE);
         }
         let mut alt = NONE;
-        for &(child, set) in groups.iter() {
+        for &(set, child) in groups.iter() {
             let mut t = self.mk_set(set)?;
-            if child != 0 {
-                let sub = self.emit_canon(c, child)?;
+            if child != mbset::EXIT {
+                let sub = self.emit_tree(f, child)?;
                 t = self.mk_raw(NK::Concat, t, sub)?;
             }
             alt = if alt == NONE { t } else { self.mk_raw(NK::Alt, alt, t)? };
@@ -903,10 +1040,13 @@ impl<'a> Parser<'a> {
         Ok(alt)
     }
 
+    /// `.`: one character. In a multibyte locale a single byte (minus the newline and NUL the syntax excludes), or
+    /// a multibyte character.
     fn mk_period(&mut self, tok: &Tok) -> Res {
         if self.mb == Mb::None {
             return self.mk_tok(tok);
         }
+        // (for UTF-8 glibc's own map of the single bytes: 0..0x7f)
         let mut sb: Set = if self.mb == Mb::Utf8 { [!0, !0, 0, 0] } else { self.sbc };
         if self.syntax & RE_DOT_NEWLINE == 0 {
             sb[0] &= !(1u64 << b'\n');
@@ -918,14 +1058,24 @@ impl<'a> Parser<'a> {
         let mut key: V<u8> = V::new();
         key.extend_from_slice(b"period");
         key.push(mb as u8);
+        let icase = self.icase;
+        key.push(u8::from(icase));
         key.extend_from_slice(&(rusty_libc_core::locale::current_key(rusty_libc_core::locale::LC_CTYPE)).to_ne_bytes());
         let mut build = |seqs: &mut V<Seq>| {
             if mb == Mb::Utf8 {
+                // what glibc's OP_UTF8_PERIOD accepts: lead byte, then continuation bytes, with its overlong checks
                 let c = (0x80u8, 0xbfu8);
                 let z = (0, 0);
                 seqs.push(Seq { r: [(0xc2, 0xdf), c, z, z, z, z], n: 2 });
                 seqs.push(Seq { r: [(0xe0, 0xe0), (0xa0, 0xbf), c, z, z, z], n: 3 });
-                seqs.push(Seq { r: [(0xe1, 0xef), c, c, z, z, z], n: 3 });
+                if icase {
+                    // REG_ICASE: glibc reads the text through mbrtowc, which refuses the surrogates (ED A0..BF xx)
+                    seqs.push(Seq { r: [(0xe1, 0xec), c, c, z, z, z], n: 3 });
+                    seqs.push(Seq { r: [(0xed, 0xed), (0x80, 0x9f), c, z, z, z], n: 3 });
+                    seqs.push(Seq { r: [(0xee, 0xef), c, c, z, z, z], n: 3 });
+                } else {
+                    seqs.push(Seq { r: [(0xe1, 0xef), c, c, z, z, z], n: 3 });
+                }
                 seqs.push(Seq { r: [(0xf0, 0xf0), (0x90, 0xbf), c, c, z, z], n: 4 });
                 seqs.push(Seq { r: [(0xf1, 0xf7), c, c, c, z, z], n: 4 });
                 seqs.push(Seq { r: [(0xf8, 0xf8), (0x88, 0xbf), c, c, c, z], n: 5 });
@@ -933,17 +1083,30 @@ impl<'a> Parser<'a> {
                 seqs.push(Seq { r: [(0xfc, 0xfc), (0x84, 0xbf), c, c, c, c], n: 6 });
                 seqs.push(Seq { r: [(0xfd, 0xfd), c, c, c, c, c], n: 6 });
             } else {
-                mbset::collect(mb, false, 0x10ffff, &mut |_, _| true, seqs);
+                // (GB18030's runs of four-byte codes whole, not character by character)
+                // (from the charset's rows when it has them: no question per character)
+                if !mbset::rows_seqs(None, seqs) {
+                    mbset::collect_listed(mb, false, 0x10ffff, &mut |_, _| true, seqs);
+                }
+                let mut all: mbset::Ranges = V::new();
+                all.push((0, u32::MAX));
+                mbset::runs_in(mbset::other_runs(), &all, seqs);
             }
         };
         let s = self.mk_set(sb)?;
-        let m = self.cached_tree(&key, &mut build)?;
+        let rows = if mb == Mb::Other { self.rows_tree(&key, None)? } else { None };
+        let m = match rows {
+            Some(r) => r,
+            None => self.cached_tree(&key, &mut build)?,
+        };
         if m == NONE {
             return Ok(s);
         }
         self.mk_raw(NK::Alt, s, m)
     }
 
+    /// Does the multibyte character `wc` match the complex part of a bracket expression (glibc's
+    /// `check_node_accept_bytes` for COMPLEX_BRACKET)?
     fn complex_member(acc: &Acc, coll: &charset::Collation, wc: u32) -> bool {
         let mut hit = acc.mbchars.contains(&wc) || acc.classes.iter().any(|&c| charset::in_class_wc(c as usize, wc));
         if !hit {
@@ -965,83 +1128,52 @@ impl<'a> Parser<'a> {
         hit != acc.non_match
     }
 
+    /// The tree of the collating elements of several characters that the bracket accepts as a unit (`NONE` if there are
+    /// none). The sequences are not prefix free (Hungarian "dz" and "dzs"): a trie cannot hold both, so they go into
+    /// groups in which none is a prefix of another, one tree per group, as alternatives.
     fn units_tree(&mut self, acc: &Acc) -> Res {
-        let mut all: V<Seq> = V::new();
-        self.contraction_seqs(acc, &mut all);
-        if all.oom {
-            return Err(REG_ESPACE);
+        // (`contraction_seqs` finds none otherwise)
+        if !self.is_complex_bracket(acc) || charset::Collation::current().nrules() == 0 {
+            return Ok(NONE);
         }
-        let mut elems: V<Rest> = V::new();
-        if !all.is_empty() {
-            charset::Collation::current().each_element(&mut |elem, _| {
-                if (2..=6).contains(&elem.len()) && !self.element_unseen(elem) {
-                    let mut b = [0u8; 6];
-                    b[..elem.len()].copy_from_slice(elem);
-                    elems.push((b, elem.len() as u8));
-                }
-            });
-        }
-        let fold = |b: u8| if self.icase { b.to_ascii_uppercase() } else { b };
-        let mut units: V<Seq> = V::new();
-        let mut guarded: V<(Seq, V<Rest>)> = V::new();
-        for u in all.iter() {
-            let n = u.n as usize;
-            let mut rests: V<Rest> = V::new();
-            for (e, el) in elems.iter() {
-                let el = *el as usize;
-                if el > n && (0..n).all(|i| fold(u.r[i].0) == e[i]) {
-                    let mut r = [0u8; 6];
-                    r[..el - n].copy_from_slice(&e[n..el]);
-                    rests.push((r, (el - n) as u8));
-                }
-            }
-            if rests.is_empty() {
-                units.push(*u);
-            } else {
-                guarded.push((*u, rests));
+        // the units depend on the bracket, case ignoring, the charset and the collation (the key of the bracket's set plus its
+        // collating symbols and multi-character equivalence classes); they are kept for later patterns
+        let mut key = self.bracket_key(acc, true);
+        key[0] += 2;
+        for c in acc.colls.iter() {
+            key.push(c.n);
+            for &(lo, hi) in c.r.iter() {
+                key.push(lo);
+                key.push(hi);
             }
         }
-        if units.oom || guarded.oom || elems.oom {
+        key.push(0xff);
+        for &(r, w) in acc.equivs_mb.iter() {
+            key.push(r);
+            key.extend_from_slice(&(w.len() as u32).to_ne_bytes());
+            key.extend_from_slice(w);
+        }
+        if key.oom {
             return Err(REG_ESPACE);
         }
-        let n = units.len();
-        let mut done: V<bool> = V::from_elem(false, n);
+        if let Some(r) = mbset::units_with(&key, |units| self.emit_units(units)) {
+            return r;
+        }
+        let units = self.units_build(acc)?;
+        let r = self.emit_units(&units);
+        mbset::units_put(&key, units);
+        r
+    }
+
+    /// The tree of the units: the groups, then each element that needs its `Guard` nodes, as alternatives.
+    fn emit_units(&mut self, units: &[mbset::Unit]) -> Res {
         let mut result = NONE;
-        let mut left = n;
-        while left > 0 {
-            let mut group: V<Seq> = V::new();
-            for i in 0..n {
-                if done[i] {
-                    continue;
-                }
-                let a = units[i];
-                let clash = group.iter().any(|b| {
-                    let k = a.n.min(b.n) as usize;
-                    a.r[..k] == b.r[..k]
-                });
-                if !clash {
-                    group.push(a);
-                    done[i] = true;
-                    left -= 1;
-                }
-            }
-            if group.oom || done.oom {
-                return Err(REG_ESPACE);
-            }
-            let t = self.tree_of_seqs(&group)?;
+        for u in units {
+            let mut t = self.emit_frag(&u.frag)?;
             if t == NONE {
                 continue;
             }
-            result = if result == NONE { t } else { self.mk_raw(NK::Alt, result, t)? };
-        }
-        for (u, rests) in guarded.iter() {
-            let mut one: V<Seq> = V::new();
-            one.push(*u);
-            let mut t = self.tree_of_seqs(&one)?;
-            if t == NONE {
-                continue;
-            }
-            for (r, rl) in rests.iter() {
+            for (r, rl) in u.rests.iter() {
                 let gid = self.guards.len() as u32;
                 self.guards.push((*r, *rl));
                 let g = self.mk_raw(NK::Guard, NONE, NONE)?;
@@ -1057,6 +1189,143 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
+    /// The units of `units_tree`, made from the collation tables.
+    fn units_build(&mut self, acc: &Acc) -> Result<V<mbset::Unit>, i32> {
+        let mut out: V<mbset::Unit> = V::new();
+        let mut all: V<Seq> = V::new();
+        self.contraction_seqs(acc, &mut all);
+        if all.oom {
+            return Err(REG_ESPACE);
+        }
+        // glibc sees only the longest collating element that starts at a position (Hungarian "dzs" is one element, not
+        // "dz" and "s"): a unit that is the start of a longer element of the locale is accepted only where the text does
+        // not go on like that element. Such a unit gets a `Guard` node per longer element after it (the matcher then
+        // takes the exact path, as for back-references); the other units form the prefix free groups below.
+        let mut elems: V<Rest> = V::new();
+        if !all.is_empty() {
+            charset::Collation::current().each_element(&mut |elem, _| {
+                if (2..=6).contains(&elem.len()) && !self.element_unseen(elem) {
+                    let mut b = [0u8; 6];
+                    b[..elem.len()].copy_from_slice(elem);
+                    elems.push((b, elem.len() as u8));
+                }
+            });
+        }
+        let fold = |b: u8| if self.icase { b.to_ascii_uppercase() } else { b };
+        let mut units: V<Seq> = V::new();
+        let mut guarded: V<(Seq, V<Rest>)> = V::new();
+        // the elements sorted by their bytes: those that start with a unit's bytes are one run of it, found by binary search
+        // instead of a scan of every element for every unit. An element is packed as its bytes left-aligned in the top 48
+        // bits (zero after its end) and its length in the low byte: the order of these numbers is the order of the byte
+        // strings (a string before the longer ones it starts), so the run is a range of the numbers.
+        let pack = |b: &[u8]| -> u64 {
+            let mut k = b.len() as u64;
+            for (i, &x) in b.iter().enumerate() {
+                k |= u64::from(x) << (56 - 8 * i);
+            }
+            k
+        };
+        let mut by_bytes: V<(u64, u32)> = V::new();
+        if !all.is_empty() {
+            by_bytes.reserve(elems.len());
+            for (i, (b, l)) in elems.iter().enumerate() {
+                by_bytes.push((pack(&b[..*l as usize]), i as u32));
+            }
+            by_bytes.sort_unstable();
+        }
+        let mut hits: V<u32> = V::new();
+        for u in all.iter() {
+            let n = u.n as usize;
+            let mut rests: V<Rest> = V::new();
+            if n < 6 {
+                let mut key = [0u8; 6];
+                for (i, k) in key.iter_mut().enumerate().take(n) {
+                    *k = fold(u.r[i].0);
+                }
+                let kp = pack(&key[..n]);
+                // (the bits of the first n bytes)
+                let top = if n == 0 { 0 } else { !0u64 << (64 - 8 * n) };
+                let lo = by_bytes.partition_point(|&(e, _)| e < kp);
+                let hi = lo + by_bytes[lo..].partition_point(|&(e, _)| e & top == kp & top);
+                hits.clear();
+                for &(e, i) in by_bytes[lo..hi].iter() {
+                    if (e & 0xff) as usize > n {
+                        hits.push(i);
+                    }
+                }
+                // (in the order of the elements, as the scan found them)
+                hits.sort_unstable();
+                for &i in hits.iter() {
+                    let (e, el) = &elems[i as usize];
+                    let el = *el as usize;
+                    let mut r = [0u8; 6];
+                    r[..el - n].copy_from_slice(&e[n..el]);
+                    rests.push((r, (el - n) as u8));
+                }
+            }
+            if rests.is_empty() {
+                units.push(*u);
+            } else {
+                guarded.push((*u, rests));
+            }
+        }
+        if units.oom || guarded.oom || elems.oom || by_bytes.oom || hits.oom {
+            return Err(REG_ESPACE);
+        }
+        let n = units.len();
+        let mut done: V<bool> = V::from_elem(false, n);
+        let mut left = n;
+        // each pass builds a group from the sequences left that are not a prefix of, nor have as a prefix, one already in it
+        // (the group's sequences by their prefixes: "is one a prefix of this one, or this one a prefix of one" in a few lookups)
+        let mut in_group = mbset::PrefixSet::new();
+        // when no unit is a prefix of another (nor equal to one) the first pass takes them all: in byte order, a prefix
+        // relation between any two shows between neighbours (a prefix of c and b between them is a prefix of b too)
+        if n > 0 {
+            let mut sorted: V<Seq> = V::new();
+            sorted.extend_from_slice(&units);
+            mbset::sort_seqs(&mut sorted);
+            let starts = |a: &Seq, b: &Seq| a.n <= b.n && a.r[..a.n as usize] == b.r[..a.n as usize];
+            let clash = sorted.windows(2).any(|w| starts(&w[0], &w[1]));
+            if sorted.oom {
+                return Err(REG_ESPACE);
+            }
+            if !clash {
+                out.push(mbset::Unit { frag: frag_of(&sorted, false)?, rests: V::new() });
+                left = 0;
+            }
+        }
+        while left > 0 {
+            let mut group: V<Seq> = V::new();
+            in_group.clear();
+            for i in 0..n {
+                if done[i] {
+                    continue;
+                }
+                let a = units[i];
+                if !in_group.clashes(&a) {
+                    group.push(a);
+                    in_group.add(&a);
+                    done[i] = true;
+                    left -= 1;
+                }
+            }
+            if group.oom || done.oom || in_group.oom {
+                return Err(REG_ESPACE);
+            }
+            out.push(mbset::Unit { frag: frag_of(&group, true)?, rests: V::new() });
+        }
+        for (u, rests) in guarded.iter() {
+            let mut one: V<Seq> = V::new();
+            one.push(*u);
+            out.push(mbset::Unit { frag: frag_of(&one, false)?, rests: rests.duplicate() });
+        }
+        if out.oom {
+            return Err(REG_ESPACE);
+        }
+        Ok(out)
+    }
+
+    /// `m` (a tree, or `NONE`) or the collating elements the bracket accepts as a unit.
     fn add_units(&mut self, m: u32, acc: &Acc) -> Res {
         let u = self.units_tree(acc)?;
         if u == NONE {
@@ -1068,6 +1337,9 @@ impl<'a> Parser<'a> {
         self.mk_raw(NK::Alt, m, u)
     }
 
+    /// glibc's matcher treats a bracket expression with multibyte characters, collating symbols, equivalence classes or
+    /// ranges (and, in a multibyte locale, one with character classes or a negation) as a COMPLEX_BRACKET node: besides the
+    /// single characters it asks at every position which collating element of the locale starts there.
     fn is_complex_bracket(&self, acc: &Acc) -> bool {
         !acc.mbchars.is_empty()
             || !acc.colls.is_empty()
@@ -1077,6 +1349,9 @@ impl<'a> Parser<'a> {
             || (self.mb != Mb::None && (!acc.classes.is_empty() || acc.non_match))
     }
 
+    /// glibc, single-byte locale, case ignored: collating elements of 4 or more characters are not seen by the longest-element
+    /// rule, and a collating symbol of that many characters matches nothing (Hungarian "ddzs": `[[.ddzs.]]` matches nothing,
+    /// `[[.ddz.]]` matches the start of "ddzs", `[c-h]` still takes "ddzs" whole; found by tests/c/regex_coll_diff.c).
     fn element_unseen(&self, elem: &[u8]) -> bool {
         self.icase && self.mb == Mb::None && elem.len() >= 4
     }
@@ -1085,6 +1360,14 @@ impl<'a> Parser<'a> {
         self.element_unseen(elem)
     }
 
+    /// The collating elements of several characters (a contraction, Czech "ch") that the bracket accepts as ONE unit, as
+    /// byte sequences. glibc's `check_node_accept_bytes` looks at the element that starts at the position: a class or a
+    /// listed character matching its first character accepts that character only (the ordinary single-character path
+    /// already does); otherwise the element is accepted whole when it is a named collating symbol of the bracket, lies in
+    /// one of its ranges (by the element's collation sequence value) or is in one of its equivalence classes; a negated
+    /// bracket accepts the whole element when none of these holds. (The element is the longest the tables find at the
+    /// position: with contractions of different lengths starting alike, such as Hungarian "dz" and "dzs", the shorter one
+    /// is accepted here even where the longer one is what glibc sees.)
     fn contraction_seqs(&self, acc: &Acc, out: &mut V<Seq>) {
         if !self.is_complex_bracket(acc) {
             return;
@@ -1108,6 +1391,7 @@ impl<'a> Parser<'a> {
                 return;
             }
             let up = |wc: u32| if self.mb == Mb::None { u32::from(charset::to_upper(wc as u8)) } else { charset::upper_wc(wc) };
+            // with case ignored glibc compares the text in upper case: only upper case elements can occur
             if self.icase && chars[..n].iter().any(|&c| up(c) != c) {
                 return;
             }
@@ -1129,6 +1413,8 @@ impl<'a> Parser<'a> {
         });
     }
 
+    /// The sequence of a collating element; with case ignored every combination of the characters and their lower case
+    /// forms (the text is read in upper case, so "cH" is the element "CH").
     fn push_element(&self, chars: &[u32], elem: &[u8], out: &mut V<Seq>) {
         if !self.icase {
             let mut s = Seq { r: [(0, 0); 6], n: elem.len() as u8 };
@@ -1183,6 +1469,8 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The tree for the finished bracket expression (or `\w`-like class): `acc.sb` is the single-byte set before
+    /// the optional negation.
     fn finish_bracket(&mut self, mut acc: Acc, always_alt: bool) -> Res {
         if self.mb == Mb::None {
             if acc.non_match {
@@ -1202,6 +1490,7 @@ impl<'a> Parser<'a> {
         for (w, m) in acc.sb.iter_mut().zip(self.sbc.iter()) {
             *w &= *m;
         }
+        // (a collating element of several characters is a sequence of its own: it needs no scan)
         let has_complex = !acc.mbchars.is_empty() || !acc.equivs.is_empty() || !acc.ranges.is_empty() || !acc.classes.is_empty() || acc.non_match;
         let coll = charset::Collation::current();
         if self.mb == Mb::Utf8 && !FORCE_SCAN.load(core::sync::atomic::Ordering::Relaxed) {
@@ -1210,9 +1499,14 @@ impl<'a> Parser<'a> {
         let key = self.bracket_key(&acc, has_complex);
         let (mb, icase, sbc) = (self.mb, self.icase, self.sbc);
         let sb = acc.sb;
-        let mut build = |seqs: &mut V<Seq>| {
+        // GB18030's runs of four-byte codes (1,100,000 characters) are not asked one by one: `runs_set_seqs` takes them
+        // from the set as ranges of characters, and `build` then sees only the listed characters (`listed`)
+        let build = |seqs: &mut V<Seq>, listed: bool| {
+            let collect = if listed { mbset::collect_listed } else { mbset::collect };
             if icase && mb != Mb::Utf8 {
-                mbset::collect_folded(
+                // the text is compared in upper case: a character is in the set when its upper case form is
+                let collect_folded = if listed { mbset::collect_folded_listed } else { mbset::collect_folded };
+                collect_folded(
                     mb,
                     &mut |_, x, single| {
                         if single >= 0 && set_has(&sbc, single as u8) {
@@ -1223,6 +1517,7 @@ impl<'a> Parser<'a> {
                     seqs,
                 );
             } else if icase {
+                // the text is compared in upper case: a character is in the set when its upper case form is
                 let mut pred = |c: u32, _n: usize| -> bool {
                     let x = charset::upper_wc(c);
                     let mut b = [0u8; 6];
@@ -1233,16 +1528,49 @@ impl<'a> Parser<'a> {
                     }
                     has_complex && Self::complex_member(&acc, &coll, x)
                 };
-                mbset::collect(mb, true, if has_complex { 0x10ffff } else { 0x3000 }, &mut pred, seqs);
+                collect(mb, true, if has_complex { 0x10ffff } else { 0x3000 }, &mut pred, seqs);
             } else if has_complex {
                 let mut pred = |c: u32, n: usize| -> bool { n > 1 && Self::complex_member(&acc, &coll, c) };
-                mbset::collect(mb, false, 0x10ffff, &mut pred, seqs);
+                collect(mb, false, 0x10ffff, &mut pred, seqs);
             }
         };
         let sb_any = acc.sb.iter().any(|&w| w != 0);
-        let m = self.cached_tree(&key, &mut build)?;
+        let m = match mbset::canon_with(&key, |f| self.emit_frag(f)) {
+            Some(r) => r?,
+            None => {
+                let mut seqs: V<Seq> = V::new();
+                // a set without case ignoring: its characters as ranges of values (as for UTF-8), taken from the charset's
+                // rows (the same sequences the scan below finds: FIXLIST #148)
+                let by_rows = if mb == Mb::Other && !icase && has_complex {
+                    let m = self.set_ranges(&acc, true, &coll)?;
+                    let canon = if mbset::other_runs().is_empty() { mbset::rows_canon(Some(&m)) } else { mbset::rows_gb_canon(Some(&m)) };
+                    if let Some(canon) = canon {
+                        Some(self.canon_put_tree(&key, canon)?)
+                    } else if self.rows_bracket_seqs(&m, &mut seqs)? {
+                        Some(self.tree_put(&key, &seqs)?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(t) = by_rows {
+                    t
+                } else {
+                    seqs.clear();
+                    // (the list of the charset is made only for a set that looks at it: `build` does nothing otherwise)
+                    let runs: &[mbset::Run] = if mb == Mb::Other && (icase || has_complex) { mbset::other_runs() } else { &[] };
+                    build(&mut seqs, !runs.is_empty());
+                    if !runs.is_empty() {
+                        self.runs_set_seqs(&acc, has_complex, &coll, runs, &mut seqs)?;
+                    }
+                    self.tree_put(&key, &seqs)?
+                }
+            }
+        };
         let m = self.add_units(m, &acc)?;
         if self.icase {
+            // the single bytes are inside `seqs` already
             return if m == NONE { self.mk_set([0; 4]) } else { Ok(m) };
         }
         if m == NONE {
@@ -1255,7 +1583,195 @@ impl<'a> Parser<'a> {
         self.mk_raw(NK::Alt, s, m)
     }
 
+    /// The bracket set of a UTF-8 locale as ranges of code points, built from the tables by blocks (no question per
+    /// character), then written as byte sequences.
     fn finish_utf8(&mut self, acc: Acc, always_alt: bool, has_complex: bool, coll: &charset::Collation) -> Res {
+        // a set of listed characters and code-point ranges only (no classes, equivalence classes, collation order, negation or
+        // case ignoring) costs less to build than to look up
+        let cheap = acc.classes.is_empty() && acc.equivs.is_empty() && !acc.non_match && (coll.nrules() == 0 || acc.ranges.is_empty()) && !self.icase;
+        if cheap {
+            let r = self.utf8_set_ranges(&acc, has_complex, coll)?;
+            let f = utf8_frag(&r)?;
+            let t = self.emit_frag(&f)?;
+            return self.finish_utf8_tree(t, acc, always_alt);
+        }
+        // otherwise the set is kept as its description and matched against the tables (`u8set`), when its characters have
+        // two lengths or more (its automaton then has a state with two groups, so has_plural holds as before)
+        let runs = match self.u8_node(&acc, has_complex, coll)? {
+            Ok(t) => return self.finish_utf8_tree(t, acc, always_alt),
+            Err(runs) => runs,
+        };
+        // else the tree of the set's sequences comes from the cache of canonical forms when the same set was compiled
+        // before in the same locale (the key holds the set, case ignoring, the charset and the identities of LC_CTYPE and
+        // LC_COLLATE)
+        let mut key = self.bracket_key(&acc, has_complex);
+        // (the scan of every character, FORCE_SCAN, keeps its own entries: a test compares the two; so does NO_U8)
+        key.push(if NO_U8.load(core::sync::atomic::Ordering::Relaxed) { b'U' } else { b'u' });
+        if key.oom {
+            return Err(REG_ESPACE);
+        }
+        let t = match mbset::canon_with(&key, |f| self.emit_frag(f)) {
+            Some(r) => r?,
+            None => {
+                // (the runs `u8_node` read already are this set)
+                let r = match runs {
+                    Some(r) => r,
+                    None => self.utf8_set_ranges(&acc, has_complex, coll)?,
+                };
+                let f = utf8_frag(&r)?;
+                let t = self.emit_frag(&f)?;
+                mbset::canon_put(&key, f);
+                t
+            }
+        };
+        self.finish_utf8_tree(t, acc, always_alt)
+    }
+
+    /// The `U8` node of a bracket set (UTF-8, not one of the cheap sets), or `Err` when its automaton is to be built (the
+    /// characters of the set have one length only, or the case table could not be kept), with the set's runs when they
+    /// were read whole (`U8Spec::compute_root`).
+    #[allow(clippy::type_complexity)]
+    fn u8_node(&mut self, acc: &Acc, has_complex: bool, coll: &charset::Collation) -> Result<Result<u32, Option<mbset::Ranges>>, i32> {
+        if NO_U8.load(core::sync::atomic::Ordering::Relaxed) {
+            return Ok(Err(None));
+        }
+        let cased = if self.icase {
+            match mbset::cased_cached() {
+                Some(c) => Some(c),
+                None => return Ok(Err(None)),
+            }
+        } else {
+            None
+        };
+        let mut spec = crate::u8set::U8Spec {
+            sb: acc.sb,
+            mbchars: acc.mbchars.duplicate(),
+            classes: acc.classes.duplicate(),
+            ranges: acc.ranges.duplicate(),
+            equivs: acc.equivs.duplicate(),
+            non_match: acc.non_match,
+            has_complex,
+            icase: self.icase,
+            coll: *coll,
+            ctype: rusty_libc_core::locale::current(rusty_libc_core::locale::LC_CTYPE),
+            cs: rusty_libc_wchar::charset(),
+            collate: rusty_libc_core::locale::current(rusty_libc_core::locale::LC_COLLATE),
+            cased,
+            root: [0; 4],
+            memo: [const { core::sync::atomic::AtomicU64::new(0) }; crate::u8set::MEMO_WORDS],
+            blocks: [const { core::sync::atomic::AtomicU64::new(0) }; 2 * crate::u8set::BLOCK_SLOTS],
+        };
+        if spec.mbchars.oom || spec.classes.oom || spec.ranges.oom || spec.equivs.oom {
+            return Err(REG_ESPACE);
+        }
+        // (the first bytes cost about fifty questions to the tables: kept for later patterns under the set's key)
+        let mut key = self.bracket_key(acc, has_complex);
+        key.push(b'r');
+        if key.oom {
+            return Err(REG_ESPACE);
+        }
+        let mut runs = None;
+        match mbset::root_get(&key) {
+            Some(r) => spec.root = r,
+            None => {
+                runs = spec.compute_root();
+                mbset::root_put(&key, spec.root);
+            }
+        }
+        if spec.lengths() < 2 {
+            if runs.as_ref().is_some_and(|r| r.oom) {
+                return Err(REG_ESPACE);
+            }
+            return Ok(Err(runs));
+        }
+        let id = self.mk_raw(NK::U8, NONE, NONE)?;
+        self.nodes[id as usize].idx = self.u8specs.len() as u32;
+        self.u8specs.push(spec);
+        if self.u8specs.oom {
+            return Err(REG_ESPACE);
+        }
+        Ok(Ok(id))
+    }
+
+    /// The rest of `finish_utf8` once the tree `t` of the set's sequences is made: the collating elements of several
+    /// characters and the single bytes.
+    fn finish_utf8_tree(&mut self, t: u32, acc: Acc, always_alt: bool) -> Res {
+        let non_match = acc.non_match;
+        let t = self.finish_utf8_set(t, acc, always_alt)?;
+        if non_match { self.add_high_forms(t) } else { Ok(t) }
+    }
+
+    /// A negated bracket also takes the characters glibc's `mbrtowc` reads above U+10FFFF (the four to six byte forms up to
+    /// U+7FFFFFFF, not overlong): none of them is in any class or range, so they are outside every set that is not negated
+    /// (FIXLIST #143). The tables of the sets stop at U+10FFFF; these forms are a tree of their own.
+    fn add_high_forms(&mut self, t: u32) -> Res {
+        let mut key: V<u8> = V::new();
+        key.extend_from_slice(b"u8high");
+        if key.oom {
+            return Err(REG_ESPACE);
+        }
+        let mut build = |seqs: &mut V<Seq>| {
+            let c = (0x80u8, 0xbfu8);
+            let z = (0, 0);
+            seqs.push(Seq { r: [(0xf4, 0xf4), (0x90, 0xbf), c, c, z, z], n: 4 });
+            seqs.push(Seq { r: [(0xf5, 0xf7), c, c, c, z, z], n: 4 });
+            seqs.push(Seq { r: [(0xf8, 0xf8), (0x88, 0xbf), c, c, c, z], n: 5 });
+            seqs.push(Seq { r: [(0xf9, 0xfb), c, c, c, c, z], n: 5 });
+            seqs.push(Seq { r: [(0xfc, 0xfc), (0x84, 0xbf), c, c, c, c], n: 6 });
+            seqs.push(Seq { r: [(0xfd, 0xfd), c, c, c, c, c], n: 6 });
+        };
+        let h = self.cached_tree(&key, &mut build)?;
+        if t == NONE || h == NONE {
+            return Ok(if t == NONE { h } else { t });
+        }
+        self.mk_raw(NK::Alt, t, h)
+    }
+
+    fn finish_utf8_set(&mut self, t: u32, acc: Acc, always_alt: bool) -> Res {
+        let sb_any = acc.sb.iter().any(|&w| w != 0);
+        let t = self.add_units(t, &acc)?;
+        if self.icase {
+            return if t == NONE { self.mk_set([0; 4]) } else { Ok(t) };
+        }
+        if t == NONE {
+            return self.mk_set(acc.sb);
+        }
+        if !sb_any && !always_alt {
+            return Ok(t);
+        }
+        let s = self.mk_set(acc.sb)?;
+        self.mk_raw(NK::Alt, s, t)
+    }
+
+    /// The characters of a bracket set (UTF-8) beyond its single bytes (with case ignored, all of them), as ranges.
+    fn utf8_set_ranges(&mut self, acc: &Acc, has_complex: bool, coll: &charset::Collation) -> Result<mbset::Ranges, i32> {
+        let m = self.set_ranges(acc, has_complex, coll)?;
+        if self.icase {
+            // S, the set of upper case forms: the ASCII bytes of the set and `m`
+            let mut s_set: mbset::Ranges = V::new();
+            for b in 0..0x80u32 {
+                if set_has(&acc.sb, b as u8) {
+                    s_set.push((b, b));
+                }
+            }
+            for &r in m.iter() {
+                s_set.push(r);
+            }
+            mbset::normalize(&mut s_set);
+            let res = self.upper_preimage(&s_set);
+            if h_oom(&s_set) || h_oom(&res) {
+                return Err(REG_ESPACE);
+            }
+            Ok(res)
+        } else {
+            Ok(m)
+        }
+    }
+
+    /// The characters from 0x80 up that a bracket set holds, as ranges, read from the tables by blocks (no question per
+    /// character): what `complex_member` answers for each of them (case not ignored).
+    fn set_ranges(&mut self, acc: &Acc, has_complex: bool, coll: &charset::Collation) -> Result<mbset::Ranges, i32> {
+        // the class numbers of `CLASS_NAMES` as bit numbers of rusty-libc-wchar's classes
         const WBIT: [u32; 12] = [0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11];
         let mut m: mbset::Ranges = V::new();
         if has_complex {
@@ -1274,6 +1790,7 @@ impl<'a> Parser<'a> {
                     rusty_libc_locale::equiv_runs_wc(r, w, &mut |lo, hi| h.push((lo, hi)));
                 }
             } else {
+                // no collation rules: a range is by character value
                 for &(s, e) in acc.ranges.iter() {
                     if e >= 0x80 {
                         h.push((s.max(0x80), e));
@@ -1287,50 +1804,81 @@ impl<'a> Parser<'a> {
         if h_oom(&m) || acc.colls.oom {
             return Err(REG_ESPACE);
         }
-        let mut seqs: V<Seq> = V::new();
-        if self.icase {
+        Ok(m)
+    }
+
+    /// The characters whose upper case form is in `s_set` (normalized ranges): `s_set` without the characters the mapping
+    /// changes, plus the changed characters whose upper case form is in it (the text is compared in upper case).
+    fn upper_preimage(&mut self, s_set: &mbset::Ranges) -> mbset::Ranges {
+        let mut res: mbset::Ranges = V::new();
+        let (pairs, kept) = self.cased();
+        res.extend_from_slice(&mbset::clip(s_set, kept));
+        for &(t, u) in pairs {
+            if mbset::contains(s_set, u) {
+                res.push((t, t));
+            }
+        }
+        mbset::normalize(&mut res);
+        res
+    }
+
+    /// The sequences of the multibyte characters of a bracket set (case not ignored, a complex part) of a charset with rows:
+    /// the set as ranges of values (`set_ranges`), then the rows' characters with a value in them, and GB18030's four-byte
+    /// codes as ranges. False (nothing added) when the charset has no rows.
+    fn rows_bracket_seqs(&mut self, m: &mbset::Ranges, seqs: &mut V<Seq>) -> Result<bool, i32> {
+        if !mbset::rows_seqs(Some(m), seqs) {
+            return Ok(false);
+        }
+        mbset::runs_in(mbset::other_runs(), m, seqs);
+        if seqs.oom {
+            return Err(REG_ESPACE);
+        }
+        Ok(true)
+    }
+
+    /// The sequences of GB18030's four-byte codes (`runs`) of a bracket set, from the set as ranges of characters (as for
+    /// UTF-8) instead of a question per character: what the scan of `finish_bracket` accepts of them.
+    fn runs_set_seqs(&mut self, acc: &Acc, has_complex: bool, coll: &charset::Collation, runs: &[mbset::Run], seqs: &mut V<Seq>) -> Result<(), i32> {
+        // (every four-byte character is from 0x80 up and has no form of one byte)
+        let m = self.set_ranges(acc, has_complex, coll)?;
+        let res = if self.icase {
+            // the scan's question for a character with upper case form x: the set's single byte when x is one, else
+            // `complex_member`
             let mut s_set: mbset::Ranges = V::new();
-            for b in 0..0x80u32 {
-                if set_has(&acc.sb, b as u8) {
-                    s_set.push((b, b));
+            let mut b = [0u8; 6];
+            for x in 0..0x80u32 {
+                let hit = match charset::encode(self.mb, x, &mut b) {
+                    Some(1) if set_has(&self.sbc, b[0]) => set_has(&acc.sb, b[0]),
+                    _ => has_complex && Self::complex_member(acc, coll, x),
+                };
+                if hit {
+                    s_set.push((x, x));
                 }
             }
             for &r in m.iter() {
                 s_set.push(r);
             }
             mbset::normalize(&mut s_set);
-            let mut res: mbset::Ranges = V::new();
-            let (pairs, kept) = self.cased();
-            res.extend_from_slice(&mbset::clip(&s_set, kept));
-            for &(t, u) in pairs {
-                if mbset::contains(&s_set, u) {
-                    res.push((t, t));
-                }
+            if h_oom(&s_set) {
+                return Err(REG_ESPACE);
             }
-            mbset::normalize(&mut res);
-            mbset::utf8_seqs(&res, &mut seqs);
+            self.upper_preimage(&s_set)
+        } else if has_complex {
+            m
         } else {
-            mbset::utf8_seqs(&m, &mut seqs);
+            V::new()
+        };
+        if h_oom(&res) {
+            return Err(REG_ESPACE);
         }
+        mbset::runs_in(runs, &res, seqs);
         if seqs.oom {
             return Err(REG_ESPACE);
         }
-        let sb_any = acc.sb.iter().any(|&w| w != 0);
-        let t = self.tree_of_seqs(&seqs)?;
-        let t = self.add_units(t, &acc)?;
-        if self.icase {
-            return if t == NONE { self.mk_set([0; 4]) } else { Ok(t) };
-        }
-        if t == NONE {
-            return self.mk_set(acc.sb);
-        }
-        if !sb_any && !always_alt {
-            return Ok(t);
-        }
-        let s = self.mk_set(acc.sb)?;
-        self.mk_raw(NK::Alt, s, t)
+        Ok(())
     }
 
+    /// A byte string that describes a bracket set and the locale it is read in (the key of the scan cache).
     fn bracket_key(&self, acc: &Acc, has_complex: bool) -> V<u8> {
         let mut k: V<u8> = V::new();
         k.push(self.icase as u8);
@@ -1390,6 +1938,7 @@ impl<'a> Parser<'a> {
             }
         }
         let _ = non_match;
+        // The first ']' is a normal character.
         if tok.ty == T::OpCloseBracket {
             tok.ty = T::Character;
         }
@@ -1416,6 +1965,7 @@ impl<'a> Parser<'a> {
                         return Err(REG_EBRACK);
                     }
                     if tok2.ty == T::OpCloseBracket {
+                        // The last '-' is a normal character.
                         self.idx -= token_len;
                         tok.ty = T::Character;
                     } else {
@@ -1453,6 +2003,8 @@ impl<'a> Parser<'a> {
         self.finish_bracket(acc, false)
     }
 
+    /// An element that is one character: a single-byte element when the character is one byte that is a complete
+    /// character, else a multibyte one (REG_ICASE: the upper case form, as glibc parses the upper-cased pattern).
     fn set_char_elem(&self, elem: &mut Elem, wc: u32) {
         let x = if self.icase { charset::upper_wc(wc) } else { wc };
         let mut b = [0u8; 6];
@@ -1523,6 +2075,7 @@ impl<'a> Parser<'a> {
             T::OpOpenEquivClass => ET::EquivClass,
             _ => ET::CharClass,
         };
+        // REG_ICASE in a multibyte locale: glibc reads names from the upper-cased pattern
         if self.mb != Mb::None && self.icase && elem.ty != ET::CharClass {
             self.upcase_name(&mut elem.name);
         }
@@ -1554,6 +2107,7 @@ impl<'a> Parser<'a> {
         *name = out;
     }
 
+    /// The collation sequence value glibc's `lookup_collation_sequence_value` gives an element (`NO_SEQ`: none).
     fn seq_value(&self, coll: &charset::Collation, x: &Elem) -> u32 {
         match x.ty {
             ET::SbChar => coll.seq_of_byte(x.ch),
@@ -1590,6 +2144,7 @@ impl<'a> Parser<'a> {
             acc.ranges.push((sv, ev));
         }
         if coll.is_byte_identity() {
+            // sequence value = byte value: the bytes of sv..=ev
             for ch in sv..=ev.min(255) {
                 set_bit(&mut acc.sb, ch as u8);
             }
@@ -1604,6 +2159,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// `[=name=]`: glibc's `build_equiv_class`.
     fn build_equiv_class(&self, acc: &mut Acc, name: &[u8]) -> Result<(), i32> {
         let coll = charset::Collation::current();
         if coll.nrules() == 0 {
@@ -1628,8 +2184,10 @@ impl<'a> Parser<'a> {
                 set_bit(&mut acc.sb, ch as u8);
             }
         }
+        // (the weights are also kept for the collating elements of several characters, see `contraction_seqs`)
         acc.equivs_mb.push((rule, w1));
         if self.mb != Mb::None {
+            // the multibyte characters of the class: compared through the wide table
             let mut wide = [0u32; 34];
             let (mut i, mut n) = (0usize, 0usize);
             while i < name.len() {
@@ -1645,8 +2203,11 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// `[.name.]`: glibc's `build_collating_symbol`.
     fn build_collating_symbol(&self, acc: &mut Acc, name: &[u8]) -> Result<(), i32> {
         let coll = charset::Collation::current();
+        // glibc reads the pattern through its translation table: when case is ignored the name is in upper case (in a
+        // single-byte locale `parse` has translated the pattern already)
         let mut upper = [0u8; 40];
         let mut name = name;
         if self.icase && self.mb != Mb::None && name.len() <= 32 {
@@ -1672,6 +2233,7 @@ impl<'a> Parser<'a> {
         }
         if coll.nrules() != 0 {
             if let Some(elem) = coll.symbol_elem(name) {
+                // the element's bytes: several characters are a sequence to match; one multibyte character joins the set
                 if self.mb != Mb::None
                     && let Some((wc, n)) = charset::decode(self.mb, elem)
                     && n == elem.len()
@@ -1727,6 +2289,7 @@ impl<'a> Parser<'a> {
     fn build_charclass_op(&mut self, class_name: &[u8], extra: &[u8], non_match: bool) -> Res {
         let mut acc = Acc::new();
         acc.non_match = non_match;
+        // The syntax does not matter here (glibc passes 0).
         let saved = self.syntax;
         self.syntax = 0;
         let r = self.build_charclass(&mut acc, class_name);
@@ -1746,15 +2309,24 @@ fn h_oom(r: &mbset::Ranges) -> bool {
     r.oom
 }
 
+/// Test hook: build the sets of a UTF-8 locale by asking every character (the slow, plain way) instead of walking the
+/// tables; the tests compare the two.
 pub static FORCE_SCAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Test hook: build the automaton of every UTF-8 bracket set (no `U8` nodes); the tests compare the two.
+pub static NO_U8: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// What a bracket expression collects: glibc's `sbcset` and `re_charset_t`.
 struct Acc {
     sb: Set,
     mbchars: V<u32>,
     classes: V<u8>,
     ranges: V<(u32, u32)>,
     equivs: V<(u8, &'static [u32])>,
+    /// the weights of the equivalence classes as the byte tables give them (a collating element of several characters is
+    /// compared with these)
     equivs_mb: V<(u8, &'static [u8])>,
+    /// the collating elements of several characters named by `[.xy.]` (in upper case when the match ignores case)
     colls: V<Seq>,
     non_match: bool,
 }
@@ -1765,10 +2337,14 @@ impl Acc {
     }
 }
 
+/// Parses `pattern` under `syntax`; `trans` is the optional translation table of the pattern
+/// buffer. The result is glibc's parse tree: CONCAT(tree, END), or END alone for an empty pattern.
 pub fn parse(pattern: &[u8], syntax: u64, trans: Option<&[u8; 256]>) -> Result<Parsed, i32> {
     let icase = syntax & RE_ICASE != 0;
     let mb = charset::mb_kind();
     let mut up: V<u8> = V::new();
+    // in a multibyte locale the case is handled per character (see `mk_character`, `finish_bracket`): the pattern
+    // text stays as it is
     if (icase && mb == Mb::None) || trans.is_some() {
         up.reserve(pattern.len());
         for &b in pattern {
@@ -1806,18 +2382,73 @@ pub fn parse(pattern: &[u8], syntax: u64, trans: Option<&[u8; 256]>) -> Result<P
         ucache: V::new(),
         cased: None,
         cased_own: None,
+        frags: V::new(),
+        u8specs: V::new(),
     };
     let mut tok = p.fetch_token(syntax | RE_CARET_ANCHORS_HERE);
     let tree = p.parse_reg_exp(&mut tok, 0)?;
     let eor = p.mk_raw(NK::End, NONE, NONE)?;
     let root = if tree != NONE { p.mk_raw(NK::Concat, tree, eor)? } else { eor };
-    Ok(Parsed { nodes: p.nodes, root, sets: p.sets, nsub: p.nsub, nbackref: p.nbackref, guards: p.guards, mb })
+    Ok(Parsed { nodes: p.nodes, root, sets: p.sets, nsub: p.nsub, nbackref: p.nbackref, guards: p.guards, mb, frags: p.frags, u8specs: p.u8specs })
 }
 
+/// The automaton of the UTF-8 sequences of the characters in the normalized `r`.
+fn utf8_frag(r: &mbset::Ranges) -> Result<Frag, i32> {
+    let canon = mbset::utf8_canon(r);
+    if canon.oom {
+        return Err(REG_ESPACE);
+    }
+    let f = Frag::from_canon(&canon);
+    if f.oom {
+        return Err(REG_ESPACE);
+    }
+    Ok(f)
+}
+
+/// The automaton of the sequences `seqs` (inserted in order when `sort`: the trie is then built without scans).
+fn frag_of(seqs: &V<Seq>, sort: bool) -> Result<Frag, i32> {
+    if seqs.oom {
+        return Err(REG_ESPACE);
+    }
+    let mut trie = Trie::new();
+    if sort {
+        let mut v: V<Seq> = V::new();
+        v.extend_from_slice(seqs);
+        if v.oom {
+            return Err(REG_ESPACE);
+        }
+        mbset::sort_seqs(&mut v);
+        for s in v.iter() {
+            trie.insert(s);
+        }
+    } else {
+        for s in seqs.iter() {
+            trie.insert(s);
+        }
+    }
+    if trie.oom() {
+        return Err(REG_ESPACE);
+    }
+    if trie.is_empty() {
+        return Ok(Frag::empty());
+    }
+    let canon = trie.canon();
+    if canon.oom {
+        return Err(REG_ESPACE);
+    }
+    let f = Frag::from_canon(&canon);
+    if f.oom {
+        return Err(REG_ESPACE);
+    }
+    Ok(f)
+}
+
+/// The bytes of `s` before its first NUL (all of `s` if it has none): what the C-string form of the collation lookup saw.
 fn until_nul(s: &[u8]) -> &[u8] {
     s.iter().position(|&b| b == 0).map_or(s, |n| &s[..n])
 }
 
+/// The wide characters of `s` up to and including its first 0 (all of `s` if it has none).
 fn through_nul(s: &[u32]) -> &[u32] {
     s.iter().position(|&c| c == 0).map_or(s, |n| &s[..=n])
 }
