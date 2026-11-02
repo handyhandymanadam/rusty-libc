@@ -502,3 +502,42 @@ fn keys_as_the_glibc_client_sends_them() {
     long.push(&[0]);
     assert!(long.overflow);
 }
+
+/// A sink that records the most it was asked to hold.
+#[derive(Default)]
+struct Recording {
+    bytes: Vec<u8>,
+    most: usize,
+}
+
+impl super::Sink for Recording {
+    fn reserve(&mut self, bytes: usize) -> bool {
+        self.most = self.most.max(bytes);
+        if self.bytes.len() < bytes {
+            self.bytes.resize(bytes, 0);
+        }
+        true
+    }
+
+    fn bytes(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+}
+
+#[test]
+fn fill_takes_what_the_daemon_sends_and_no_more() {
+    use super::{Fill, fill};
+    // all of it
+    let data: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+    let mut sink = Recording::default();
+    assert_eq!(fill(&mut Mem(&data), &mut sink, data.len()), Fill::Done);
+    assert_eq!(&sink.bytes[..data.len()], &data[..]);
+    // a header that claims 2 GiB over 10 bytes of data: short, and the sink never held more than a few steps
+    let mut sink = Recording::default();
+    assert_eq!(fill(&mut Mem(&[1u8; 10]), &mut sink, 0x7FFF_FFD0), Fill::Short);
+    assert!(sink.most <= 128 * 1024, "held {} bytes", sink.most);
+    // a length no allocation could have: no memory at once
+    let mut sink = Recording::default();
+    assert_eq!(fill(&mut Mem(&[]), &mut sink, usize::MAX - 7), Fill::NoMemory);
+    assert_eq!(sink.most, 0);
+}

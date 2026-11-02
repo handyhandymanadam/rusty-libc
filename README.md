@@ -22,18 +22,18 @@ Behaviour is checked against the real glibc 2.43 with differential tests: the sa
 
 ## Status
 
-Result of the last full CI run (commit `e0c4b9d1` of the development repository, 2026-11-01); all 9 stages passed:
+Result of the last full CI run (commit `0eddc226` of the development repository, 2026-11-01); all 9 stages passed:
 
 | check | result |
 |---|---|
-| build | 93 crates, one `libc.so.6` |
+| build | one `libc.so.6` |
 | C and Rust tests | 349 passed, 0 failed |
-| dynamic (shared build) tests | 359 passed, 0 failed |
+| dynamic (shared build) tests | 360 passed, 0 failed, 1 skipped |
 | symbol check | 220 of 220 |
 | glibc exports present | 4,515 of 4,800 |
-| cargo tests | 1,451 passed, 0 failed, 116 ignored |
+| cargo tests | 1,471 passed, 0 failed, 116 ignored |
 | clippy | 0 errors |
-| glibc's own test suite | 2,464 tests ran, 2 failures (both known, none new) |
+| system swap test (`rootfs`) | all 23 workloads pass with rusty-libc swapped into a copy of a Fedora root (build, Python, Rust workspace, DNS, locales, musl build and others) |
 
 The shared `libc.so.6` is about 13 MB and contains libm, pthread, dl, rt, util, resolv and anl. `ld-linux-x86-64.so.2` is about 250 KB. This is a snapshot of the development tree, not a promise. Some functions are not yet as fast as glibc's.
 

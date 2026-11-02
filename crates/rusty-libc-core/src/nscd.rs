@@ -303,6 +303,40 @@ pub trait Sink {
     fn bytes(&mut self) -> &mut [u8];
 }
 
+/// How `fill` ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Fill {
+    /// All the bytes are in the sink.
+    Done,
+    /// The sink could not get the memory.
+    NoMemory,
+    /// The daemon sent fewer bytes than its header said.
+    Short,
+}
+
+/// Read `len` bytes from `conn` into the sink, which grows with what arrives (at most doubling, in steps of 64 KiB or more).
+/// glibc mallocs the whole length and never touches what the daemon does not send; a sink that is zero-filled up front would
+/// commit gigabytes for a header that claims them (an `int` sum of counts can reach 2 GiB), so the length is not reserved at once.
+/// A length no allocation could ever have (above `isize::MAX`, a wrapped negative sum) is `NoMemory` at once, as malloc fails.
+fn fill(conn: &mut impl conn::Source, sink: &mut impl Sink, len: usize) -> Fill {
+    const STEP: usize = 64 * 1024;
+    if len > isize::MAX as usize {
+        return Fill::NoMemory;
+    }
+    let mut done = 0;
+    while done < len {
+        let step = (len - done).min(STEP);
+        if !sink.reserve(len.min((done * 2).max(done + step))) {
+            return Fill::NoMemory;
+        }
+        if conn.read_all(&mut sink.bytes()[done..done + step]) != step {
+            return Fill::Short;
+        }
+        done += step;
+    }
+    Fill::Done
+}
+
 /// What `addr_info` came to.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AddrInfo {
@@ -352,11 +386,12 @@ pub fn addr_info(name: &[u8], sink: &mut impl Sink) -> AddrInfo {
     // glibc adds the three 32-bit counts as `int` (wrapping) and widens the sum to size_t, so counts that add up past
     // 2 GiB give a smaller (or, negative, a huge) length than their real sum: the same here, for the same answers.
     let datalen = (naddrs as i32).wrapping_add(addrslen as i32).wrapping_add(canonlen as i32) as isize as usize;
-    if !sink.reserve(datalen) {
-        return AddrInfo::NoMemory;
+    match fill(&mut conn, sink, datalen) {
+        Fill::Done => {}
+        Fill::NoMemory => return AddrInfo::NoMemory,
+        Fill::Short => return AddrInfo::Failed,
     }
-    let data = &mut sink.bytes()[..datalen];
-    if conn.read_all(data) != datalen || AddrInfoData::split(data, naddrs, addrslen, canonlen).is_none() {
+    if AddrInfoData::split(&sink.bytes()[..datalen], naddrs, addrslen, canonlen).is_none() {
         return AddrInfo::Failed;
     }
     AddrInfo::Found { naddrs, addrslen, canonlen }
@@ -460,7 +495,7 @@ pub fn netgroup(group: &[u8], sink: &mut impl Sink) -> Netgroup {
         _ => return Netgroup::NotFound,
     }
     let Some(len) = wire::size(&header, 3) else { return Netgroup::Fallback };
-    if !sink.reserve(len) || conn.read_all(&mut sink.bytes()[..len]) != len {
+    if fill(&mut conn, sink, len) != Fill::Done {
         return Netgroup::Fallback;
     }
     Netgroup::Found { len }
